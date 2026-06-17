@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bloodyroar2_gym::{
-    Action, BloodyRoar2Env, MameConfig, MameRuntime, NullBackend, action_space_json,
-    api_index_json, observation_space_json,
+    Action, BloodyRoar2Env, MameConfig, MameRuntime, NullBackend, ZincConfig, ZincRuntime,
+    action_space_json, api_index_json, observation_space_json,
 };
 
 fn main() -> ExitCode {
@@ -116,6 +116,33 @@ fn run() -> Result<(), String> {
                 .play(&extra_args)
                 .map_err(|error| error.to_string())
         }
+        "prepare-zinc" => {
+            let archive = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym prepare-zinc <archive.zip> [extract_dir]".to_string()
+            })?;
+            let extract_dir = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/extracted"));
+            let runtime = ZincRuntime::new(zinc_config(None));
+            runtime
+                .prepare_bundle(&archive, &extract_dir)
+                .map_err(|error| error.to_string())?;
+            println!("prepared ZiNc bundle under {}", extract_dir.display());
+            Ok(())
+        }
+        "zinc-check" => {
+            let config = zinc_config(args.next());
+            println!("{}", ZincRuntime::new(config).check());
+            Ok(())
+        }
+        "zinc-play" => {
+            let config = zinc_config(args.next());
+            let extra_args = args.collect::<Vec<_>>();
+            ZincRuntime::new(config)
+                .play(&extra_args)
+                .map_err(|error| error.to_string())
+        }
         "asset-check" => {
             let path = args
                 .next()
@@ -128,7 +155,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
@@ -146,6 +173,25 @@ fn mame_config(rom_dir: Option<String>) -> MameConfig {
         rom_dir,
         game: env::var("BLOODYROAR2_MAME_GAME").unwrap_or_else(|_| "bldyror2".to_string()),
     }
+}
+
+fn zinc_config(bundle_dir: Option<String>) -> ZincConfig {
+    let mut config = ZincConfig::default();
+    if let Some(wine) = env::var_os("BLOODYROAR2_WINE") {
+        config.wine = PathBuf::from(wine);
+    }
+    if let Some(bundle_dir) = bundle_dir {
+        config.bundle_dir = PathBuf::from(bundle_dir);
+    } else if let Some(bundle_dir) = env::var_os("BLOODYROAR2_ZINC_DIR") {
+        config.bundle_dir = PathBuf::from(bundle_dir);
+    }
+    if let Ok(renderer) = env::var("BLOODYROAR2_ZINC_RENDERER") {
+        config.renderer = renderer;
+    }
+    if let Ok(renderer_cfg) = env::var("BLOODYROAR2_ZINC_RENDERER_CFG") {
+        config.renderer_cfg = renderer_cfg;
+    }
+    config
 }
 
 fn asset_check(path: &str) -> Result<(), String> {

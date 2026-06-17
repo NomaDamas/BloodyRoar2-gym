@@ -58,6 +58,29 @@ Windows executable is not native Apple Silicon software; running it would
 require a separate Wine/Rosetta-style compatibility layer and is not the default
 or recommended path.
 
+## ZiNc compatibility path
+
+The downloaded bundle is structured for ZiNc on Windows. On Apple Silicon this
+is not native, but it can be attempted through Rosetta plus Wine:
+
+```sh
+cargo run -- prepare-zinc "BloodRoar2 (2).zip" assets/extracted
+cargo run -- zinc-check assets/extracted/BloodRoar2
+cargo run -- zinc-play assets/extracted/BloodRoar2
+```
+
+Configuration:
+
+- `BLOODYROAR2_WINE`: override the Wine executable path.
+- `BLOODYROAR2_ZINC_DIR`: override the extracted ZiNc bundle directory.
+- `BLOODYROAR2_ZINC_RENDERER`: override renderer, default `renderer-sft.znc`.
+- `BLOODYROAR2_ZINC_RENDERER_CFG`: override renderer config, default
+  `zenith-renderer70.cfg`.
+
+If Wine is missing, install a Wine distribution manually. Homebrew
+`wine-stable` may require `sudo` for its GStreamer dependency and may not be
+installable from non-interactive automation.
+
 ## HTTP API
 
 ```sh
