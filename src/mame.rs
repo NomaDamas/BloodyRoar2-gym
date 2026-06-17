@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -118,24 +119,14 @@ impl MameRuntime {
 
     pub fn check(&self) -> Result<String, BackendError> {
         self.ensure_ready()?;
-        let output = Command::new(&self.config.executable)
-            .arg("-rompath")
-            .arg(&self.config.rom_dir)
-            .arg("-verifyroms")
-            .arg(&self.config.game)
-            .output()
-            .map_err(|error| {
-                BackendError::new(format!(
-                    "failed to run {}: {error}",
-                    self.config.executable.display()
-                ))
-            })?;
+        let (success, report) = self.run_mame_output([
+            OsStr::new("-rompath"),
+            self.config.rom_dir.as_os_str(),
+            OsStr::new("-verifyroms"),
+            OsStr::new(&self.config.game),
+        ])?;
 
-        let mut report = String::new();
-        report.push_str(&String::from_utf8_lossy(&output.stdout));
-        report.push_str(&String::from_utf8_lossy(&output.stderr));
-
-        if !output.status.success() {
+        if !success {
             return Err(BackendError::new(format!(
                 "MAME ROM verification failed:\n{}",
                 report.trim()
@@ -143,6 +134,72 @@ impl MameRuntime {
         }
 
         Ok(report)
+    }
+
+    pub fn identify_roms(&self) -> Result<String, BackendError> {
+        let game_rom = self
+            .config
+            .rom_dir
+            .join(format!("{}.zip", self.config.game));
+        if !game_rom.is_file() {
+            return Err(BackendError::new(format!(
+                "game ROM archive not found: {}",
+                game_rom.display()
+            )));
+        }
+
+        let (_, report) = self.run_mame_output([OsStr::new("-romident"), game_rom.as_os_str()])?;
+        Ok(report)
+    }
+
+    pub fn required_roms(&self) -> Result<String, BackendError> {
+        let (_, report) =
+            self.run_mame_output([OsStr::new("-listroms"), OsStr::new(&self.config.game)])?;
+        Ok(report)
+    }
+
+    pub fn doctor(&self) -> String {
+        let mut report = String::new();
+        report.push_str("{\n");
+        report.push_str(&format!(
+            "  \"mame_executable\": \"{}\",\n",
+            self.config.executable.display()
+        ));
+        report.push_str(&format!(
+            "  \"rom_dir\": \"{}\",\n",
+            self.config.rom_dir.display()
+        ));
+        report.push_str(&format!("  \"game\": \"{}\",\n", self.config.game));
+        report.push_str(&format!(
+            "  \"mame_found\": {},\n",
+            command_exists(&self.config.executable)
+        ));
+        report.push_str(&format!(
+            "  \"rom_dir_found\": {},\n",
+            self.config.rom_dir.is_dir()
+        ));
+        report.push_str(&format!(
+            "  \"game_rom_found\": {},\n",
+            self.config
+                .rom_dir
+                .join(format!("{}.zip", self.config.game))
+                .is_file()
+        ));
+
+        match self.identify_roms() {
+            Ok(output) => report.push_str(&json_block("romident", &output, true)),
+            Err(error) => report.push_str(&json_block("romident_error", &error.to_string(), true)),
+        }
+
+        match self.check() {
+            Ok(output) => report.push_str(&json_block("verifyroms", &output, false)),
+            Err(error) => {
+                report.push_str(&json_block("verifyroms_error", &error.to_string(), false))
+            }
+        }
+
+        report.push_str("}\n");
+        report
     }
 
     pub fn play(&self, extra_args: &[String]) -> Result<(), BackendError> {
@@ -197,6 +254,27 @@ impl MameRuntime {
 
         Ok(())
     }
+
+    fn run_mame_output<I, S>(&self, args: I) -> Result<(bool, String), BackendError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let output = Command::new(&self.config.executable)
+            .args(args)
+            .output()
+            .map_err(|error| {
+                BackendError::new(format!(
+                    "failed to run {}: {error}",
+                    self.config.executable.display()
+                ))
+            })?;
+
+        let mut report = String::new();
+        report.push_str(&String::from_utf8_lossy(&output.stdout));
+        report.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok((output.status.success(), report))
+    }
 }
 
 fn status_ok(status: ExitStatus, message: String) -> Result<(), BackendError> {
@@ -219,4 +297,16 @@ fn command_exists(path: &Path) -> bool {
                 .any(|candidate| candidate.is_file())
         })
         .unwrap_or(false)
+}
+
+fn json_block(key: &str, value: &str, comma: bool) -> String {
+    format!(
+        "  \"{}\": \"{}\"{}\n",
+        key,
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n"),
+        if comma { "," } else { "" }
+    )
 }

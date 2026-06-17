@@ -36,7 +36,10 @@ Install MAME and prepare local assets from your legally owned archive:
 ```sh
 brew install mame
 cargo run -- prepare-assets "BloodRoar2 (2).zip" assets/roms
+cargo run -- rom-ident assets/roms
+cargo run -- mame-required assets/roms
 cargo run -- mame-check assets/roms
+cargo run -- doctor assets/roms
 cargo run -- play assets/roms
 ```
 
@@ -49,6 +52,11 @@ Configuration:
 - `BLOODYROAR2_MAME`: override the MAME executable path.
 - `BLOODYROAR2_ROM_DIR`: override the local ROM directory.
 - `BLOODYROAR2_MAME_GAME`: override the MAME game id, default `bldyror2`.
+
+On Apple Silicon, Homebrew MAME is the native emulator path. The original ZiNc
+Windows executable is not native Apple Silicon software; running it would
+require a separate Wine/Rosetta-style compatibility layer and is not the default
+or recommended path.
 
 ## HTTP API
 

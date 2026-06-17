@@ -88,6 +88,27 @@ fn run() -> Result<(), String> {
             println!("{}", report.trim());
             Ok(())
         }
+        "mame-required" => {
+            let config = mame_config(args.next());
+            let report = MameRuntime::new(config)
+                .required_roms()
+                .map_err(|error| error.to_string())?;
+            println!("{}", report.trim());
+            Ok(())
+        }
+        "rom-ident" => {
+            let config = mame_config(args.next());
+            let report = MameRuntime::new(config)
+                .identify_roms()
+                .map_err(|error| error.to_string())?;
+            println!("{}", report.trim());
+            Ok(())
+        }
+        "doctor" => {
+            let config = mame_config(args.next());
+            println!("{}", MameRuntime::new(config).doctor());
+            Ok(())
+        }
         "play" => {
             let config = mame_config(args.next());
             let extra_args = args.collect::<Vec<_>>();
@@ -107,7 +128,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-check [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
