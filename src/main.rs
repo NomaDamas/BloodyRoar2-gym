@@ -1,0 +1,104 @@
+use std::env;
+use std::process::ExitCode;
+
+use bloodyroar2_gym::{
+    Action, BloodyRoar2Env, NullBackend, action_space_json, api_index_json, observation_space_json,
+};
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    let mut args = env::args().skip(1);
+    let command = args.next().unwrap_or_else(|| "help".to_string());
+
+    match command.as_str() {
+        "help" | "--help" | "-h" => {
+            print_help();
+            Ok(())
+        }
+        "info" => {
+            println!("{}", api_index_json());
+            Ok(())
+        }
+        "action-space" => {
+            println!("{}", action_space_json());
+            Ok(())
+        }
+        "observation-space" => {
+            println!("{}", observation_space_json());
+            Ok(())
+        }
+        "reset" => {
+            let mut env = BloodyRoar2Env::new(NullBackend::default());
+            let observation = env.reset().map_err(|error| error.to_string())?;
+            println!("{{\"observation\":{},\"info\":{{}}}}", observation.json());
+            Ok(())
+        }
+        "step" => {
+            let action_index = args
+                .next()
+                .unwrap_or_else(|| "0".to_string())
+                .parse::<usize>()
+                .map_err(|_| "action index must be a non-negative integer".to_string())?;
+            let frames = args
+                .next()
+                .unwrap_or_else(|| "1".to_string())
+                .parse::<u32>()
+                .map_err(|_| "frames must be a non-negative integer".to_string())?;
+            let action = Action::from_index(action_index)
+                .ok_or_else(|| "action index is outside the action space".to_string())?;
+            let mut env = BloodyRoar2Env::new(NullBackend::default());
+            env.reset().map_err(|error| error.to_string())?;
+            let step = env
+                .step(action, frames)
+                .map_err(|error| error.to_string())?;
+            println!("{}", step.json());
+            Ok(())
+        }
+        "serve" => {
+            let address = args.next().unwrap_or_else(|| "127.0.0.1:8765".to_string());
+            bloodyroar2_gym::server::serve(&address).map_err(|error| error.to_string())
+        }
+        "asset-check" => {
+            let path = args
+                .next()
+                .ok_or_else(|| "usage: bloodyroar2-gym asset-check <path>".to_string())?;
+            asset_check(&path)
+        }
+        _ => Err(format!("unknown command: {command}")),
+    }
+}
+
+fn print_help() {
+    println!(
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+    );
+}
+
+fn asset_check(path: &str) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| format!("{path}: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{path}: expected a file"));
+    }
+
+    let lowercase = path.to_ascii_lowercase();
+    let risky_extension = [".zip", ".bin", ".cue", ".iso", ".chd", ".exe", ".dll"]
+        .iter()
+        .any(|extension| lowercase.ends_with(extension));
+
+    println!(
+        "{{\"path\":\"{}\",\"size_bytes\":{},\"git_policy\":\"keep outside repository\",\"requires_legal_source\":{},\"note\":\"This tool does not validate ownership. Use only assets you are legally allowed to use.\"}}",
+        path.replace('"', "'"),
+        metadata.len(),
+        risky_extension
+    );
+    Ok(())
+}

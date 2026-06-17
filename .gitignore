@@ -1,0 +1,24 @@
+target/
+
+# Proprietary game dumps, BIOS files, extracted emulator bundles, and split archives.
+BloodRoar2*/
+BloodRoar2*.zip
+BloodRoar2*.z??
+*.rom
+*.bin
+*.cue
+*.iso
+*.chd
+*.pbp
+*.exe
+*.dll
+*.znc
+
+# Local runtime configuration.
+.env
+assets/
+roms/
+bios/
+captures/
+*.sav
+*.state

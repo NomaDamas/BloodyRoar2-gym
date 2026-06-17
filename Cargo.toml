@@ -1,0 +1,8 @@
+[package]
+name = "bloodyroar2-gym"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+description = "Rust RL/LLM control harness for legally supplied Bloody Roar 2-compatible emulator backends."
+
+[dependencies]
