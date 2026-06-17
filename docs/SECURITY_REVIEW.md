@@ -45,3 +45,4 @@ runtime and never committed.
   sensitive credentials.
 - Scan the joined archive with a current antivirus engine before any extraction.
 - Keep proprietary ROM/game assets outside the repository.
+- Prefer the macOS MAME runtime over the bundled ZiNc Windows executables.

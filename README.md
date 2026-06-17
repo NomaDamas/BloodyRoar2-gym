@@ -13,11 +13,11 @@ future backend adapter only if you have the legal right to use them.
 - Discrete action space for fighter controls.
 - Observation contract compatible with RL loops.
 - CLI and HTTP JSON API using a deterministic `NullBackend`.
+- macOS MAME launch path for local human play with legally supplied ROM assets.
 - Asset policy and static security notes for the supplied Windows bundle.
 
-The actual game runtime is intentionally a pluggable backend. The original ZiNc
-Windows bundle cannot be safely or legally republished here, and it is not a
-portable macOS Rust codebase.
+The original ZiNc Windows bundle is not republished and is not treated as
+portable Rust source. Human play on macOS is handled through MAME.
 
 ## CLI
 
@@ -28,6 +28,27 @@ cargo run -- reset
 cargo run -- step 5 4
 cargo run -- serve 127.0.0.1:8765
 ```
+
+## macOS play path
+
+Install MAME and prepare local assets from your legally owned archive:
+
+```sh
+brew install mame
+cargo run -- prepare-assets "BloodRoar2 (2).zip" assets/roms
+cargo run -- mame-check assets/roms
+cargo run -- play assets/roms
+```
+
+`play` expects `mame-check` to pass first. If MAME reports missing files or
+incorrect checksums, supply a ROM set that matches the installed MAME version;
+the project will not download, patch, or commit proprietary ROM data.
+
+Configuration:
+
+- `BLOODYROAR2_MAME`: override the MAME executable path.
+- `BLOODYROAR2_ROM_DIR`: override the local ROM directory.
+- `BLOODYROAR2_MAME_GAME`: override the MAME game id, default `bldyror2`.
 
 ## HTTP API
 
@@ -72,6 +93,7 @@ Observation space:
 
 ## Next backend step
 
-Implement a `Backend` for a macOS-compatible emulator that can expose frame
-advance, input injection, memory observation, and screenshot capture. The public
-Rust trait is already in `src/backend.rs`.
+For deterministic RL, connect a MAME debugger/Lua/input bridge to the `Backend`
+trait so `step(action, frames)` drives the running emulator. The current `play`
+command launches the real macOS emulator for human play, while `serve` exposes
+the stable Gym-style API contract.

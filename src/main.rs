@@ -1,8 +1,10 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bloodyroar2_gym::{
-    Action, BloodyRoar2Env, NullBackend, action_space_json, api_index_json, observation_space_json,
+    Action, BloodyRoar2Env, MameConfig, MameRuntime, NullBackend, action_space_json,
+    api_index_json, observation_space_json,
 };
 
 fn main() -> ExitCode {
@@ -67,6 +69,32 @@ fn run() -> Result<(), String> {
             let address = args.next().unwrap_or_else(|| "127.0.0.1:8765".to_string());
             bloodyroar2_gym::server::serve(&address).map_err(|error| error.to_string())
         }
+        "prepare-assets" => {
+            let archive = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym prepare-assets <archive.zip> [rom_dir]".to_string()
+            })?;
+            let config = mame_config(args.next());
+            MameRuntime::new(config)
+                .prepare_assets(&archive)
+                .map_err(|error| error.to_string())?;
+            println!("prepared local ROM assets from {}", archive.display());
+            Ok(())
+        }
+        "mame-check" => {
+            let config = mame_config(args.next());
+            let report = MameRuntime::new(config)
+                .check()
+                .map_err(|error| error.to_string())?;
+            println!("{}", report.trim());
+            Ok(())
+        }
+        "play" => {
+            let config = mame_config(args.next());
+            let extra_args = args.collect::<Vec<_>>();
+            MameRuntime::new(config)
+                .play(&extra_args)
+                .map_err(|error| error.to_string())
+        }
         "asset-check" => {
             let path = args
                 .next()
@@ -79,8 +107,24 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-check [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
+}
+
+fn mame_config(rom_dir: Option<String>) -> MameConfig {
+    let executable = env::var_os("BLOODYROAR2_MAME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("mame"));
+    let rom_dir = rom_dir
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("BLOODYROAR2_ROM_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("assets/roms"));
+
+    MameConfig {
+        executable,
+        rom_dir,
+        game: env::var("BLOODYROAR2_MAME_GAME").unwrap_or_else(|_| "bldyror2".to_string()),
+    }
 }
 
 fn asset_check(path: &str) -> Result<(), String> {
