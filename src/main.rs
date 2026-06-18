@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bloodyroar2_gym::{
-    Action, BloodyRoar2Env, MameConfig, MameRuntime, NativeEmulator, NativeRomSet, NullBackend,
-    ZincConfig, ZincRuntime, action_space_json, api_index_json, observation_space_json,
+    Action, BloodyRoar2Env, MameConfig, MameRuntime, NativeEmulator, NativeRomSet,
+    NativeTraceConfig, NullBackend, ZincConfig, ZincRuntime, action_space_json, api_index_json,
+    observation_space_json,
 };
 
 fn main() -> ExitCode {
@@ -182,6 +183,33 @@ fn run() -> Result<(), String> {
             println!("{}", emulator.json());
             Ok(())
         }
+        "native-trace" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let count = args
+                .next()
+                .unwrap_or_else(|| "1000000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instruction count must be a non-negative integer".to_string())?;
+            let hot_limit = args
+                .next()
+                .unwrap_or_else(|| "12".to_string())
+                .parse::<usize>()
+                .map_err(|_| "hot_limit must be a non-negative integer".to_string())?;
+            let recent_limit = args
+                .next()
+                .unwrap_or_else(|| "24".to_string())
+                .parse::<usize>()
+                .map_err(|_| "recent_limit must be a non-negative integer".to_string())?;
+            let trace_options = parse_native_trace_options(args.collect::<Vec<_>>())?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let trace = emulator.trace_instructions(count, hot_limit, recent_limit, trace_options);
+            println!("{}", trace.json());
+            Ok(())
+        }
         "native-env-step" => {
             let rom = args
                 .next()
@@ -226,8 +254,90 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
+}
+
+fn parse_native_trace_options(values: Vec<String>) -> Result<NativeTraceConfig, String> {
+    let mut options = NativeTraceConfig::default();
+    let mut positional = Vec::new();
+    let mut args = values.into_iter().peekable();
+
+    while let Some(value) = args.next() {
+        match value.as_str() {
+            "--stop-pc" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--stop-pc requires an address".to_string())?;
+                options.stop_pc = Some(parse_trace_u32(&raw, "--stop-pc")?);
+            }
+            "--stop-below-pc" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--stop-below-pc requires an address".to_string())?;
+                options.stop_below_pc = Some(parse_trace_u32(&raw, "--stop-below-pc")?);
+            }
+            "--watch" => {
+                let raw_address = args
+                    .next()
+                    .ok_or_else(|| "--watch requires an address".to_string())?;
+                let address = parse_trace_u32(&raw_address, "--watch address")?;
+                let len = if args.peek().is_some_and(|next| !next.starts_with("--")) {
+                    let raw_len = args.next().expect("peeked watch length");
+                    parse_watch_len(&raw_len)?
+                } else {
+                    4
+                };
+                options.watch_ranges.push((address, len));
+            }
+            "--watch-only" => {
+                options.watch_only = true;
+            }
+            _ if value.starts_with("--") => {
+                return Err(format!("unknown native-trace option: {value}"));
+            }
+            _ => positional.push(value),
+        }
+    }
+
+    if let Some(raw) = positional.first() {
+        options.stop_pc = Some(parse_trace_u32(raw, "stop_pc")?);
+    }
+    if let Some(raw) = positional.get(1) {
+        options.stop_below_pc = Some(parse_trace_u32(raw, "stop_below_pc")?);
+    }
+    if positional.len() > 2 {
+        return Err(
+            "native-trace accepts at most two positional trace options; use --watch for memory watches"
+                .to_string(),
+        );
+    }
+
+    Ok(options)
+}
+
+fn parse_trace_u32(value: &str, label: &str) -> Result<u32, String> {
+    parse_u32_auto(value)
+        .map_err(|_| format!("{label} must be a u32 integer, optionally prefixed with 0x"))
+}
+
+fn parse_watch_len(value: &str) -> Result<u32, String> {
+    let len = parse_trace_u32(value, "--watch length")?;
+    if len == 0 {
+        return Err("--watch length must be greater than zero".to_string());
+    }
+    Ok(len)
+}
+
+fn parse_u32_auto(value: &str) -> Result<u32, std::num::ParseIntError> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u32>()
+    }
 }
 
 fn mame_config(rom_dir: Option<String>) -> MameConfig {

@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use crate::action::ActionButtons;
 
 pub const IO_REGION_START: u32 = 0x1f80_1000;
@@ -618,6 +620,10 @@ impl Io {
         self.controller.set_buttons(buttons);
     }
 
+    pub fn tick(&mut self, cycles: u64) {
+        self.timers.tick(cycles);
+    }
+
     pub fn json(&self) -> String {
         format!(
             "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{}}}",
@@ -699,7 +705,7 @@ impl Io {
             }
             IRQ_STATUS | IRQ_MASK => self.irq.read_u32(address),
             GPU_GP0 => self.gpu.gp0_read,
-            GPU_GP1 => self.gpu.status,
+            GPU_GP1 => self.gpu.read_status(),
             DMA_REGION_START..=DMA_REGION_END => self.dma.read_u32(address),
             TIMER0_COUNTER | TIMER0_MODE | TIMER0_TARGET | TIMER1_COUNTER | TIMER1_MODE
             | TIMER1_TARGET | TIMER2_COUNTER | TIMER2_MODE | TIMER2_TARGET => {
@@ -916,6 +922,7 @@ pub struct Gpu {
     pub display_area_start: u32,
     pub horizontal_range: u32,
     pub vertical_range: u32,
+    status_reads: Cell<u32>,
 }
 
 impl Default for Gpu {
@@ -927,11 +934,22 @@ impl Default for Gpu {
             display_area_start: 0,
             horizontal_range: 0,
             vertical_range: 0,
+            status_reads: Cell::new(0),
         }
     }
 }
 
 impl Gpu {
+    pub fn read_status(&self) -> u32 {
+        let reads = self.status_reads.get().wrapping_add(1);
+        self.status_reads.set(reads);
+        if reads & 1 == 0 {
+            self.status & !0x8000_0000
+        } else {
+            self.status | 0x8000_0000
+        }
+    }
+
     pub fn write_gp0(&mut self, value: u32) {
         self.gp0_read = value;
         self.commands_seen += 1;
@@ -959,9 +977,7 @@ impl Gpu {
             0x08 => {
                 self.status = (self.status & !0x007f_0000) | ((value & 0x3f) << 17);
             }
-            _ => {
-                self.status = (self.status & 0x00ff_ffff) | (command << 24);
-            }
+            _ => {}
         }
         self.commands_seen += 1;
     }
@@ -987,6 +1003,14 @@ impl Default for Dma {
 }
 
 impl Dma {
+    pub fn channel_state(&self, channel: usize) -> Option<DmaChannelState> {
+        self.channels.get(channel).map(|channel| DmaChannelState {
+            madr: channel.madr,
+            bcr: channel.bcr,
+            chcr: channel.chcr,
+        })
+    }
+
     pub fn read_u32(&self, address: u32) -> u32 {
         match dma_register_slot(address) {
             DmaRegisterSlot::Channel(channel, DmaChannelRegister::Madr) => {
@@ -1024,6 +1048,10 @@ impl Dma {
         }
     }
 
+    pub fn irq_pending(&self) -> bool {
+        self.interrupt_with_master_flag() & (1 << 31) != 0
+    }
+
     fn mark_channel_complete(&mut self, channel: usize) {
         let channel_bit = 1 << (16 + channel);
         if self.interrupt & channel_bit != 0 {
@@ -1055,6 +1083,13 @@ struct DmaChannel {
     madr: u32,
     bcr: u32,
     chcr: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaChannelState {
+    pub madr: u32,
+    pub bcr: u32,
+    pub chcr: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1094,6 +1129,12 @@ fn dma_register_slot(address: u32) -> DmaRegisterSlot {
 pub struct Timers(pub [Timer; 3]);
 
 impl Timers {
+    pub fn tick(&mut self, cycles: u64) {
+        for timer in &mut self.0 {
+            timer.tick(cycles);
+        }
+    }
+
     fn read_u32(&self, address: u32) -> u32 {
         let (timer, register) = timer_register_slot(address);
         self.0[timer].read(register) as u32
@@ -1110,9 +1151,19 @@ pub struct Timer {
     pub counter: u16,
     pub mode: u16,
     pub target: u16,
+    cycle_accumulator: u64,
 }
 
 impl Timer {
+    fn tick(&mut self, cycles: u64) {
+        const TIMER_COUNTER_DIVISOR: u64 = 128;
+
+        self.cycle_accumulator = self.cycle_accumulator.saturating_add(cycles);
+        let increments = self.cycle_accumulator / TIMER_COUNTER_DIVISOR;
+        self.cycle_accumulator %= TIMER_COUNTER_DIVISOR;
+        self.counter = self.counter.wrapping_add(increments as u16);
+    }
+
     fn read(self, register: TimerRegister) -> u16 {
         match register {
             TimerRegister::Counter => self.counter,
@@ -1156,6 +1207,9 @@ pub struct Controller {
     pub control: u16,
     pub baud: u16,
     transfer_index: u8,
+    security_transfer_index: usize,
+    security_response: Vec<u8>,
+    cat702: [Option<Cat702>; 2],
     response: u8,
 }
 
@@ -1169,15 +1223,40 @@ impl Default for Controller {
             control: 0,
             baud: 0,
             transfer_index: 0,
+            security_transfer_index: 0,
+            security_response: Vec::new(),
+            cat702: [None, None],
             response: 0xff,
         }
     }
 }
 
 impl Controller {
+    pub fn set_security_response(&mut self, response: Vec<u8>) {
+        self.security_response = response;
+        self.security_transfer_index = 0;
+        self.response = 0xff;
+        self.status |= 0x0003;
+    }
+
+    pub fn set_cat702_transforms(&mut self, cat702_1: Option<[u8; 8]>, cat702_2: Option<[u8; 8]>) {
+        self.cat702 = [cat702_1.map(Cat702::new), cat702_2.map(Cat702::new)];
+        self.response = 0xff;
+        self.status |= 0x0003;
+    }
+
+    pub fn set_security_selects(&mut self, cat702_1_select: bool, cat702_2_select: bool) {
+        if let Some(cat702) = &mut self.cat702[0] {
+            cat702.write_select(cat702_1_select);
+        }
+        if let Some(cat702) = &mut self.cat702[1] {
+            cat702.write_select(cat702_2_select);
+        }
+    }
+
     fn read_u32(&self, address: u32) -> u32 {
         match address {
-            SIO_DATA => self.p1_state as u32,
+            SIO_DATA => self.response as u32,
             SIO_STATUS => self.status as u32,
             SIO_MODE => self.mode as u32,
             SIO_CONTROL => self.control as u32,
@@ -1199,30 +1278,74 @@ impl Controller {
     fn write_data(&mut self, value: u16) {
         self.last_write = value;
         let value = value as u8;
-        self.response = match self.transfer_index {
-            0 => 0xff,
-            1 if value == 0x42 => 0x41,
-            1 => 0xff,
-            2 => 0x5a,
-            3 => self.p1_state as u8,
-            4 => (self.p1_state >> 8) as u8,
-            _ => 0xff,
-        };
-        self.transfer_index = if value == 0x01 {
-            1
+        if self.cat702_selected() {
+            self.response = self.transfer_cat702_byte(value);
+        } else if self.security_response.is_empty() || value == 0x01 {
+            self.response = match self.transfer_index {
+                0 => 0xff,
+                1 if value == 0x42 => 0x41,
+                1 => 0xff,
+                2 => 0x5a,
+                3 => self.p1_state as u8,
+                4 => (self.p1_state >> 8) as u8,
+                _ => 0xff,
+            };
+            self.transfer_index = if value == 0x01 {
+                1
+            } else {
+                self.transfer_index.saturating_add(1)
+            };
         } else {
-            self.transfer_index.saturating_add(1)
-        };
-        self.status |= 0x0001;
+            self.response = self.security_response_byte();
+            self.security_transfer_index = self.security_transfer_index.saturating_add(1);
+        }
+        self.status |= 0x0003;
     }
 
     fn write_control(&mut self, value: u16) {
         self.control = value;
         if value & 0x0040 != 0 {
             self.transfer_index = 0;
+            self.security_transfer_index = 0;
             self.response = 0xff;
-            self.status = 0x0005;
+            self.status = 0x0007;
+        } else if value & 0x0003 == 0x0003 {
+            self.security_transfer_index = 0;
+            self.status |= 0x0003;
         }
+    }
+
+    fn security_response_byte(&self) -> u8 {
+        if self.security_transfer_index == 0 {
+            return 0xff;
+        }
+
+        self.security_response
+            .get(self.security_transfer_index - 1)
+            .copied()
+            .unwrap_or(0xff)
+    }
+
+    fn cat702_selected(&self) -> bool {
+        self.cat702
+            .iter()
+            .flatten()
+            .any(|cat702| cat702.is_selected())
+    }
+
+    fn transfer_cat702_byte(&mut self, value: u8) -> u8 {
+        let mut response = 0u8;
+        for bit in 0..8 {
+            let datain = (value >> bit) & 1 != 0;
+            let mut dataout = true;
+            for cat702 in self.cat702.iter_mut().flatten() {
+                dataout &= cat702.transfer_bit(datain);
+            }
+            if dataout {
+                response |= 1 << bit;
+            }
+        }
+        response
     }
 
     pub fn set_buttons(&mut self, buttons: ActionButtons) {
@@ -1236,6 +1359,99 @@ impl Controller {
         clear_if(&mut state, 0x1000, buttons.beast);
         clear_if(&mut state, 0x8000, buttons.guard);
         self.p1_state = state;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Cat702 {
+    transform: [u8; 8],
+    select: bool,
+    state: u8,
+    bit: u8,
+    dataout: bool,
+}
+
+impl Cat702 {
+    const INITIAL_SBOX: [u8; 8] = [0xff, 0xfe, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x7f];
+
+    fn new(transform: [u8; 8]) -> Self {
+        Self {
+            transform,
+            select: true,
+            state: 0,
+            bit: 0,
+            dataout: true,
+        }
+    }
+
+    fn write_select(&mut self, select: bool) {
+        if self.select == select {
+            return;
+        }
+
+        if select {
+            self.dataout = true;
+        } else {
+            self.state = 0xfc;
+            self.bit = 0;
+        }
+        self.select = select;
+    }
+
+    fn is_selected(&self) -> bool {
+        !self.select
+    }
+
+    fn transfer_bit(&mut self, datain: bool) -> bool {
+        if self.select {
+            self.dataout = true;
+            return true;
+        }
+
+        if self.bit == 0 {
+            self.apply_sbox(&Self::INITIAL_SBOX);
+        }
+
+        self.dataout = self.state & (1 << self.bit) != 0;
+        if !datain {
+            self.apply_bit_sbox(self.bit);
+        }
+        self.bit = self.bit.wrapping_add(1) & 7;
+        self.dataout
+    }
+
+    fn apply_sbox(&mut self, sbox: &[u8; 8]) {
+        let mut next = 0u8;
+        for (bit, coefficient) in sbox.iter().enumerate() {
+            if self.state & (1 << bit) != 0 {
+                next ^= *coefficient;
+            }
+        }
+        self.state = next;
+    }
+
+    fn apply_bit_sbox(&mut self, selector: u8) {
+        let mut next = 0u8;
+        for bit in 0..8 {
+            if self.state & (1 << bit) != 0 {
+                next ^= self.sbox_coefficient(selector, bit as u8);
+            }
+        }
+        self.state = next;
+    }
+
+    fn sbox_coefficient(&self, selector: u8, bit: u8) -> u8 {
+        if selector == 0 {
+            return self.transform[bit as usize];
+        }
+
+        let previous = self.sbox_coefficient(selector.wrapping_sub(1) & 7, bit.wrapping_sub(1) & 7);
+        let shifted = (previous << 1) | (((previous >> 7) ^ (previous >> 6)) & 1);
+        if bit == 7 {
+            shifted ^ self.sbox_coefficient(selector, 0)
+        } else {
+            shifted
+        }
     }
 }
 
@@ -1278,6 +1494,7 @@ impl Cdrom {
 #[derive(Clone, Debug)]
 pub struct Mdec {
     command: u32,
+    control: u32,
     status: u32,
 }
 
@@ -1285,6 +1502,7 @@ impl Default for Mdec {
     fn default() -> Self {
         Self {
             command: 0,
+            control: 0,
             status: 0x8004_0000,
         }
     }
@@ -1303,12 +1521,23 @@ impl Mdec {
         match address {
             MDEC_COMMAND => {
                 self.command = value;
-                self.status &= !0x2000_0000;
+                self.status = mdec_ready_status();
             }
-            MDEC_STATUS => self.status = value,
+            MDEC_STATUS => {
+                if value & 0x8000_0000 != 0 {
+                    *self = Self::default();
+                } else {
+                    self.control = value & 0x6000_0000;
+                    self.status = mdec_ready_status();
+                }
+            }
             _ => {}
         }
     }
+}
+
+fn mdec_ready_status() -> u32 {
+    0x8004_0000
 }
 
 const SPU_REGISTER_COUNT: usize = ((SPU_REGION_END - SPU_REGION_START).div_ceil(2)) as usize;
@@ -1352,8 +1581,8 @@ fn clear_if(state: &mut u16, mask: u16, pressed: bool) {
 mod tests {
     use super::{
         ACCESS_WIDTH_16, ACCESS_WIDTH_32, DMA_GPU_CHCR, DMA_INTERRUPT, GPU_GP1, IO_REGISTER_MAP,
-        IRQ_MASK, IRQ_STATUS, Io, IoAccess, IoDevice, SIO_DATA, SPU_REGION_START, io_register,
-        io_register_range, is_io_register_address,
+        IRQ_MASK, IRQ_STATUS, Io, IoAccess, IoDevice, MDEC_COMMAND, MDEC_STATUS, SIO_DATA,
+        SPU_REGION_START, io_register, io_register_range, is_io_register_address,
     };
 
     #[test]
@@ -1431,5 +1660,40 @@ mod tests {
         assert_eq!(io.read_u32(IRQ_MASK), 0x0101);
         assert_eq!(io.controller.last_write, 0x1234);
         assert_eq!(io.gpu.status & (1 << 23), 0);
+    }
+
+    #[test]
+    fn gpu_unmodeled_gp1_commands_preserve_ready_status() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP1, 0x1000_0000);
+        assert_eq!(io.read_u32(GPU_GP1) & 0x0400_0000, 0x0400_0000);
+        assert_eq!(io.gpu.status & 0xff00_0000, 0x1400_0000);
+    }
+
+    #[test]
+    fn gpu_status_read_toggles_scanline_parity_bit() {
+        let io = Io::default();
+
+        let first = io.read_u32(GPU_GP1);
+        let second = io.read_u32(GPU_GP1);
+
+        assert_ne!(first & 0x8000_0000, second & 0x8000_0000);
+        assert_eq!(first & 0x0400_0000, 0x0400_0000);
+        assert_eq!(second & 0x0400_0000, 0x0400_0000);
+    }
+
+    #[test]
+    fn mdec_control_writes_keep_status_ready() {
+        let mut io = Io::default();
+
+        io.write_u32(MDEC_STATUS, 0x6000_0000);
+        assert_eq!(io.read_u32(MDEC_STATUS), 0x8004_0000);
+
+        io.write_u32(MDEC_COMMAND, 0x1234_5678);
+        assert_eq!(io.read_u32(MDEC_STATUS), 0x8004_0000);
+
+        io.write_u32(MDEC_STATUS, 0x8000_0000);
+        assert_eq!(io.read_u32(MDEC_STATUS), 0x8004_0000);
     }
 }

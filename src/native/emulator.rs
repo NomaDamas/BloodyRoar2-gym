@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::action::ActionButtons;
@@ -20,9 +21,11 @@ impl NativeEmulator {
     pub fn from_rom_zip(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let romset = NativeRomSet::inspect(path.into())?;
         let boot_rom = romset.load_boot_rom()?;
+        let banked_roms = romset.load_banked_roms()?;
+        let board_assets = romset.load_board_assets();
         Ok(Self {
             cpu: Cpu::default(),
-            bus: Bus::new(boot_rom, 2 * 1024 * 1024),
+            bus: Bus::with_board_assets(boot_rom, banked_roms, 4 * 1024 * 1024, board_assets),
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,
@@ -50,6 +53,54 @@ impl NativeEmulator {
         self.executed_steps - start_steps
     }
 
+    pub fn trace_instructions(
+        &mut self,
+        count: u64,
+        hot_limit: usize,
+        recent_limit: usize,
+        config: NativeTraceConfig,
+    ) -> NativeTrace {
+        self.bus.set_access_trace_limit(recent_limit.max(32));
+        self.bus.set_access_trace_watch_ranges(config.watch_ranges);
+        self.bus.set_access_trace_watch_only(config.watch_only);
+        let mut pc_counts = BTreeMap::new();
+        let mut unsupported = BTreeMap::new();
+        let mut recent_steps = Vec::new();
+        let start_steps = self.executed_steps;
+
+        for _ in 0..count {
+            let report = self.step_instruction();
+            *pc_counts.entry(report.start_pc).or_insert(0) += 1;
+            if let StepOutcome::Unsupported(instruction) = report.outcome {
+                *unsupported.entry(instruction).or_insert(0) += 1;
+            }
+            let reached_stop_pc = config.stop_pc.is_some_and(|pc| report.start_pc == pc);
+            let reached_low_pc = config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
+
+            if recent_limit > 0 {
+                recent_steps.push(report);
+                if recent_steps.len() > recent_limit {
+                    recent_steps.remove(0);
+                }
+            }
+
+            if report.outcome != StepOutcome::Continue || reached_stop_pc || reached_low_pc {
+                break;
+            }
+        }
+
+        NativeTrace::new(NativeTraceParts {
+            requested_steps: count,
+            executed_steps: self.executed_steps - start_steps,
+            pc_counts,
+            unsupported,
+            recent_steps,
+            hot_limit,
+            bus_access_trace_json: self.bus.access_trace_json(),
+            state_json: self.json(),
+        })
+    }
+
     pub fn set_input(&mut self, buttons: ActionButtons) {
         self.bus.set_input(buttons);
     }
@@ -64,15 +115,149 @@ impl NativeEmulator {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"cpu\":{},\"io\":{},\"platform\":{},\"rom_bytes\":{},\"ram_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":false,\"development_stage\":\"mips_cpu_io_bootstrap\"}}",
+            "{{\"cpu\":{},\"io\":{},\"zn_board\":{},\"platform\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":false,\"development_stage\":\"mips_cpu_io_bootstrap\"}}",
             self.cpu.json(),
             self.bus.io_json(),
+            self.bus.zn_board_json(),
             native_platform_json(),
             self.bus.rom_len(),
+            self.bus.banked_rom_len(),
             self.bus.ram_len(),
+            self.bus.scratchpad_len(),
             self.executed_steps,
             optional_step_json(self.last_step),
             self.last_outcome
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NativeTraceConfig {
+    pub stop_pc: Option<u32>,
+    pub stop_below_pc: Option<u32>,
+    pub watch_ranges: Vec<(u32, u32)>,
+    pub watch_only: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeTrace {
+    requested_steps: u64,
+    executed_steps: u64,
+    unique_pcs: usize,
+    hot_pcs: Vec<NativeTracePc>,
+    unsupported_instructions: Vec<NativeTraceInstruction>,
+    recent_steps: Vec<StepReport>,
+    bus_access_trace_json: String,
+    state_json: String,
+}
+
+impl NativeTrace {
+    fn new(parts: NativeTraceParts) -> Self {
+        let unique_pcs = parts.pc_counts.len();
+        let mut hot_pcs = parts
+            .pc_counts
+            .into_iter()
+            .map(|(pc, count)| NativeTracePc { pc, count })
+            .collect::<Vec<_>>();
+        hot_pcs.sort_by(|left, right| right.count.cmp(&left.count).then(left.pc.cmp(&right.pc)));
+        hot_pcs.truncate(parts.hot_limit);
+
+        let mut unsupported_instructions = parts
+            .unsupported
+            .into_iter()
+            .map(|(instruction, count)| NativeTraceInstruction { instruction, count })
+            .collect::<Vec<_>>();
+        unsupported_instructions.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then(left.instruction.cmp(&right.instruction))
+        });
+
+        Self {
+            requested_steps: parts.requested_steps,
+            executed_steps: parts.executed_steps,
+            unique_pcs,
+            hot_pcs,
+            unsupported_instructions,
+            recent_steps: parts.recent_steps,
+            bus_access_trace_json: parts.bus_access_trace_json,
+            state_json: parts.state_json,
+        }
+    }
+
+    pub fn json(&self) -> String {
+        let hot_pcs = self
+            .hot_pcs
+            .iter()
+            .map(NativeTracePc::json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let unsupported_instructions = self
+            .unsupported_instructions
+            .iter()
+            .map(NativeTraceInstruction::json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let recent_steps = self
+            .recent_steps
+            .iter()
+            .map(StepReport::json)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "{{\"requested_steps\":{},\"executed_steps\":{},\"unique_pcs\":{},\"hot_pcs\":[{}],\"unsupported_instructions\":[{}],\"recent_steps\":[{}],\"bus_access_trace\":[{}],\"state\":{}}}",
+            self.requested_steps,
+            self.executed_steps,
+            self.unique_pcs,
+            hot_pcs,
+            unsupported_instructions,
+            recent_steps,
+            self.bus_access_trace_json,
+            self.state_json
+        )
+    }
+}
+
+#[derive(Debug)]
+struct NativeTraceParts {
+    requested_steps: u64,
+    executed_steps: u64,
+    pc_counts: BTreeMap<u32, u64>,
+    unsupported: BTreeMap<u32, u64>,
+    recent_steps: Vec<StepReport>,
+    hot_limit: usize,
+    bus_access_trace_json: String,
+    state_json: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeTracePc {
+    pc: u32,
+    count: u64,
+}
+
+impl NativeTracePc {
+    fn json(&self) -> String {
+        format!(
+            "{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"count\":{}}}",
+            self.pc, self.pc, self.count
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeTraceInstruction {
+    instruction: u32,
+    count: u64,
+}
+
+impl NativeTraceInstruction {
+    fn json(&self) -> String {
+        format!(
+            "{{\"instruction\":{},\"instruction_hex\":\"0x{:08x}\",\"count\":{}}}",
+            self.instruction, self.instruction, self.count
         )
     }
 }

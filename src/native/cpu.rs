@@ -6,6 +6,7 @@ const CP0_EPC: usize = 14;
 
 const STATUS_IE: u32 = 1 << 0;
 const STATUS_INTERRUPT_MASK: u32 = 0xff << 8;
+const STATUS_ISOLATE_CACHE: u32 = 1 << 16;
 
 const CAUSE_BD: u32 = 1 << 31;
 const CAUSE_EXCODE_MASK: u32 = 0x1f << 2;
@@ -17,6 +18,8 @@ const EXCEPTION_VECTOR: u32 = 0x8000_0080;
 pub struct Cpu {
     pub regs: [u32; 32],
     pub cp0: [u32; 32],
+    pub cop2_data: [u32; 32],
+    pub cop2_control: [u32; 32],
     pub hi: u32,
     pub lo: u32,
     pub pc: u32,
@@ -61,11 +64,15 @@ impl StepReport {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"start_pc\":{},\"end_pc\":{},\"next_pc\":{},\"instruction\":{},\"cycles_before\":{},\"cycles_after\":{},\"cycles_elapsed\":{},\"outcome\":\"{:?}\"}}",
+            "{{\"start_pc\":{},\"start_pc_hex\":\"0x{:08x}\",\"end_pc\":{},\"end_pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"instruction\":{},\"instruction_hex\":{},\"cycles_before\":{},\"cycles_after\":{},\"cycles_elapsed\":{},\"outcome\":\"{:?}\"}}",
+            self.start_pc,
             self.start_pc,
             self.end_pc,
+            self.end_pc,
+            self.next_pc,
             self.next_pc,
             optional_u32_json(self.instruction),
+            optional_u32_hex_json(self.instruction),
             self.cycles_before,
             self.cycles_after,
             self.cycles_elapsed,
@@ -79,6 +86,8 @@ impl Default for Cpu {
         Self {
             regs: [0; 32],
             cp0: [0; 32],
+            cop2_data: [0; 32],
+            cop2_control: [0; 32],
             hi: 0,
             lo: 0,
             pc: 0x1fc0_0000,
@@ -102,12 +111,16 @@ impl Cpu {
 
         let start_pc = self.pc;
         let cycles_before = self.cycles;
+        bus.set_trace_context(start_pc, cycles_before);
         self.refresh_interrupts(bus);
         if self.delay_slot_branch_pc.is_none() && self.interrupt_pending() {
             self.cycles += 1;
             let outcome = self.raise_exception(self.pc, None, Exception::Interrupt);
             self.regs[0] = 0;
-            return self.step_report_from(start_pc, None, cycles_before, outcome);
+            let report = self.step_report_from(start_pc, None, cycles_before, outcome);
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
         }
 
         let delay_slot_branch_pc = self.delay_slot_branch_pc.take();
@@ -116,16 +129,20 @@ impl Cpu {
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
         self.cycles += 1;
+        bus.set_trace_context(current_pc, self.cycles);
 
         let outcome = self.execute(instruction, current_pc, delay_slot_branch_pc, bus);
         self.cycles += fixed_cycle_cost(Some(instruction), outcome).saturating_sub(1);
         self.regs[0] = 0;
-        self.step_report_from(start_pc, Some(instruction), cycles_before, outcome)
+        let report = self.step_report_from(start_pc, Some(instruction), cycles_before, outcome);
+        bus.tick(report.cycles_elapsed);
+        bus.clear_trace_context();
+        report
     }
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"r2\":{},\"r4\":{},\"r29\":{},\"r31\":{}}}",
+            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{},\"r8\":{},\"r9\":{},\"r10\":{},\"r11\":{},\"r16\":{},\"r29\":{},\"r31\":{}}}",
             self.pc,
             self.next_pc,
             self.cycles,
@@ -134,7 +151,15 @@ impl Cpu {
             self.cp0[CP0_CAUSE],
             self.cp0[CP0_EPC],
             self.regs[2],
+            self.regs[3],
             self.regs[4],
+            self.regs[5],
+            self.regs[6],
+            self.regs[8],
+            self.regs[9],
+            self.regs[10],
+            self.regs[11],
+            self.regs[16],
             self.regs[29],
             self.regs[31]
         )
@@ -256,7 +281,8 @@ impl Cpu {
                 self.regs[rt(instruction)] = (instruction & 0xffff) << 16;
                 StepOutcome::Continue
             }
-            0x10 => self.execute_cop0(instruction),
+            0x10 => self.execute_cop0(instruction, bus),
+            0x12 => self.execute_cop2(instruction),
             0x20 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
                 self.regs[rt(instruction)] = (bus.read_u8(address) as i8) as i32 as u32;
@@ -317,6 +343,16 @@ impl Cpu {
             0x2e => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
                 store_word_right(bus, address, self.regs[rt(instruction)]);
+                StepOutcome::Continue
+            }
+            0x32 => {
+                let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                self.cop2_data[rt(instruction)] = bus.read_u32(address);
+                StepOutcome::Continue
+            }
+            0x3a => {
+                let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                bus.write_u32(address, self.cop2_data[rt(instruction)]);
                 StepOutcome::Continue
             }
             _ => StepOutcome::Unsupported(instruction),
@@ -535,7 +571,7 @@ impl Cpu {
         }
     }
 
-    fn execute_cop0(&mut self, instruction: u32) -> StepOutcome {
+    fn execute_cop0(&mut self, instruction: u32, bus: &mut Bus) -> StepOutcome {
         match rs(instruction) {
             0x00 => {
                 self.regs[rt(instruction)] = self.cp0[rd(instruction)];
@@ -543,14 +579,59 @@ impl Cpu {
             }
             0x04 => {
                 self.cp0[rd(instruction)] = self.regs[rt(instruction)];
+                if rd(instruction) == CP0_STATUS {
+                    bus.set_cache_isolated(self.cp0[CP0_STATUS] & STATUS_ISOLATE_CACHE != 0);
+                }
                 StepOutcome::Continue
             }
             0x10 if (instruction & 0x3f) == 0x10 => {
                 let mode_bits = self.cp0[CP0_STATUS] & 0x3f;
                 self.cp0[CP0_STATUS] = (self.cp0[CP0_STATUS] & !0x0f) | ((mode_bits >> 2) & 0x0f);
+                bus.set_cache_isolated(self.cp0[CP0_STATUS] & STATUS_ISOLATE_CACHE != 0);
                 StepOutcome::Continue
             }
             _ => StepOutcome::Unsupported(instruction),
+        }
+    }
+
+    fn execute_cop2(&mut self, instruction: u32) -> StepOutcome {
+        match rs(instruction) {
+            0x00 => {
+                self.regs[rt(instruction)] = self.cop2_data[rd(instruction)];
+                StepOutcome::Continue
+            }
+            0x02 => {
+                self.regs[rt(instruction)] = self.cop2_control[rd(instruction)];
+                StepOutcome::Continue
+            }
+            0x04 => {
+                self.cop2_data[rd(instruction)] = self.regs[rt(instruction)];
+                StepOutcome::Continue
+            }
+            0x06 => {
+                self.cop2_control[rd(instruction)] = self.regs[rt(instruction)];
+                StepOutcome::Continue
+            }
+            0x10..=0x1f => {
+                self.execute_gte_command(instruction);
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Unsupported(instruction),
+        }
+    }
+
+    fn execute_gte_command(&mut self, instruction: u32) {
+        let command = instruction & 0x3f;
+        match command {
+            // Minimal deterministic placeholders for BIOS/game progression. Accurate GTE
+            // geometry and color math is implemented incrementally behind these registers.
+            0x01 | 0x06 | 0x0c | 0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x16 | 0x1b | 0x1c | 0x1e
+            | 0x20 | 0x28 | 0x29 | 0x2a | 0x2d | 0x2e | 0x30 | 0x3d | 0x3e | 0x3f => {
+                self.cop2_data[31] = 0;
+            }
+            _ => {
+                self.cop2_data[31] = 0;
+            }
         }
     }
 
@@ -651,6 +732,10 @@ fn instruction_cycle_cost(instruction: u32) -> u64 {
 
 fn optional_u32_json(value: Option<u32>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn optional_u32_hex_json(value: Option<u32>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| format!("\"0x{value:08x}\""))
 }
 
 fn load_word_left(bus: &Bus, address: u32, old_value: u32) -> u32 {
@@ -830,7 +915,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first.1,
-            "{\"pc\":2147483776,\"next_pc\":2147483780,\"cycles\":4,\"halted\":true,\"status\":0,\"cause\":36,\"epc\":532676620,\"r2\":42,\"r4\":7,\"r29\":0,\"r31\":0}"
+            "{\"pc\":2147483776,\"next_pc\":2147483780,\"cycles\":4,\"halted\":true,\"status\":0,\"cause\":36,\"epc\":532676620,\"r2\":42,\"r3\":0,\"r4\":7,\"r5\":0,\"r6\":0,\"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r16\":0,\"r29\":0,\"r31\":0}"
         );
     }
 
@@ -884,6 +969,30 @@ mod tests {
         cpu.step(&mut bus);
         cpu.step(&mut bus);
         assert_eq!(cpu.regs[12], 0x1234);
+    }
+
+    #[test]
+    fn executes_cop2_register_transfers_and_memory_accesses() {
+        let rom = program(&[
+            i_type(0x0f, 0, 8, 0x1234),                          // lui t0, 0x1234
+            i_type(0x0d, 8, 8, 0x5678),                          // ori t0, t0, 0x5678
+            (0x12 << 26) | (0x04 << 21) | (8 << 16) | (2 << 11), // mtc2 t0, r2
+            (0x3a << 26) | (2 << 16),                            // swc2 r2, 0(zero)
+            (0x32 << 26) | (3 << 16),                            // lwc2 r3, 0(zero)
+            (0x12 << 26) | (9 << 16) | (3 << 11),                // mfc2 t1, r3
+            (0x12 << 26) | (0x10 << 21) | 0x01,                  // rtps placeholder
+        ]);
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+
+        for _ in 0..7 {
+            assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+        }
+
+        assert_eq!(bus.read_u32(0), 0x1234_5678);
+        assert_eq!(cpu.cop2_data[3], 0x1234_5678);
+        assert_eq!(cpu.regs[9], 0x1234_5678);
+        assert_eq!(cpu.cop2_data[31], 0);
     }
 
     #[test]

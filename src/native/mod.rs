@@ -7,7 +7,7 @@ pub mod platform;
 pub mod romset;
 
 pub use backend::NativeBackend;
-pub use emulator::NativeEmulator;
+pub use emulator::{NativeEmulator, NativeTraceConfig};
 pub use platform::{
     GenericNativePlatform, NativePlatformInfo, native_platform_json, preferred_platform_info,
 };

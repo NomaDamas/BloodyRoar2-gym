@@ -4,11 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::backend::BackendError;
+use crate::native::bus::NativeBoardAssets;
 
 const EOCD_SIGNATURE: u32 = 0x0605_4b50;
 const CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD: u16 = 0x0001;
 const BLOODY_ROAR_2_GAME_ID: &str = "bldyror2";
+const CAT702_ET01_CRC32: u32 = 0xa7dd_922e;
+const CAT702_ET03_CRC32: u32 = 0x779b_0bfd;
+const AT28C16_WORLD_CRC32: u32 = 0x01b4_2397;
 const BLOODY_ROAR_2_MANIFEST: NativeRomManifest = NativeRomManifest {
     game_id: BLOODY_ROAR_2_GAME_ID,
     title: "Bloody Roar 2 (World)",
@@ -18,6 +22,7 @@ const BLOODY_ROAR_2_MANIFEST: NativeRomManifest = NativeRomManifest {
     bios_assets: &SONY_ZN_BIOS_MANIFEST_ASSETS,
     game_assets: &BLOODY_ROAR_2_GAME_MANIFEST_ASSETS,
 };
+const ROM_NAME_ALIASES: [(&str, &str); 1] = [("coh-1002e.353", "m27c402cz-54.ic353")];
 const SONY_ZN_BIOS_MANIFEST_ASSETS: [NativeRomManifestEntry; 3] = [
     NativeRomManifestEntry {
         name: "m27c402cz-54.ic353",
@@ -680,16 +685,96 @@ impl NativeRomSet {
     }
 
     pub fn load_boot_rom(&self) -> Result<Vec<u8>, BackendError> {
-        let preferred = ["coh-1002e.353", "m27c402cz-54.ic353"];
-        for candidate in preferred {
-            if self.entries.iter().any(|entry| entry == candidate) {
-                return unzip_entry(&self.path, candidate);
+        self.load_manifest_asset("m27c402cz-54.ic353")
+            .map_err(|_| BackendError::new("no supported boot ROM entry found in ROM set"))
+    }
+
+    pub fn load_banked_roms(&self) -> Result<Vec<u8>, BackendError> {
+        self.load_manifest_region("bankedroms")
+    }
+
+    pub fn load_board_assets(&self) -> NativeBoardAssets {
+        let mut assets = NativeBoardAssets {
+            cat702_1: self.load_exact_8_asset("et01.ic652"),
+            cat702_2: self.load_exact_8_asset("et03"),
+            at28c16: self.load_exact_asset("at28c16_world", 2048),
+        };
+
+        if assets.cat702_1.is_some() && assets.cat702_2.is_some() && assets.at28c16.is_some() {
+            return assets;
+        }
+
+        for path in board_asset_candidates(&self.path) {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+
+            if assets.cat702_1.is_none() {
+                assets.cat702_1 = find_crc32_window_8(&bytes, CAT702_ET01_CRC32);
+            }
+            if assets.cat702_2.is_none() {
+                assets.cat702_2 = find_crc32_window_8(&bytes, CAT702_ET03_CRC32);
+            }
+            if assets.at28c16.is_none() {
+                assets.at28c16 = at28c16_fallback_bytes(&path, &bytes);
+            }
+
+            if assets.cat702_1.is_some() && assets.cat702_2.is_some() && assets.at28c16.is_some() {
+                break;
             }
         }
 
-        Err(BackendError::new(
-            "no supported boot ROM entry found in ROM set",
-        ))
+        assets
+    }
+
+    pub fn load_manifest_region(&self, region: &str) -> Result<Vec<u8>, BackendError> {
+        let region_assets = BLOODY_ROAR_2_MANIFEST
+            .game_assets
+            .iter()
+            .filter(|entry| entry.region == region)
+            .collect::<Vec<_>>();
+
+        if region_assets.is_empty() {
+            return Err(BackendError::new(format!(
+                "no manifest assets are defined for region {region}"
+            )));
+        }
+
+        let mut image = Vec::new();
+        let mut loaded_assets = 0usize;
+        for manifest_entry in region_assets {
+            let Some(entry) = self.find_entry(manifest_entry.name) else {
+                continue;
+            };
+            let offset = parse_manifest_offset(manifest_entry.offset)?;
+            let bytes = self.load_entry_bytes(entry)?;
+            let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+                BackendError::new(format!(
+                    "region {region} asset {} overflows address space",
+                    manifest_entry.name
+                ))
+            })?;
+            if image.len() < end {
+                image.resize(end, 0);
+            }
+            image[offset..end].copy_from_slice(&bytes);
+            loaded_assets += 1;
+        }
+
+        if loaded_assets == 0 {
+            return Err(BackendError::new(format!(
+                "no local assets found for manifest region {region}"
+            )));
+        }
+
+        Ok(image)
+    }
+
+    pub fn load_manifest_asset(&self, manifest_name: &str) -> Result<Vec<u8>, BackendError> {
+        let entry = self.find_entry(manifest_name).ok_or_else(|| {
+            BackendError::new(format!("manifest asset {manifest_name} is missing"))
+        })?;
+        self.load_entry_bytes(entry)
     }
 
     pub fn bloody_roar_2_compatibility(&self) -> NativeRomCompatibilityReport {
@@ -794,6 +879,24 @@ impl NativeRomSet {
             .find(|entry| asset_names_match(&entry.name, name))
     }
 
+    fn load_entry_bytes(&self, entry: &NativeRomEntry) -> Result<Vec<u8>, BackendError> {
+        if self.path.is_dir() {
+            return read_scanned_entry_bytes(&self.path, &entry.name);
+        }
+
+        unzip_entry(&self.path, &entry.name)
+    }
+
+    fn load_exact_8_asset(&self, manifest_name: &str) -> Option<[u8; 8]> {
+        let bytes = self.load_manifest_asset(manifest_name).ok()?;
+        exact_8_bytes(&bytes)
+    }
+
+    fn load_exact_asset(&self, manifest_name: &str, expected_len: usize) -> Option<Vec<u8>> {
+        let bytes = self.load_manifest_asset(manifest_name).ok()?;
+        (bytes.len() == expected_len).then_some(bytes)
+    }
+
     pub fn duplicate_assets(&self) -> Vec<NativeRomDuplicateAsset> {
         duplicate_assets(&self.entry_metadata)
     }
@@ -857,6 +960,76 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), BackendErr
     }
 
     Ok(())
+}
+
+fn board_asset_candidates(path: &Path) -> Vec<PathBuf> {
+    let roots = board_asset_roots(path);
+    let mut candidates = Vec::new();
+
+    for root in roots {
+        push_candidate(&mut candidates, root.join("et01.ic652"));
+        push_candidate(&mut candidates, root.join("et03"));
+        push_candidate(&mut candidates, root.join("at28c16_world"));
+        push_candidate(&mut candidates, root.join("bldyror2.cfg"));
+        push_candidate(&mut candidates, root.join("ZiNc.exe"));
+        push_candidate(&mut candidates, root.join("cfg/bldyror2.cfg"));
+        push_candidate(&mut candidates, root.join("extracted/BloodRoar2/ZiNc.exe"));
+        push_candidate(
+            &mut candidates,
+            root.join("extracted/BloodRoar2/cfg/bldyror2.cfg"),
+        );
+    }
+
+    candidates
+}
+
+fn board_asset_roots(path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if path.is_dir() {
+        roots.push(path.to_path_buf());
+    }
+    if let Some(parent) = path.parent() {
+        roots.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            roots.push(grandparent.to_path_buf());
+        }
+    }
+    roots
+}
+
+fn push_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_file() && !candidates.iter().any(|candidate| candidate == &path) {
+        candidates.push(path);
+    }
+}
+
+fn exact_8_bytes(bytes: &[u8]) -> Option<[u8; 8]> {
+    let bytes: [u8; 8] = bytes.try_into().ok()?;
+    Some(bytes)
+}
+
+fn find_crc32_window_8(bytes: &[u8], expected_crc32: u32) -> Option<[u8; 8]> {
+    bytes
+        .windows(8)
+        .find(|window| crc32(window) == expected_crc32)
+        .and_then(exact_8_bytes)
+}
+
+fn at28c16_fallback_bytes(path: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() != 2048 {
+        return None;
+    }
+
+    if crc32(bytes) == AT28C16_WORLD_CRC32
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("bldyror2.cfg"))
+    {
+        return Some(bytes.to_vec());
+    }
+
+    None
 }
 
 fn is_zip_path(path: &Path) -> bool {
@@ -950,7 +1123,13 @@ fn entry_mismatches_manifest(
 }
 
 fn asset_names_match(provided_name: &str, manifest_name: &str) -> bool {
-    normalized_file_name(provided_name) == normalized_file_name(manifest_name)
+    let provided = normalized_file_name(provided_name);
+    let manifest = normalized_file_name(manifest_name);
+    provided == manifest
+        || ROM_NAME_ALIASES.iter().any(|(alias, canonical)| {
+            (provided == *alias && manifest == *canonical)
+                || (provided == *canonical && manifest == *alias)
+        })
 }
 
 fn duplicate_asset_key(name: &str) -> String {
@@ -977,6 +1156,11 @@ fn is_required_asset_name(name: &str) -> bool {
     BLOODY_ROAR_2_REQUIRED_ASSETS
         .iter()
         .any(|expectation| asset_names_match(name, expectation.name))
+}
+
+fn parse_manifest_offset(offset: &str) -> Result<usize, BackendError> {
+    usize::from_str_radix(offset, 16)
+        .map_err(|error| BackendError::new(format!("invalid manifest offset {offset}: {error}")))
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -1154,7 +1338,6 @@ fn zip64_sizes(
 }
 
 fn unzip_entry(path: &Path, entry: &str) -> Result<Vec<u8>, BackendError> {
-    let temp_path = std::env::temp_dir().join(format!("bloodyroar2-{entry}"));
     let status = Command::new("unzip")
         .arg("-p")
         .arg(path)
@@ -1169,12 +1352,25 @@ fn unzip_entry(path: &Path, entry: &str) -> Result<Vec<u8>, BackendError> {
         )));
     }
 
-    fs::write(&temp_path, &status.stdout)
-        .map_err(|error| BackendError::new(format!("failed to write temp ROM: {error}")))?;
-    let bytes = fs::read(&temp_path)
-        .map_err(|error| BackendError::new(format!("failed to read temp ROM: {error}")))?;
-    let _ = fs::remove_file(temp_path);
-    Ok(bytes)
+    Ok(status.stdout)
+}
+
+fn read_scanned_entry_bytes(root: &Path, entry_name: &str) -> Result<Vec<u8>, BackendError> {
+    if let Some((archive_name, inner_entry)) = split_scanned_zip_entry(entry_name) {
+        return unzip_entry(&root.join(archive_name), inner_entry);
+    }
+
+    fs::read(root.join(entry_name)).map_err(|error| {
+        BackendError::new(format!(
+            "failed to read scanned ROM entry {}: {error}",
+            root.join(entry_name).display()
+        ))
+    })
+}
+
+fn split_scanned_zip_entry(entry_name: &str) -> Option<(&str, &str)> {
+    let (archive_name, inner_entry) = entry_name.split_once(".zip/")?;
+    Some((entry_name.get(..archive_name.len() + 4)?, inner_entry))
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, BackendError> {
@@ -1696,6 +1892,49 @@ mod tests {
         assert_eq!(report.present_assets.len(), 14);
         assert!(report.missing_required_assets.is_empty());
         assert!(report.mismatched_assets.is_empty());
+    }
+
+    #[test]
+    fn compatibility_treats_coh1002e_filename_as_bios_alias() {
+        let romset = NativeRomSet {
+            path: PathBuf::from("fixture.zip"),
+            entries: vec!["coh-1002e.353".to_string()],
+            entry_metadata: vec![NativeRomEntry {
+                name: "coh-1002e.353".to_string(),
+                uncompressed_size: 524_288,
+                compressed_size: 524_288,
+                crc32: 0x910f_3a8b,
+                compression_method: 0,
+            }],
+        };
+
+        let report = romset.bloody_roar_2_compatibility();
+
+        assert!(
+            report
+                .present_bios_assets
+                .contains(&"m27c402cz-54.ic353".to_string())
+        );
+        assert!(!report.unknown_assets.contains(&"coh-1002e.353".to_string()));
+        assert!(
+            report
+                .missing_required_assets
+                .contains(&"flash0.021".to_string())
+        );
+    }
+
+    #[test]
+    fn load_banked_roms_places_assets_at_manifest_offsets() {
+        let scan_dir = temp_scan_dir("banked-rom-load");
+        fs::write(scan_dir.join("flash0.021"), [0x11, 0x22]).expect("write flash0");
+        fs::write(scan_dir.join("rom-1a.028"), [0xaa, 0xbb]).expect("write rom-1a");
+
+        let romset = NativeRomSet::scan(&scan_dir).expect("scan banked ROM fixture");
+        let banked_roms = romset.load_banked_roms().expect("load banked ROM fixture");
+        let _ = fs::remove_dir_all(&scan_dir);
+
+        assert_eq!(&banked_roms[0..2], &[0x11, 0x22]);
+        assert_eq!(&banked_roms[0x80_0000..0x80_0002], &[0xaa, 0xbb]);
     }
 
     fn inspect_fixture(name: &str, bytes: Vec<u8>) -> NativeRomSet {
