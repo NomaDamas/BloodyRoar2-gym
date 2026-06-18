@@ -9,6 +9,9 @@ use crate::native::platform::{NativePlatformOps, PreferredNativePlatform};
 const DMA_CHANNEL_COUNT: usize = 7;
 const DMA_GPU_CHANNEL: usize = 2;
 const DMA_OTC_CHANNEL: usize = 6;
+const DMA_DIRECTION_FROM_RAM: u32 = 1 << 0;
+const DMA_STEP_DECREMENT: u32 = 1 << 1;
+const DMA_LINKED_LIST_MODE: u32 = 1 << 10;
 const DMA_GPU_COMPLETION_DELAY_CYCLES: u64 = 4_096;
 const DMA_OTC_COMPLETION_DELAY_CYCLES: u64 = 512;
 const BR2_DRAW_SYNC_FLAG_VIRTUAL: u32 = 0x803a_2210;
@@ -462,10 +465,12 @@ impl Bus {
             return;
         };
 
-        if control & 0x0400 != 0 {
+        if control & DMA_DIRECTION_FROM_RAM == 0 {
+            self.process_gpu_read_dma(channel.madr, channel.bcr, control);
+        } else if control & DMA_LINKED_LIST_MODE != 0 {
             self.process_gpu_linked_list_dma(channel.madr);
         } else {
-            self.process_gpu_block_dma(channel.madr, channel.bcr);
+            self.process_gpu_block_dma(channel.madr, channel.bcr, control);
         }
         self.schedule_dma_completion(DMA_GPU_CHANNEL, DMA_GPU_COMPLETION_DELAY_CYCLES);
     }
@@ -488,13 +493,24 @@ impl Bus {
         }
     }
 
-    fn process_gpu_block_dma(&mut self, start_address: u32, bcr: u32) {
+    fn process_gpu_block_dma(&mut self, start_address: u32, bcr: u32, control: u32) {
         let words = dma_word_count(bcr).min(4096);
         let mut address = start_address & 0x00ff_fffc;
+        let step = dma_address_step(control);
         for _ in 0..words {
             let command = self.read_u32(address);
             self.io.gpu.write_gp0(command);
-            address = address.wrapping_add(4);
+            address = address.wrapping_add(step);
+        }
+    }
+
+    fn process_gpu_read_dma(&mut self, start_address: u32, bcr: u32, control: u32) {
+        let words = dma_word_count(bcr).min(4096);
+        let mut address = start_address & 0x00ff_fffc;
+        let step = dma_address_step(control);
+        for _ in 0..words {
+            self.write_u32(address, self.io.gpu.gp0_read);
+            address = address.wrapping_add(step);
         }
     }
 
@@ -717,6 +733,14 @@ fn dma_word_count(bcr: u32) -> u32 {
         (_, 0) => block_size,
         (0, _) => block_count,
         _ => block_size.saturating_mul(block_count),
+    }
+}
+
+fn dma_address_step(control: u32) -> u32 {
+    if control & DMA_STEP_DECREMENT != 0 {
+        u32::MAX - 3
+    } else {
+        4
     }
 }
 
@@ -1006,11 +1030,13 @@ fn optional_u32_hex_json(value: Option<u32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BR2_DRAW_SYNC_FLAG_VIRTUAL, Bus, DMA_GPU_COMPLETION_DELAY_CYCLES};
+    use super::{
+        BR2_DRAW_SYNC_FLAG_VIRTUAL, Bus, DMA_GPU_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT,
+    };
     use crate::action::ActionButtons;
     use crate::native::io::{
-        DMA_GPU_CHCR, DMA_GPU_MADR, DMA_INTERRUPT, DMA_OTC_BCR, DMA_OTC_CHCR, DMA_OTC_MADR,
-        DMA_SPU_CHCR, GPU_GP0, IRQ_MASK, IRQ_STATUS, SIO_DATA, SPU_REGION_START,
+        DMA_GPU_BCR, DMA_GPU_CHCR, DMA_GPU_MADR, DMA_INTERRUPT, DMA_OTC_BCR, DMA_OTC_CHCR,
+        DMA_OTC_MADR, DMA_SPU_CHCR, GPU_GP0, IRQ_MASK, IRQ_STATUS, SIO_DATA, SPU_REGION_START,
     };
 
     #[test]
@@ -1220,6 +1246,62 @@ mod tests {
         bus.tick(1);
         assert_eq!(bus.io.irq.status & (1 << 3), 1 << 3);
         assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
+    }
+
+    #[test]
+    fn gpu_block_dma_from_ram_feeds_gp0_commands() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        bus.write_u32(0x0000_3000, 0xe100_0400);
+
+        bus.write_u32(DMA_GPU_MADR, 0x0000_3000);
+        bus.write_u32(DMA_GPU_BCR, 1);
+        bus.write_u32(DMA_GPU_CHCR, (1 << 24) | 1);
+
+        assert_eq!(bus.io.gpu.gp0_read, 0xe100_0400);
+        assert_eq!(bus.io.gpu.commands_seen, 1);
+    }
+
+    #[test]
+    fn gpu_block_dma_from_ram_honors_decrement_step() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        bus.write_u32(0x0000_3000, 0xe100_0400);
+        bus.write_u32(0x0000_2ffc, 0xe600_0000);
+
+        bus.write_u32(DMA_GPU_MADR, 0x0000_3000);
+        bus.write_u32(DMA_GPU_BCR, 2);
+        bus.write_u32(DMA_GPU_CHCR, (1 << 24) | 0x03);
+
+        assert_eq!(bus.io.gpu.gp0_read, 0xe600_0000);
+        assert_eq!(bus.io.gpu.commands_seen, 2);
+    }
+
+    #[test]
+    fn gpu_block_dma_to_ram_does_not_feed_gp0_commands() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        bus.write_u32(0x0000_3000, 0xe100_0400);
+        bus.io.gpu.gp0_read = 0xdead_beef;
+
+        bus.write_u32(DMA_GPU_MADR, 0x0000_3000);
+        bus.write_u32(DMA_GPU_BCR, 2);
+        bus.write_u32(DMA_GPU_CHCR, 1 << 24);
+
+        assert_eq!(bus.io.gpu.commands_seen, 0);
+        assert_eq!(bus.read_u32(0x0000_3000), 0xdead_beef);
+        assert_eq!(bus.read_u32(0x0000_3004), 0xdead_beef);
+    }
+
+    #[test]
+    fn gpu_block_dma_to_ram_honors_decrement_step() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        bus.io.gpu.gp0_read = 0xfeed_cafe;
+
+        bus.write_u32(DMA_GPU_MADR, 0x0000_3000);
+        bus.write_u32(DMA_GPU_BCR, 2);
+        bus.write_u32(DMA_GPU_CHCR, (1 << 24) | DMA_STEP_DECREMENT);
+
+        assert_eq!(bus.io.gpu.commands_seen, 0);
+        assert_eq!(bus.read_u32(0x0000_3000), 0xfeed_cafe);
+        assert_eq!(bus.read_u32(0x0000_2ffc), 0xfeed_cafe);
     }
 
     #[test]

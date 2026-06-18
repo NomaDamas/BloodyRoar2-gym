@@ -1075,6 +1075,16 @@ impl Gpu {
         )
     }
 
+    pub fn display_png(&self) -> Vec<u8> {
+        let (start_x, start_y) = display_area_start_xy(self.display_area_start);
+        self.framebuffer.png(
+            start_x,
+            start_y,
+            DEFAULT_DISPLAY_WIDTH,
+            DEFAULT_DISPLAY_HEIGHT,
+        )
+    }
+
     pub fn screenshot_window(&self) -> FrameBufferWindow {
         let (start_x, start_y) = display_area_start_xy(self.display_area_start);
         let stats = self.framebuffer.display_stats(

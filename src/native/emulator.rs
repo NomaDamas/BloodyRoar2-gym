@@ -128,6 +128,10 @@ impl NativeEmulator {
         self.bus.io.gpu.screenshot_png()
     }
 
+    pub fn display_png(&self) -> Vec<u8> {
+        self.bus.io.gpu.display_png()
+    }
+
     pub fn vram_png(&self) -> Vec<u8> {
         self.bus.io.gpu.vram_png()
     }
