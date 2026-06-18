@@ -1,6 +1,11 @@
 use std::cell::Cell;
 
 use crate::action::ActionButtons;
+use crate::native::framebuffer::{
+    ClipRect, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH, FrameBufferBounds, FrameBufferStats,
+    FrameBufferWindow, NativeFrameBuffer, Point, TextureCoordinate, TextureWindow, TexturedPoint,
+    VRAM_HEIGHT, VRAM_WIDTH,
+};
 
 pub const IO_REGION_START: u32 = 0x1f80_1000;
 pub const IO_REGION_END: u32 = 0x1f80_1fff;
@@ -77,6 +82,8 @@ const IRQ_BITS: u32 = 0x07ff;
 const DMA_CHANNEL_COUNT: usize = 7;
 const DMA_INTERRUPT_IRQ_ENABLE_MASK: u32 = 0x007f_0000;
 const DMA_INTERRUPT_FLAG_MASK: u32 = 0x7f00_0000;
+const GP0_RECENT_COMMAND_LIMIT: usize = 16;
+const GP0_RECENT_COMMAND_WORD_LIMIT: usize = 12;
 
 pub const ACCESS_WIDTH_8: u8 = 1 << 0;
 pub const ACCESS_WIDTH_16: u8 = 1 << 1;
@@ -625,14 +632,46 @@ impl Io {
     }
 
     pub fn json(&self) -> String {
+        let framebuffer_stats = self.gpu.framebuffer_stats();
+        let vram_stats = self.gpu.vram_stats();
+        let vram_bounds = self.gpu.vram_nonzero_bounds_json();
+        let screenshot_window = self.gpu.screenshot_window();
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{}}}",
+            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"gpu_gp0_pending_words\":{},\"gpu_gp0_pending_head\":{},\"gpu_gp0_expected_words\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_vram_nonzero_bounds\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_area_start\":{},\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_gp0_command_counts\":[{}],\"gpu_recent_gp0_commands\":[{}],\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{}}}",
             self.irq.status,
             self.irq.mask,
             self.dma.control,
             self.dma.interrupt,
             self.gpu.status,
             self.gpu.commands_seen,
+            self.gpu.gp0_pending_words(),
+            self.gpu.gp0_pending_head(),
+            optional_usize_json(self.gpu.gp0_pending_expected_words()),
+            framebuffer_stats.nonzero_pixels,
+            framebuffer_stats.checksum,
+            vram_stats.nonzero_pixels,
+            vram_stats.checksum,
+            vram_bounds,
+            screenshot_window.x,
+            screenshot_window.y,
+            screenshot_window.stats.nonzero_pixels,
+            screenshot_window.stats.checksum,
+            self.gpu.display_area_start,
+            self.gpu.horizontal_range,
+            self.gpu.vertical_range,
+            self.gpu.drawing_area_top_left,
+            self.gpu.drawing_area_bottom_right,
+            self.gpu.drawing_offset,
+            self.gpu.texture_page,
+            self.gpu.fill_rect_commands,
+            self.gpu.flat_triangle_commands,
+            self.gpu.textured_triangle_commands,
+            self.gpu.textured_rect_commands,
+            self.gpu.flat_line_commands,
+            self.gpu.image_upload_commands,
+            self.gpu.vram_copy_commands,
+            self.gpu.gp0_command_counts_json(),
+            self.gpu.recent_gp0_commands_json(),
             self.timers.0[0].counter,
             self.timers.0[1].counter,
             self.timers.0[2].counter,
@@ -923,6 +962,22 @@ pub struct Gpu {
     pub horizontal_range: u32,
     pub vertical_range: u32,
     status_reads: Cell<u32>,
+    framebuffer: NativeFrameBuffer,
+    gp0_fifo: Vec<u32>,
+    drawing_area_top_left: u32,
+    drawing_area_bottom_right: u32,
+    drawing_offset: u32,
+    texture_page: u16,
+    texture_window: TextureWindow,
+    gp0_command_counts: [u64; 256],
+    fill_rect_commands: u64,
+    flat_triangle_commands: u64,
+    textured_triangle_commands: u64,
+    textured_rect_commands: u64,
+    flat_line_commands: u64,
+    image_upload_commands: u64,
+    vram_copy_commands: u64,
+    recent_gp0_commands: Vec<Gp0CommandTrace>,
 }
 
 impl Default for Gpu {
@@ -935,6 +990,22 @@ impl Default for Gpu {
             horizontal_range: 0,
             vertical_range: 0,
             status_reads: Cell::new(0),
+            framebuffer: NativeFrameBuffer::default(),
+            gp0_fifo: Vec::new(),
+            drawing_area_top_left: 0,
+            drawing_area_bottom_right: 0,
+            drawing_offset: 0,
+            texture_page: 0,
+            texture_window: TextureWindow::default(),
+            gp0_command_counts: [0; 256],
+            fill_rect_commands: 0,
+            flat_triangle_commands: 0,
+            textured_triangle_commands: 0,
+            textured_rect_commands: 0,
+            flat_line_commands: 0,
+            image_upload_commands: 0,
+            vram_copy_commands: 0,
+            recent_gp0_commands: Vec::new(),
         }
     }
 }
@@ -953,6 +1024,8 @@ impl Gpu {
     pub fn write_gp0(&mut self, value: u32) {
         self.gp0_read = value;
         self.commands_seen += 1;
+        self.gp0_fifo.push(value);
+        self.drain_gp0_fifo();
     }
 
     pub fn write_gp1(&mut self, value: u32) {
@@ -981,6 +1054,585 @@ impl Gpu {
         }
         self.commands_seen += 1;
     }
+
+    pub fn screenshot_png_base64(&self) -> String {
+        let window = self.screenshot_window();
+        self.framebuffer.png_base64(
+            window.x,
+            window.y,
+            DEFAULT_DISPLAY_WIDTH,
+            DEFAULT_DISPLAY_HEIGHT,
+        )
+    }
+
+    pub fn screenshot_png(&self) -> Vec<u8> {
+        let window = self.screenshot_window();
+        self.framebuffer.png(
+            window.x,
+            window.y,
+            DEFAULT_DISPLAY_WIDTH,
+            DEFAULT_DISPLAY_HEIGHT,
+        )
+    }
+
+    pub fn screenshot_window(&self) -> FrameBufferWindow {
+        let (start_x, start_y) = display_area_start_xy(self.display_area_start);
+        let stats = self.framebuffer.display_stats(
+            start_x,
+            start_y,
+            DEFAULT_DISPLAY_WIDTH,
+            DEFAULT_DISPLAY_HEIGHT,
+        );
+        let display_window = FrameBufferWindow {
+            x: start_x,
+            y: start_y,
+            stats,
+        };
+        let (drawing_x, drawing_y) = drawing_area_xy(self.drawing_area_top_left);
+        let drawing_x = drawing_x.max(0) as usize;
+        let drawing_y = drawing_y.max(0) as usize;
+        let drawing_window = FrameBufferWindow {
+            x: drawing_x,
+            y: drawing_y,
+            stats: self.framebuffer.display_stats(
+                drawing_x,
+                drawing_y,
+                DEFAULT_DISPLAY_WIDTH,
+                DEFAULT_DISPLAY_HEIGHT,
+            ),
+        };
+
+        let mut best_window = display_window;
+        if should_use_observation_fallback(best_window.stats, drawing_window.stats) {
+            best_window = drawing_window;
+        }
+
+        let Some(densest_window) =
+            self.framebuffer
+                .densest_window(DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT, 8)
+        else {
+            return best_window;
+        };
+
+        if should_use_observation_fallback(best_window.stats, densest_window.stats) {
+            best_window = densest_window;
+        }
+        best_window
+    }
+
+    pub fn vram_png(&self) -> Vec<u8> {
+        self.framebuffer.png(0, 0, VRAM_WIDTH, VRAM_HEIGHT)
+    }
+
+    pub fn framebuffer_stats(&self) -> FrameBufferStats {
+        let (start_x, start_y) = display_area_start_xy(self.display_area_start);
+        self.framebuffer.display_stats(
+            start_x,
+            start_y,
+            DEFAULT_DISPLAY_WIDTH,
+            DEFAULT_DISPLAY_HEIGHT,
+        )
+    }
+
+    pub fn vram_stats(&self) -> FrameBufferStats {
+        self.framebuffer.stats()
+    }
+
+    pub fn vram_nonzero_bounds(&self) -> Option<FrameBufferBounds> {
+        self.framebuffer.nonzero_bounds()
+    }
+
+    pub fn vram_nonzero_bounds_json(&self) -> String {
+        self.vram_nonzero_bounds()
+            .map_or_else(|| "null".to_string(), FrameBufferBounds::json)
+    }
+
+    pub fn gp0_pending_words(&self) -> usize {
+        self.gp0_fifo.len()
+    }
+
+    pub fn gp0_pending_head(&self) -> u32 {
+        self.gp0_fifo.first().copied().unwrap_or(0)
+    }
+
+    pub fn gp0_pending_expected_words(&self) -> Option<usize> {
+        gp0_expected_words(&self.gp0_fifo)
+    }
+
+    fn drain_gp0_fifo(&mut self) {
+        loop {
+            let Some(expected_words) = gp0_expected_words(&self.gp0_fifo) else {
+                return;
+            };
+            if self.gp0_fifo.len() < expected_words {
+                return;
+            }
+
+            let command = self.gp0_fifo[..expected_words].to_vec();
+            self.gp0_fifo.drain(..expected_words);
+            self.execute_gp0_command(&command);
+        }
+    }
+
+    fn execute_gp0_command(&mut self, words: &[u32]) {
+        if words.is_empty() {
+            return;
+        }
+
+        let command = (words[0] >> 24) as u8;
+        self.gp0_command_counts[command as usize] =
+            self.gp0_command_counts[command as usize].saturating_add(1);
+        self.push_recent_gp0_command(words);
+        match command {
+            0x02 if words.len() >= 3 => {
+                let (x, y) = xy(words[1]);
+                let width = (words[2] & 0xffff) as i32;
+                let height = (words[2] >> 16) as i32;
+                self.fill_rect_commands += 1;
+                self.framebuffer
+                    .fill_rect_unclipped(x, y, width, height, color(words[0]));
+            }
+            0x20..=0x23 if words.len() >= 4 => {
+                self.draw_flat_triangle(words[1], words[2], words[3], color(words[0]));
+            }
+            0x24..=0x27 if words.len() >= 7 => {
+                self.draw_textured_triangle([
+                    (words[1], words[2]),
+                    (words[3], words[4]),
+                    (words[5], words[6]),
+                ]);
+            }
+            0x28..=0x2b if words.len() >= 5 => {
+                self.draw_flat_quad(words[1], words[2], words[3], words[4], color(words[0]));
+            }
+            0x2c..=0x2f if words.len() >= 9 => {
+                self.draw_textured_quad([
+                    (words[1], words[2]),
+                    (words[3], words[4]),
+                    (words[5], words[6]),
+                    (words[7], words[8]),
+                ]);
+            }
+            0x30..=0x33 if words.len() >= 6 => {
+                self.draw_flat_triangle(words[1], words[3], words[5], color(words[0]));
+            }
+            0x34..=0x37 if words.len() >= 9 => {
+                self.draw_textured_triangle([
+                    (words[1], words[2]),
+                    (words[4], words[5]),
+                    (words[7], words[8]),
+                ]);
+            }
+            0x38..=0x3b if words.len() >= 8 => {
+                self.draw_flat_quad(words[1], words[3], words[5], words[7], color(words[0]));
+            }
+            0x3c..=0x3f if words.len() >= 12 => {
+                self.draw_textured_quad([
+                    (words[1], words[2]),
+                    (words[4], words[5]),
+                    (words[7], words[8]),
+                    (words[10], words[11]),
+                ]);
+            }
+            0x40..=0x47 if words.len() >= 3 => {
+                self.draw_flat_line(words[1], words[2], color(words[0]));
+            }
+            0x50..=0x57 if words.len() >= 4 => {
+                self.draw_flat_line(words[1], words[3], color(words[0]));
+            }
+            0x60..=0x63 if words.len() >= 3 => {
+                let (x, y) = xy(words[1]);
+                let width = (words[2] & 0xffff) as i32;
+                let height = (words[2] >> 16) as i32;
+                self.fill_rect_commands += 1;
+                self.framebuffer
+                    .fill_rect(x, y, width, height, color(words[0]));
+            }
+            0x64..=0x67 if words.len() >= 4 => {
+                let width = (words[3] & 0xffff) as i32;
+                let height = (words[3] >> 16) as i32;
+                self.draw_textured_rect(words[1], words[2], width, height);
+            }
+            0x68..=0x6f if words.len() >= 2 => {
+                let (x, y) = xy(words[1]);
+                self.fill_rect_commands += 1;
+                self.framebuffer.fill_rect(x, y, 1, 1, color(words[0]));
+            }
+            0x70..=0x73 if words.len() >= 2 => {
+                let (x, y) = xy(words[1]);
+                self.fill_rect_commands += 1;
+                self.framebuffer.fill_rect(x, y, 8, 8, color(words[0]));
+            }
+            0x74..=0x77 if words.len() >= 3 => {
+                self.draw_textured_rect(words[1], words[2], 8, 8);
+            }
+            0x78..=0x7b if words.len() >= 2 => {
+                let (x, y) = xy(words[1]);
+                self.fill_rect_commands += 1;
+                self.framebuffer.fill_rect(x, y, 16, 16, color(words[0]));
+            }
+            0x7c..=0x7f if words.len() >= 3 => {
+                self.draw_textured_rect(words[1], words[2], 16, 16);
+            }
+            0x80 if words.len() >= 4 => {
+                let (source_x, source_y) = unsigned_xy(words[1]);
+                let (dest_x, dest_y) = unsigned_xy(words[2]);
+                let (width, height) = dimensions(words[3]);
+                self.vram_copy_commands += 1;
+                self.framebuffer
+                    .copy_rect(source_x, source_y, dest_x, dest_y, width, height);
+            }
+            0xa0 if words.len() >= 3 => {
+                let (x, y) = unsigned_xy(words[1]);
+                if let Some((width, height)) = image_transfer_dimensions(words[2]) {
+                    self.image_upload_commands += 1;
+                    self.framebuffer.write_rgb555_image(
+                        x,
+                        y,
+                        width as i32,
+                        height as i32,
+                        &words[3..],
+                    );
+                }
+            }
+            0xc0 if words.len() >= 3 => {
+                self.gp0_read = 0;
+            }
+            0xe1 => self.texture_page = (words[0] & 0x07ff) as u16,
+            0xe2 => self.texture_window = TextureWindow::from_gp0_e2(words[0]),
+            0xe3 => {
+                self.drawing_area_top_left = words[0] & 0x000f_ffff;
+                self.update_drawing_clip();
+            }
+            0xe4 => {
+                self.drawing_area_bottom_right = words[0] & 0x000f_ffff;
+                self.update_drawing_clip();
+            }
+            0xe5 => self.drawing_offset = words[0] & 0x003f_ffff,
+            _ => {}
+        }
+    }
+
+    fn draw_flat_triangle(&mut self, a: u32, b: u32, c: u32, color: u32) {
+        self.flat_triangle_commands += 1;
+        self.framebuffer.draw_triangle(
+            self.offset_point(point(a)),
+            self.offset_point(point(b)),
+            self.offset_point(point(c)),
+            color,
+        );
+    }
+
+    fn draw_flat_quad(&mut self, a: u32, b: u32, c: u32, d: u32, color: u32) {
+        self.flat_triangle_commands += 2;
+        let a = self.offset_point(point(a));
+        let b = self.offset_point(point(b));
+        let c = self.offset_point(point(c));
+        let d = self.offset_point(point(d));
+        self.framebuffer.draw_triangle(a, b, c, color);
+        self.framebuffer.draw_triangle(b, c, d, color);
+    }
+
+    fn draw_flat_line(&mut self, a: u32, b: u32, color: u32) {
+        self.flat_line_commands += 1;
+        self.framebuffer.draw_line(
+            self.offset_point(point(a)),
+            self.offset_point(point(b)),
+            color,
+        );
+    }
+
+    fn draw_textured_triangle(&mut self, vertices: [(u32, u32); 3]) {
+        self.textured_triangle_commands += 1;
+        let [(a, a_uv), (b, b_uv), (c, c_uv)] = vertices;
+        let clut = clut(a_uv);
+        let texture_page = texture_page(b_uv);
+        self.texture_page = texture_page;
+        self.framebuffer.draw_textured_triangle(
+            self.textured_point(a, a_uv),
+            self.textured_point(b, b_uv),
+            self.textured_point(c, c_uv),
+            texture_page,
+            clut,
+            self.texture_window,
+        );
+    }
+
+    fn draw_textured_quad(&mut self, vertices: [(u32, u32); 4]) {
+        self.textured_triangle_commands += 2;
+        let [(a, a_uv), (b, b_uv), (c, c_uv), (d, d_uv)] = vertices;
+        let clut = clut(a_uv);
+        let texture_page = texture_page(b_uv);
+        self.texture_page = texture_page;
+        let a = self.textured_point(a, a_uv);
+        let b = self.textured_point(b, b_uv);
+        let c = self.textured_point(c, c_uv);
+        let d = self.textured_point(d, d_uv);
+        self.framebuffer
+            .draw_textured_triangle(a, b, c, texture_page, clut, self.texture_window);
+        self.framebuffer
+            .draw_textured_triangle(b, c, d, texture_page, clut, self.texture_window);
+    }
+
+    fn draw_textured_rect(&mut self, xy: u32, uv: u32, width: i32, height: i32) {
+        self.textured_rect_commands += 1;
+        let point = self.offset_point(point(xy));
+        self.framebuffer.draw_textured_rect(
+            point,
+            (width, height),
+            self.texture_page,
+            clut(uv),
+            texture_coordinate(uv),
+            self.texture_window,
+        );
+    }
+
+    fn textured_point(&self, xy: u32, uv: u32) -> TexturedPoint {
+        TexturedPoint {
+            point: self.offset_point(point(xy)),
+            u: (uv & 0xff) as u8,
+            v: ((uv >> 8) & 0xff) as u8,
+        }
+    }
+
+    fn offset_point(&self, point: Point) -> Point {
+        let (x, y) = drawing_offset_xy(self.drawing_offset);
+        Point {
+            x: point.x + x,
+            y: point.y + y,
+        }
+    }
+
+    fn update_drawing_clip(&mut self) {
+        self.framebuffer.set_clip(drawing_area_clip(
+            self.drawing_area_top_left,
+            self.drawing_area_bottom_right,
+        ));
+    }
+
+    fn gp0_command_counts_json(&self) -> String {
+        self.gp0_command_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(command, count)| {
+                format!(
+                    "{{\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"count\":{}}}",
+                    command, command, count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn push_recent_gp0_command(&mut self, words: &[u32]) {
+        self.recent_gp0_commands.push(Gp0CommandTrace::new(words));
+        if self.recent_gp0_commands.len() > GP0_RECENT_COMMAND_LIMIT {
+            self.recent_gp0_commands.remove(0);
+        }
+    }
+
+    fn recent_gp0_commands_json(&self) -> String {
+        self.recent_gp0_commands
+            .iter()
+            .map(Gp0CommandTrace::json)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Gp0CommandTrace {
+    opcode: u8,
+    word_count: usize,
+    words: Vec<u32>,
+}
+
+impl Gp0CommandTrace {
+    fn new(words: &[u32]) -> Self {
+        Self {
+            opcode: (words[0] >> 24) as u8,
+            word_count: words.len(),
+            words: words
+                .iter()
+                .copied()
+                .take(GP0_RECENT_COMMAND_WORD_LIMIT)
+                .collect(),
+        }
+    }
+
+    fn json(&self) -> String {
+        let words = self
+            .words
+            .iter()
+            .map(|word| format!("{{\"value\":{},\"value_hex\":\"0x{word:08x}\"}}", word))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"word_count\":{},\"words\":[{}]}}",
+            self.opcode, self.opcode, self.word_count, words
+        )
+    }
+}
+
+fn gp0_expected_words(fifo: &[u32]) -> Option<usize> {
+    let first = *fifo.first()?;
+    let command = (first >> 24) as u8;
+    let expected = match command {
+        0x00 | 0x01 | 0x03..=0x1f | 0xe1..=0xe6 => 1,
+        0x02 => 3,
+        0x20..=0x23 => 4,
+        0x24..=0x27 => 7,
+        0x28..=0x2b => 5,
+        0x2c..=0x2f => 9,
+        0x30..=0x33 => 6,
+        0x34..=0x37 => 9,
+        0x38..=0x3b => 8,
+        0x3c..=0x3f => 12,
+        0x40..=0x47 => 3,
+        0x48..=0x4f => polyline_words(fifo)?,
+        0x50..=0x57 => 4,
+        0x58..=0x5f => polyline_words(fifo)?,
+        0x60..=0x63 => 3,
+        0x64..=0x67 => 4,
+        0x68..=0x6f => 2,
+        0x70..=0x73 => 2,
+        0x74..=0x77 => 3,
+        0x78..=0x7b => 2,
+        0x7c..=0x7f => 3,
+        0x80 => 4,
+        0xa0 => image_transfer_words(fifo)?,
+        0xc0 => 3,
+        _ => 1,
+    };
+    Some(expected)
+}
+
+fn polyline_words(fifo: &[u32]) -> Option<usize> {
+    fifo.iter()
+        .position(|word| *word == 0x5555_5555)
+        .map(|index| index + 1)
+        .or_else(|| (fifo.len() > 256).then_some(fifo.len()))
+}
+
+fn image_transfer_words(fifo: &[u32]) -> Option<usize> {
+    if fifo.len() < 3 {
+        return Some(3);
+    }
+
+    let Some((width, height)) = image_transfer_dimensions(fifo[2]) else {
+        return Some(3);
+    };
+    let pixels = width.saturating_mul(height);
+    Some(3 + pixels.div_ceil(2) as usize)
+}
+
+fn image_transfer_dimensions(value: u32) -> Option<(u32, u32)> {
+    let width = value & 0xffff;
+    let height = (value >> 16) & 0xffff;
+    if width == 0 || height == 0 || width > VRAM_WIDTH as u32 || height > VRAM_HEIGHT as u32 {
+        return None;
+    }
+    Some((width, height))
+}
+
+fn display_area_start_xy(value: u32) -> (usize, usize) {
+    let x = (value & 0x03ff) as usize;
+    let y = ((value >> 10) & 0x01ff) as usize;
+    (x.min(VRAM_WIDTH - 1), y.min(VRAM_HEIGHT - 1))
+}
+
+fn xy(value: u32) -> (i32, i32) {
+    (
+        sign_extend_11(value & 0x07ff),
+        sign_extend_11((value >> 16) & 0x07ff),
+    )
+}
+
+fn unsigned_xy(value: u32) -> (i32, i32) {
+    (
+        (value & 0x03ff).min((VRAM_WIDTH - 1) as u32) as i32,
+        ((value >> 16) & 0x01ff).min((VRAM_HEIGHT - 1) as u32) as i32,
+    )
+}
+
+fn dimensions(value: u32) -> (i32, i32) {
+    let width = (value & 0xffff).max(1).min(VRAM_WIDTH as u32) as i32;
+    let height = ((value >> 16) & 0xffff).max(1).min(VRAM_HEIGHT as u32) as i32;
+    (width, height)
+}
+
+fn drawing_offset_xy(value: u32) -> (i32, i32) {
+    (
+        sign_extend_11(value & 0x07ff),
+        sign_extend_11((value >> 11) & 0x07ff),
+    )
+}
+
+fn drawing_area_xy(value: u32) -> (i32, i32) {
+    (
+        (value & 0x03ff).min((VRAM_WIDTH - 1) as u32) as i32,
+        ((value >> 10) & 0x01ff).min((VRAM_HEIGHT - 1) as u32) as i32,
+    )
+}
+
+fn drawing_area_clip(top_left: u32, bottom_right: u32) -> Option<ClipRect> {
+    let (left, top) = drawing_area_xy(top_left);
+    let (right, bottom) = drawing_area_xy(bottom_right);
+    ClipRect::new(left, top, right, bottom)
+}
+
+fn point(value: u32) -> Point {
+    let (x, y) = xy(value);
+    Point { x, y }
+}
+
+fn sign_extend_11(value: u32) -> i32 {
+    let value = value & 0x07ff;
+    if value & 0x0400 != 0 {
+        (value | !0x07ff) as i32
+    } else {
+        value as i32
+    }
+}
+
+fn color(value: u32) -> u32 {
+    let r = value & 0xff;
+    let g = (value >> 8) & 0xff;
+    let b = (value >> 16) & 0xff;
+    (r << 16) | (g << 8) | b
+}
+
+fn clut(value: u32) -> u16 {
+    (value >> 16) as u16
+}
+
+fn texture_page(value: u32) -> u16 {
+    (value >> 16) as u16
+}
+
+fn texture_coordinate(value: u32) -> TextureCoordinate {
+    TextureCoordinate {
+        u: (value & 0xff) as u8,
+        v: ((value >> 8) & 0xff) as u8,
+    }
+}
+
+fn optional_usize_json(value: Option<usize>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn should_use_observation_fallback(
+    display_stats: FrameBufferStats,
+    candidate_stats: FrameBufferStats,
+) -> bool {
+    is_sparse_display(display_stats)
+        && candidate_stats.nonzero_pixels > display_stats.nonzero_pixels.saturating_mul(4)
+}
+
+fn is_sparse_display(display_stats: FrameBufferStats) -> bool {
+    let sparse_display_cutoff = (DEFAULT_DISPLAY_WIDTH * DEFAULT_DISPLAY_HEIGHT / 128) as u64;
+    display_stats.nonzero_pixels < sparse_display_cutoff
 }
 
 #[derive(Clone, Debug)]
@@ -1037,9 +1689,9 @@ impl Dma {
                 self.channels[channel].bcr = value;
             }
             DmaRegisterSlot::Channel(channel, DmaChannelRegister::Chcr) => {
-                self.channels[channel].chcr = value & !(1 << 24);
-                if value & (1 << 24) != 0 {
-                    self.mark_channel_complete(channel);
+                self.channels[channel].chcr = value;
+                if value & (1 << 24) != 0 && !bus_driven_dma_channel(channel) {
+                    self.complete_channel(channel);
                 }
             }
             DmaRegisterSlot::Control => self.control = value,
@@ -1050,6 +1702,15 @@ impl Dma {
 
     pub fn irq_pending(&self) -> bool {
         self.interrupt_with_master_flag() & (1 << 31) != 0
+    }
+
+    pub fn complete_channel(&mut self, channel: usize) {
+        if channel >= self.channels.len() {
+            return;
+        }
+
+        self.channels[channel].chcr &= !(1 << 24);
+        self.mark_channel_complete(channel);
     }
 
     fn mark_channel_complete(&mut self, channel: usize) {
@@ -1076,6 +1737,10 @@ impl Dma {
             self.interrupt & !(1 << 31)
         }
     }
+}
+
+fn bus_driven_dma_channel(channel: usize) -> bool {
+    matches!(channel, 2 | 6)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1358,6 +2023,7 @@ impl Controller {
         clear_if(&mut state, 0x2000, buttons.kick);
         clear_if(&mut state, 0x1000, buttons.beast);
         clear_if(&mut state, 0x8000, buttons.guard);
+        clear_if(&mut state, 0x0008, buttons.start);
         self.p1_state = state;
     }
 }
@@ -1580,9 +2246,9 @@ fn clear_if(state: &mut u16, mask: u16, pressed: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_WIDTH_16, ACCESS_WIDTH_32, DMA_GPU_CHCR, DMA_INTERRUPT, GPU_GP1, IO_REGISTER_MAP,
-        IRQ_MASK, IRQ_STATUS, Io, IoAccess, IoDevice, MDEC_COMMAND, MDEC_STATUS, SIO_DATA,
-        SPU_REGION_START, io_register, io_register_range, is_io_register_address,
+        ACCESS_WIDTH_16, ACCESS_WIDTH_32, DMA_GPU_CHCR, DMA_INTERRUPT, GPU_GP0, GPU_GP1,
+        IO_REGISTER_MAP, IRQ_MASK, IRQ_STATUS, Io, IoAccess, IoDevice, MDEC_COMMAND, MDEC_STATUS,
+        SIO_DATA, SPU_REGION_START, io_register, io_register_range, is_io_register_address,
     };
 
     #[test]
@@ -1681,6 +2347,197 @@ mod tests {
         assert_ne!(first & 0x8000_0000, second & 0x8000_0000);
         assert_eq!(first & 0x0400_0000, 0x0400_0000);
         assert_eq!(second & 0x0400_0000, 0x0400_0000);
+    }
+
+    #[test]
+    fn gpu_gp0_fill_rect_updates_screenshot() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0x0200_00ff);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0008_0008);
+
+        assert!(io.gpu.screenshot_png_base64().starts_with("iVBORw0KGgo"));
+    }
+
+    #[test]
+    fn gpu_gp0_recent_command_json_records_completed_commands() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xe100_0001);
+
+        let json = io.json();
+        assert!(json.contains("\"gpu_recent_gp0_commands\""));
+        assert!(json.contains("\"opcode_hex\":\"0xe1\""));
+        assert!(json.contains("\"value_hex\":\"0xe1000001\""));
+    }
+
+    #[test]
+    fn gpu_screenshot_window_prefers_dense_backbuffer_when_display_is_sparse() {
+        let mut io = Io::default();
+
+        io.gpu.framebuffer.fill_rect_unclipped(0, 0, 4, 4, 0xff);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 240, 320, 240, 0x0000_ff00);
+        io.write_u32(GPU_GP0, 0xe303_c000);
+
+        let window = io.gpu.screenshot_window();
+
+        assert_eq!(window.x, 0);
+        assert_eq!(window.y, 240);
+        assert!(window.stats.nonzero_pixels > 16);
+    }
+
+    #[test]
+    fn gpu_screenshot_window_does_not_stop_at_sparse_drawing_area() {
+        let mut io = Io::default();
+
+        io.gpu.framebuffer.fill_rect_unclipped(0, 0, 4, 4, 0xff);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(400, 240, 320, 240, 0x0000_ff00);
+
+        let window = io.gpu.screenshot_window();
+
+        assert_eq!(window.x, 400);
+        assert_eq!(window.y, 240);
+        assert!(window.stats.nonzero_pixels > 16);
+    }
+
+    #[test]
+    fn gpu_gp0_image_upload_and_vram_copy_update_framebuffer() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0001_0002);
+        io.write_u32(GPU_GP0, 0x03e0_001f);
+        io.write_u32(GPU_GP0, 0x8000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0004_0004);
+        io.write_u32(GPU_GP0, 0x0001_0002);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_eq!(io.gpu.framebuffer_stats().nonzero_pixels, 4);
+    }
+
+    #[test]
+    fn gpu_gp0_textured_quad_samples_vram_texture() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0001_0010);
+        io.write_u32(GPU_GP0, 0x001f_0000);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0040);
+        io.write_u32(GPU_GP0, 0x0008_0002);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+
+        io.write_u32(GPU_GP0, 0x2c80_8080);
+        io.write_u32(GPU_GP0, 0x000a_000a);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x000a_0014);
+        io.write_u32(GPU_GP0, 0x0001_0000);
+        io.write_u32(GPU_GP0, 0x0014_000a);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0014_0014);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert!(io.gpu.framebuffer_stats().nonzero_pixels > 16);
+    }
+
+    #[test]
+    fn gpu_gp0_textured_sprite_samples_current_texture_page() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0001_0010);
+        io.write_u32(GPU_GP0, 0x001f_0000);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0040);
+        io.write_u32(GPU_GP0, 0x0008_0002);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+
+        io.write_u32(GPU_GP0, 0xe100_0001);
+        io.write_u32(GPU_GP0, 0x7480_8080);
+        io.write_u32(GPU_GP0, 0x0010_0010);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert!(io.gpu.framebuffer_stats().nonzero_pixels >= 64);
+    }
+
+    #[test]
+    fn gpu_gp0_accepts_image_upload_command_variants() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xa090_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0001_0002);
+        io.write_u32(GPU_GP0, 0x03e0_001f);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_eq!(io.gpu.gp0_pending_expected_words(), None);
+        assert_eq!(io.gpu.image_upload_commands, 1);
+        assert_eq!(io.gpu.framebuffer_stats().nonzero_pixels, 2);
+    }
+
+    #[test]
+    fn gpu_gp0_invalid_image_upload_dimensions_do_not_stall_fifo() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xa0a5_9982);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0xffff_ffff);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_eq!(io.gpu.gp0_pending_expected_words(), None);
+        assert_eq!(io.gpu.image_upload_commands, 0);
+    }
+
+    #[test]
+    fn gpu_gp0_ignores_non_command_image_data_when_fifo_is_idle() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xb990_0000);
+        io.write_u32(GPU_GP0, 0xb8a5_9982);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_eq!(io.gpu.gp0_pending_expected_words(), None);
     }
 
     #[test]

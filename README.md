@@ -132,9 +132,11 @@ boot ROM loader, memory bus, and a small MIPS R3000A interpreter foundation:
 
 ```sh
 cargo run -- native-inspect assets/roms/bldyror2.zip
+cargo run -- native-rom-summary assets/roms/bldyror2.zip
 cargo run -- native-step assets/roms/bldyror2.zip 16
 cargo run -- native-step assets/roms/bldyror2.zip 1000000
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
+cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
 cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
 ```
 
@@ -145,6 +147,10 @@ The current native core can execute the bundled COH-1002E boot ROM instruction
 stream and exposes CPU/IO state for iterative development.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend.
+`native-scripted-step` applies a sequence of Gym actions to the native core and
+writes a PNG observation for repeatable boot/input debugging. A valid native
+play result still requires a ROM set that passes compatibility checks and more
+complete GPU/GTE/SPU/protection implementation.
 
 See [docs/NATIVE_WORKFLOW.md](docs/NATIVE_WORKFLOW.md) for the canonical macOS
 Apple Silicon build, test, native-step, Gym API, and asset-compliance validation
@@ -170,7 +176,7 @@ Endpoints:
 
 Action space:
 
-- Type: `Discrete(16)`
+- Type: `Discrete(19)`
 - Values: see `cargo run -- action-space`
 
 Observation space:

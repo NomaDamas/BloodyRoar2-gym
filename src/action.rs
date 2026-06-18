@@ -16,10 +16,15 @@ pub enum Action {
     PunchKick,
     BeastPunch,
     BeastKick,
+    Start,
+    Coin,
+    CoinStart,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ActionButtons {
+    pub start: bool,
+    pub coin: bool,
     pub up: bool,
     pub down: bool,
     pub left: bool,
@@ -30,7 +35,7 @@ pub struct ActionButtons {
     pub guard: bool,
 }
 
-pub const ACTION_SPACE: [Action; 16] = [
+pub const ACTION_SPACE: [Action; 19] = [
     Action::Noop,
     Action::Up,
     Action::Down,
@@ -47,11 +52,28 @@ pub const ACTION_SPACE: [Action; 16] = [
     Action::PunchKick,
     Action::BeastPunch,
     Action::BeastKick,
+    Action::Start,
+    Action::Coin,
+    Action::CoinStart,
 ];
 
 impl Action {
     pub fn from_index(index: usize) -> Option<Self> {
         ACTION_SPACE.get(index).copied()
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        let normalized = name.trim().to_ascii_lowercase();
+        let normalized = normalized.replace(['_', '-'], "+");
+
+        if normalized == "none" || normalized == "no+op" {
+            return Some(Action::Noop);
+        }
+
+        ACTION_SPACE
+            .iter()
+            .copied()
+            .find(|action| action.name() == normalized)
     }
 
     pub fn index(self) -> usize {
@@ -79,6 +101,9 @@ impl Action {
             Action::PunchKick => "punch+kick",
             Action::BeastPunch => "beast+punch",
             Action::BeastKick => "beast+kick",
+            Action::Start => "start",
+            Action::Coin => "coin",
+            Action::CoinStart => "coin+start",
         }
     }
 
@@ -152,6 +177,19 @@ impl Action {
                 kick: true,
                 ..ActionButtons::default()
             },
+            Action::Start => ActionButtons {
+                start: true,
+                ..ActionButtons::default()
+            },
+            Action::Coin => ActionButtons {
+                coin: true,
+                ..ActionButtons::default()
+            },
+            Action::CoinStart => ActionButtons {
+                coin: true,
+                start: true,
+                ..ActionButtons::default()
+            },
         }
     }
 }
@@ -159,7 +197,9 @@ impl Action {
 impl ActionButtons {
     pub fn json(self) -> String {
         format!(
-            "{{\"up\":{},\"down\":{},\"left\":{},\"right\":{},\"punch\":{},\"kick\":{},\"beast\":{},\"guard\":{}}}",
+            "{{\"start\":{},\"coin\":{},\"up\":{},\"down\":{},\"left\":{},\"right\":{},\"punch\":{},\"kick\":{},\"beast\":{},\"guard\":{}}}",
+            self.start,
+            self.coin,
             self.up,
             self.down,
             self.left,
@@ -182,5 +222,15 @@ mod tests {
             assert_eq!(Action::from_index(index), Some(*action));
             assert_eq!(action.index(), index);
         }
+    }
+
+    #[test]
+    fn action_names_accept_cli_friendly_aliases() {
+        assert_eq!(Action::from_name("noop"), Some(Action::Noop));
+        assert_eq!(Action::from_name("no-op"), Some(Action::Noop));
+        assert_eq!(Action::from_name("coin+start"), Some(Action::CoinStart));
+        assert_eq!(Action::from_name("coin_start"), Some(Action::CoinStart));
+        assert_eq!(Action::from_name("BEAST-KICK"), Some(Action::BeastKick));
+        assert_eq!(Action::from_name("invalid"), None);
     }
 }

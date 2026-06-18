@@ -2,6 +2,7 @@ pub mod backend;
 pub mod bus;
 pub mod cpu;
 pub mod emulator;
+pub mod framebuffer;
 pub mod io;
 pub mod platform;
 pub mod romset;

@@ -497,6 +497,25 @@ pub struct NativeRomCompatibilityReport {
 }
 
 impl NativeRomCompatibilityReport {
+    pub fn missing_all_required_assets() -> Self {
+        Self {
+            game_id: BLOODY_ROAR_2_GAME_ID,
+            manifest_source: BLOODY_ROAR_2_MANIFEST.source,
+            present_assets: Vec::new(),
+            present_bios_assets: Vec::new(),
+            present_game_assets: Vec::new(),
+            missing_required_assets: BLOODY_ROAR_2_REQUIRED_ASSETS
+                .iter()
+                .map(|asset| asset.name.to_string())
+                .collect(),
+            unknown_assets: Vec::new(),
+            mismatched_assets: Vec::new(),
+            asset_matches: Vec::new(),
+            duplicate_assets: Vec::new(),
+            expectations: BLOODY_ROAR_2_REQUIRED_ASSETS.to_vec(),
+        }
+    }
+
     pub fn compatible(&self) -> bool {
         self.missing_required_assets.is_empty()
             && self.unknown_assets.is_empty()
@@ -508,6 +527,25 @@ impl NativeRomCompatibilityReport {
         self.duplicate_assets
             .iter()
             .any(|duplicate| is_required_asset_name(&duplicate.normalized_name))
+    }
+
+    pub fn summary_json(&self) -> String {
+        let mismatched_assets = self
+            .mismatched_assets
+            .iter()
+            .map(NativeRomAssetMismatch::json)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"missing_required_assets\":[{}],\"mismatched_assets\":[{}],\"unknown_asset_count\":{},\"duplicate_required_assets\":{}}}",
+            self.game_id,
+            escape_json(self.manifest_source),
+            self.compatible(),
+            json_string_array(&self.missing_required_assets),
+            mismatched_assets,
+            self.unknown_assets.len(),
+            self.has_duplicate_required_assets()
+        )
     }
 
     fn json(&self) -> String {
@@ -623,7 +661,7 @@ impl NativeRomSet {
         let bytes = fs::read(&path).map_err(|error| {
             BackendError::new(format!("failed to read {}: {error}", path.display()))
         })?;
-        let entry_metadata = parse_zip_entries(&bytes)?;
+        let entry_metadata = parse_zip_entries_with_nested_archives(&path, &bytes)?;
         let entries = entry_metadata
             .iter()
             .map(|entry| entry.name.clone())
@@ -646,10 +684,11 @@ impl NativeRomSet {
                     BackendError::new(format!("failed to read {}: {error}", file.display()))
                 })?;
                 let archive_name = file
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| file.display().to_string());
-                for mut entry in parse_zip_entries(&bytes)? {
+                    .strip_prefix(&path)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                for mut entry in parse_zip_entries_with_nested_archives(&file, &bytes)? {
                     if entry.name.ends_with('/') {
                         continue;
                     }
@@ -841,6 +880,10 @@ impl NativeRomSet {
         }
     }
 
+    pub fn compatibility_report(&self) -> NativeRomCompatibilityReport {
+        self.bloody_roar_2_compatibility()
+    }
+
     pub fn bloody_roar_2_manifest(&self) -> &'static NativeRomManifest {
         &BLOODY_ROAR_2_MANIFEST
     }
@@ -882,6 +925,10 @@ impl NativeRomSet {
     fn load_entry_bytes(&self, entry: &NativeRomEntry) -> Result<Vec<u8>, BackendError> {
         if self.path.is_dir() {
             return read_scanned_entry_bytes(&self.path, &entry.name);
+        }
+
+        if let Some((archive_name, inner_entry)) = split_scanned_zip_entry(&entry.name) {
+            return unzip_nested_entry(&self.path, archive_name, inner_entry);
         }
 
         unzip_entry(&self.path, &entry.name)
@@ -1036,6 +1083,10 @@ fn is_zip_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+}
+
+fn is_zip_entry_name(name: &str) -> bool {
+    !name.ends_with('/') && normalized_asset_name(name).ends_with(".zip")
 }
 
 fn manifest_match_for_entry(entry: &NativeRomEntry) -> NativeRomAssetMatch {
@@ -1217,6 +1268,37 @@ fn parse_zip_entries(bytes: &[u8]) -> Result<Vec<NativeRomEntry>, BackendError> 
     Ok(entries)
 }
 
+fn parse_zip_entries_with_nested_archives(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Vec<NativeRomEntry>, BackendError> {
+    let entries = parse_zip_entries(bytes)?;
+    let mut expanded = entries.clone();
+
+    for entry in entries {
+        if !is_zip_entry_name(&entry.name) {
+            continue;
+        }
+
+        let Ok(nested_bytes) = unzip_entry(path, &entry.name) else {
+            continue;
+        };
+        let Ok(nested_entries) = parse_zip_entries(&nested_bytes) else {
+            continue;
+        };
+
+        for mut nested_entry in nested_entries {
+            if nested_entry.name.ends_with('/') {
+                continue;
+            }
+            nested_entry.name = format!("{}/{}", entry.name, nested_entry.name);
+            expanded.push(nested_entry);
+        }
+    }
+
+    Ok(expanded)
+}
+
 fn find_eocd(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 22 {
         return None;
@@ -1355,8 +1437,48 @@ fn unzip_entry(path: &Path, entry: &str) -> Result<Vec<u8>, BackendError> {
     Ok(status.stdout)
 }
 
+fn unzip_nested_entry(
+    path: &Path,
+    archive_entry: &str,
+    inner_entry: &str,
+) -> Result<Vec<u8>, BackendError> {
+    let archive_bytes = unzip_entry(path, archive_entry)?;
+    let temp_path = std::env::temp_dir().join(format!(
+        "bloodyroar2-nested-zip-{}-{}.zip",
+        std::process::id(),
+        monotonic_temp_suffix()
+    ));
+    fs::write(&temp_path, archive_bytes).map_err(|error| {
+        BackendError::new(format!(
+            "failed to stage nested ZIP {} from {}: {error}",
+            archive_entry,
+            path.display()
+        ))
+    })?;
+
+    let result = unzip_entry(&temp_path, inner_entry);
+    let _ = fs::remove_file(&temp_path);
+    result
+}
+
+fn monotonic_temp_suffix() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
 fn read_scanned_entry_bytes(root: &Path, entry_name: &str) -> Result<Vec<u8>, BackendError> {
     if let Some((archive_name, inner_entry)) = split_scanned_zip_entry(entry_name) {
+        if let Some((nested_archive, nested_inner_entry)) = split_scanned_zip_entry(inner_entry) {
+            return unzip_nested_entry(
+                &root.join(archive_name),
+                nested_archive,
+                nested_inner_entry,
+            );
+        }
         return unzip_entry(&root.join(archive_name), inner_entry);
     }
 
@@ -1482,6 +1604,27 @@ mod tests {
         assert!(json.contains("\"entry_count\":2"));
         assert!(json.contains("\"crc32\":\"1234abcd\""));
         assert!(json.contains("\"compression_method_name\":\"deflated\""));
+    }
+
+    #[test]
+    fn inspect_expands_and_loads_nested_zip_entries() {
+        let inner_zip = fixture_stored_zip(&[("flash0.021", &[0x11, 0x22, 0x33, 0x44])]);
+        let outer_zip = fixture_stored_zip(&[("BloodRoar2/roms/bldyror2.zip", &inner_zip)]);
+        let zip_path = temp_zip_path("nested");
+        fs::write(&zip_path, outer_zip).expect("write nested ZIP fixture");
+        let romset = NativeRomSet::inspect(&zip_path).expect("inspect nested ZIP fixture");
+
+        assert!(
+            romset
+                .entries
+                .contains(&"BloodRoar2/roms/bldyror2.zip/flash0.021".to_string())
+        );
+
+        let bytes = romset
+            .load_manifest_asset("flash0.021")
+            .expect("load nested flash0 entry");
+        assert_eq!(bytes, vec![0x11, 0x22, 0x33, 0x44]);
+        let _ = fs::remove_file(zip_path);
     }
 
     #[test]
@@ -1938,18 +2081,22 @@ mod tests {
     }
 
     fn inspect_fixture(name: &str, bytes: Vec<u8>) -> NativeRomSet {
-        let zip_path = std::env::temp_dir().join(format!(
-            "bloodyroar2-native-romset-{name}-{}.zip",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock before unix epoch")
-                .as_nanos()
-        ));
+        let zip_path = temp_zip_path(name);
         fs::write(&zip_path, bytes).expect("write test ZIP");
 
         let romset = NativeRomSet::inspect(&zip_path).expect("inspect test ZIP");
         let _ = fs::remove_file(&zip_path);
         romset
+    }
+
+    fn temp_zip_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bloodyroar2-native-romset-{name}-{}.zip",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ))
     }
 
     fn temp_scan_dir(name: &str) -> PathBuf {
@@ -2136,6 +2283,26 @@ mod tests {
         }
 
         finish_zip(zip, central_directory, 4)
+    }
+
+    fn fixture_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = Vec::new();
+        let mut central_directory = Vec::new();
+
+        for (name, data) in entries {
+            push_entry(
+                &mut zip,
+                &mut central_directory,
+                name,
+                0,
+                crc32(data),
+                data.len() as u32,
+                data.len() as u32,
+                data,
+            );
+        }
+
+        finish_zip(zip, central_directory, entries.len() as u16)
     }
 
     fn finish_zip(mut zip: Vec<u8>, central_directory: Vec<u8>, entry_count: u16) -> Vec<u8> {

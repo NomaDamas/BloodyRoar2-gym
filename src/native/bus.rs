@@ -1,9 +1,18 @@
 use std::cell::{Cell, RefCell};
 
+use crate::action::ActionButtons;
 use crate::native::io::{
     DMA_GPU_CHCR, DMA_OTC_CHCR, IO_REGION_END, IO_REGION_START, Io, io_access_for,
 };
 use crate::native::platform::{NativePlatformOps, PreferredNativePlatform};
+
+const DMA_CHANNEL_COUNT: usize = 7;
+const DMA_GPU_CHANNEL: usize = 2;
+const DMA_OTC_CHANNEL: usize = 6;
+const DMA_GPU_COMPLETION_DELAY_CYCLES: u64 = 4_096;
+const DMA_OTC_COMPLETION_DELAY_CYCLES: u64 = 512;
+const BR2_DRAW_SYNC_FLAG_VIRTUAL: u32 = 0x803a_2210;
+const BR2_DRAW_SYNC_FLAG_PHYSICAL: u32 = 0x003a_2210;
 
 #[derive(Clone, Debug)]
 pub struct Bus {
@@ -14,7 +23,10 @@ pub struct Bus {
     zn_board: ZnBoard,
     cache_control: u32,
     cache_isolated: bool,
+    pending_dma_completion_cycles: [u64; DMA_CHANNEL_COUNT],
     vblank_cycle_accumulator: u64,
+    vblank_draw_sync_clears: u64,
+    board_asset_status: NativeBoardAssetStatus,
     pub io: Io,
     access_trace_limit: usize,
     access_trace_watch_only: bool,
@@ -39,6 +51,7 @@ impl Bus {
         ram_size: usize,
         board_assets: NativeBoardAssets,
     ) -> Self {
+        let board_asset_status = NativeBoardAssetStatus::from_assets(&board_assets);
         let mut bus = Self {
             ram: vec![0; ram_size],
             scratchpad: vec![0; 1024],
@@ -47,7 +60,10 @@ impl Bus {
             zn_board: ZnBoard::with_at28c16(board_assets.at28c16),
             cache_control: 0,
             cache_isolated: false,
+            pending_dma_completion_cycles: [0; DMA_CHANNEL_COUNT],
             vblank_cycle_accumulator: 0,
+            vblank_draw_sync_clears: 0,
+            board_asset_status,
             io: Io::default(),
             access_trace_limit: 0,
             access_trace_watch_only: false,
@@ -245,23 +261,39 @@ impl Bus {
 
     pub fn tick(&mut self, cycles: u64) {
         self.io.tick(cycles);
+        self.tick_pending_dma(cycles);
         self.vblank_cycle_accumulator = self.vblank_cycle_accumulator.saturating_add(cycles);
         while self.vblank_cycle_accumulator >= 566_000 {
             self.vblank_cycle_accumulator -= 566_000;
             self.io.irq.status |= 1;
+            self.complete_draw_sync_on_vblank();
         }
     }
 
     pub fn zn_board_json(&self) -> String {
-        self.zn_board.json()
+        format!(
+            "{{\"state\":{},\"assets\":{}}}",
+            self.zn_board.json(),
+            self.board_asset_status.json()
+        )
+    }
+
+    pub fn native_sync_json(&self) -> String {
+        format!(
+            "{{\"br2_draw_sync_flag\":{},\"vblank_draw_sync_clears\":{}}}",
+            self.read_ram_u32_physical(BR2_DRAW_SYNC_FLAG_PHYSICAL)
+                .unwrap_or(0),
+            self.vblank_draw_sync_clears
+        )
     }
 
     pub fn io_json(&self) -> String {
         self.io.json()
     }
 
-    pub fn set_input(&mut self, buttons: crate::action::ActionButtons) {
+    pub fn set_input(&mut self, buttons: ActionButtons) {
         self.io.set_input(buttons);
+        self.zn_board.set_input(buttons);
     }
 
     pub fn set_access_trace_limit(&mut self, limit: usize) {
@@ -369,6 +401,50 @@ impl Bus {
         }
     }
 
+    fn tick_pending_dma(&mut self, cycles: u64) {
+        if cycles == 0 {
+            return;
+        }
+
+        let mut completed_dma = false;
+        for channel in 0..self.pending_dma_completion_cycles.len() {
+            let remaining = &mut self.pending_dma_completion_cycles[channel];
+            if *remaining == 0 {
+                continue;
+            }
+
+            *remaining = (*remaining).saturating_sub(cycles);
+            if *remaining == 0 {
+                self.io.dma.complete_channel(channel);
+                completed_dma = true;
+            }
+        }
+
+        if completed_dma {
+            self.sync_dma_irq();
+        }
+    }
+
+    fn schedule_dma_completion(&mut self, channel: usize, delay_cycles: u64) {
+        if let Some(remaining) = self.pending_dma_completion_cycles.get_mut(channel) {
+            *remaining = delay_cycles.max(1);
+        }
+    }
+
+    fn complete_draw_sync_on_vblank(&mut self) {
+        let Some(value) = self.read_ram_u32_physical(BR2_DRAW_SYNC_FLAG_PHYSICAL) else {
+            return;
+        };
+        if value == 0 {
+            return;
+        }
+
+        if self.write_ram_u32_physical(BR2_DRAW_SYNC_FLAG_PHYSICAL, 0) {
+            self.vblank_draw_sync_clears += 1;
+            self.record_watch_trace("write", "ram", BR2_DRAW_SYNC_FLAG_VIRTUAL, 4, 0);
+        }
+    }
+
     fn process_dma_transfer(&mut self, io_address: u32, control: u32) {
         if control & (1 << 24) == 0 {
             return;
@@ -391,6 +467,7 @@ impl Bus {
         } else {
             self.process_gpu_block_dma(channel.madr, channel.bcr);
         }
+        self.schedule_dma_completion(DMA_GPU_CHANNEL, DMA_GPU_COMPLETION_DELAY_CYCLES);
     }
 
     fn process_gpu_linked_list_dma(&mut self, start_address: u32) {
@@ -437,6 +514,7 @@ impl Bus {
             self.write_u32(address, next);
             address = address.wrapping_sub(4);
         }
+        self.schedule_dma_completion(DMA_OTC_CHANNEL, DMA_OTC_COMPLETION_DELAY_CYCLES);
     }
 
     fn read_bytes(&self, address: u32, len: usize) -> Vec<u8> {
@@ -464,6 +542,24 @@ impl Bus {
 
         self.record_access_trace("read", "unmapped", address, len as u8, 0);
         vec![0; len]
+    }
+
+    fn read_ram_u32_physical(&self, physical: u32) -> Option<u32> {
+        let offset = physical as usize;
+        let bytes = self.ram.get(offset..offset.checked_add(4)?)?;
+        Some(PreferredNativePlatform::read_le_u32(bytes))
+    }
+
+    fn write_ram_u32_physical(&mut self, physical: u32, value: u32) -> bool {
+        let offset = physical as usize;
+        let Some(end) = offset.checked_add(4) else {
+            return false;
+        };
+        let Some(bytes) = self.ram.get_mut(offset..end) else {
+            return false;
+        };
+        bytes.copy_from_slice(&PreferredNativePlatform::write_le_u32(value));
+        true
     }
 
     fn write_bytes(&mut self, address: u32, bytes: &[u8]) {
@@ -523,6 +619,30 @@ pub struct NativeBoardAssets {
     pub cat702_1: Option<[u8; 8]>,
     pub cat702_2: Option<[u8; 8]>,
     pub at28c16: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeBoardAssetStatus {
+    cat702_1_loaded: bool,
+    cat702_2_loaded: bool,
+    at28c16_loaded: bool,
+}
+
+impl NativeBoardAssetStatus {
+    fn from_assets(assets: &NativeBoardAssets) -> Self {
+        Self {
+            cat702_1_loaded: assets.cat702_1.is_some(),
+            cat702_2_loaded: assets.cat702_2.is_some(),
+            at28c16_loaded: assets.at28c16.is_some(),
+        }
+    }
+
+    fn json(self) -> String {
+        format!(
+            "{{\"cat702_1_loaded\":{},\"cat702_2_loaded\":{},\"at28c16_loaded\":{}}}",
+            self.cat702_1_loaded, self.cat702_2_loaded, self.at28c16_loaded
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,6 +805,7 @@ struct ZnBoard {
     coin: u8,
     sound_irq_latch: u8,
     at28c16: [u8; 2048],
+    input: ActionButtons,
 }
 
 impl Default for ZnBoard {
@@ -706,6 +827,7 @@ impl ZnBoard {
             coin: 0,
             sound_irq_latch: 0,
             at28c16,
+            input: ActionButtons::default(),
         }
     }
 }
@@ -729,9 +851,10 @@ impl ZnBoard {
     fn read_base_u32(&self, address: u32) -> u32 {
         let physical = physical_address(address);
         match physical {
-            0x1fa0_0000 | 0x1fa0_0100 | 0x1fa0_0200 | 0x1fa0_0300 | 0x1fa1_0000 | 0x1fa1_0100 => {
-                0xffff_ffff
-            }
+            0x1fa0_0000 => active_low_player_input(self.input),
+            0x1fa0_0100 => 0xffff_ffff,
+            0x1fa0_0200 => active_low_system_input(self.input),
+            0x1fa0_0300 | 0x1fa1_0000 | 0x1fa1_0100 => 0xffff_ffff,
             0x1fa1_0200 => 0x0000_0069,
             0x1fa1_0300 => self.znsecsel as u32,
             0x1fa2_0000 => self.coin as u32,
@@ -776,6 +899,36 @@ impl ZnBoard {
 
     fn cat702_2_select(&self) -> bool {
         self.znsecsel & 0x08 != 0
+    }
+
+    fn set_input(&mut self, input: ActionButtons) {
+        self.input = input;
+    }
+}
+
+fn active_low_player_input(input: ActionButtons) -> u32 {
+    let mut value = 0xffff_ffff;
+    clear_bit_if(&mut value, 0x0000_0001, input.up);
+    clear_bit_if(&mut value, 0x0000_0002, input.down);
+    clear_bit_if(&mut value, 0x0000_0004, input.left);
+    clear_bit_if(&mut value, 0x0000_0008, input.right);
+    clear_bit_if(&mut value, 0x0000_0010, input.punch);
+    clear_bit_if(&mut value, 0x0000_0020, input.kick);
+    clear_bit_if(&mut value, 0x0000_0040, input.beast);
+    clear_bit_if(&mut value, 0x0000_0080, input.guard);
+    value
+}
+
+fn active_low_system_input(input: ActionButtons) -> u32 {
+    let mut value = 0xffff_ffff;
+    clear_bit_if(&mut value, 0x0000_0001, input.coin);
+    clear_bit_if(&mut value, 0x0000_0008, input.start);
+    value
+}
+
+fn clear_bit_if(value: &mut u32, bit: u32, clear: bool) {
+    if clear {
+        *value &= !bit;
     }
 }
 
@@ -853,7 +1006,8 @@ fn optional_u32_hex_json(value: Option<u32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Bus;
+    use super::{BR2_DRAW_SYNC_FLAG_VIRTUAL, Bus, DMA_GPU_COMPLETION_DELAY_CYCLES};
+    use crate::action::ActionButtons;
     use crate::native::io::{
         DMA_GPU_CHCR, DMA_GPU_MADR, DMA_INTERRUPT, DMA_OTC_BCR, DMA_OTC_CHCR, DMA_OTC_MADR,
         DMA_SPU_CHCR, GPU_GP0, IRQ_MASK, IRQ_STATUS, SIO_DATA, SPU_REGION_START,
@@ -898,6 +1052,25 @@ mod tests {
         assert_eq!(bus.io.gpu.commands_seen, 1);
         assert_eq!(bus.read_u32(GPU_GP0), 0x1234_5678);
         assert_eq!(bus.read_u32(DMA_GPU_MADR), 0x0012_3000);
+    }
+
+    #[test]
+    fn bus_maps_action_buttons_to_controller_and_board_inputs() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        bus.set_input(ActionButtons {
+            start: true,
+            coin: true,
+            up: true,
+            punch: true,
+            ..ActionButtons::default()
+        });
+
+        assert_eq!(bus.io.controller.p1_state & 0x0008, 0);
+        assert_eq!(bus.io.controller.p1_state & 0x0010, 0);
+        assert_eq!(bus.io.controller.p1_state & 0x4000, 0);
+        assert_eq!(bus.read_u8(0x1fa0_0000) & 0x11, 0);
+        assert_eq!(bus.read_u8(0x1fa0_0200) & 0x09, 0);
     }
 
     #[test]
@@ -1000,6 +1173,20 @@ mod tests {
     }
 
     #[test]
+    fn vblank_clears_bloody_roar_draw_sync_flag() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+
+        bus.write_u32(BR2_DRAW_SYNC_FLAG_VIRTUAL, 1);
+        bus.tick(566_000);
+
+        assert_eq!(bus.read_u32(BR2_DRAW_SYNC_FLAG_VIRTUAL), 0);
+        assert!(
+            bus.native_sync_json()
+                .contains("\"vblank_draw_sync_clears\":1")
+        );
+    }
+
+    #[test]
     fn bus_raises_dma_irq_when_enabled_channel_completes() {
         let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
 
@@ -1016,12 +1203,23 @@ mod tests {
         bus.write_u32(0x0000_1000, 0x0200_ffff);
         bus.write_u32(0x0000_1004, 0xe100_0400);
         bus.write_u32(0x0000_1008, 0xe600_0000);
+        bus.write_u32(DMA_INTERRUPT, (1 << 23) | (1 << 18));
 
         bus.write_u32(DMA_GPU_MADR, 0x0000_1000);
         bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
 
         assert_eq!(bus.io.gpu.gp0_read, 0xe600_0000);
         assert_eq!(bus.io.gpu.commands_seen, 2);
+        assert_eq!(bus.io.irq.status & (1 << 3), 0);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 1 << 24);
+
+        bus.tick(DMA_GPU_COMPLETION_DELAY_CYCLES - 1);
+        assert_eq!(bus.io.irq.status & (1 << 3), 0);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 1 << 24);
+
+        bus.tick(1);
+        assert_eq!(bus.io.irq.status & (1 << 3), 1 << 3);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
     }
 
     #[test]

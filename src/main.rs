@@ -167,6 +167,15 @@ fn run() -> Result<(), String> {
             println!("{}", romset.json());
             Ok(())
         }
+        "native-rom-summary" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let romset = NativeRomSet::scan(rom).map_err(|error| error.to_string())?;
+            println!("{}", romset.compatibility_report().summary_json());
+            Ok(())
+        }
         "native-step" => {
             let rom = args
                 .next()
@@ -181,6 +190,109 @@ fn run() -> Result<(), String> {
                 NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
             emulator.step_instructions(count);
             println!("{}", emulator.json());
+            Ok(())
+        }
+        "native-screenshot" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let count = args
+                .next()
+                .unwrap_or_else(|| "32000000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instruction count must be a non-negative integer".to_string())?;
+            let output = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("native-frame.png"));
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            emulator.step_instructions(count);
+            std::fs::write(&output, emulator.screenshot_png())
+                .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+            println!(
+                "{{\"output\":\"{}\",\"state\":{}}}",
+                output.display(),
+                emulator.json()
+            );
+            Ok(())
+        }
+        "native-vram-screenshot" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let count = args
+                .next()
+                .unwrap_or_else(|| "32000000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instruction count must be a non-negative integer".to_string())?;
+            let output = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("native-vram.png"));
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            emulator.step_instructions(count);
+            std::fs::write(&output, emulator.vram_png())
+                .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+            println!(
+                "{{\"output\":\"{}\",\"state\":{}}}",
+                output.display(),
+                emulator.json()
+            );
+            Ok(())
+        }
+        "native-scripted-step" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let output = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>..."
+                    .to_string()
+            })?;
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let mut total_frames = 0u64;
+
+            for segment in &segments {
+                emulator.set_input(segment.action.buttons());
+                for _ in 0..segment.frames {
+                    emulator.step_instructions(instructions_per_frame);
+                    total_frames += 1;
+                    if emulator.is_terminal() {
+                        break;
+                    }
+                }
+                if emulator.is_terminal() {
+                    break;
+                }
+            }
+
+            std::fs::write(&output, emulator.screenshot_png())
+                .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+            println!(
+                "{{\"output\":\"{}\",\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"segments\":[{}],\"state\":{}}}",
+                escape_json(&output.display().to_string()),
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                native_script_segments_json(&segments),
+                emulator.json()
+            );
             Ok(())
         }
         "native-trace" => {
@@ -254,8 +366,66 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeScriptSegment {
+    action: Action,
+    frames: u64,
+}
+
+fn parse_native_script_segments(values: Vec<String>) -> Result<Vec<NativeScriptSegment>, String> {
+    if values.is_empty() {
+        return Err(
+            "native-scripted-step requires at least one <action:frames> segment".to_string(),
+        );
+    }
+
+    values
+        .into_iter()
+        .map(|value| parse_native_script_segment(&value))
+        .collect()
+}
+
+fn parse_native_script_segment(value: &str) -> Result<NativeScriptSegment, String> {
+    let (raw_action, raw_frames) = value
+        .split_once(':')
+        .ok_or_else(|| format!("script segment must use <action:frames>: {value}"))?;
+    let action = parse_action_token(raw_action)?;
+    let frames = raw_frames
+        .parse::<u64>()
+        .map_err(|_| format!("script segment frames must be a positive integer: {value}"))?;
+    if frames == 0 {
+        return Err(format!(
+            "script segment frames must be greater than zero: {value}"
+        ));
+    }
+    Ok(NativeScriptSegment { action, frames })
+}
+
+fn parse_action_token(value: &str) -> Result<Action, String> {
+    if let Ok(index) = value.parse::<usize>() {
+        return Action::from_index(index)
+            .ok_or_else(|| format!("action index is outside the action space: {index}"));
+    }
+    Action::from_name(value).ok_or_else(|| format!("unknown action token: {value}"))
+}
+
+fn native_script_segments_json(segments: &[NativeScriptSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| {
+            format!(
+                "{{\"action_index\":{},\"action\":\"{}\",\"frames\":{}}}",
+                segment.action.index(),
+                segment.action.name(),
+                segment.frames
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_native_trace_options(values: Vec<String>) -> Result<NativeTraceConfig, String> {
@@ -393,4 +563,46 @@ fn asset_check(path: &str) -> Result<(), String> {
         risky_extension
     );
     Ok(())
+}
+
+fn escape_json(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NativeScriptSegment, parse_action_token, parse_native_script_segments};
+    use bloodyroar2_gym::Action;
+
+    #[test]
+    fn parses_native_script_segments_by_index_and_name() {
+        let segments =
+            parse_native_script_segments(vec!["17:3".to_string(), "coin+start:5".to_string()])
+                .expect("script parses");
+
+        assert_eq!(
+            segments,
+            vec![
+                NativeScriptSegment {
+                    action: Action::Coin,
+                    frames: 3
+                },
+                NativeScriptSegment {
+                    action: Action::CoinStart,
+                    frames: 5
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_script_segments() {
+        assert!(parse_native_script_segments(Vec::new()).is_err());
+        assert!(parse_native_script_segments(vec!["coin".to_string()]).is_err());
+        assert!(parse_native_script_segments(vec!["coin:0".to_string()]).is_err());
+        assert!(parse_action_token("999").is_err());
+    }
 }

@@ -6,12 +6,13 @@ use crate::backend::BackendError;
 use crate::native::bus::Bus;
 use crate::native::cpu::{Cpu, StepOutcome, StepReport};
 use crate::native::platform::native_platform_json;
-use crate::native::romset::NativeRomSet;
+use crate::native::romset::{NativeRomCompatibilityReport, NativeRomSet};
 
 #[derive(Clone, Debug)]
 pub struct NativeEmulator {
     pub cpu: Cpu,
     bus: Bus,
+    rom_compatibility: NativeRomCompatibilityReport,
     last_outcome: StepOutcome,
     executed_steps: u64,
     last_step: Option<StepReport>,
@@ -19,13 +20,15 @@ pub struct NativeEmulator {
 
 impl NativeEmulator {
     pub fn from_rom_zip(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
-        let romset = NativeRomSet::inspect(path.into())?;
+        let romset = NativeRomSet::scan(path.into())?;
+        let rom_compatibility = romset.compatibility_report();
         let boot_rom = romset.load_boot_rom()?;
         let banked_roms = romset.load_banked_roms()?;
         let board_assets = romset.load_board_assets();
         Ok(Self {
             cpu: Cpu::default(),
             bus: Bus::with_board_assets(boot_rom, banked_roms, 4 * 1024 * 1024, board_assets),
+            rom_compatibility,
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,
@@ -113,13 +116,31 @@ impl NativeEmulator {
         ((self.cpu.cycles % 1_000_000) as f32) / 1_000_000.0
     }
 
+    pub fn executed_steps(&self) -> u64 {
+        self.executed_steps
+    }
+
+    pub fn screenshot_png_base64(&self) -> String {
+        self.bus.io.gpu.screenshot_png_base64()
+    }
+
+    pub fn screenshot_png(&self) -> Vec<u8> {
+        self.bus.io.gpu.screenshot_png()
+    }
+
+    pub fn vram_png(&self) -> Vec<u8> {
+        self.bus.io.gpu.vram_png()
+    }
+
     pub fn json(&self) -> String {
         format!(
-            "{{\"cpu\":{},\"io\":{},\"zn_board\":{},\"platform\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":false,\"development_stage\":\"mips_cpu_io_bootstrap\"}}",
+            "{{\"cpu\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":false,\"development_stage\":\"mips_cpu_io_bootstrap\"}}",
             self.cpu.json(),
             self.bus.io_json(),
             self.bus.zn_board_json(),
+            self.bus.native_sync_json(),
             native_platform_json(),
+            self.rom_compatibility.summary_json(),
             self.bus.rom_len(),
             self.bus.banked_rom_len(),
             self.bus.ram_len(),
@@ -269,6 +290,7 @@ fn optional_step_json(report: Option<StepReport>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Bus, Cpu, NativeEmulator, StepOutcome};
+    use crate::native::romset::NativeRomCompatibilityReport;
 
     fn program(instructions: &[u32]) -> Vec<u8> {
         instructions
@@ -295,6 +317,7 @@ mod tests {
         let mut emulator = NativeEmulator {
             cpu: Cpu::default(),
             bus: Bus::new(rom, 2 * 1024 * 1024),
+            rom_compatibility: NativeRomCompatibilityReport::missing_all_required_assets(),
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,

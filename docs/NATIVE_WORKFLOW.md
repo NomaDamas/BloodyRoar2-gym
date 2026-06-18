@@ -100,6 +100,15 @@ cargo run -- native-inspect assets/roms/bldyror2.zip
 
 The command emits JSON describing ZIP entries, boot ROM classification, and
 compatibility diagnostics for the native loader.
+For day-to-day diagnosis, prefer the compact compatibility summary:
+
+```sh
+cargo run -- native-rom-summary assets/roms/bldyror2.zip
+```
+
+`compatible:false` means native playability cannot be proven with that asset set.
+Fix missing or mismatched local assets first; do not patch, download, or commit
+proprietary ROM data in this repository.
 
 ## 4. Deterministic Native Stepping
 
@@ -133,6 +142,16 @@ Exercise one native backend environment step from the CLI:
 ```sh
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 ```
+
+Run a deterministic input script and write the selected PNG observation:
+
+```sh
+cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
+```
+
+Each script segment is `<action:frames>` where `action` is either an action
+index from `cargo run -- action-space` or an action name such as `coin`,
+`start`, or `coin+start`.
 
 Serve the native backend over the Gym-style HTTP API:
 

@@ -35,7 +35,7 @@ impl NativeBackend {
             beast_meter: self.emulator.progress_signal(),
             round_time: (99.0 - (self.frame as f32 / 60.0)).max(0.0),
             terminal: self.emulator.is_terminal(),
-            screenshot_b64: None,
+            screenshot_b64: Some(self.emulator.screenshot_png_base64()),
         }
     }
 }

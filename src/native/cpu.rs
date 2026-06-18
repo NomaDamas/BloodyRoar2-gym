@@ -20,12 +20,17 @@ pub struct Cpu {
     pub cp0: [u32; 32],
     pub cop2_data: [u32; 32],
     pub cop2_control: [u32; 32],
+    pub gte_command_counts: [u64; 64],
     pub hi: u32,
     pub lo: u32,
     pub pc: u32,
     pub next_pc: u32,
     pub cycles: u64,
     pub halted: bool,
+    pending_load: Option<(usize, u32)>,
+    load_commit_register: Option<usize>,
+    load_commit_value: Option<u32>,
+    load_commit_cancelled: bool,
     delay_slot_branch_pc: Option<u32>,
 }
 
@@ -88,12 +93,17 @@ impl Default for Cpu {
             cp0: [0; 32],
             cop2_data: [0; 32],
             cop2_control: [0; 32],
+            gte_command_counts: [0; 64],
             hi: 0,
             lo: 0,
             pc: 0x1fc0_0000,
             next_pc: 0x1fc0_0004,
             cycles: 0,
             halted: false,
+            pending_load: None,
+            load_commit_register: None,
+            load_commit_value: None,
+            load_commit_cancelled: false,
             delay_slot_branch_pc: None,
         }
     }
@@ -131,9 +141,18 @@ impl Cpu {
         self.cycles += 1;
         bus.set_trace_context(current_pc, self.cycles);
 
+        let delayed_load = self.pending_load.take();
+        self.load_commit_register = delayed_load.map(|(register, _)| register);
+        self.load_commit_value = delayed_load.map(|(_, value)| value);
+        self.load_commit_cancelled = false;
+
         let outcome = self.execute(instruction, current_pc, delay_slot_branch_pc, bus);
+        self.commit_delayed_load(delayed_load);
         self.cycles += fixed_cycle_cost(Some(instruction), outcome).saturating_sub(1);
         self.regs[0] = 0;
+        self.load_commit_register = None;
+        self.load_commit_value = None;
+        self.load_commit_cancelled = false;
         let report = self.step_report_from(start_pc, Some(instruction), cycles_before, outcome);
         bus.tick(report.cycles_elapsed);
         bus.clear_trace_context();
@@ -142,7 +161,7 @@ impl Cpu {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{},\"r8\":{},\"r9\":{},\"r10\":{},\"r11\":{},\"r16\":{},\"r29\":{},\"r31\":{}}}",
+            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{},\"r8\":{},\"r9\":{},\"r10\":{},\"r11\":{},\"r16\":{},\"r29\":{},\"r31\":{},\"gte_command_counts\":[{}]}}",
             self.pc,
             self.next_pc,
             self.cycles,
@@ -161,7 +180,8 @@ impl Cpu {
             self.regs[11],
             self.regs[16],
             self.regs[29],
-            self.regs[31]
+            self.regs[31],
+            self.gte_command_counts_json()
         )
     }
 
@@ -201,7 +221,7 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x03 => {
-                self.regs[31] = self.next_pc;
+                self.set_reg(31, self.next_pc);
                 self.next_pc = jump_target(current_pc, instruction);
                 self.delay_slot_branch_pc = Some(current_pc);
                 StepOutcome::Continue
@@ -238,7 +258,7 @@ impl Cpu {
                 match (self.regs[rs(instruction)] as i32)
                     .checked_add(sign_extend_16(instruction) as i32)
                 {
-                    Some(value) => self.regs[rt(instruction)] = value as u32,
+                    Some(value) => self.set_reg(rt(instruction), value as u32),
                     None => {
                         return self.raise_exception(
                             current_pc,
@@ -250,74 +270,96 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x09 => {
-                self.regs[rt(instruction)] =
-                    self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                self.set_reg(
+                    rt(instruction),
+                    self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction)),
+                );
                 StepOutcome::Continue
             }
             0x0a => {
-                self.regs[rt(instruction)] = ((self.regs[rs(instruction)] as i32)
-                    < (sign_extend_16(instruction) as i32))
-                    as u32;
+                self.set_reg(
+                    rt(instruction),
+                    ((self.regs[rs(instruction)] as i32) < (sign_extend_16(instruction) as i32))
+                        as u32,
+                );
                 StepOutcome::Continue
             }
             0x0b => {
-                self.regs[rt(instruction)] =
-                    (self.regs[rs(instruction)] < sign_extend_16(instruction)) as u32;
+                self.set_reg(
+                    rt(instruction),
+                    (self.regs[rs(instruction)] < sign_extend_16(instruction)) as u32,
+                );
                 StepOutcome::Continue
             }
             0x0c => {
-                self.regs[rt(instruction)] = self.regs[rs(instruction)] & (instruction & 0xffff);
+                self.set_reg(
+                    rt(instruction),
+                    self.regs[rs(instruction)] & (instruction & 0xffff),
+                );
                 StepOutcome::Continue
             }
             0x0d => {
-                self.regs[rt(instruction)] = self.regs[rs(instruction)] | (instruction & 0xffff);
+                self.set_reg(
+                    rt(instruction),
+                    self.regs[rs(instruction)] | (instruction & 0xffff),
+                );
                 StepOutcome::Continue
             }
             0x0e => {
-                self.regs[rt(instruction)] = self.regs[rs(instruction)] ^ (instruction & 0xffff);
+                self.set_reg(
+                    rt(instruction),
+                    self.regs[rs(instruction)] ^ (instruction & 0xffff),
+                );
                 StepOutcome::Continue
             }
             0x0f => {
-                self.regs[rt(instruction)] = (instruction & 0xffff) << 16;
+                self.set_reg(rt(instruction), (instruction & 0xffff) << 16);
                 StepOutcome::Continue
             }
             0x10 => self.execute_cop0(instruction, bus),
             0x12 => self.execute_cop2(instruction),
             0x20 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
-                self.regs[rt(instruction)] = (bus.read_u8(address) as i8) as i32 as u32;
+                self.schedule_load(rt(instruction), (bus.read_u8(address) as i8) as i32 as u32);
                 StepOutcome::Continue
             }
             0x21 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
-                self.regs[rt(instruction)] = (bus.read_u16(address) as i16) as i32 as u32;
+                self.schedule_load(
+                    rt(instruction),
+                    (bus.read_u16(address) as i16) as i32 as u32,
+                );
                 StepOutcome::Continue
             }
             0x22 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
-                self.regs[rt(instruction)] =
-                    load_word_left(bus, address, self.regs[rt(instruction)]);
+                self.schedule_load(
+                    rt(instruction),
+                    load_word_left(bus, address, self.load_merge_value(rt(instruction))),
+                );
                 StepOutcome::Continue
             }
             0x23 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
-                self.regs[rt(instruction)] = bus.read_u32(address);
+                self.schedule_load(rt(instruction), bus.read_u32(address));
                 StepOutcome::Continue
             }
             0x24 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
-                self.regs[rt(instruction)] = bus.read_u8(address) as u32;
+                self.schedule_load(rt(instruction), bus.read_u8(address) as u32);
                 StepOutcome::Continue
             }
             0x25 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
-                self.regs[rt(instruction)] = bus.read_u16(address) as u32;
+                self.schedule_load(rt(instruction), bus.read_u16(address) as u32);
                 StepOutcome::Continue
             }
             0x26 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
-                self.regs[rt(instruction)] =
-                    load_word_right(bus, address, self.regs[rt(instruction)]);
+                self.schedule_load(
+                    rt(instruction),
+                    load_word_right(bus, address, self.load_merge_value(rt(instruction))),
+                );
                 StepOutcome::Continue
             }
             0x28 => {
@@ -368,33 +410,47 @@ impl Cpu {
         match instruction & 0x3f {
             0x00 => {
                 if instruction != 0 {
-                    self.regs[rd(instruction)] = self.regs[rt(instruction)] << shamt(instruction);
+                    self.set_reg(
+                        rd(instruction),
+                        self.regs[rt(instruction)] << shamt(instruction),
+                    );
                 }
                 StepOutcome::Continue
             }
             0x04 => {
-                self.regs[rd(instruction)] =
-                    self.regs[rt(instruction)] << (self.regs[rs(instruction)] & 0x1f);
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rt(instruction)] << (self.regs[rs(instruction)] & 0x1f),
+                );
                 StepOutcome::Continue
             }
             0x02 => {
-                self.regs[rd(instruction)] = self.regs[rt(instruction)] >> shamt(instruction);
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rt(instruction)] >> shamt(instruction),
+                );
                 StepOutcome::Continue
             }
             0x03 => {
-                self.regs[rd(instruction)] =
-                    ((self.regs[rt(instruction)] as i32) >> shamt(instruction)) as u32;
+                self.set_reg(
+                    rd(instruction),
+                    ((self.regs[rt(instruction)] as i32) >> shamt(instruction)) as u32,
+                );
                 StepOutcome::Continue
             }
             0x06 => {
-                self.regs[rd(instruction)] =
-                    self.regs[rt(instruction)] >> (self.regs[rs(instruction)] & 0x1f);
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rt(instruction)] >> (self.regs[rs(instruction)] & 0x1f),
+                );
                 StepOutcome::Continue
             }
             0x07 => {
-                self.regs[rd(instruction)] = ((self.regs[rt(instruction)] as i32)
-                    >> (self.regs[rs(instruction)] & 0x1f))
-                    as u32;
+                self.set_reg(
+                    rd(instruction),
+                    ((self.regs[rt(instruction)] as i32) >> (self.regs[rs(instruction)] & 0x1f))
+                        as u32,
+                );
                 StepOutcome::Continue
             }
             0x08 => {
@@ -403,13 +459,13 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x09 => {
-                self.regs[rd(instruction)] = self.next_pc;
+                self.set_reg(rd(instruction), self.next_pc);
                 self.next_pc = self.regs[rs(instruction)];
                 self.delay_slot_branch_pc = Some(current_pc);
                 StepOutcome::Continue
             }
             0x10 => {
-                self.regs[rd(instruction)] = self.hi;
+                self.set_reg(rd(instruction), self.hi);
                 StepOutcome::Continue
             }
             0x11 => {
@@ -417,7 +473,7 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x12 => {
-                self.regs[rd(instruction)] = self.lo;
+                self.set_reg(rd(instruction), self.lo);
                 StepOutcome::Continue
             }
             0x13 => {
@@ -464,7 +520,7 @@ impl Cpu {
                 match (self.regs[rs(instruction)] as i32)
                     .checked_add(self.regs[rt(instruction)] as i32)
                 {
-                    Some(value) => self.regs[rd(instruction)] = value as u32,
+                    Some(value) => self.set_reg(rd(instruction), value as u32),
                     None => {
                         return self.raise_exception(
                             current_pc,
@@ -476,15 +532,17 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x21 => {
-                self.regs[rd(instruction)] =
-                    self.regs[rs(instruction)].wrapping_add(self.regs[rt(instruction)]);
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rs(instruction)].wrapping_add(self.regs[rt(instruction)]),
+                );
                 StepOutcome::Continue
             }
             0x22 => {
                 match (self.regs[rs(instruction)] as i32)
                     .checked_sub(self.regs[rt(instruction)] as i32)
                 {
-                    Some(value) => self.regs[rd(instruction)] = value as u32,
+                    Some(value) => self.set_reg(rd(instruction), value as u32),
                     None => {
                         return self.raise_exception(
                             current_pc,
@@ -496,39 +554,53 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x23 => {
-                self.regs[rd(instruction)] =
-                    self.regs[rs(instruction)].wrapping_sub(self.regs[rt(instruction)]);
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rs(instruction)].wrapping_sub(self.regs[rt(instruction)]),
+                );
                 StepOutcome::Continue
             }
             0x24 => {
-                self.regs[rd(instruction)] =
-                    self.regs[rs(instruction)] & self.regs[rt(instruction)];
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rs(instruction)] & self.regs[rt(instruction)],
+                );
                 StepOutcome::Continue
             }
             0x25 => {
-                self.regs[rd(instruction)] =
-                    self.regs[rs(instruction)] | self.regs[rt(instruction)];
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rs(instruction)] | self.regs[rt(instruction)],
+                );
                 StepOutcome::Continue
             }
             0x26 => {
-                self.regs[rd(instruction)] =
-                    self.regs[rs(instruction)] ^ self.regs[rt(instruction)];
+                self.set_reg(
+                    rd(instruction),
+                    self.regs[rs(instruction)] ^ self.regs[rt(instruction)],
+                );
                 StepOutcome::Continue
             }
             0x27 => {
-                self.regs[rd(instruction)] =
-                    !(self.regs[rs(instruction)] | self.regs[rt(instruction)]);
+                self.set_reg(
+                    rd(instruction),
+                    !(self.regs[rs(instruction)] | self.regs[rt(instruction)]),
+                );
                 StepOutcome::Continue
             }
             0x2a => {
-                self.regs[rd(instruction)] = ((self.regs[rs(instruction)] as i32)
-                    < (self.regs[rt(instruction)] as i32))
-                    as u32;
+                self.set_reg(
+                    rd(instruction),
+                    ((self.regs[rs(instruction)] as i32) < (self.regs[rt(instruction)] as i32))
+                        as u32,
+                );
                 StepOutcome::Continue
             }
             0x2b => {
-                self.regs[rd(instruction)] =
-                    (self.regs[rs(instruction)] < self.regs[rt(instruction)]) as u32;
+                self.set_reg(
+                    rd(instruction),
+                    (self.regs[rs(instruction)] < self.regs[rt(instruction)]) as u32,
+                );
                 StepOutcome::Continue
             }
             _ => StepOutcome::Unsupported(instruction),
@@ -552,7 +624,7 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x10 => {
-                self.regs[31] = self.next_pc;
+                self.set_reg(31, self.next_pc);
                 if (self.regs[rs(instruction)] as i32) < 0 {
                     self.next_pc = branch_target(self.pc, instruction);
                 }
@@ -560,7 +632,7 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x11 => {
-                self.regs[31] = self.next_pc;
+                self.set_reg(31, self.next_pc);
                 if (self.regs[rs(instruction)] as i32) >= 0 {
                     self.next_pc = branch_target(self.pc, instruction);
                 }
@@ -574,7 +646,7 @@ impl Cpu {
     fn execute_cop0(&mut self, instruction: u32, bus: &mut Bus) -> StepOutcome {
         match rs(instruction) {
             0x00 => {
-                self.regs[rt(instruction)] = self.cp0[rd(instruction)];
+                self.set_reg(rt(instruction), self.cp0[rd(instruction)]);
                 StepOutcome::Continue
             }
             0x04 => {
@@ -597,11 +669,11 @@ impl Cpu {
     fn execute_cop2(&mut self, instruction: u32) -> StepOutcome {
         match rs(instruction) {
             0x00 => {
-                self.regs[rt(instruction)] = self.cop2_data[rd(instruction)];
+                self.set_reg(rt(instruction), self.cop2_data[rd(instruction)]);
                 StepOutcome::Continue
             }
             0x02 => {
-                self.regs[rt(instruction)] = self.cop2_control[rd(instruction)];
+                self.set_reg(rt(instruction), self.cop2_control[rd(instruction)]);
                 StepOutcome::Continue
             }
             0x04 => {
@@ -622,6 +694,8 @@ impl Cpu {
 
     fn execute_gte_command(&mut self, instruction: u32) {
         let command = instruction & 0x3f;
+        self.gte_command_counts[command as usize] =
+            self.gte_command_counts[command as usize].saturating_add(1);
         match command {
             // Minimal deterministic placeholders for BIOS/game progression. Accurate GTE
             // geometry and color math is implemented incrementally behind these registers.
@@ -633,6 +707,21 @@ impl Cpu {
                 self.cop2_data[31] = 0;
             }
         }
+    }
+
+    fn gte_command_counts_json(&self) -> String {
+        self.gte_command_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(command, count)| {
+                format!(
+                    "{{\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"count\":{}}}",
+                    command, command, count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn refresh_interrupts(&mut self, bus: &Bus) {
@@ -671,6 +760,41 @@ impl Cpu {
         self.pc = EXCEPTION_VECTOR;
         self.next_pc = EXCEPTION_VECTOR + 4;
         StepOutcome::Continue
+    }
+
+    fn set_reg(&mut self, register: usize, value: u32) {
+        if register == 0 {
+            return;
+        }
+        if self.load_commit_register == Some(register) {
+            self.load_commit_cancelled = true;
+        }
+        self.regs[register] = value;
+    }
+
+    fn schedule_load(&mut self, register: usize, value: u32) {
+        if register != 0 {
+            if self.load_commit_register == Some(register) {
+                self.load_commit_cancelled = true;
+            }
+            self.pending_load = Some((register, value));
+        }
+    }
+
+    fn load_merge_value(&self, register: usize) -> u32 {
+        if self.load_commit_register == Some(register) {
+            return self.load_commit_value.unwrap_or(self.regs[register]);
+        }
+        self.regs[register]
+    }
+
+    fn commit_delayed_load(&mut self, delayed_load: Option<(usize, u32)>) {
+        let Some((register, value)) = delayed_load else {
+            return;
+        };
+        if register != 0 && !self.load_commit_cancelled {
+            self.regs[register] = value;
+        }
     }
 }
 
@@ -915,7 +1039,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first.1,
-            "{\"pc\":2147483776,\"next_pc\":2147483780,\"cycles\":4,\"halted\":true,\"status\":0,\"cause\":36,\"epc\":532676620,\"r2\":42,\"r3\":0,\"r4\":7,\"r5\":0,\"r6\":0,\"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r16\":0,\"r29\":0,\"r31\":0}"
+            "{\"pc\":2147483776,\"next_pc\":2147483780,\"cycles\":4,\"halted\":true,\"status\":0,\"cause\":36,\"epc\":532676620,\"r2\":42,\"r3\":0,\"r4\":7,\"r5\":0,\"r6\":0,\"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r16\":0,\"r29\":0,\"r31\":0,\"gte_command_counts\":[]}"
         );
     }
 
@@ -948,6 +1072,7 @@ mod tests {
         let mut bus = Bus::new(rom, 2 * 1024 * 1024);
         let mut cpu = Cpu::default();
 
+        cpu.step(&mut bus);
         cpu.step(&mut bus);
         cpu.step(&mut bus);
         cpu.step(&mut bus);
@@ -1051,6 +1176,7 @@ mod tests {
             i_type(0x0d, 9, 9, -13091), // ori t1, t1, 0xccdd
             i_type(0x22, 0, 9, 1),      // lwl t1, 1(zero)
             i_type(0x26, 0, 9, 2),      // lwr t1, 2(zero)
+            r_type(0, 0, 0, 0, 0x00),   // delay slot for final partial load
         ]);
         let mut bus = Bus::new(rom, 2 * 1024 * 1024);
         let mut cpu = Cpu::default();
@@ -1064,11 +1190,33 @@ mod tests {
         assert_eq!(bus.read_u8(2), 0x44);
         assert_eq!(bus.read_u8(3), 0x33);
 
-        for _ in 0..4 {
+        for _ in 0..5 {
             assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
         }
 
         assert_eq!(cpu.regs[9], 0x1122_3344);
+    }
+
+    #[test]
+    fn load_results_are_delayed_one_instruction() {
+        let rom = program(&[
+            i_type(0x09, 0, 8, 7),    // addiu t0, zero, 7
+            i_type(0x2b, 0, 8, 0),    // sw t0, 0(zero)
+            i_type(0x23, 0, 9, 0),    // lw t1, 0(zero)
+            i_type(0x09, 9, 10, 1),   // addiu t2, t1, 1; sees old t1
+            i_type(0x09, 9, 11, 1),   // addiu t3, t1, 1; sees loaded t1
+            r_type(0, 0, 0, 0, 0x0d), // break
+        ]);
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+
+        for _ in 0..5 {
+            assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+        }
+
+        assert_eq!(cpu.regs[9], 7);
+        assert_eq!(cpu.regs[10], 1);
+        assert_eq!(cpu.regs[11], 8);
     }
 
     #[test]
