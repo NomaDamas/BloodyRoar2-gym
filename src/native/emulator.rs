@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::action::ActionButtons;
 use crate::backend::BackendError;
 use crate::native::bus::Bus;
 use crate::native::cpu::{Cpu, StepOutcome};
@@ -30,6 +31,18 @@ impl NativeEmulator {
                 break;
             }
         }
+    }
+
+    pub fn set_input(&mut self, buttons: ActionButtons) {
+        self.bus.set_input(buttons);
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.last_outcome != StepOutcome::Continue || self.cpu.halted
+    }
+
+    pub fn progress_signal(&self) -> f32 {
+        ((self.cpu.cycles % 1_000_000) as f32) / 1_000_000.0
     }
 
     pub fn json(&self) -> String {

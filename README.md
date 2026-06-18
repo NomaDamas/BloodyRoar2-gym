@@ -91,6 +91,8 @@ boot ROM loader, memory bus, and a small MIPS R3000A interpreter foundation:
 cargo run -- native-inspect assets/roms/bldyror2.zip
 cargo run -- native-step assets/roms/bldyror2.zip 16
 cargo run -- native-step assets/roms/bldyror2.zip 1000000
+cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
+cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
 ```
 
 The native path is intentionally separated from MAME and ZiNc compatibility
@@ -98,6 +100,8 @@ commands so long-term emulator work can proceed without pretending incomplete
 CPU/GPU/SPU/protection-chip implementation is already game-playable.
 The current native core can execute the bundled COH-1002E boot ROM instruction
 stream and exposes CPU/IO state for iterative development.
+`native-env-step` and `serve-native` connect the native core to the same
+Gym-style action/observation contract used by the null backend.
 
 ## HTTP API
 

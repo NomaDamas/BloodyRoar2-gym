@@ -1,8 +1,11 @@
+use crate::action::ActionButtons;
+
 #[derive(Clone, Debug, Default)]
 pub struct Io {
     pub irq: InterruptController,
     pub gpu: Gpu,
     pub dma: Dma,
+    pub controller: Controller,
 }
 
 impl Io {
@@ -13,6 +16,7 @@ impl Io {
             0x1f80_1810 => self.gpu.gp0_read,
             0x1f80_1814 => self.gpu.status,
             0x1f80_1080..=0x1f80_10ff => self.dma.read_u32(address),
+            0x1f80_1040 => self.controller.p1_state as u32,
             _ => 0,
         }
     }
@@ -24,8 +28,13 @@ impl Io {
             0x1f80_1810 => self.gpu.write_gp0(value),
             0x1f80_1814 => self.gpu.write_gp1(value),
             0x1f80_1080..=0x1f80_10ff => self.dma.write_u32(address, value),
+            0x1f80_1040 => self.controller.last_write = value as u16,
             _ => {}
         }
+    }
+
+    pub fn set_input(&mut self, buttons: ActionButtons) {
+        self.controller.set_buttons(buttons);
     }
 }
 
@@ -98,4 +107,40 @@ impl Dma {
 
 fn index(address: u32) -> usize {
     (((address - 0x1f80_1080) / 4) as usize).min(31)
+}
+
+#[derive(Clone, Debug)]
+pub struct Controller {
+    pub p1_state: u16,
+    pub last_write: u16,
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Self {
+            p1_state: 0xffff,
+            last_write: 0,
+        }
+    }
+}
+
+impl Controller {
+    pub fn set_buttons(&mut self, buttons: ActionButtons) {
+        let mut state = 0xffff_u16;
+        clear_if(&mut state, 0x0010, buttons.up);
+        clear_if(&mut state, 0x0040, buttons.down);
+        clear_if(&mut state, 0x0080, buttons.left);
+        clear_if(&mut state, 0x0020, buttons.right);
+        clear_if(&mut state, 0x4000, buttons.punch);
+        clear_if(&mut state, 0x2000, buttons.kick);
+        clear_if(&mut state, 0x1000, buttons.beast);
+        clear_if(&mut state, 0x8000, buttons.guard);
+        self.p1_state = state;
+    }
+}
+
+fn clear_if(state: &mut u16, mask: u16, pressed: bool) {
+    if pressed {
+        *state &= !mask;
+    }
 }

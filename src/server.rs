@@ -3,14 +3,31 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use crate::action::Action;
-use crate::backend::{BackendError, NullBackend};
+use crate::backend::{Backend, BackendError, NullBackend};
 use crate::env::BloodyRoar2Env;
+use crate::native::NativeBackend;
 use crate::protocol::{action_space_json, api_index_json, observation_space_json};
 
 pub fn serve(address: &str) -> Result<(), BackendError> {
+    serve_with_backend(address, NullBackend::default())
+}
+
+pub fn serve_native(
+    address: &str,
+    rom_path: impl Into<std::path::PathBuf>,
+    instructions_per_frame: u64,
+) -> Result<(), BackendError> {
+    let backend = NativeBackend::from_rom_zip(rom_path, instructions_per_frame)?;
+    serve_with_backend(address, backend)
+}
+
+fn serve_with_backend<B>(address: &str, backend: B) -> Result<(), BackendError>
+where
+    B: Backend + Send + 'static,
+{
     let listener = TcpListener::bind(address)
         .map_err(|error| BackendError::new(format!("failed to bind {address}: {error}")))?;
-    let env = Arc::new(Mutex::new(BloodyRoar2Env::new(NullBackend::default())));
+    let env = Arc::new(Mutex::new(BloodyRoar2Env::new(backend)));
 
     for stream in listener.incoming() {
         match stream {
@@ -27,10 +44,13 @@ pub fn serve(address: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-fn handle_client(
+fn handle_client<B>(
     mut stream: TcpStream,
-    env: Arc<Mutex<BloodyRoar2Env<NullBackend>>>,
-) -> Result<(), BackendError> {
+    env: Arc<Mutex<BloodyRoar2Env<B>>>,
+) -> Result<(), BackendError>
+where
+    B: Backend,
+{
     let mut buffer = [0_u8; 4096];
     let read = stream
         .read(&mut buffer)

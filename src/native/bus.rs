@@ -62,9 +62,17 @@ impl Bus {
 
     pub fn io_json(&self) -> String {
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_status\":{},\"gpu_commands_seen\":{}}}",
-            self.io.irq.status, self.io.irq.mask, self.io.gpu.status, self.io.gpu.commands_seen
+            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"p1_state\":{}}}",
+            self.io.irq.status,
+            self.io.irq.mask,
+            self.io.gpu.status,
+            self.io.gpu.commands_seen,
+            self.io.controller.p1_state
         )
+    }
+
+    pub fn set_input(&mut self, buttons: crate::action::ActionButtons) {
+        self.io.set_input(buttons);
     }
 
     fn read_bytes(&self, address: u32, len: usize) -> Vec<u8> {

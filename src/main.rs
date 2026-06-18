@@ -69,6 +69,20 @@ fn run() -> Result<(), String> {
             let address = args.next().unwrap_or_else(|| "127.0.0.1:8765".to_string());
             bloodyroar2_gym::server::serve(&address).map_err(|error| error.to_string())
         }
+        "serve-native" => {
+            let address = args.next().unwrap_or_else(|| "127.0.0.1:8765".to_string());
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let instructions_per_frame = args
+                .next()
+                .unwrap_or_else(|| "10000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            bloodyroar2_gym::server::serve_native(&address, rom, instructions_per_frame)
+                .map_err(|error| error.to_string())
+        }
         "prepare-assets" => {
             let archive = args.next().map(PathBuf::from).ok_or_else(|| {
                 "usage: bloodyroar2-gym prepare-assets <archive.zip> [rom_dir]".to_string()
@@ -168,6 +182,38 @@ fn run() -> Result<(), String> {
             println!("{}", emulator.json());
             Ok(())
         }
+        "native-env-step" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let action_index = args
+                .next()
+                .unwrap_or_else(|| "0".to_string())
+                .parse::<usize>()
+                .map_err(|_| "action index must be a non-negative integer".to_string())?;
+            let frames = args
+                .next()
+                .unwrap_or_else(|| "1".to_string())
+                .parse::<u32>()
+                .map_err(|_| "frames must be a non-negative integer".to_string())?;
+            let instructions_per_frame = args
+                .next()
+                .unwrap_or_else(|| "10000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let action = Action::from_index(action_index)
+                .ok_or_else(|| "action index is outside the action space".to_string())?;
+            let backend = bloodyroar2_gym::NativeBackend::from_rom_zip(rom, instructions_per_frame)
+                .map_err(|error| error.to_string())?;
+            let mut env = BloodyRoar2Env::new(backend);
+            env.reset().map_err(|error| error.to_string())?;
+            let step = env
+                .step(action, frames)
+                .map_err(|error| error.to_string())?;
+            println!("{}", step.json());
+            Ok(())
+        }
         "asset-check" => {
             let path = args
                 .next()
@@ -180,7 +226,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip]\n  native-step [rom_zip] [instruction_count]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip]\n  native-step [rom_zip] [instruction_count]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
