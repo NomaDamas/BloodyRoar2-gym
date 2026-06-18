@@ -81,6 +81,21 @@ If Wine is missing, install a Wine distribution manually. Homebrew
 `wine-stable` may require `sudo` for its GStreamer dependency and may not be
 installable from non-interactive automation.
 
+## Native Emulator Development
+
+This repository also contains the start of a from-scratch Apple Silicon-native
+emulator path. It is not playable yet; it currently provides a ROM ZIP inspector,
+boot ROM loader, memory bus, and a small MIPS R3000A interpreter foundation:
+
+```sh
+cargo run -- native-inspect assets/roms/bldyror2.zip
+cargo run -- native-step assets/roms/bldyror2.zip 16
+```
+
+The native path is intentionally separated from MAME and ZiNc compatibility
+commands so long-term emulator work can proceed without pretending incomplete
+CPU/GPU/SPU/protection-chip implementation is already game-playable.
+
 ## HTTP API
 
 ```sh

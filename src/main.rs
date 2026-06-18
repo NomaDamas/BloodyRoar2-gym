@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bloodyroar2_gym::{
-    Action, BloodyRoar2Env, MameConfig, MameRuntime, NullBackend, ZincConfig, ZincRuntime,
-    action_space_json, api_index_json, observation_space_json,
+    Action, BloodyRoar2Env, MameConfig, MameRuntime, NativeEmulator, NativeRomSet, NullBackend,
+    ZincConfig, ZincRuntime, action_space_json, api_index_json, observation_space_json,
 };
 
 fn main() -> ExitCode {
@@ -143,6 +143,31 @@ fn run() -> Result<(), String> {
                 .play(&extra_args)
                 .map_err(|error| error.to_string())
         }
+        "native-inspect" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let romset = NativeRomSet::inspect(rom).map_err(|error| error.to_string())?;
+            println!("{}", romset.json());
+            Ok(())
+        }
+        "native-step" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let count = args
+                .next()
+                .unwrap_or_else(|| "1".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instruction count must be a non-negative integer".to_string())?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            emulator.step_instructions(count);
+            println!("{}", emulator.json());
+            Ok(())
+        }
         "asset-check" => {
             let path = args
                 .next()
@@ -155,7 +180,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip]\n  native-step [rom_zip] [instruction_count]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
