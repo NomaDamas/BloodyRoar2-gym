@@ -2,16 +2,35 @@ target/
 
 # Proprietary game dumps, BIOS files, extracted emulator bundles, and split archives.
 BloodRoar2*/
+BloodyRoar2*/
 BloodRoar2*.zip
+BloodyRoar2*.zip
 BloodRoar2*.z??
+BloodyRoar2*.z??
+bldyror2.zip
+cpzn1.zip
+cpzn2.zip
+firmware.zip
+*.zip
+*.7z
+*.rar
+*.z[0-9][0-9]
 *.rom
 *.bin
 *.cue
 *.iso
 *.chd
+*.img
+*.ecm
+*.ccd
+*.sub
+*.mdf
+*.mds
 *.pbp
 *.exe
 *.dll
+*.dylib
+*.so
 *.znc
 
 # Local runtime configuration.
@@ -19,6 +38,8 @@ BloodRoar2*.z??
 assets/
 roms/
 bios/
+isos/
+samples/
 captures/
 *.sav
 *.state

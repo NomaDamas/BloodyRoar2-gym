@@ -11,6 +11,11 @@ pub use action::{ACTION_SPACE, Action, ActionButtons};
 pub use backend::{Backend, BackendError, NullBackend};
 pub use env::{BloodyRoar2Env, StepResult};
 pub use mame::{MameConfig, MameRuntime};
-pub use native::{NativeBackend, NativeEmulator, NativeRomSet};
+pub use native::{
+    GenericNativePlatform, NativeBackend, NativeEmulator, NativePlatformInfo,
+    NativeRomAssetExpectation, NativeRomAssetMatch, NativeRomAssetMismatch,
+    NativeRomCompatibilityReport, NativeRomDuplicateAsset, NativeRomEntry, NativeRomSet,
+    native_platform_json, preferred_platform_info,
+};
 pub use protocol::{action_space_json, api_index_json, observation_space_json};
 pub use zinc::{ZincConfig, ZincRuntime};

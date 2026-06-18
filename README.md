@@ -7,6 +7,49 @@ This repository does not contain ROMs, BIOS files, Windows executables, DLLs, or
 other proprietary game assets. Keep those outside Git and pass their paths to a
 future backend adapter only if you have the legal right to use them.
 
+## Supported platform
+
+The primary supported development and execution platform is macOS on Apple
+Silicon. Build, CLI, HTTP API, native emulator, and local MAME workflows are
+validated first on arm64 macOS.
+
+Other Unix-like hosts may work for asset-free Rust development, but they are
+secondary and should not be assumed to have the same runtime coverage. Windows
+ZiNc compatibility remains a legacy fallback path and is not the default target
+for emulator-core work.
+
+## macOS Apple Silicon setup
+
+Required baseline for development on Apple Silicon:
+
+```sh
+xcode-select --install
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install rustup-init mame
+rustup-init
+rustup default stable
+rustup target add aarch64-apple-darwin
+rustup component add rustfmt clippy
+cargo test
+```
+
+Notes:
+
+- The repository uses Rust edition 2024, so keep the stable toolchain current.
+- `aarch64-apple-darwin` is the primary target; Rosetta/x86_64 builds are not
+  the default validation path.
+- Xcode Command Line Tools provide the macOS SDK and linker used by Cargo.
+- Homebrew MAME is required for the local macOS play path and ROM-set checks.
+- Python is optional and only needed for scripts that wrap the HTTP API in
+  `examples/python`; the client itself uses the Python standard library.
+- Wine is optional and only relevant to the legacy ZiNc compatibility path, not
+  native emulator development.
+
+Keep ROMs, BIOS files, ZiNc bundles, MAME samples, captures, save states, and
+other proprietary runtime assets in ignored local directories such as `assets/`,
+`roms/`, or `bios/`. The setup process must not download or commit proprietary
+game data.
+
 ## Current status
 
 - macOS-safe Rust project scaffold.
@@ -102,6 +145,10 @@ The current native core can execute the bundled COH-1002E boot ROM instruction
 stream and exposes CPU/IO state for iterative development.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend.
+
+See [docs/NATIVE_WORKFLOW.md](docs/NATIVE_WORKFLOW.md) for the canonical macOS
+Apple Silicon build, test, native-step, Gym API, and asset-compliance validation
+path.
 
 ## HTTP API
 

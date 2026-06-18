@@ -21,6 +21,10 @@ pub trait Backend {
 
 ## macOS porting notes
 
+macOS on Apple Silicon is the primary supported development and execution
+platform for this project. Backend work should assume arm64 macOS first for
+local tooling, deterministic stepping, and native emulator integration.
+
 The supplied ZiNc bundle is Windows binary content, not Rust source. A practical
 macOS path is therefore an adapter around a macOS-compatible emulator core or a
 separate process that exposes deterministic frame stepping and input injection.

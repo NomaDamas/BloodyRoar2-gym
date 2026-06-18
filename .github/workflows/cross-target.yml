@@ -1,0 +1,73 @@
+name: Native emulator validation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-emulator-validation:
+    name: macOS native emulator validation
+    runs-on: macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup component add rustfmt clippy
+
+      - name: Report compiler and runner target
+        run: |
+          rustc -vV
+          uname -a
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint emulator validation targets
+        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+
+      - name: Build Apple Silicon emulator target
+        run: cargo build --all-targets --target aarch64-apple-darwin
+
+      - name: Run emulator validation test suite
+        run: cargo test --all-targets
+
+      - name: Run Apple Silicon target tests when available
+        if: runner.arch == 'ARM64'
+        run: cargo test --all-targets --target aarch64-apple-darwin
+
+      - name: Enforce proprietary asset policy
+        run: |
+          if git ls-files | grep -Ei '(^|/)(assets|roms|bios|isos|samples|captures)/|\.(zip|7z|rar|rom|bin|cue|iso|chd|img|ecm|ccd|sub|mdf|mds|pbp|exe|dll|dylib|so|znc)$'; then
+            echo "::error::Tracked proprietary or emulator asset-like file detected."
+            exit 1
+          fi
+
+  linux-portability-validation:
+    name: Linux portability validation
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add x86_64-unknown-linux-gnu
+
+      - name: Report compiler target
+        run: rustc -vV
+
+      - name: Compile all Rust targets
+        run: cargo check --all-targets --target x86_64-unknown-linux-gnu
+
+      - name: Run target test suite
+        run: cargo test --target x86_64-unknown-linux-gnu
