@@ -34,8 +34,9 @@ impl NativeEmulator {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"cpu\":{},\"rom_bytes\":{},\"ram_bytes\":{},\"last_outcome\":\"{:?}\",\"playable\":false,\"development_stage\":\"mips_cpu_bootstrap\"}}",
+            "{{\"cpu\":{},\"io\":{},\"rom_bytes\":{},\"ram_bytes\":{},\"last_outcome\":\"{:?}\",\"playable\":false,\"development_stage\":\"mips_cpu_io_bootstrap\"}}",
             self.cpu.json(),
+            self.bus.io_json(),
             self.bus.rom_len(),
             self.bus.ram_len(),
             self.last_outcome
