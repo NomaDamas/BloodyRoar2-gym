@@ -1,12 +1,13 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bloodyroar2_gym::{
-    Action, BloodyRoar2Env, MameConfig, MameRuntime, NativeEmulator, NativeRomSet,
+    ACTION_SPACE, Action, BloodyRoar2Env, MameConfig, MameRuntime, NativeEmulator, NativeRomSet,
     NativeTraceConfig, NullBackend, ZincConfig, ZincRuntime, action_space_json, api_index_json,
     observation_space_json,
 };
+use minifb::{Key, Scale, Window, WindowOptions};
 
 fn main() -> ExitCode {
     match run() {
@@ -270,6 +271,197 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        "native-screen-dump" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let count = args
+                .next()
+                .unwrap_or_else(|| "32000000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instruction count must be a non-negative integer".to_string())?;
+            let output_prefix = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("native-screen"));
+            let actual_display_output = suffixed_path(&output_prefix, "actual-display.png");
+            let raw_actual_display_output = suffixed_path(&output_prefix, "raw-actual-display.png");
+            let display_output = suffixed_path(&output_prefix, "display.png");
+            let observation_output = suffixed_path(&output_prefix, "observation.png");
+            let vram_output = suffixed_path(&output_prefix, "vram.png");
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            emulator.step_instructions(count);
+            std::fs::write(&actual_display_output, emulator.actual_display_png()).map_err(
+                |error| {
+                    format!(
+                        "failed to write {}: {error}",
+                        actual_display_output.display()
+                    )
+                },
+            )?;
+            std::fs::write(
+                &raw_actual_display_output,
+                emulator.raw_actual_display_png(),
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to write {}: {error}",
+                    raw_actual_display_output.display()
+                )
+            })?;
+            std::fs::write(&display_output, emulator.display_png()).map_err(|error| {
+                format!("failed to write {}: {error}", display_output.display())
+            })?;
+            std::fs::write(&observation_output, emulator.screenshot_png()).map_err(|error| {
+                format!("failed to write {}: {error}", observation_output.display())
+            })?;
+            std::fs::write(&vram_output, emulator.vram_png())
+                .map_err(|error| format!("failed to write {}: {error}", vram_output.display()))?;
+            println!(
+                "{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"state\":{}}}",
+                escape_json(&actual_display_output.display().to_string()),
+                escape_json(&raw_actual_display_output.display().to_string()),
+                escape_json(&display_output.display().to_string()),
+                escape_json(&observation_output.display().to_string()),
+                escape_json(&vram_output.display().to_string()),
+                emulator.json()
+            );
+            Ok(())
+        }
+        "native-play" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let instructions_per_frame = args
+                .next()
+                .unwrap_or_else(|| "500000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let scale = parse_native_window_scale(args.next())?;
+            let max_frames = args
+                .next()
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "max_frames must be a positive integer".to_string())
+                })
+                .transpose()?;
+            run_native_play(rom, instructions_per_frame.max(1), scale, max_frames)
+        }
+        "native-input-check" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let instructions_per_frame = args
+                .next()
+                .unwrap_or_else(|| "500000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let segments = [
+                NativeScriptSegment {
+                    action: Action::Noop,
+                    frames: 300,
+                },
+                NativeScriptSegment {
+                    action: Action::Coin,
+                    frames: 30,
+                },
+                NativeScriptSegment {
+                    action: Action::Noop,
+                    frames: 120,
+                },
+                NativeScriptSegment {
+                    action: Action::Start,
+                    frames: 300,
+                },
+                NativeScriptSegment {
+                    action: Action::Noop,
+                    frames: 60,
+                },
+                NativeScriptSegment {
+                    action: Action::Right,
+                    frames: 30,
+                },
+                NativeScriptSegment {
+                    action: Action::Noop,
+                    frames: 60,
+                },
+                NativeScriptSegment {
+                    action: Action::Punch,
+                    frames: 60,
+                },
+                NativeScriptSegment {
+                    action: Action::Kick,
+                    frames: 60,
+                },
+                NativeScriptSegment {
+                    action: Action::Beast,
+                    frames: 60,
+                },
+                NativeScriptSegment {
+                    action: Action::Guard,
+                    frames: 60,
+                },
+            ];
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let mut total_frames = 0u64;
+            let mut observed_native_playable_candidate = false;
+            let mut first_native_playable_frame = None;
+            let mut last_native_playable_frame = None;
+            for segment in &segments {
+                emulator.set_input(segment.action.buttons());
+                for _ in 0..segment.frames {
+                    emulator.step_until_next_vblank(instructions_per_frame);
+                    total_frames += 1;
+                    if emulator.native_playable_candidate() {
+                        observed_native_playable_candidate = true;
+                        first_native_playable_frame.get_or_insert(total_frames);
+                        last_native_playable_frame = Some(total_frames);
+                    }
+                    if emulator.is_terminal() {
+                        break;
+                    }
+                }
+                if emulator.is_terminal() {
+                    break;
+                }
+            }
+            let input_activity = emulator.input_activity_json();
+            let final_native_playable_candidate = emulator.native_playable_candidate();
+            let input_controls_active = emulator.has_play_control_activity();
+            let playable = observed_native_playable_candidate && input_controls_active;
+            let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
+            let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
+            println!(
+                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"playable\":{},\"state\":{}}}",
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                input_activity,
+                observed_native_playable_candidate,
+                observed_native_playable_candidate,
+                first_native_playable_frame,
+                last_native_playable_frame,
+                final_native_playable_candidate,
+                input_controls_active,
+                playable,
+                emulator.probe_json()
+            );
+            if playable {
+                Ok(())
+            } else {
+                Err(
+                    "native input check failed: native playability or mapped controls were not observed"
+                        .into(),
+                )
+            }
+        }
         "native-scripted-step" => {
             let rom = args.next().map(PathBuf::from).ok_or_else(|| {
                 "usage: bloodyroar2-gym native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>..."
@@ -297,7 +489,7 @@ fn run() -> Result<(), String> {
             for segment in &segments {
                 emulator.set_input(segment.action.buttons());
                 for _ in 0..segment.frames {
-                    emulator.step_instructions(instructions_per_frame);
+                    emulator.step_until_next_vblank(instructions_per_frame);
                     total_frames += 1;
                     if emulator.is_terminal() {
                         break;
@@ -317,6 +509,691 @@ fn run() -> Result<(), String> {
                 total_frames,
                 emulator.executed_steps(),
                 native_script_segments_json(&segments),
+                emulator.json()
+            );
+            Ok(())
+        }
+        "native-scripted-dump" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let output_prefix = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let total_frames = run_native_script(&mut emulator, instructions_per_frame, &segments);
+            let (
+                actual_display_output,
+                raw_actual_display_output,
+                display_output,
+                observation_output,
+                vram_output,
+            ) = write_native_snapshot(&emulator, &output_prefix)?;
+            println!(
+                "{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"segments\":[{}],\"state\":{}}}",
+                escape_json(&actual_display_output.display().to_string()),
+                escape_json(&raw_actual_display_output.display().to_string()),
+                escape_json(&display_output.display().to_string()),
+                escape_json(&observation_output.display().to_string()),
+                escape_json(&vram_output.display().to_string()),
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                native_script_segments_json(&segments),
+                emulator.json()
+            );
+            Ok(())
+        }
+        "native-scripted-candidates" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let output_prefix = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let total_frames = run_native_script(&mut emulator, instructions_per_frame, &segments);
+            let candidates = write_native_display_candidates(&emulator, &output_prefix)?;
+            println!(
+                "{{\"candidate_outputs\":[{}],\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"segments\":[{}],\"state\":{}}}",
+                candidates.join(","),
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                native_script_segments_json(&segments),
+                emulator.probe_json()
+            );
+            Ok(())
+        }
+        "native-scripted-summary" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let total_frames = run_native_script(&mut emulator, instructions_per_frame, &segments);
+            println!(
+                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"segments\":[{}],\"state\":{}}}",
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                native_script_segments_json(&segments),
+                emulator.diagnostic_json()
+            );
+            Ok(())
+        }
+        "native-scripted-probe" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let mut total_frames = 0u64;
+            let mut probes = Vec::new();
+
+            for (index, segment) in segments.iter().enumerate() {
+                emulator.set_input(segment.action.buttons());
+                for _ in 0..segment.frames {
+                    emulator.step_until_next_vblank(instructions_per_frame);
+                    total_frames += 1;
+                    if emulator.is_terminal() {
+                        break;
+                    }
+                }
+
+                probes.push(format!(
+                    "{{\"segment_index\":{},\"action_index\":{},\"action\":\"{}\",\"segment_frames\":{},\"total_frames\":{},\"executed_steps\":{},\"state\":{}}}",
+                    index,
+                    segment.action.index(),
+                    segment.action.name(),
+                    segment.frames,
+                    total_frames,
+                    emulator.executed_steps(),
+                    emulator.probe_json()
+                ));
+
+                if emulator.is_terminal() {
+                    break;
+                }
+            }
+
+            println!(
+                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"segments\":[{}],\"probes\":[{}],\"state\":{}}}",
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                native_script_segments_json(&segments),
+                probes.join(","),
+                emulator.probe_json()
+            );
+            Ok(())
+        }
+        "native-scripted-frame-probe" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let probe_stride = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "probe_stride_frames must be a positive integer".to_string())?;
+            if probe_stride == 0 {
+                return Err("probe_stride_frames must be greater than zero".to_string());
+            }
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let mut total_frames = 0u64;
+            let mut probes = Vec::new();
+
+            for (segment_index, segment) in segments.iter().enumerate() {
+                emulator.set_input(segment.action.buttons());
+                for frame_in_segment in 1..=segment.frames {
+                    emulator.step_until_next_vblank(instructions_per_frame);
+                    total_frames += 1;
+                    if frame_in_segment % probe_stride == 0
+                        || frame_in_segment == segment.frames
+                        || emulator.is_terminal()
+                    {
+                        probes.push(format!(
+                            "{{\"segment_index\":{},\"action_index\":{},\"action\":\"{}\",\"frame_in_segment\":{},\"segment_frames\":{},\"total_frames\":{},\"executed_steps\":{},\"state\":{}}}",
+                            segment_index,
+                            segment.action.index(),
+                            segment.action.name(),
+                            frame_in_segment,
+                            segment.frames,
+                            total_frames,
+                            emulator.executed_steps(),
+                            emulator.probe_json()
+                        ));
+                    }
+                    if emulator.is_terminal() {
+                        break;
+                    }
+                }
+                if emulator.is_terminal() {
+                    break;
+                }
+            }
+
+            println!(
+                "{{\"instructions_per_frame\":{},\"probe_stride_frames\":{},\"total_frames\":{},\"executed_steps\":{},\"segments\":[{}],\"probes\":[{}],\"state\":{}}}",
+                instructions_per_frame,
+                probe_stride,
+                total_frames,
+                emulator.executed_steps(),
+                native_script_segments_json(&segments),
+                probes.join(","),
+                emulator.probe_json()
+            );
+            Ok(())
+        }
+        "native-scripted-trace" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]"
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]"
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let hot_limit = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]"
+                        .to_string()
+                })?
+                .parse::<usize>()
+                .map_err(|_| "hot_limit must be a non-negative integer".to_string())?;
+            let recent_limit = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]"
+                        .to_string()
+                })?
+                .parse::<usize>()
+                .map_err(|_| "recent_limit must be a non-negative integer".to_string())?;
+            let raw_args = args.collect::<Vec<_>>();
+            let split_at = raw_args
+                .iter()
+                .position(|value| value == "--")
+                .unwrap_or(raw_args.len());
+            let raw_segments = raw_args[..split_at].to_vec();
+            let raw_trace_options = if split_at < raw_args.len() {
+                raw_args[split_at + 1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let (warmup_segments, segments) = parse_native_script_trace_segments(raw_segments)?;
+            let trace_options = parse_native_trace_options(raw_trace_options)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let warmup_frames = run_native_script(
+                &mut emulator,
+                instructions_per_frame.max(1),
+                &warmup_segments,
+            );
+            let trace_segments = segments
+                .iter()
+                .map(|segment| (segment.action.buttons(), segment.frames))
+                .collect::<Vec<_>>();
+            let trace = emulator.trace_scripted_frames(
+                instructions_per_frame,
+                &trace_segments,
+                hot_limit,
+                recent_limit,
+                trace_options,
+            );
+            println!(
+                "{{\"instructions_per_frame\":{},\"warmup_frames\":{},\"warmup_segments\":[{}],\"segments\":[{}],\"trace\":{}}}",
+                instructions_per_frame.max(1),
+                warmup_frames,
+                native_script_segments_json(&warmup_segments),
+                native_script_segments_json(&segments),
+                trace.json()
+            );
+            Ok(())
+        }
+        "native-scripted-timeline" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let output_prefix = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let mut total_frames = 0u64;
+            let mut snapshots = Vec::new();
+
+            for (index, segment) in segments.iter().enumerate() {
+                emulator.set_input(segment.action.buttons());
+                for _ in 0..segment.frames {
+                    emulator.step_until_next_vblank(instructions_per_frame);
+                    total_frames += 1;
+                    if emulator.is_terminal() {
+                        break;
+                    }
+                }
+
+                let snapshot_prefix = suffixed_path(
+                    &output_prefix,
+                    &format!(
+                        "segment-{:02}-{}",
+                        index + 1,
+                        native_script_filename_action(segment.action)
+                    ),
+                );
+                let (
+                    actual_display_output,
+                    raw_actual_display_output,
+                    display_output,
+                    observation_output,
+                    vram_output,
+                ) = write_native_snapshot(&emulator, &snapshot_prefix)?;
+                snapshots.push(format!(
+                    "{{\"segment_index\":{},\"action_index\":{},\"action\":\"{}\",\"segment_frames\":{},\"total_frames\":{},\"executed_steps\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\"}}",
+                    index,
+                    segment.action.index(),
+                    segment.action.name(),
+                    segment.frames,
+                    total_frames,
+                    emulator.executed_steps(),
+                    escape_json(&actual_display_output.display().to_string()),
+                    escape_json(&raw_actual_display_output.display().to_string()),
+                    escape_json(&display_output.display().to_string()),
+                    escape_json(&observation_output.display().to_string()),
+                    escape_json(&vram_output.display().to_string())
+                ));
+
+                if emulator.is_terminal() {
+                    break;
+                }
+            }
+
+            println!(
+                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"segments\":[{}],\"snapshots\":[{}],\"state\":{}}}",
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                native_script_segments_json(&segments),
+                snapshots.join(","),
+                emulator.json()
+            );
+            Ok(())
+        }
+        "native-scripted-branch" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let output_prefix = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                    .to_string()
+            })?;
+            let branch_frames = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "branch_frames must be a positive integer".to_string())?;
+            let settle_frames = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "settle_frames must be a non-negative integer".to_string())?;
+            if branch_frames == 0 {
+                return Err("branch_frames must be greater than zero".to_string());
+            }
+
+            let (warmup_segments, branch_actions) =
+                parse_native_branch_values(args.collect::<Vec<_>>())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let mut checkpoint =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let warmup_frames =
+                run_native_script(&mut checkpoint, instructions_per_frame, &warmup_segments);
+            let mut branches = Vec::new();
+
+            for action in branch_actions {
+                let mut branch = checkpoint.clone();
+                let segments = [
+                    NativeScriptSegment {
+                        action,
+                        frames: branch_frames,
+                    },
+                    NativeScriptSegment {
+                        action: Action::Noop,
+                        frames: settle_frames,
+                    },
+                ];
+                let branch_total_frames =
+                    run_native_script(&mut branch, instructions_per_frame, &segments);
+                let snapshot_prefix = suffixed_path(
+                    &output_prefix,
+                    &format!(
+                        "branch-{:02}-{}",
+                        action.index(),
+                        native_script_filename_action(action)
+                    ),
+                );
+                let (
+                    actual_display_output,
+                    raw_actual_display_output,
+                    display_output,
+                    observation_output,
+                    vram_output,
+                ) = write_native_snapshot(&branch, &snapshot_prefix)?;
+                branches.push(format!(
+                    "{{\"action_index\":{},\"action\":\"{}\",\"branch_frames\":{},\"settle_frames\":{},\"total_branch_frames\":{},\"executed_steps\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"state\":{}}}",
+                    action.index(),
+                    action.name(),
+                    branch_frames,
+                    settle_frames,
+                    branch_total_frames,
+                    branch.executed_steps(),
+                    escape_json(&actual_display_output.display().to_string()),
+                    escape_json(&raw_actual_display_output.display().to_string()),
+                    escape_json(&display_output.display().to_string()),
+                    escape_json(&observation_output.display().to_string()),
+                    escape_json(&vram_output.display().to_string()),
+                    branch.probe_json()
+                ));
+            }
+
+            println!(
+                "{{\"instructions_per_frame\":{},\"warmup_frames\":{},\"warmup_executed_steps\":{},\"branch_frames\":{},\"settle_frames\":{},\"warmup_segments\":[{}],\"checkpoint_state\":{},\"branches\":[{}]}}",
+                instructions_per_frame,
+                warmup_frames,
+                checkpoint.executed_steps(),
+                branch_frames,
+                settle_frames,
+                native_script_segments_json(&warmup_segments),
+                checkpoint.probe_json(),
+                branches.join(",")
+            );
+            Ok(())
+        }
+        "native-scripted-branch-summary" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let branch_frames = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "branch_frames must be a positive integer".to_string())?;
+            let settle_frames = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "settle_frames must be a non-negative integer".to_string())?;
+            if branch_frames == 0 {
+                return Err("branch_frames must be greater than zero".to_string());
+            }
+
+            let (warmup_segments, branch_actions) =
+                parse_native_branch_values(args.collect::<Vec<_>>())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            let mut checkpoint =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let warmup_frames =
+                run_native_script(&mut checkpoint, instructions_per_frame, &warmup_segments);
+            let mut branches = Vec::new();
+
+            for action in branch_actions {
+                let mut branch = checkpoint.clone();
+                let segments = [
+                    NativeScriptSegment {
+                        action,
+                        frames: branch_frames,
+                    },
+                    NativeScriptSegment {
+                        action: Action::Noop,
+                        frames: settle_frames,
+                    },
+                ];
+                let branch_total_frames =
+                    run_native_script(&mut branch, instructions_per_frame, &segments);
+                branches.push(format!(
+                    "{{\"action_index\":{},\"action\":\"{}\",\"branch_frames\":{},\"settle_frames\":{},\"total_branch_frames\":{},\"executed_steps\":{},\"state\":{}}}",
+                    action.index(),
+                    action.name(),
+                    branch_frames,
+                    settle_frames,
+                    branch_total_frames,
+                    branch.executed_steps(),
+                    branch.probe_json()
+                ));
+            }
+
+            println!(
+                "{{\"instructions_per_frame\":{},\"warmup_frames\":{},\"warmup_executed_steps\":{},\"branch_frames\":{},\"settle_frames\":{},\"warmup_segments\":[{}],\"checkpoint_state\":{},\"branches\":[{}]}}",
+                instructions_per_frame,
+                warmup_frames,
+                checkpoint.executed_steps(),
+                branch_frames,
+                settle_frames,
+                native_script_segments_json(&warmup_segments),
+                checkpoint.probe_json(),
+                branches.join(",")
+            );
+            Ok(())
+        }
+        "native-draw-snapshot" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>"
+                    .to_string()
+            })?;
+            let count = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>"
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instruction_count must be a non-negative integer".to_string())?;
+            let sequence_start = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>"
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "sequence_start must be a non-negative integer".to_string())?;
+            let sequence_end = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>"
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "sequence_end must be a non-negative integer".to_string())?;
+            let output_prefix = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>"
+                    .to_string()
+            })?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            emulator.set_draw_capture_range(sequence_start, sequence_end);
+            emulator.step_instructions(count);
+            let captures = write_draw_captures(&emulator, &output_prefix)?;
+            println!(
+                "{{\"output_prefix\":\"{}\",\"instruction_count\":{},\"executed_steps\":{},\"sequence_start\":{},\"sequence_end\":{},\"capture_count\":{},\"captures\":[{}],\"state\":{}}}",
+                escape_json(&output_prefix.display().to_string()),
+                count,
+                emulator.executed_steps(),
+                sequence_start,
+                sequence_end,
+                emulator.draw_captures().len(),
+                captures.join(","),
+                emulator.json()
+            );
+            Ok(())
+        }
+        "native-scripted-draw-snapshot" => {
+            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let instructions_per_frame = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let sequence_start = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "sequence_start must be a non-negative integer".to_string())?;
+            let sequence_end = args
+                .next()
+                .ok_or_else(|| {
+                    "usage: bloodyroar2-gym native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>..."
+                        .to_string()
+                })?
+                .parse::<u64>()
+                .map_err(|_| "sequence_end must be a non-negative integer".to_string())?;
+            let output_prefix = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>..."
+                    .to_string()
+            })?;
+            let raw_segments = args.collect::<Vec<_>>();
+            let segments = parse_native_script_segments(raw_segments)?;
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            let instructions_per_frame = instructions_per_frame.max(1);
+            emulator.set_draw_capture_range(sequence_start, sequence_end);
+            let total_frames = run_native_script(&mut emulator, instructions_per_frame, &segments);
+            let captures = write_draw_captures(&emulator, &output_prefix)?;
+            println!(
+                "{{\"output_prefix\":\"{}\",\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"sequence_start\":{},\"sequence_end\":{},\"capture_count\":{},\"segments\":[{}],\"captures\":[{}],\"state\":{}}}",
+                escape_json(&output_prefix.display().to_string()),
+                instructions_per_frame,
+                total_frames,
+                emulator.executed_steps(),
+                sequence_start,
+                sequence_end,
+                emulator.draw_captures().len(),
+                native_script_segments_json(&segments),
+                captures.join(","),
                 emulator.json()
             );
             Ok(())
@@ -390,9 +1267,119 @@ fn run() -> Result<(), String> {
     }
 }
 
+fn run_native_play(
+    rom: PathBuf,
+    instructions_per_frame: u64,
+    scale: Scale,
+    max_frames: Option<u64>,
+) -> Result<(), String> {
+    let mut emulator = NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+    let initial_frame = emulator.display_frame();
+    let mut window = Window::new(
+        "Bloody Roar 2 native Rust - arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit",
+        initial_frame.width,
+        initial_frame.height,
+        WindowOptions {
+            resize: true,
+            scale,
+            ..WindowOptions::default()
+        },
+    )
+    .map_err(|error| format!("failed to create native play window: {error:?}"))?;
+    window.set_target_fps(60);
+    window
+        .update_with_buffer(
+            &initial_frame.pixels,
+            initial_frame.width,
+            initial_frame.height,
+        )
+        .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+
+    let mut rendered_frames = 0u64;
+    let mut observed_native_playable_candidate = emulator.native_playable_candidate();
+    let mut first_native_playable_frame =
+        observed_native_playable_candidate.then_some(rendered_frames);
+    let mut last_native_playable_frame = first_native_playable_frame;
+    while window.is_open()
+        && !window.is_key_down(Key::Escape)
+        && !emulator.is_terminal()
+        && max_frames.is_none_or(|max_frames| rendered_frames < max_frames)
+    {
+        emulator.set_input(native_window_buttons(&window));
+        emulator.step_until_next_vblank(instructions_per_frame);
+        let frame = emulator.display_frame();
+        window
+            .update_with_buffer(&frame.pixels, frame.width, frame.height)
+            .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+        rendered_frames += 1;
+        if emulator.native_playable_candidate() {
+            observed_native_playable_candidate = true;
+            first_native_playable_frame.get_or_insert(rendered_frames);
+            last_native_playable_frame = Some(rendered_frames);
+        }
+    }
+
+    let final_native_playable_candidate = emulator.native_playable_candidate();
+    let input_controls_active = emulator.has_play_control_activity();
+    let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
+    let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
+    println!(
+        "{{\"rendered_frames\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"playable\":{},\"state\":{}}}",
+        rendered_frames,
+        emulator.executed_steps(),
+        emulator.input_activity_json(),
+        observed_native_playable_candidate,
+        observed_native_playable_candidate,
+        first_native_playable_frame,
+        last_native_playable_frame,
+        final_native_playable_candidate,
+        input_controls_active,
+        observed_native_playable_candidate,
+        emulator.probe_json()
+    );
+    Ok(())
+}
+
+fn optional_u64_json(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn native_window_buttons(window: &Window) -> bloodyroar2_gym::ActionButtons {
+    bloodyroar2_gym::ActionButtons {
+        start: window.is_key_down(Key::Enter),
+        coin: window.is_key_down(Key::C),
+        up: window.is_key_down(Key::Up),
+        down: window.is_key_down(Key::Down),
+        left: window.is_key_down(Key::Left),
+        right: window.is_key_down(Key::Right),
+        punch: window.is_key_down(Key::Z),
+        kick: window.is_key_down(Key::X),
+        beast: window.is_key_down(Key::A),
+        guard: window.is_key_down(Key::S),
+    }
+}
+
+fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
+    match value
+        .as_deref()
+        .unwrap_or("2")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "x1" => Ok(Scale::X1),
+        "2" | "x2" => Ok(Scale::X2),
+        "4" | "x4" => Ok(Scale::X4),
+        "8" | "x8" => Ok(Scale::X8),
+        "fit" | "fitscreen" | "fit-screen" => Ok(Scale::FitScreen),
+        value => Err(format!(
+            "native window scale must be one of 1, 2, 4, 8, or fit: {value}"
+        )),
+    }
+}
+
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-screen-dump [rom_zip] [instruction_count] [output_prefix]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-play controls: arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit. max_frames is optional and intended for smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
@@ -413,6 +1400,54 @@ fn parse_native_script_segments(values: Vec<String>) -> Result<Vec<NativeScriptS
         .into_iter()
         .map(|value| parse_native_script_segment(&value))
         .collect()
+}
+
+fn parse_native_script_trace_segments(
+    values: Vec<String>,
+) -> Result<(Vec<NativeScriptSegment>, Vec<NativeScriptSegment>), String> {
+    let Some(split_at) = values.iter().position(|value| value == "--trace") else {
+        return Ok((Vec::new(), parse_native_script_segments(values)?));
+    };
+    let warmup = values[..split_at].to_vec();
+    let traced = values[split_at + 1..].to_vec();
+    if traced.is_empty() {
+        return Err(
+            "native-scripted-trace --trace requires traced <action:frames> segments".into(),
+        );
+    }
+    let warmup_segments = if warmup.is_empty() {
+        Vec::new()
+    } else {
+        parse_native_script_segments(warmup)?
+    };
+    let traced_segments = parse_native_script_segments(traced)?;
+    Ok((warmup_segments, traced_segments))
+}
+
+fn parse_native_branch_values(
+    values: Vec<String>,
+) -> Result<(Vec<NativeScriptSegment>, Vec<Action>), String> {
+    let Some(split_at) = values.iter().position(|value| value == "--actions") else {
+        return Ok((parse_native_script_segments(values)?, ACTION_SPACE.to_vec()));
+    };
+
+    let warmup_values = values[..split_at].to_vec();
+    let action_values = values[split_at + 1..].to_vec();
+    if action_values.is_empty() {
+        return Err("native-scripted-branch --actions requires at least one action".to_string());
+    }
+
+    let warmup_segments = if warmup_values.is_empty() {
+        Vec::new()
+    } else {
+        parse_native_script_segments(warmup_values)?
+    };
+    let branch_actions = action_values
+        .iter()
+        .map(|value| parse_action_token(value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((warmup_segments, branch_actions))
 }
 
 fn parse_native_script_segment(value: &str) -> Result<NativeScriptSegment, String> {
@@ -439,6 +1474,115 @@ fn parse_action_token(value: &str) -> Result<Action, String> {
     Action::from_name(value).ok_or_else(|| format!("unknown action token: {value}"))
 }
 
+fn suffixed_path(prefix: &std::path::Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{}", prefix.display(), suffix))
+}
+
+fn native_script_filename_action(action: Action) -> String {
+    action.name().replace('+', "_")
+}
+
+fn write_native_snapshot(
+    emulator: &NativeEmulator,
+    output_prefix: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf), String> {
+    let actual_display_output = suffixed_path(output_prefix, "actual-display.png");
+    let raw_actual_display_output = suffixed_path(output_prefix, "raw-actual-display.png");
+    let display_output = suffixed_path(output_prefix, "display.png");
+    let observation_output = suffixed_path(output_prefix, "observation.png");
+    let vram_output = suffixed_path(output_prefix, "vram.png");
+
+    std::fs::write(&actual_display_output, emulator.actual_display_png()).map_err(|error| {
+        format!(
+            "failed to write {}: {error}",
+            actual_display_output.display()
+        )
+    })?;
+    std::fs::write(
+        &raw_actual_display_output,
+        emulator.raw_actual_display_png(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write {}: {error}",
+            raw_actual_display_output.display()
+        )
+    })?;
+    std::fs::write(&display_output, emulator.display_png())
+        .map_err(|error| format!("failed to write {}: {error}", display_output.display()))?;
+    std::fs::write(&observation_output, emulator.screenshot_png())
+        .map_err(|error| format!("failed to write {}: {error}", observation_output.display()))?;
+    std::fs::write(&vram_output, emulator.vram_png())
+        .map_err(|error| format!("failed to write {}: {error}", vram_output.display()))?;
+
+    Ok((
+        actual_display_output,
+        raw_actual_display_output,
+        display_output,
+        observation_output,
+        vram_output,
+    ))
+}
+
+fn write_native_display_candidates(
+    emulator: &NativeEmulator,
+    output_prefix: &Path,
+) -> Result<Vec<String>, String> {
+    let mut outputs = Vec::new();
+    for candidate in emulator.display_candidates() {
+        let suffix = format!(
+            "candidate-{}-x{}-y{}.png",
+            filename_token(candidate.label),
+            candidate.x,
+            candidate.y
+        );
+        let output = suffixed_path(output_prefix, &suffix);
+        std::fs::write(&output, &candidate.png)
+            .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+        outputs.push(candidate.json(&output.display().to_string()));
+    }
+    Ok(outputs)
+}
+
+fn filename_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_draw_captures(
+    emulator: &NativeEmulator,
+    output_prefix: &Path,
+) -> Result<Vec<String>, String> {
+    let mut captures = Vec::new();
+    for capture in emulator.draw_captures() {
+        let display_output = suffixed_path(
+            output_prefix,
+            &format!("seq-{:06}.display.png", capture.sequence),
+        );
+        let bounds_output = suffixed_path(
+            output_prefix,
+            &format!("seq-{:06}.bounds.png", capture.sequence),
+        );
+        std::fs::write(&display_output, &capture.display_png)
+            .map_err(|error| format!("failed to write {}: {error}", display_output.display()))?;
+        std::fs::write(&bounds_output, &capture.bounds_png)
+            .map_err(|error| format!("failed to write {}: {error}", bounds_output.display()))?;
+        captures.push(capture.json(
+            &display_output.display().to_string(),
+            &bounds_output.display().to_string(),
+        ));
+    }
+    Ok(captures)
+}
+
 fn native_script_segments_json(segments: &[NativeScriptSegment]) -> String {
     segments
         .iter()
@@ -452,6 +1596,28 @@ fn native_script_segments_json(segments: &[NativeScriptSegment]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn run_native_script(
+    emulator: &mut NativeEmulator,
+    instructions_per_frame: u64,
+    segments: &[NativeScriptSegment],
+) -> u64 {
+    let mut total_frames = 0u64;
+    for segment in segments {
+        emulator.set_input(segment.action.buttons());
+        for _ in 0..segment.frames {
+            emulator.step_until_next_vblank(instructions_per_frame);
+            total_frames += 1;
+            if emulator.is_terminal() {
+                break;
+            }
+        }
+        if emulator.is_terminal() {
+            break;
+        }
+    }
+    total_frames
 }
 
 fn parse_native_trace_options(values: Vec<String>) -> Result<NativeTraceConfig, String> {

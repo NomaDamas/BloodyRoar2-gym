@@ -3,7 +3,8 @@
 This runbook is the canonical validation path for the Rust-native Sony
 ZN/PS1-family emulator milestone on Apple Silicon macOS. It keeps proprietary
 ROM, BIOS, save state, capture, and emulator binary assets outside Git while
-validating the native CPU/IO/GPU/DMA foundations that are currently implemented.
+validating the native CPU/IO/GPU/DMA/input/play-window foundations that are
+currently implemented.
 
 For milestone handoff on Apple Silicon, run these build and test commands in
 order before native ROM diagnostics:
@@ -74,7 +75,7 @@ target validates that the generic native platform path remains compilable and
 testable without Apple-specific symbols.
 
 If a local MAME install is available, verify the legally supplied ROM set before
-using the playable compatibility path:
+using the external compatibility path:
 
 ```sh
 cargo run -- mame-required assets/roms
@@ -106,8 +107,9 @@ For day-to-day diagnosis, prefer the compact compatibility summary:
 cargo run -- native-rom-summary assets/roms/bldyror2.zip
 ```
 
-`compatible:false` means native playability cannot be proven with that asset set.
-Fix missing or mismatched local assets first; do not patch, download, or commit
+`compatible:false` means the asset set does not exactly match the MAME
+manifest. The native runtime may still identify a known local ZiNc-style
+variant through `known_variants`, but do not patch, download, or commit
 proprietary ROM data in this repository.
 
 ## 4. Deterministic Native Stepping
@@ -174,7 +176,60 @@ The Python standard-library client can target the same server:
 python3 examples/python/bloodyroar2_env.py
 ```
 
-## 6. Asset Compliance
+## 6. Native Play Validation
+
+Verify that the native core reaches a textured gameplay candidate and that the
+game reads the mapped controls:
+
+```sh
+cargo run --release -- native-input-check assets/roms 500000
+```
+
+Expected success evidence includes:
+
+- Top-level `playable:true`.
+- `native_playable_candidate:true`.
+- `input_controls_active:true`.
+- `state.native_playability.classification:"native_playable_candidate"`.
+- `state.native_playability.has_actual_playfield:true`.
+- `state.native_playability.actual_display.detail_edges` above the reported
+  detail threshold implied by the current display size.
+
+Open the native macOS play window:
+
+```sh
+cargo run --release -- native-play assets/roms 500000 2
+```
+
+Controls:
+
+- Arrows: move.
+- `Z`: punch.
+- `X`: kick.
+- `A`: beast.
+- `S`: guard.
+- `C`: coin.
+- `Enter`: start.
+- `Esc`: quit.
+
+For non-interactive smoke validation, pass a frame limit:
+
+```sh
+cargo run --release -- native-play assets/roms 500000 2 700
+```
+
+Capture a deterministic visual artifact for review:
+
+```sh
+cargo run --release -- native-scripted-dump assets/roms 500000 tmp/native-validation/final-native-play-check noop:300 coin:30 noop:120 start:300 noop:120 punch:60
+```
+
+Inspect `tmp/native-validation/final-native-play-check.actual-display.png`.
+`display.png` and `observation.png` may intentionally use cached fallback
+frames for Gym-style observations, so they are not sufficient proof of native
+gameplay. Keep `tmp/` untracked.
+
+## 7. Asset Compliance
 
 Check local asset paths before use:
 

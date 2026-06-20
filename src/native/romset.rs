@@ -13,6 +13,10 @@ const BLOODY_ROAR_2_GAME_ID: &str = "bldyror2";
 const CAT702_ET01_CRC32: u32 = 0xa7dd_922e;
 const CAT702_ET03_CRC32: u32 = 0x779b_0bfd;
 const AT28C16_WORLD_CRC32: u32 = 0x01b4_2397;
+const AT28C16_USA_CRC32: u32 = 0xb78d_6fc3;
+const AT28C16_JAPAN_CRC32: u32 = 0x6cb5_5630;
+const AT28C16_ASIA_CRC32: u32 = 0xda8c_1a64;
+const ZINC_JP_FLASH1_CRC32: u32 = 0x4866_dce3;
 const BLOODY_ROAR_2_MANIFEST: NativeRomManifest = NativeRomManifest {
     game_id: BLOODY_ROAR_2_GAME_ID,
     title: "Bloody Roar 2 (World)",
@@ -536,11 +540,13 @@ impl NativeRomCompatibilityReport {
             .map(NativeRomAssetMismatch::json)
             .collect::<Vec<_>>()
             .join(",");
+        let known_variants = self.known_variants_json();
         format!(
-            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"missing_required_assets\":[{}],\"mismatched_assets\":[{}],\"unknown_asset_count\":{},\"duplicate_required_assets\":{}}}",
+            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"known_variants\":[{}],\"missing_required_assets\":[{}],\"mismatched_assets\":[{}],\"unknown_asset_count\":{},\"duplicate_required_assets\":{}}}",
             self.game_id,
             escape_json(self.manifest_source),
             self.compatible(),
+            known_variants,
             json_string_array(&self.missing_required_assets),
             mismatched_assets,
             self.unknown_assets.len(),
@@ -578,11 +584,13 @@ impl NativeRomCompatibilityReport {
             .map(NativeRomAssetExpectation::json)
             .collect::<Vec<_>>()
             .join(",");
+        let known_variants = self.known_variants_json();
         format!(
-            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"present_assets\":[{}],\"present_bios_assets\":[{}],\"present_game_assets\":[{}],\"missing_required_assets\":[{}],\"unknown_assets\":[{}],\"mismatched_assets\":[{}],\"asset_matches\":[{}],\"has_duplicate_required_assets\":{},\"duplicate_assets\":[{}],\"expectations\":[{}]}}",
+            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"known_variants\":[{}],\"present_assets\":[{}],\"present_bios_assets\":[{}],\"present_game_assets\":[{}],\"missing_required_assets\":[{}],\"unknown_assets\":[{}],\"mismatched_assets\":[{}],\"asset_matches\":[{}],\"has_duplicate_required_assets\":{},\"duplicate_assets\":[{}],\"expectations\":[{}]}}",
             self.game_id,
             escape_json(self.manifest_source),
             self.compatible(),
+            known_variants,
             present_assets,
             present_bios_assets,
             present_game_assets,
@@ -594,6 +602,28 @@ impl NativeRomCompatibilityReport {
             duplicate_assets,
             expectations
         )
+    }
+
+    fn known_variants_json(&self) -> String {
+        let variants = self
+            .known_variants()
+            .into_iter()
+            .map(|variant| format!("\"{}\"", escape_json(variant)))
+            .collect::<Vec<_>>();
+        variants.join(",")
+    }
+
+    fn known_variants(&self) -> Vec<&'static str> {
+        let has_zinc_jp_flash = self.mismatched_assets.iter().any(|mismatch| {
+            mismatch.name.eq_ignore_ascii_case("flash1.024")
+                && mismatch.actual_crc32 == ZINC_JP_FLASH1_CRC32
+        });
+
+        if has_zinc_jp_flash {
+            vec!["zinc_jp_bundle_flash_variant"]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -1017,6 +1047,9 @@ fn board_asset_candidates(path: &Path) -> Vec<PathBuf> {
         push_candidate(&mut candidates, root.join("et01.ic652"));
         push_candidate(&mut candidates, root.join("et03"));
         push_candidate(&mut candidates, root.join("at28c16_world"));
+        push_candidate(&mut candidates, root.join("at28c16_usa"));
+        push_candidate(&mut candidates, root.join("at28c16_japan"));
+        push_candidate(&mut candidates, root.join("at28c16_asia"));
         push_candidate(&mut candidates, root.join("bldyror2.cfg"));
         push_candidate(&mut candidates, root.join("ZiNc.exe"));
         push_candidate(&mut candidates, root.join("cfg/bldyror2.cfg"));
@@ -1067,12 +1100,23 @@ fn at28c16_fallback_bytes(path: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    if crc32(bytes) == AT28C16_WORLD_CRC32
-        || path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("bldyror2.cfg"))
-    {
+    let crc = crc32(bytes);
+    let is_known_region_eeprom = matches!(
+        crc,
+        AT28C16_WORLD_CRC32 | AT28C16_USA_CRC32 | AT28C16_JAPAN_CRC32 | AT28C16_ASIA_CRC32
+    );
+    let is_named_cfg = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("bldyror2.cfg")
+                || name.eq_ignore_ascii_case("at28c16_world")
+                || name.eq_ignore_ascii_case("at28c16_usa")
+                || name.eq_ignore_ascii_case("at28c16_japan")
+                || name.eq_ignore_ascii_case("at28c16_asia")
+        });
+
+    if is_known_region_eeprom || is_named_cfg {
         return Some(bytes.to_vec());
     }
 

@@ -1,5 +1,6 @@
 pub const VRAM_WIDTH: usize = 1024;
-pub const VRAM_HEIGHT: usize = 512;
+pub const VRAM_HEIGHT: usize = 1024;
+pub const PSX_VRAM_HEIGHT: usize = 512;
 pub const DEFAULT_DISPLAY_WIDTH: usize = 320;
 pub const DEFAULT_DISPLAY_HEIGHT: usize = 240;
 
@@ -8,6 +9,12 @@ pub struct NativeFrameBuffer {
     pixels: Vec<u32>,
     raw_pixels: Vec<u16>,
     clip: Option<ClipRect>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PixelWriteOptions {
+    pub set_mask_bit: bool,
+    pub check_mask_bit: bool,
 }
 
 impl Default for NativeFrameBuffer {
@@ -26,34 +33,78 @@ impl NativeFrameBuffer {
     }
 
     pub fn set_pixel(&mut self, x: i32, y: i32, color: u32) {
+        self.set_pixel_with_options(x, y, color, PixelWriteOptions::default());
+    }
+
+    pub fn set_pixel_with_options(
+        &mut self,
+        x: i32,
+        y: i32,
+        color: u32,
+        options: PixelWriteOptions,
+    ) -> bool {
         if !self.in_clip(x, y) {
-            return;
+            return false;
         }
         if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
-            return;
+            return false;
         }
 
         let index = y as usize * VRAM_WIDTH + x as usize;
         let rgb = color & 0x00ff_ffff;
-        self.pixels[index] = rgb;
-        self.raw_pixels[index] = rgb888_to_rgb555(rgb);
+        self.write_raw_pixel_index(index, rgb888_to_rgb555(rgb), options)
     }
 
-    pub fn set_raw_pixel(&mut self, x: i32, y: i32, color: u16) {
+    pub fn set_raw_pixel(&mut self, x: i32, y: i32, color: u16) -> bool {
+        self.set_raw_pixel_with_options(x, y, color, PixelWriteOptions::default())
+    }
+
+    pub fn set_raw_pixel_with_options(
+        &mut self,
+        x: i32,
+        y: i32,
+        color: u16,
+        options: PixelWriteOptions,
+    ) -> bool {
         if !self.in_clip(x, y) {
-            return;
+            return false;
         }
-        self.set_raw_pixel_unclipped(x, y, color);
+        self.set_raw_pixel_unclipped_with_options(x, y, color, options)
     }
 
-    fn set_raw_pixel_unclipped(&mut self, x: i32, y: i32, color: u16) {
+    fn set_raw_pixel_unclipped_with_options(
+        &mut self,
+        x: i32,
+        y: i32,
+        color: u16,
+        options: PixelWriteOptions,
+    ) -> bool {
         if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
-            return;
+            return false;
         }
 
         let index = y as usize * VRAM_WIDTH + x as usize;
+        self.write_raw_pixel_index(index, color, options)
+    }
+
+    fn write_raw_pixel_index(
+        &mut self,
+        index: usize,
+        color: u16,
+        options: PixelWriteOptions,
+    ) -> bool {
+        if options.check_mask_bit && self.raw_pixels[index] & 0x8000 != 0 {
+            return false;
+        }
+
+        let color = if options.set_mask_bit {
+            color | 0x8000
+        } else {
+            color
+        };
         self.raw_pixels[index] = color;
         self.pixels[index] = rgb555_to_rgb888(color);
+        true
     }
 
     pub fn pixel(&self, x: i32, y: i32) -> u32 {
@@ -73,6 +124,25 @@ impl NativeFrameBuffer {
     }
 
     pub fn fill_rect_unclipped(&mut self, x: i32, y: i32, width: i32, height: i32, color: u32) {
+        self.fill_rect_unclipped_with_options(
+            x,
+            y,
+            width,
+            height,
+            color,
+            PixelWriteOptions::default(),
+        );
+    }
+
+    pub fn fill_rect_unclipped_with_options(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        color: u32,
+        options: PixelWriteOptions,
+    ) {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -85,10 +155,22 @@ impl NativeFrameBuffer {
             return;
         }
 
-        self.fill_rect_region(left, top, right, bottom, color);
+        self.fill_rect_region(left, top, right, bottom, color, options);
     }
 
     pub fn fill_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: u32) {
+        self.fill_rect_with_options(x, y, width, height, color, PixelWriteOptions::default());
+    }
+
+    pub fn fill_rect_with_options(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        color: u32,
+        options: PixelWriteOptions,
+    ) {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -102,7 +184,7 @@ impl NativeFrameBuffer {
             return;
         }
 
-        self.fill_rect_region(left, top, right, bottom, color);
+        self.fill_rect_region(left, top, right, bottom, color, options);
     }
 
     fn fill_rect_region(
@@ -112,14 +194,14 @@ impl NativeFrameBuffer {
         right: usize,
         bottom: usize,
         color: u32,
+        options: PixelWriteOptions,
     ) {
         let rgb = color & 0x00ff_ffff;
         let raw = rgb888_to_rgb555(rgb);
         for row in top..bottom {
             let offset = row * VRAM_WIDTH;
             for col in left..right {
-                self.pixels[offset + col] = rgb;
-                self.raw_pixels[offset + col] = raw;
+                self.write_raw_pixel_index(offset + col, raw, options);
             }
         }
     }
@@ -133,6 +215,27 @@ impl NativeFrameBuffer {
         width: i32,
         height: i32,
     ) {
+        self.copy_rect_with_options(
+            source_x,
+            source_y,
+            dest_x,
+            dest_y,
+            width,
+            height,
+            PixelWriteOptions::default(),
+        );
+    }
+
+    pub fn copy_rect_with_options(
+        &mut self,
+        source_x: i32,
+        source_y: i32,
+        dest_x: i32,
+        dest_y: i32,
+        width: i32,
+        height: i32,
+        options: PixelWriteOptions,
+    ) {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -140,9 +243,11 @@ impl NativeFrameBuffer {
         let mut copied = Vec::with_capacity((width as usize).saturating_mul(height as usize));
         for row in 0..height {
             for col in 0..width {
+                let source_x = wrap_vram_x(source_x + col);
+                let source_y = wrap_vram_y(source_y + row);
                 copied.push((
-                    self.pixel(source_x + col, source_y + row),
-                    self.raw_pixel(source_x + col, source_y + row),
+                    self.pixel(source_x, source_y),
+                    self.raw_pixel(source_x, source_y),
                 ));
             }
         }
@@ -153,20 +258,37 @@ impl NativeFrameBuffer {
                     .saturating_mul(width as usize)
                     .saturating_add(col as usize);
                 if let Some((rgb, raw)) = copied.get(index) {
-                    let x = dest_x + col;
-                    let y = dest_y + row;
-                    if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
-                        continue;
-                    }
+                    let x = wrap_vram_x(dest_x + col);
+                    let y = wrap_vram_y(dest_y + row);
                     let dest_index = y as usize * VRAM_WIDTH + x as usize;
-                    self.pixels[dest_index] = *rgb;
-                    self.raw_pixels[dest_index] = *raw;
+                    if self.write_raw_pixel_index(dest_index, *raw, options) {
+                        self.pixels[dest_index] = *rgb;
+                    }
                 }
             }
         }
     }
 
     pub fn write_rgb555_image(&mut self, x: i32, y: i32, width: i32, height: i32, words: &[u32]) {
+        self.write_rgb555_image_with_options(
+            x,
+            y,
+            width,
+            height,
+            words,
+            PixelWriteOptions::default(),
+        );
+    }
+
+    pub fn write_rgb555_image_with_options(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        words: &[u32],
+        options: PixelWriteOptions,
+    ) {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -183,11 +305,21 @@ impl NativeFrameBuffer {
             };
             let col = (index % width as usize) as i32;
             let row = (index / width as usize) as i32;
-            self.set_raw_pixel_unclipped(x + col, y + row, raw as u16);
+            self.set_raw_pixel_unclipped_with_options(x + col, y + row, raw as u16, options);
         }
     }
 
     pub fn draw_line(&mut self, a: Point, b: Point, color: u32) {
+        self.draw_line_with_options(a, b, color, PixelWriteOptions::default());
+    }
+
+    pub fn draw_line_with_options(
+        &mut self,
+        a: Point,
+        b: Point,
+        color: u32,
+        options: PixelWriteOptions,
+    ) {
         let mut x0 = a.x;
         let mut y0 = a.y;
         let x1 = b.x;
@@ -199,7 +331,7 @@ impl NativeFrameBuffer {
         let mut err = dx + dy;
 
         loop {
-            self.set_pixel(x0, y0, color);
+            self.set_pixel_with_options(x0, y0, color, options);
             if x0 == x1 && y0 == y1 {
                 break;
             }
@@ -216,6 +348,17 @@ impl NativeFrameBuffer {
     }
 
     pub fn draw_triangle(&mut self, a: Point, b: Point, c: Point, color: u32) {
+        self.draw_triangle_with_options(a, b, c, color, PixelWriteOptions::default());
+    }
+
+    pub fn draw_triangle_with_options(
+        &mut self,
+        a: Point,
+        b: Point,
+        c: Point,
+        color: u32,
+        options: PixelWriteOptions,
+    ) {
         let (clip_left, clip_top, clip_right, clip_bottom) = self.clip_bounds();
         if clip_left >= clip_right || clip_top >= clip_bottom {
             return;
@@ -247,7 +390,7 @@ impl NativeFrameBuffer {
                     w0 <= 0 && w1 <= 0 && w2 <= 0
                 };
                 if inside {
-                    self.set_pixel(x, y, rgb);
+                    self.set_pixel_with_options(x, y, rgb, options);
                 }
             }
         }
@@ -260,11 +403,13 @@ impl NativeFrameBuffer {
         c: TexturedPoint,
         texture_page: u16,
         clut: u16,
+        options: TextureDrawOptions,
         texture_window: TextureWindow,
-    ) {
+    ) -> TexturedDrawStats {
+        let mut stats = TexturedDrawStats::default();
         let (clip_left, clip_top, clip_right, clip_bottom) = self.clip_bounds();
         if clip_left >= clip_right || clip_top >= clip_bottom {
-            return;
+            return stats;
         }
 
         let min_x = a
@@ -293,7 +438,7 @@ impl NativeFrameBuffer {
             .clamp(clip_top, clip_bottom - 1);
         let area = edge(a.point, b.point, c.point);
         if area == 0 {
-            return;
+            return stats;
         }
 
         let source = self.clone();
@@ -313,6 +458,7 @@ impl NativeFrameBuffer {
                     continue;
                 }
 
+                stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
                 if area < 0 {
                     w0 = -w0;
                     w1 = -w1;
@@ -322,10 +468,20 @@ impl NativeFrameBuffer {
                 let v = ((a.v as i64 * w0 + b.v as i64 * w1 + c.v as i64 * w2) / denom) as u8;
                 let (u, v) = texture_window.apply(u, v);
                 if let Some(color) = source.sample_texture(texture_page, clut, u, v) {
-                    self.set_raw_pixel(x, y, color);
+                    let color = options.apply_color(color);
+                    stats.record_color(color);
+                    stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
+                    if self.set_textured_pixel(x, y, color, options) {
+                        stats.written_pixels = stats.written_pixels.saturating_add(1);
+                    } else {
+                        stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
+                    }
+                } else {
+                    stats.transparent_pixels = stats.transparent_pixels.saturating_add(1);
                 }
             }
         }
+        stats
     }
 
     pub fn draw_textured_rect(
@@ -335,24 +491,37 @@ impl NativeFrameBuffer {
         texture_page: u16,
         clut: u16,
         uv: TextureCoordinate,
+        options: TextureDrawOptions,
         texture_window: TextureWindow,
-    ) {
+    ) -> TexturedDrawStats {
+        let mut stats = TexturedDrawStats::default();
         let (width, height) = size;
         if width <= 0 || height <= 0 {
-            return;
+            return stats;
         }
 
         let source = self.clone();
         for row in 0..height {
             for col in 0..width {
+                stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
                 let u = uv.u.wrapping_add(col as u8);
                 let v = uv.v.wrapping_add(row as u8);
                 let (u, v) = texture_window.apply(u, v);
                 if let Some(color) = source.sample_texture(texture_page, clut, u, v) {
-                    self.set_raw_pixel(dest.x + col, dest.y + row, color);
+                    let color = options.apply_color(color);
+                    stats.record_color(color);
+                    stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
+                    if self.set_textured_pixel(dest.x + col, dest.y + row, color, options) {
+                        stats.written_pixels = stats.written_pixels.saturating_add(1);
+                    } else {
+                        stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
+                    }
+                } else {
+                    stats.transparent_pixels = stats.transparent_pixels.saturating_add(1);
                 }
             }
         }
+        stats
     }
 
     fn in_clip(&self, x: i32, y: i32) -> bool {
@@ -386,7 +555,7 @@ impl NativeFrameBuffer {
                 let index = ((packed >> ((u & 3) * 4)) & 0x0f) as i32;
                 self.raw_pixel(
                     ((clut & 0x3f) as i32) * 16 + index,
-                    ((clut >> 6) & 0x01ff) as i32,
+                    ((clut >> 6) & 0x03ff) as i32,
                 )
             }
             1 => {
@@ -398,13 +567,43 @@ impl NativeFrameBuffer {
                 } as i32;
                 self.raw_pixel(
                     ((clut & 0x3f) as i32) * 16 + index,
-                    ((clut >> 6) & 0x01ff) as i32,
+                    ((clut >> 6) & 0x03ff) as i32,
                 )
             }
             _ => self.raw_pixel(page_x + u, page_y + v),
         };
 
         (color & 0x7fff != 0).then_some(color)
+    }
+
+    fn set_textured_pixel(
+        &mut self,
+        x: i32,
+        y: i32,
+        color: u16,
+        options: TextureDrawOptions,
+    ) -> bool {
+        if !self.in_clip(x, y) {
+            return false;
+        }
+        if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
+            return false;
+        }
+
+        let index = y as usize * VRAM_WIDTH + x as usize;
+        if options.check_mask_bit && self.raw_pixels[index] & 0x8000 != 0 {
+            return false;
+        }
+        let color = if options.semi_transparent {
+            blend_rgb555(
+                color,
+                self.raw_pixels[index],
+                options.semi_transparency_mode,
+            )
+        } else {
+            color
+        };
+        self.write_raw_pixel_index(index, color, options.pixel_write_options())
     }
 
     pub fn png_base64(
@@ -425,6 +624,75 @@ impl NativeFrameBuffer {
         )
     }
 
+    pub fn psx_display_png(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        png_rgb(
+            width.max(1),
+            height.max(1),
+            &self.psx_display_rgb_rows(start_x, start_y, width.max(1), height.max(1)),
+        )
+    }
+
+    pub fn psx_display_png_base64(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+    ) -> String {
+        base64_encode(&self.psx_display_png(start_x, start_y, width, height))
+    }
+
+    pub fn rgb_window(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<u32> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let mut pixels = Vec::with_capacity(width * height);
+        for y in 0..height {
+            let source_y = start_y + y;
+            for x in 0..width {
+                let source_x = start_x + x;
+                let rgb = if source_x < VRAM_WIDTH && source_y < VRAM_HEIGHT {
+                    self.pixels[source_y * VRAM_WIDTH + source_x]
+                } else {
+                    0
+                };
+                pixels.push(rgb);
+            }
+        }
+        pixels
+    }
+
+    pub fn psx_display_rgb_window(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<u32> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let mut pixels = Vec::with_capacity(width * height);
+        for y in 0..height {
+            let source_y = (start_y + y) % PSX_VRAM_HEIGHT;
+            for x in 0..width {
+                let source_x = (start_x + x) % VRAM_WIDTH;
+                pixels.push(self.pixels[source_y * VRAM_WIDTH + source_x]);
+            }
+        }
+        pixels
+    }
+
     pub fn display_stats(
         &self,
         start_x: usize,
@@ -432,10 +700,17 @@ impl NativeFrameBuffer {
         width: usize,
         height: usize,
     ) -> FrameBufferStats {
+        let pixel_count = (width as u64).saturating_mul(height as u64);
         let mut nonzero_pixels = 0_u64;
+        let mut bright_pixels = 0_u64;
+        let mut luma_sum = 0_u64;
+        let mut max_luma = 0_u8;
+        let mut detail_edges = 0_u64;
         let mut checksum = 0x811c_9dc5_u32;
+        let mut previous_row_luma = vec![0_u8; width];
         for y in 0..height {
             let source_y = start_y + y;
+            let mut previous_luma = 0_u8;
             for x in 0..width {
                 let source_x = start_x + x;
                 let rgb = if source_x < VRAM_WIDTH && source_y < VRAM_HEIGHT {
@@ -446,12 +721,98 @@ impl NativeFrameBuffer {
                 if rgb != 0 {
                     nonzero_pixels += 1;
                 }
+                let luma = rgb_luma(rgb);
+                if luma >= 32 {
+                    bright_pixels += 1;
+                }
+                luma_sum = luma_sum.saturating_add(luma as u64);
+                max_luma = max_luma.max(luma);
+                if x > 0 && luma.abs_diff(previous_luma) >= 16 {
+                    detail_edges += 1;
+                }
+                if y > 0
+                    && previous_row_luma
+                        .get(x)
+                        .is_some_and(|previous| luma.abs_diff(*previous) >= 16)
+                {
+                    detail_edges += 1;
+                }
+                previous_luma = luma;
+                if let Some(previous_row_luma) = previous_row_luma.get_mut(x) {
+                    *previous_row_luma = luma;
+                }
                 checksum ^= rgb;
                 checksum = checksum.wrapping_mul(16_777_619);
             }
         }
         FrameBufferStats {
+            pixel_count,
             nonzero_pixels,
+            bright_pixels,
+            luma_sum,
+            max_luma,
+            detail_edges,
+            checksum,
+        }
+    }
+
+    pub fn psx_display_stats(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+    ) -> FrameBufferStats {
+        let width = width.max(1);
+        let height = height.max(1);
+        let pixel_count = (width as u64).saturating_mul(height as u64);
+        let mut nonzero_pixels = 0_u64;
+        let mut bright_pixels = 0_u64;
+        let mut luma_sum = 0_u64;
+        let mut max_luma = 0_u8;
+        let mut detail_edges = 0_u64;
+        let mut checksum = 0x811c_9dc5_u32;
+        let mut previous_row_luma = vec![0_u8; width];
+        for y in 0..height {
+            let source_y = (start_y + y) % PSX_VRAM_HEIGHT;
+            let mut previous_luma = 0_u8;
+            for x in 0..width {
+                let source_x = (start_x + x) % VRAM_WIDTH;
+                let rgb = self.pixels[source_y * VRAM_WIDTH + source_x];
+                if rgb != 0 {
+                    nonzero_pixels += 1;
+                }
+                let luma = rgb_luma(rgb);
+                if luma >= 32 {
+                    bright_pixels += 1;
+                }
+                luma_sum = luma_sum.saturating_add(luma as u64);
+                max_luma = max_luma.max(luma);
+                if x > 0 && luma.abs_diff(previous_luma) >= 16 {
+                    detail_edges += 1;
+                }
+                if y > 0
+                    && previous_row_luma
+                        .get(x)
+                        .is_some_and(|previous| luma.abs_diff(*previous) >= 16)
+                {
+                    detail_edges += 1;
+                }
+                previous_luma = luma;
+                if let Some(previous_row_luma) = previous_row_luma.get_mut(x) {
+                    *previous_row_luma = luma;
+                }
+                checksum ^= rgb;
+                checksum = checksum.wrapping_mul(16_777_619);
+            }
+        }
+        FrameBufferStats {
+            pixel_count,
+            nonzero_pixels,
+            bright_pixels,
+            luma_sum,
+            max_luma,
+            detail_edges,
             checksum,
         }
     }
@@ -487,6 +848,43 @@ impl NativeFrameBuffer {
 
         let (x, y, nonzero_pixels) = best?;
         (nonzero_pixels > 0).then(|| FrameBufferWindow {
+            x,
+            y,
+            stats: self.display_stats(x, y, width, height),
+        })
+    }
+
+    pub fn brightest_window(
+        &self,
+        width: usize,
+        height: usize,
+        step: usize,
+    ) -> Option<FrameBufferWindow> {
+        if width == 0 || height == 0 || width > VRAM_WIDTH || height > VRAM_HEIGHT {
+            return None;
+        }
+
+        let step = step.max(1);
+        let (bright_integral, luma_integral) = self.brightness_integral_images();
+        let max_x = VRAM_WIDTH - width;
+        let max_y = VRAM_HEIGHT - height;
+        let mut best: Option<(usize, usize, u64, u64)> = None;
+
+        for y in stepped_positions(max_y, step) {
+            for x in stepped_positions(max_x, step) {
+                let bright_pixels = integral_rect(&bright_integral, x, y, width, height);
+                let luma_sum = integral_rect_u64(&luma_integral, x, y, width, height);
+                if best.is_none_or(|(_, _, best_bright, best_luma)| {
+                    bright_pixels > best_bright
+                        || (bright_pixels == best_bright && luma_sum > best_luma)
+                }) {
+                    best = Some((x, y, bright_pixels, luma_sum));
+                }
+            }
+        }
+
+        let (x, y, bright_pixels, _) = best?;
+        (bright_pixels > 0).then(|| FrameBufferWindow {
             x,
             y,
             stats: self.display_stats(x, y, width, height),
@@ -537,6 +935,29 @@ impl NativeFrameBuffer {
         integral
     }
 
+    fn brightness_integral_images(&self) -> (Vec<u32>, Vec<u64>) {
+        let stride = VRAM_WIDTH + 1;
+        let mut bright_integral = vec![0_u32; stride * (VRAM_HEIGHT + 1)];
+        let mut luma_integral = vec![0_u64; stride * (VRAM_HEIGHT + 1)];
+
+        for y in 0..VRAM_HEIGHT {
+            let mut row_bright = 0_u32;
+            let mut row_luma = 0_u64;
+            for x in 0..VRAM_WIDTH {
+                let luma = rgb_luma(self.pixels[y * VRAM_WIDTH + x]);
+                if luma >= 32 {
+                    row_bright += 1;
+                }
+                row_luma += luma as u64;
+                let index = (y + 1) * stride + x + 1;
+                bright_integral[index] = bright_integral[y * stride + x + 1] + row_bright;
+                luma_integral[index] = luma_integral[y * stride + x + 1] + row_luma;
+            }
+        }
+
+        (bright_integral, luma_integral)
+    }
+
     fn rgb_rows(&self, start_x: usize, start_y: usize, width: usize, height: usize) -> Vec<u8> {
         let mut rows = Vec::with_capacity(height * (1 + width * 3));
         for y in 0..height {
@@ -556,12 +977,62 @@ impl NativeFrameBuffer {
         }
         rows
     }
+
+    fn psx_display_rgb_rows(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let mut rows = Vec::with_capacity(height * (1 + width * 3));
+        for y in 0..height {
+            rows.push(0);
+            let source_y = (start_y + y) % PSX_VRAM_HEIGHT;
+            for x in 0..width {
+                let source_x = (start_x + x) % VRAM_WIDTH;
+                let rgb = self.pixels[source_y * VRAM_WIDTH + source_x];
+                rows.push(((rgb >> 16) & 0xff) as u8);
+                rows.push(((rgb >> 8) & 0xff) as u8);
+                rows.push((rgb & 0xff) as u8);
+            }
+        }
+        rows
+    }
+}
+
+fn wrap_vram_x(x: i32) -> i32 {
+    x.rem_euclid(VRAM_WIDTH as i32)
+}
+
+fn wrap_vram_y(y: i32) -> i32 {
+    y.rem_euclid(VRAM_HEIGHT as i32)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameBufferStats {
+    pub pixel_count: u64,
     pub nonzero_pixels: u64,
+    pub bright_pixels: u64,
+    pub luma_sum: u64,
+    pub max_luma: u8,
+    pub detail_edges: u64,
     pub checksum: u32,
+}
+
+impl FrameBufferStats {
+    pub fn json(self) -> String {
+        format!(
+            "{{\"pixel_count\":{},\"nonzero_pixels\":{},\"bright_pixels\":{},\"avg_luma\":{},\"max_luma\":{},\"detail_edges\":{},\"checksum\":{}}}",
+            self.pixel_count,
+            self.nonzero_pixels,
+            self.bright_pixels,
+            self.luma_sum.checked_div(self.pixel_count).unwrap_or(0),
+            self.max_luma,
+            self.detail_edges,
+            self.checksum
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,10 +1095,73 @@ pub struct TexturedPoint {
     pub v: u8,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TexturedDrawStats {
+    pub sampled_pixels: u64,
+    pub drawn_pixels: u64,
+    pub written_pixels: u64,
+    pub clipped_pixels: u64,
+    pub transparent_pixels: u64,
+    pub first_color: u16,
+    pub last_color: u16,
+    pub color_hash: u32,
+    pub color_changes: u64,
+}
+
+impl TexturedDrawStats {
+    fn record_color(&mut self, color: u16) {
+        if self.drawn_pixels == 0 {
+            self.first_color = color;
+        } else if self.last_color != color {
+            self.color_changes = self.color_changes.saturating_add(1);
+        }
+        self.last_color = color;
+        self.color_hash ^= u32::from(color);
+        self.color_hash = self.color_hash.wrapping_mul(16_777_619);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TextureCoordinate {
     pub u: u8,
     pub v: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextureDrawOptions {
+    pub primitive_color: u32,
+    pub raw_texture: bool,
+    pub semi_transparent: bool,
+    pub semi_transparency_mode: u8,
+    pub set_mask_bit: bool,
+    pub check_mask_bit: bool,
+}
+
+impl TextureDrawOptions {
+    pub const fn opaque_raw() -> Self {
+        Self {
+            primitive_color: 0x0080_8080,
+            raw_texture: true,
+            semi_transparent: false,
+            semi_transparency_mode: 0,
+            set_mask_bit: false,
+            check_mask_bit: false,
+        }
+    }
+
+    fn apply_color(self, color: u16) -> u16 {
+        if self.raw_texture {
+            return color;
+        }
+        modulate_rgb555(color, self.primitive_color)
+    }
+
+    fn pixel_write_options(self) -> PixelWriteOptions {
+        PixelWriteOptions {
+            set_mask_bit: self.set_mask_bit,
+            check_mask_bit: self.check_mask_bit,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -668,6 +1202,15 @@ fn integral_rect(integral: &[u32], x: usize, y: usize, width: usize, height: usi
         - integral[y * stride + right]
         - integral[bottom * stride + x];
     value as u64
+}
+
+fn integral_rect_u64(integral: &[u64], x: usize, y: usize, width: usize, height: usize) -> u64 {
+    let stride = VRAM_WIDTH + 1;
+    let right = x + width;
+    let bottom = y + height;
+    integral[bottom * stride + right] + integral[y * stride + x]
+        - integral[y * stride + right]
+        - integral[bottom * stride + x]
 }
 
 fn stepped_positions(max: usize, step: usize) -> impl Iterator<Item = usize> {
@@ -764,6 +1307,47 @@ fn rgb888_to_rgb555(value: u32) -> u16 {
     r | (g << 5) | (b << 10)
 }
 
+fn modulate_rgb555(color: u16, primitive_color: u32) -> u16 {
+    let r = modulate_channel(color & 0x1f, primitive_color & 0xff);
+    let g = modulate_channel((color >> 5) & 0x1f, (primitive_color >> 8) & 0xff);
+    let b = modulate_channel((color >> 10) & 0x1f, (primitive_color >> 16) & 0xff);
+    (color & 0x8000) | r | (g << 5) | (b << 10)
+}
+
+fn modulate_channel(value_5bit: u16, primitive_8bit: u32) -> u16 {
+    ((u32::from(value_5bit) * primitive_8bit) >> 7).min(0x1f) as u16
+}
+
+fn blend_rgb555(source: u16, destination: u16, mode: u8) -> u16 {
+    let r = blend_channel(source & 0x1f, destination & 0x1f, mode);
+    let g = blend_channel((source >> 5) & 0x1f, (destination >> 5) & 0x1f, mode);
+    let b = blend_channel((source >> 10) & 0x1f, (destination >> 10) & 0x1f, mode);
+    (source & 0x8000) | r | (g << 5) | (b << 10)
+}
+
+fn blend_channel(source: u16, destination: u16, mode: u8) -> u16 {
+    let source = i32::from(source);
+    let destination = i32::from(destination);
+    let value = match mode & 0x03 {
+        0 => destination / 2 + source / 2,
+        1 => destination + source,
+        2 => destination - source,
+        _ => destination + source / 4,
+    };
+    value.clamp(0, 0x1f) as u16
+}
+
+fn rgb_luma(value: u32) -> u8 {
+    let r = (value >> 16) & 0xff;
+    let g = (value >> 8) & 0xff;
+    let b = value & 0xff;
+    ((77 * r + 150 * g + 29 * b) >> 8) as u8
+}
+
+pub fn bytes_base64(data: &[u8]) -> String {
+    base64_encode(data)
+}
+
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -789,7 +1373,7 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeFrameBuffer, Point};
+    use super::{NativeFrameBuffer, PSX_VRAM_HEIGHT, Point, VRAM_HEIGHT, VRAM_WIDTH};
 
     #[test]
     fn framebuffer_exports_png_base64() {
@@ -828,6 +1412,57 @@ mod tests {
     }
 
     #[test]
+    fn framebuffer_preserves_extended_2mb_vram_rows() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let extended_y = 768;
+
+        framebuffer.write_rgb555_image(4, extended_y, 2, 1, &[0x03e0_001f]);
+        framebuffer.copy_rect(4, extended_y, 8, extended_y + 8, 2, 1);
+
+        assert_eq!(framebuffer.pixel(8, extended_y + 8), 0x00ff_0000);
+        assert_eq!(framebuffer.pixel(9, extended_y + 8), 0x0000_ff00);
+        assert_eq!(
+            framebuffer.pixel(8, extended_y + 8 - PSX_VRAM_HEIGHT as i32),
+            0
+        );
+    }
+
+    #[test]
+    fn framebuffer_psx_display_reads_wrap_at_512_vram_rows() {
+        let mut framebuffer = NativeFrameBuffer::default();
+
+        framebuffer.set_raw_pixel(0, (PSX_VRAM_HEIGHT - 1) as i32, 0x001f);
+        framebuffer.set_raw_pixel(0, 0, 0x03e0);
+        framebuffer.set_raw_pixel(0, PSX_VRAM_HEIGHT as i32, 0x7c00);
+
+        let pixels = framebuffer.psx_display_rgb_window(0, PSX_VRAM_HEIGHT - 1, 1, 2);
+        let stats = framebuffer.psx_display_stats(0, PSX_VRAM_HEIGHT - 1, 1, 2);
+
+        assert_eq!(pixels, vec![0x00ff_0000, 0x0000_ff00]);
+        assert_eq!(stats.nonzero_pixels, 2);
+        assert_ne!(pixels[1], framebuffer.pixel(0, PSX_VRAM_HEIGHT as i32));
+    }
+
+    #[test]
+    fn framebuffer_vram_copies_wrap_edges() {
+        let mut framebuffer = NativeFrameBuffer::default();
+
+        framebuffer.set_raw_pixel((VRAM_WIDTH - 1) as i32, (VRAM_HEIGHT - 1) as i32, 0x001f);
+        framebuffer.set_raw_pixel(0, 0, 0x03e0);
+        framebuffer.copy_rect(
+            (VRAM_WIDTH - 1) as i32,
+            (VRAM_HEIGHT - 1) as i32,
+            2,
+            3,
+            2,
+            2,
+        );
+
+        assert_eq!(framebuffer.pixel(2, 3), 0x00ff_0000);
+        assert_eq!(framebuffer.pixel(3, 4), 0x0000_ff00);
+    }
+
+    #[test]
     fn framebuffer_finds_densest_nonzero_window() {
         let mut framebuffer = NativeFrameBuffer::default();
 
@@ -840,5 +1475,21 @@ mod tests {
         assert_eq!(window.x, 224);
         assert_eq!(window.y, 0);
         assert_eq!(window.stats.nonzero_pixels, 1024);
+    }
+
+    #[test]
+    fn framebuffer_finds_brightest_window_over_dark_nonzero_pixels() {
+        let mut framebuffer = NativeFrameBuffer::default();
+
+        framebuffer.fill_rect_unclipped(0, 0, 320, 240, 0x0000_0008);
+        framebuffer.fill_rect_unclipped(496, 256, 320, 240, 0x0000_ff00);
+
+        let window = framebuffer
+            .brightest_window(320, 240, 8)
+            .expect("brightest window");
+
+        assert_eq!(window.x, 496);
+        assert_eq!(window.y, 256);
+        assert_eq!(window.stats.bright_pixels, 320 * 240);
     }
 }

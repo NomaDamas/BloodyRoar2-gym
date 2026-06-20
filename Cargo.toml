@@ -6,3 +6,4 @@ license-file = "LICENSE"
 description = "Rust RL/LLM control harness for legally supplied Bloody Roar 2-compatible emulator backends."
 
 [dependencies]
+minifb = "0.28.0"

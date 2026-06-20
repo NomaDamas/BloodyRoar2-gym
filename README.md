@@ -56,11 +56,15 @@ game data.
 - Discrete action space for fighter controls.
 - Observation contract compatible with RL loops.
 - CLI and HTTP JSON API using a deterministic `NullBackend`.
-- macOS MAME launch path for local human play with legally supplied ROM assets.
+- Apple Silicon-native Rust play window with GPU framebuffer presentation.
+- Native scripted input validation for Gym/RL action wiring.
+- macOS MAME launch path for local compatibility checks with legally supplied
+  ROM assets.
 - Asset policy and static security notes for the supplied Windows bundle.
 
 The original ZiNc Windows bundle is not republished and is not treated as
-portable Rust source. Human play on macOS is handled through MAME.
+portable Rust source. Human play on macOS can use the Rust-native window first;
+MAME remains useful as an external compatibility reference.
 
 ## CLI
 
@@ -74,7 +78,31 @@ cargo run -- serve 127.0.0.1:8765
 
 ## macOS play path
 
-Install MAME and prepare local assets from your legally owned archive:
+Run the Rust-native Apple Silicon play window with legally supplied local assets:
+
+```sh
+cargo run -- native-input-check assets/roms 500000
+cargo run -- native-play assets/roms 500000 2
+```
+
+`native-play` controls:
+
+- Arrows: move.
+- `Z`: punch.
+- `X`: kick.
+- `A`: beast.
+- `S`: guard.
+- `C`: coin.
+- `Enter`: start.
+- `Esc`: quit.
+
+For automated smoke tests, pass an optional frame limit:
+
+```sh
+cargo run -- native-play assets/roms 500000 2 700
+```
+
+Install MAME if you also want an external compatibility reference:
 
 ```sh
 brew install mame
@@ -96,10 +124,10 @@ Configuration:
 - `BLOODYROAR2_ROM_DIR`: override the local ROM directory.
 - `BLOODYROAR2_MAME_GAME`: override the MAME game id, default `bldyror2`.
 
-On Apple Silicon, Homebrew MAME is the native emulator path. The original ZiNc
-Windows executable is not native Apple Silicon software; running it would
-require a separate Wine/Rosetta-style compatibility layer and is not the default
-or recommended path.
+On Apple Silicon, the Rust-native path is the default development target. The
+original ZiNc Windows executable is not native Apple Silicon software; running it
+would require a separate Wine/Rosetta-style compatibility layer and is not the
+default or recommended path.
 
 ## ZiNc compatibility path
 
@@ -126,9 +154,10 @@ installable from non-interactive automation.
 
 ## Native Emulator Development
 
-This repository also contains the start of a from-scratch Apple Silicon-native
-emulator path. It is not playable yet; it currently provides a ROM ZIP inspector,
-boot ROM loader, memory bus, and a small MIPS R3000A interpreter foundation:
+This repository also contains a from-scratch Apple Silicon-native emulator path.
+It provides a ROM ZIP/directory inspector, boot ROM loader, MIPS R3000A/GTE
+execution foundation, memory bus, DMA, GPU framebuffer renderer, input mapping,
+Gym-style native backend, and a minifb-powered local play window:
 
 ```sh
 cargo run -- native-inspect assets/roms/bldyror2.zip
@@ -137,20 +166,23 @@ cargo run -- native-step assets/roms/bldyror2.zip 16
 cargo run -- native-step assets/roms/bldyror2.zip 1000000
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
+cargo run -- native-input-check assets/roms 500000
+cargo run -- native-play assets/roms 500000 2
 cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
 ```
 
 The native path is intentionally separated from MAME and ZiNc compatibility
-commands so long-term emulator work can proceed without pretending incomplete
-CPU/GPU/SPU/protection-chip implementation is already game-playable.
-The current native core can execute the bundled COH-1002E boot ROM instruction
-stream and exposes CPU/IO state for iterative development.
+commands so emulator-core work can proceed without republishing proprietary
+Windows binaries or ROM data.
+The current native core reaches a visible, textured gameplay candidate screen,
+tracks presentation quality, and exposes CPU/IO/GPU state for iterative
+validation.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend.
 `native-scripted-step` applies a sequence of Gym actions to the native core and
-writes a PNG observation for repeatable boot/input debugging. A valid native
-play result still requires a ROM set that passes compatibility checks and more
-complete GPU/GTE/SPU/protection implementation.
+writes a PNG observation for repeatable boot/input debugging. `native-input-check`
+verifies that the game reads mapped coin/start/fighter controls, and
+`native-play` opens the native macOS framebuffer window.
 
 See [docs/NATIVE_WORKFLOW.md](docs/NATIVE_WORKFLOW.md) for the canonical macOS
 Apple Silicon build, test, native-step, Gym API, and asset-compliance validation

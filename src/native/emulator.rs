@@ -5,8 +5,16 @@ use crate::action::ActionButtons;
 use crate::backend::BackendError;
 use crate::native::bus::Bus;
 use crate::native::cpu::{Cpu, StepOutcome, StepReport};
+use crate::native::io::{NativeGpuDisplayCandidate, NativeGpuDrawCapture};
 use crate::native::platform::native_platform_json;
 use crate::native::romset::{NativeRomCompatibilityReport, NativeRomSet};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDisplayFrame {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u32>,
+}
 
 #[derive(Clone, Debug)]
 pub struct NativeEmulator {
@@ -54,6 +62,23 @@ impl NativeEmulator {
             }
         }
         self.executed_steps - start_steps
+    }
+
+    pub fn step_until_next_vblank(&mut self, max_instructions: u64) -> u64 {
+        let start_steps = self.executed_steps;
+        let start_vblank = self.bus.vblank_count();
+        let max_instructions = max_instructions.max(1);
+        while self.executed_steps - start_steps < max_instructions
+            && self.bus.vblank_count() == start_vblank
+            && self.last_outcome == StepOutcome::Continue
+        {
+            self.step_instruction();
+        }
+        self.executed_steps - start_steps
+    }
+
+    pub fn vblank_count(&self) -> u64 {
+        self.bus.vblank_count()
     }
 
     pub fn trace_instructions(
@@ -104,6 +129,68 @@ impl NativeEmulator {
         })
     }
 
+    pub fn trace_scripted_frames(
+        &mut self,
+        instructions_per_frame: u64,
+        segments: &[(ActionButtons, u64)],
+        hot_limit: usize,
+        recent_limit: usize,
+        config: NativeTraceConfig,
+    ) -> NativeTrace {
+        self.bus.set_access_trace_limit(recent_limit.max(32));
+        self.bus.set_access_trace_watch_ranges(config.watch_ranges);
+        self.bus.set_access_trace_watch_only(config.watch_only);
+        let mut pc_counts = BTreeMap::new();
+        let mut unsupported = BTreeMap::new();
+        let mut recent_steps = Vec::new();
+        let start_steps = self.executed_steps;
+        let instructions_per_frame = instructions_per_frame.max(1);
+        let requested_steps = segments.iter().fold(0u64, |total, (_, frames)| {
+            total.saturating_add(frames.saturating_mul(instructions_per_frame))
+        });
+
+        'script: for (buttons, frames) in segments {
+            self.set_input(*buttons);
+            for _ in 0..*frames {
+                for _ in 0..instructions_per_frame {
+                    let report = self.step_instruction();
+                    *pc_counts.entry(report.start_pc).or_insert(0) += 1;
+                    if let StepOutcome::Unsupported(instruction) = report.outcome {
+                        *unsupported.entry(instruction).or_insert(0) += 1;
+                    }
+                    let reached_stop_pc = config.stop_pc.is_some_and(|pc| report.start_pc == pc);
+                    let reached_low_pc =
+                        config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
+
+                    if recent_limit > 0 {
+                        recent_steps.push(report);
+                        if recent_steps.len() > recent_limit {
+                            recent_steps.remove(0);
+                        }
+                    }
+
+                    if self.last_outcome != StepOutcome::Continue
+                        || reached_stop_pc
+                        || reached_low_pc
+                    {
+                        break 'script;
+                    }
+                }
+            }
+        }
+
+        NativeTrace::new(NativeTraceParts {
+            requested_steps,
+            executed_steps: self.executed_steps - start_steps,
+            pc_counts,
+            unsupported,
+            recent_steps,
+            hot_limit,
+            bus_access_trace_json: self.bus.access_trace_json(),
+            state_json: self.json(),
+        })
+    }
+
     pub fn set_input(&mut self, buttons: ActionButtons) {
         self.bus.set_input(buttons);
     }
@@ -132,17 +219,60 @@ impl NativeEmulator {
         self.bus.io.gpu.display_png()
     }
 
+    pub fn display_frame(&self) -> NativeDisplayFrame {
+        let (width, height, pixels) = self.bus.display_rgb_frame();
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    pub fn actual_display_png(&self) -> Vec<u8> {
+        self.bus.io.gpu.actual_display_png()
+    }
+
+    pub fn raw_actual_display_png(&self) -> Vec<u8> {
+        self.bus.io.gpu.raw_actual_display_png()
+    }
+
     pub fn vram_png(&self) -> Vec<u8> {
         self.bus.io.gpu.vram_png()
     }
 
+    pub fn set_draw_capture_range(&mut self, start: u64, end: u64) {
+        self.bus.set_gpu_draw_capture_range(start, end);
+    }
+
+    pub fn draw_captures(&self) -> &[NativeGpuDrawCapture] {
+        self.bus.gpu_draw_captures()
+    }
+
+    pub fn display_candidates(&self) -> Vec<NativeGpuDisplayCandidate> {
+        self.bus.gpu_display_candidates()
+    }
+
+    pub fn input_activity_json(&self) -> String {
+        self.bus.input_activity().json()
+    }
+
+    pub fn has_play_control_activity(&self) -> bool {
+        self.bus.input_activity().has_play_control_activity()
+    }
+
+    pub fn native_playable_candidate(&self) -> bool {
+        self.bus.native_playable_candidate()
+    }
+
     pub fn json(&self) -> String {
         format!(
-            "{{\"cpu\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":false,\"development_stage\":\"mips_cpu_io_bootstrap\"}}",
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
+            self.cpu.gte_json(),
             self.bus.io_json(),
             self.bus.zn_board_json(),
             self.bus.native_sync_json(),
+            self.bus.native_playability_json(),
             native_platform_json(),
             self.rom_compatibility.summary_json(),
             self.bus.rom_len(),
@@ -151,7 +281,52 @@ impl NativeEmulator {
             self.bus.scratchpad_len(),
             self.executed_steps,
             optional_step_json(self.last_step),
-            self.last_outcome
+            self.last_outcome,
+            self.bus.native_playable_candidate()
+        )
+    }
+
+    pub fn diagnostic_json(&self) -> String {
+        format!(
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            self.cpu.json(),
+            self.cpu.gte_json(),
+            self.bus.io_compact_json(),
+            self.bus.zn_board_json(),
+            self.bus.native_sync_json(),
+            self.bus.native_playability_json(),
+            native_platform_json(),
+            self.rom_compatibility.summary_json(),
+            self.bus.rom_len(),
+            self.bus.banked_rom_len(),
+            self.bus.ram_len(),
+            self.bus.scratchpad_len(),
+            self.executed_steps,
+            optional_step_json(self.last_step),
+            self.last_outcome,
+            self.bus.native_playable_candidate()
+        )
+    }
+
+    pub fn probe_json(&self) -> String {
+        format!(
+            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"status\":{},\"status_hex\":\"0x{:08x}\",\"cause\":{},\"cause_hex\":\"0x{:08x}\",\"epc\":{},\"epc_hex\":\"0x{:08x}\"}},\"runtime\":{},\"native_playability\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            self.cpu.pc,
+            self.cpu.pc,
+            self.cpu.cycles,
+            self.cpu.halted,
+            self.cpu.cp0[12],
+            self.cpu.cp0[12],
+            self.cpu.cp0[13],
+            self.cpu.cp0[13],
+            self.cpu.cp0[14],
+            self.cpu.cp0[14],
+            self.bus.runtime_probe_json(),
+            self.bus.native_playability_json(),
+            self.rom_compatibility.summary_json(),
+            self.executed_steps,
+            self.last_outcome,
+            self.bus.native_playable_candidate()
         )
     }
 }
