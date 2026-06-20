@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::action::ActionButtons;
 use crate::backend::BackendError;
-use crate::native::bus::Bus;
+use crate::native::bus::{Bus, NativeInputActivity};
 use crate::native::cpu::{Cpu, StepOutcome, StepReport};
 use crate::native::io::{NativeGpuDisplayCandidate, NativeGpuDrawCapture};
 use crate::native::platform::native_platform_json;
@@ -256,8 +256,16 @@ impl NativeEmulator {
         self.bus.input_activity().json()
     }
 
+    pub fn input_activity(&self) -> NativeInputActivity {
+        self.bus.input_activity()
+    }
+
     pub fn has_play_control_activity(&self) -> bool {
         self.bus.input_activity().has_play_control_activity()
+    }
+
+    pub fn has_full_control_activity(&self) -> bool {
+        self.bus.input_activity().has_full_control_activity()
     }
 
     pub fn native_playable_candidate(&self) -> bool {

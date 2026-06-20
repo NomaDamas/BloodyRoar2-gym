@@ -82,6 +82,7 @@ Run the Rust-native Apple Silicon play window with legally supplied local assets
 
 ```sh
 cargo run -- native-input-check assets/roms 500000
+cargo run -- native-health-check assets/roms 500000
 cargo run -- native-autoplay assets/roms 500000 2
 cargo run -- native-play assets/roms 500000 2
 ```
@@ -90,6 +91,10 @@ cargo run -- native-play assets/roms 500000 2
 fighter-control script until a playable candidate is observed, then falls back
 to keyboard control. Use `native-play` when you want fully manual input from
 boot.
+`native-health-check` is stricter than the autoplay smoke path: it verifies the
+CPU core, mapped controls, rendered frame statistics, and per-action branch
+stability. It exits non-zero when the native renderer still has a full-scene
+composition gap even if the macOS window and input path are working.
 
 Window controls:
 
@@ -174,6 +179,7 @@ cargo run -- native-step assets/roms/bldyror2.zip 1000000
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
 cargo run -- native-input-check assets/roms 500000
+cargo run -- native-health-check assets/roms 500000
 cargo run -- native-play assets/roms 500000 2
 cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
 ```
@@ -181,15 +187,18 @@ cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
 The native path is intentionally separated from MAME and ZiNc compatibility
 commands so emulator-core work can proceed without republishing proprietary
 Windows binaries or ROM data.
-The current native core reaches a visible, textured gameplay candidate screen,
-tracks presentation quality, and exposes CPU/IO/GPU state for iterative
-validation.
+The current native core runs on macOS, opens a local framebuffer window, reads
+the mapped controls, uploads visible texture data to VRAM, tracks presentation
+quality, and exposes CPU/IO/GPU state for iterative validation. Full native
+scene composition is still guarded by `native-health-check`; keep using that
+command before claiming emulator parity.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend.
 `native-scripted-step` applies a sequence of Gym actions to the native core and
 writes a PNG observation for repeatable boot/input debugging. `native-input-check`
-verifies that the game reads mapped coin/start/fighter controls, and
-`native-play` opens the native macOS framebuffer window.
+verifies that the game reads mapped coin/start/fighter controls,
+`native-health-check` fails on remaining full-scene rendering or branch-stability
+gaps, and `native-play` opens the native macOS framebuffer window.
 
 See [docs/NATIVE_WORKFLOW.md](docs/NATIVE_WORKFLOW.md) for the canonical macOS
 Apple Silicon build, test, native-step, Gym API, and asset-compliance validation

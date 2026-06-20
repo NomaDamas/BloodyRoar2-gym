@@ -37,6 +37,11 @@ const DMA_ACTIVITY_RECENT_LIMIT: usize = 64;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeInputActivity {
     pub p1_input_reads: u64,
+    pub p1_up_active_reads: u64,
+    pub p1_down_active_reads: u64,
+    pub p1_left_active_reads: u64,
+    pub p1_right_active_reads: u64,
+    pub p1_start_active_reads: u64,
     pub p1_punch_active_reads: u64,
     pub p1_kick_active_reads: u64,
     pub p1_beast_active_reads: u64,
@@ -56,13 +61,29 @@ impl NativeInputActivity {
             && self.p1_beast_active_reads > 0
             && self.p3_guard_active_reads > 0
             && self.system_coin_active_reads > 0
-            && self.system_start_active_reads > 0
+            && (self.system_start_active_reads > 0 || self.p1_start_active_reads > 0)
+    }
+
+    pub fn has_direction_activity(self) -> bool {
+        self.p1_up_active_reads > 0
+            && self.p1_down_active_reads > 0
+            && self.p1_left_active_reads > 0
+            && self.p1_right_active_reads > 0
+    }
+
+    pub fn has_full_control_activity(self) -> bool {
+        self.has_direction_activity() && self.has_play_control_activity()
     }
 
     pub fn json(self) -> String {
         format!(
-            "{{\"p1_input_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p3_input_reads\":{},\"p3_guard_active_reads\":{},\"system_input_reads\":{},\"system_coin_active_reads\":{},\"system_start_active_reads\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"has_play_control_activity\":{}}}",
+            "{{\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p3_input_reads\":{},\"p3_guard_active_reads\":{},\"system_input_reads\":{},\"system_coin_active_reads\":{},\"system_start_active_reads\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"has_direction_activity\":{},\"has_play_control_activity\":{},\"has_full_control_activity\":{}}}",
             self.p1_input_reads,
+            self.p1_up_active_reads,
+            self.p1_down_active_reads,
+            self.p1_left_active_reads,
+            self.p1_right_active_reads,
+            self.p1_start_active_reads,
             self.p1_punch_active_reads,
             self.p1_kick_active_reads,
             self.p1_beast_active_reads,
@@ -73,7 +94,9 @@ impl NativeInputActivity {
             self.system_start_active_reads,
             self.coin_register_reads,
             self.coin_register_active_reads,
-            self.has_play_control_activity()
+            self.has_direction_activity(),
+            self.has_play_control_activity(),
+            self.has_full_control_activity()
         )
     }
 }
@@ -2345,6 +2368,11 @@ impl ZnBoard {
     fn input_activity(&self) -> NativeInputActivity {
         NativeInputActivity {
             p1_input_reads: self.p1_input_reads.get(),
+            p1_up_active_reads: self.p1_up_active_reads.get(),
+            p1_down_active_reads: self.p1_down_active_reads.get(),
+            p1_left_active_reads: self.p1_left_active_reads.get(),
+            p1_right_active_reads: self.p1_right_active_reads.get(),
+            p1_start_active_reads: self.p1_start_active_reads.get(),
             p1_punch_active_reads: self.p1_punch_active_reads.get(),
             p1_kick_active_reads: self.p1_kick_active_reads.get(),
             p1_beast_active_reads: self.p1_beast_active_reads.get(),
@@ -2372,6 +2400,7 @@ impl ZnBoard {
         increment_if(&self.p1_down_active_reads, self.input.down);
         increment_if(&self.p1_left_active_reads, self.input.left);
         increment_if(&self.p1_right_active_reads, self.input.right);
+        increment_if(&self.p1_start_active_reads, self.input.start);
         increment_if(&self.p1_punch_active_reads, self.input.punch);
         increment_if(&self.p1_kick_active_reads, self.input.kick);
         increment_if(&self.p1_beast_active_reads, self.input.beast);
@@ -2424,6 +2453,7 @@ fn active_low_player1_input(input: ActionButtons) -> u32 {
     clear_bit_if(&mut value, 0x0000_0010, input.punch);
     clear_bit_if(&mut value, 0x0000_0020, input.kick);
     clear_bit_if(&mut value, 0x0000_0040, input.beast);
+    clear_bit_if(&mut value, 0x0000_0100, input.start);
     value
 }
 
@@ -2644,7 +2674,7 @@ mod tests {
     use super::{
         BR2_DRAW_SYNC_FLAG_VIRTUAL, Bus, DMA_GPU_COMPLETION_DELAY_CYCLES,
         DMA_MDEC_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT, GPU_LINKED_LIST_NODE_LIMIT,
-        gpu_linked_list_command_ranges,
+        NativeInputActivity, gpu_linked_list_command_ranges,
     };
     use crate::action::ActionButtons;
     use crate::native::io::{
@@ -2712,16 +2742,51 @@ mod tests {
         assert_eq!(bus.io.controller.p1_state & 0x0010, 0);
         assert_eq!(bus.io.controller.p1_state & 0x4000, 0);
         let p1 = bus.read_u16(0x1fa0_0000);
-        assert_eq!(p1 & 0x0011, 0);
-        assert_eq!(p1 & 0x0100, 0x0100);
+        assert_eq!(p1 & 0x0111, 0);
         assert_eq!(bus.read_u8(0x1fa0_0200), 0xff);
         assert_eq!(bus.read_u8(0x1fa0_0300) & 0x31, 0);
         assert_eq!(bus.read_u8(0x1fa1_0000) & 0x10, 0);
         let board_json = bus.zn_board_json();
         assert!(board_json.contains("\"p1_up_active_reads\":1"));
-        assert!(board_json.contains("\"p1_start_active_reads\":0"));
+        assert!(board_json.contains("\"p1_start_active_reads\":1"));
         assert!(board_json.contains("\"p1_punch_active_reads\":1"));
         assert!(board_json.contains("\"p3_guard_active_reads\":1"));
+    }
+
+    #[test]
+    fn input_activity_reports_direction_and_full_control_status() {
+        let no_activity = NativeInputActivity::default();
+        assert!(!no_activity.has_direction_activity());
+        assert!(!no_activity.has_play_control_activity());
+        assert!(!no_activity.has_full_control_activity());
+
+        let full_activity = NativeInputActivity {
+            p1_input_reads: 8,
+            p1_up_active_reads: 1,
+            p1_down_active_reads: 1,
+            p1_left_active_reads: 1,
+            p1_right_active_reads: 1,
+            p1_start_active_reads: 1,
+            p1_punch_active_reads: 1,
+            p1_kick_active_reads: 1,
+            p1_beast_active_reads: 1,
+            p3_input_reads: 1,
+            p3_guard_active_reads: 1,
+            system_input_reads: 2,
+            system_coin_active_reads: 1,
+            system_start_active_reads: 1,
+            coin_register_reads: 1,
+            coin_register_active_reads: 1,
+        };
+
+        assert!(full_activity.has_direction_activity());
+        assert!(full_activity.has_play_control_activity());
+        assert!(full_activity.has_full_control_activity());
+
+        let json = full_activity.json();
+        assert!(json.contains("\"has_direction_activity\":true"));
+        assert!(json.contains("\"has_play_control_activity\":true"));
+        assert!(json.contains("\"has_full_control_activity\":true"));
     }
 
     #[test]

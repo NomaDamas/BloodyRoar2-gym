@@ -13,9 +13,10 @@ pub use env::{BloodyRoar2Env, StepResult};
 pub use mame::{MameConfig, MameRuntime};
 pub use native::{
     GenericNativePlatform, NativeBackend, NativeDisplayFrame, NativeEmulator,
-    NativeGpuDisplayCandidate, NativePlatformInfo, NativeRomAssetExpectation, NativeRomAssetMatch,
-    NativeRomAssetMismatch, NativeRomCompatibilityReport, NativeRomDuplicateAsset, NativeRomEntry,
-    NativeRomSet, NativeTraceConfig, native_platform_json, preferred_platform_info,
+    NativeGpuDisplayCandidate, NativeInputActivity, NativePlatformInfo, NativeRomAssetExpectation,
+    NativeRomAssetMatch, NativeRomAssetMismatch, NativeRomCompatibilityReport,
+    NativeRomDuplicateAsset, NativeRomEntry, NativeRomSet, NativeTraceConfig, native_platform_json,
+    preferred_platform_info,
 };
 pub use protocol::{action_space_json, api_index_json, observation_space_json};
 pub use zinc::{ZincConfig, ZincRuntime};

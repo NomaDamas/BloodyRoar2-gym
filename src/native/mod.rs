@@ -8,6 +8,7 @@ pub mod platform;
 pub mod romset;
 
 pub use backend::NativeBackend;
+pub use bus::NativeInputActivity;
 pub use emulator::{NativeDisplayFrame, NativeEmulator, NativeTraceConfig};
 pub use io::NativeGpuDisplayCandidate;
 pub use platform::{

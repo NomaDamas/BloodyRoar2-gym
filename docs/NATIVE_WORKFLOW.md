@@ -195,6 +195,22 @@ Expected success evidence includes:
 - `state.native_playability.actual_display.detail_edges` above the reported
   detail threshold implied by the current display size.
 
+This check is an input/progress smoke test. It is not by itself proof that the
+full 3D scene is being composed correctly on the final display.
+
+Run the stricter health gate when validating native emulator completeness:
+
+```sh
+cargo run --release -- native-health-check assets/roms 500000
+```
+
+`native-health-check` branches from the autoplay checkpoint through up, down,
+left, right, punch, kick, beast, and guard. It reports whether every action was
+read by the game I/O, whether rendered frames contain visible/detail content,
+and whether each branch remains a native playable candidate. A non-zero exit
+with `overall_status:"partial"` means the macOS core and controls are running
+but the native renderer or branch stability is not yet complete.
+
 Open the native macOS play window:
 
 ```sh
@@ -226,13 +242,13 @@ cargo run --release -- native-play assets/roms 500000 2 700
 Capture a deterministic visual artifact for review:
 
 ```sh
-cargo run --release -- native-scripted-dump assets/roms 500000 tmp/native-validation/final-native-play-check noop:300 coin:30 noop:120 start:300 noop:120 punch:60
+cargo run --release -- native-scripted-dump assets/roms 500000 tmp/native-validation/final-native-play-check noop:300 coin:30 noop:120 start:300 noop:120 punch:60 kick:60 beast:60 guard:60
 ```
 
 Inspect `tmp/native-validation/final-native-play-check.actual-display.png`.
 `display.png` and `observation.png` may intentionally use cached fallback
-frames for Gym-style observations, so they are not sufficient proof of native
-gameplay. Keep `tmp/` untracked.
+frames for Gym-style observations, so they are not sufficient proof of complete
+native gameplay. Keep `tmp/` untracked.
 
 ## 7. Asset Compliance
 
