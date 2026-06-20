@@ -349,7 +349,33 @@ fn run() -> Result<(), String> {
                         .map_err(|_| "max_frames must be a positive integer".to_string())
                 })
                 .transpose()?;
-            run_native_play(rom, instructions_per_frame.max(1), scale, max_frames)
+            run_native_play(
+                rom,
+                instructions_per_frame.max(1),
+                scale,
+                max_frames,
+                Vec::new(),
+            )
+        }
+        "native-autoplay" => {
+            let rom = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let instructions_per_frame = args
+                .next()
+                .unwrap_or_else(|| "500000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let scale = parse_native_window_scale(args.next())?;
+            let (max_frames, segments) = parse_native_autoplay_tail(args.collect::<Vec<_>>())?;
+            run_native_play(
+                rom,
+                instructions_per_frame.max(1),
+                scale,
+                max_frames,
+                segments,
+            )
         }
         "native-input-check" => {
             let rom = args
@@ -363,52 +389,7 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let mut emulator =
                 NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
-            let segments = [
-                NativeScriptSegment {
-                    action: Action::Noop,
-                    frames: 300,
-                },
-                NativeScriptSegment {
-                    action: Action::Coin,
-                    frames: 30,
-                },
-                NativeScriptSegment {
-                    action: Action::Noop,
-                    frames: 120,
-                },
-                NativeScriptSegment {
-                    action: Action::Start,
-                    frames: 300,
-                },
-                NativeScriptSegment {
-                    action: Action::Noop,
-                    frames: 60,
-                },
-                NativeScriptSegment {
-                    action: Action::Right,
-                    frames: 30,
-                },
-                NativeScriptSegment {
-                    action: Action::Noop,
-                    frames: 60,
-                },
-                NativeScriptSegment {
-                    action: Action::Punch,
-                    frames: 60,
-                },
-                NativeScriptSegment {
-                    action: Action::Kick,
-                    frames: 60,
-                },
-                NativeScriptSegment {
-                    action: Action::Beast,
-                    frames: 60,
-                },
-                NativeScriptSegment {
-                    action: Action::Guard,
-                    frames: 60,
-                },
-            ];
+            let segments = default_native_play_script();
             let instructions_per_frame = instructions_per_frame.max(1);
             let mut total_frames = 0u64;
             let mut observed_native_playable_candidate = false;
@@ -1272,11 +1253,18 @@ fn run_native_play(
     instructions_per_frame: u64,
     scale: Scale,
     max_frames: Option<u64>,
+    script_segments: Vec<NativeScriptSegment>,
 ) -> Result<(), String> {
     let mut emulator = NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
     let initial_frame = emulator.display_frame();
+    let autoplay_enabled = !script_segments.is_empty();
+    let title = if autoplay_enabled {
+        "Bloody Roar 2 native Rust autoplay - scripted boot then keyboard controls, Esc quit"
+    } else {
+        "Bloody Roar 2 native Rust - arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit"
+    };
     let mut window = Window::new(
-        "Bloody Roar 2 native Rust - arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit",
+        title,
         initial_frame.width,
         initial_frame.height,
         WindowOptions {
@@ -1300,12 +1288,26 @@ fn run_native_play(
     let mut first_native_playable_frame =
         observed_native_playable_candidate.then_some(rendered_frames);
     let mut last_native_playable_frame = first_native_playable_frame;
+    let mut script_segment_index = 0usize;
+    let mut script_segment_frame = 0u64;
+    let mut scripted_frames = 0u64;
     while window.is_open()
         && !window.is_key_down(Key::Escape)
         && !emulator.is_terminal()
         && max_frames.is_none_or(|max_frames| rendered_frames < max_frames)
     {
-        emulator.set_input(native_window_buttons(&window));
+        let scripted_action = next_scripted_action(
+            &script_segments,
+            &mut script_segment_index,
+            &mut script_segment_frame,
+        );
+        let buttons = if let Some(action) = scripted_action {
+            scripted_frames += 1;
+            action.buttons()
+        } else {
+            native_window_buttons(&window)
+        };
+        emulator.set_input(buttons);
         emulator.step_until_next_vblank(instructions_per_frame);
         let frame = emulator.display_frame();
         window
@@ -1321,12 +1323,19 @@ fn run_native_play(
 
     let final_native_playable_candidate = emulator.native_playable_candidate();
     let input_controls_active = emulator.has_play_control_activity();
+    let native_play_input_verified = observed_native_playable_candidate && input_controls_active;
+    let autoplay_script_completed = autoplay_enabled
+        && native_script_completed(&script_segments, script_segment_index, script_segment_frame);
     let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
     let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
     println!(
-        "{{\"rendered_frames\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"playable\":{},\"state\":{}}}",
+        "{{\"rendered_frames\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_segments\":[{}],\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"native_play_input_verified\":{},\"playable\":{},\"state\":{}}}",
         rendered_frames,
         emulator.executed_steps(),
+        autoplay_enabled,
+        autoplay_script_completed,
+        scripted_frames,
+        native_script_segments_json(&script_segments),
         emulator.input_activity_json(),
         observed_native_playable_candidate,
         observed_native_playable_candidate,
@@ -1334,10 +1343,42 @@ fn run_native_play(
         last_native_playable_frame,
         final_native_playable_candidate,
         input_controls_active,
-        observed_native_playable_candidate,
+        native_play_input_verified,
+        if autoplay_enabled {
+            native_play_input_verified
+        } else {
+            observed_native_playable_candidate
+        },
         emulator.probe_json()
     );
     Ok(())
+}
+
+fn next_scripted_action(
+    segments: &[NativeScriptSegment],
+    segment_index: &mut usize,
+    segment_frame: &mut u64,
+) -> Option<Action> {
+    loop {
+        let segment = segments.get(*segment_index)?;
+        if *segment_frame < segment.frames {
+            *segment_frame += 1;
+            return Some(segment.action);
+        }
+        *segment_index += 1;
+        *segment_frame = 0;
+    }
+}
+
+fn native_script_completed(
+    segments: &[NativeScriptSegment],
+    segment_index: usize,
+    segment_frame: u64,
+) -> bool {
+    let Some(segment) = segments.get(segment_index) else {
+        return true;
+    };
+    segment_index + 1 == segments.len() && segment_frame >= segment.frames
 }
 
 fn optional_u64_json(value: Option<u64>) -> String {
@@ -1379,7 +1420,7 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-screen-dump [rom_zip] [instruction_count] [output_prefix]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-play controls: arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit. max_frames is optional and intended for smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-screen-dump [rom_zip] [instruction_count] [output_prefix]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-play controls: arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit. max_frames is optional and intended for smoke tests. native-autoplay runs the built-in boot/control script first, then falls back to keyboard control.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
@@ -1400,6 +1441,85 @@ fn parse_native_script_segments(values: Vec<String>) -> Result<Vec<NativeScriptS
         .into_iter()
         .map(|value| parse_native_script_segment(&value))
         .collect()
+}
+
+fn default_native_play_script() -> Vec<NativeScriptSegment> {
+    vec![
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 300,
+        },
+        NativeScriptSegment {
+            action: Action::Coin,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 120,
+        },
+        NativeScriptSegment {
+            action: Action::Start,
+            frames: 300,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::Right,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::Punch,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::Kick,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::Beast,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::Guard,
+            frames: 60,
+        },
+    ]
+}
+
+fn parse_native_autoplay_tail(
+    values: Vec<String>,
+) -> Result<(Option<u64>, Vec<NativeScriptSegment>), String> {
+    if values.is_empty() {
+        return Ok((None, default_native_play_script()));
+    }
+
+    let first_is_segment = values.first().is_some_and(|value| value.contains(':'));
+    let (max_frames, segment_values) = if first_is_segment {
+        (None, values)
+    } else {
+        let max_frames = values
+            .first()
+            .expect("non-empty values")
+            .parse::<u64>()
+            .map_err(|_| "max_frames must be a positive integer or action:frames".to_string())?;
+        if max_frames == 0 {
+            return Err("max_frames must be greater than zero".to_string());
+        }
+        (Some(max_frames), values.into_iter().skip(1).collect())
+    };
+
+    let segments = if segment_values.is_empty() {
+        default_native_play_script()
+    } else {
+        parse_native_script_segments(segment_values)?
+    };
+    Ok((max_frames, segments))
 }
 
 fn parse_native_script_trace_segments(
@@ -1766,7 +1886,10 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeScriptSegment, parse_action_token, parse_native_script_segments};
+    use super::{
+        NativeScriptSegment, native_script_completed, next_scripted_action, parse_action_token,
+        parse_native_autoplay_tail, parse_native_script_segments,
+    };
     use bloodyroar2_gym::Action;
 
     #[test]
@@ -1796,5 +1919,81 @@ mod tests {
         assert!(parse_native_script_segments(vec!["coin".to_string()]).is_err());
         assert!(parse_native_script_segments(vec!["coin:0".to_string()]).is_err());
         assert!(parse_action_token("999").is_err());
+    }
+
+    #[test]
+    fn parses_native_autoplay_tail_with_default_and_custom_script() {
+        let (max_frames, default_segments) =
+            parse_native_autoplay_tail(Vec::new()).expect("default autoplay parses");
+        assert_eq!(max_frames, None);
+        assert_eq!(
+            default_segments.first().expect("first segment").action,
+            Action::Noop
+        );
+        assert!(default_segments.len() > 1);
+
+        let (max_frames, custom_segments) = parse_native_autoplay_tail(vec![
+            "120".to_string(),
+            "coin:2".to_string(),
+            "start:3".to_string(),
+        ])
+        .expect("custom autoplay parses");
+        assert_eq!(max_frames, Some(120));
+        assert_eq!(
+            custom_segments,
+            vec![
+                NativeScriptSegment {
+                    action: Action::Coin,
+                    frames: 2
+                },
+                NativeScriptSegment {
+                    action: Action::Start,
+                    frames: 3
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn scripted_action_advances_across_segments() {
+        let segments = vec![
+            NativeScriptSegment {
+                action: Action::Coin,
+                frames: 2,
+            },
+            NativeScriptSegment {
+                action: Action::Start,
+                frames: 1,
+            },
+        ];
+        let mut segment_index = 0;
+        let mut segment_frame = 0;
+
+        assert_eq!(
+            next_scripted_action(&segments, &mut segment_index, &mut segment_frame),
+            Some(Action::Coin)
+        );
+        assert_eq!(
+            next_scripted_action(&segments, &mut segment_index, &mut segment_frame),
+            Some(Action::Coin)
+        );
+        assert_eq!(
+            next_scripted_action(&segments, &mut segment_index, &mut segment_frame),
+            Some(Action::Start)
+        );
+        assert!(native_script_completed(
+            &segments,
+            segment_index,
+            segment_frame
+        ));
+        assert_eq!(
+            next_scripted_action(&segments, &mut segment_index, &mut segment_frame),
+            None
+        );
+        assert!(native_script_completed(
+            &segments,
+            segment_index,
+            segment_frame
+        ));
     }
 }

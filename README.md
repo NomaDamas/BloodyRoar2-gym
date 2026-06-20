@@ -82,10 +82,16 @@ Run the Rust-native Apple Silicon play window with legally supplied local assets
 
 ```sh
 cargo run -- native-input-check assets/roms 500000
+cargo run -- native-autoplay assets/roms 500000 2
 cargo run -- native-play assets/roms 500000 2
 ```
 
-`native-play` controls:
+`native-autoplay` opens the same macOS window, runs the built-in coin/start and
+fighter-control script until a playable candidate is observed, then falls back
+to keyboard control. Use `native-play` when you want fully manual input from
+boot.
+
+Window controls:
 
 - Arrows: move.
 - `Z`: punch.
@@ -99,6 +105,7 @@ cargo run -- native-play assets/roms 500000 2
 For automated smoke tests, pass an optional frame limit:
 
 ```sh
+cargo run -- native-autoplay assets/roms 500000 2 1140
 cargo run -- native-play assets/roms 500000 2 700
 ```
 

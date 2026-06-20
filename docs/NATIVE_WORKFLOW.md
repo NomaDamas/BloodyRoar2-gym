@@ -198,8 +198,12 @@ Expected success evidence includes:
 Open the native macOS play window:
 
 ```sh
+cargo run --release -- native-autoplay assets/roms 500000 2
 cargo run --release -- native-play assets/roms 500000 2
 ```
+
+`native-autoplay` runs the built-in coin/start/control script first, then returns
+control to the keyboard. Use `native-play` when you want manual input from boot.
 
 Controls:
 
@@ -215,6 +219,7 @@ Controls:
 For non-interactive smoke validation, pass a frame limit:
 
 ```sh
+cargo run --release -- native-autoplay assets/roms 500000 2 1140
 cargo run --release -- native-play assets/roms 500000 2 700
 ```
 
