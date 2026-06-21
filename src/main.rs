@@ -9,6 +9,9 @@ use bloodyroar2_gym::{
 };
 use minifb::{Key, Scale, Window, WindowOptions};
 
+const NATIVE_PLAY_MIN_WINDOW_WIDTH: usize = 512;
+const NATIVE_PLAY_MIN_WINDOW_HEIGHT: usize = 480;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -1323,7 +1326,8 @@ fn run_native_play(
     script_segments: Vec<NativeScriptSegment>,
 ) -> Result<(), String> {
     let mut emulator = NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
-    let initial_frame = emulator.display_frame();
+    let initial_raw_frame = emulator.display_frame();
+    let initial_frame = native_play_window_frame(&initial_raw_frame);
     let autoplay_enabled = !script_segments.is_empty();
     let title = if autoplay_enabled {
         "Bloody Roar 2 native Rust autoplay - scripted boot then keyboard controls, Esc quit"
@@ -1376,7 +1380,8 @@ fn run_native_play(
         };
         emulator.set_input(buttons);
         emulator.step_until_next_vblank(instructions_per_frame);
-        let frame = emulator.display_frame();
+        let raw_frame = emulator.display_frame();
+        let frame = native_play_window_frame(&raw_frame);
         window
             .update_with_buffer(&frame.pixels, frame.width, frame.height)
             .map_err(|error| format!("failed to update native play window: {error:?}"))?;
@@ -1389,10 +1394,12 @@ fn run_native_play(
     }
 
     let final_native_playable_candidate = emulator.native_playable_candidate();
-    let final_frame = emulator.display_frame();
+    let final_raw_frame = emulator.display_frame();
+    let final_frame = native_play_window_frame(&final_raw_frame);
     let final_frame_stats = NativeFrameStats::from_frame(&final_frame);
     let final_frame_full_size = final_frame.width >= 512 && final_frame.height >= 480;
     let final_frame_render_verified = final_frame_full_size && final_frame_stats.has_scene_detail();
+    let final_window_size = window.get_size();
     let input_activity = emulator.input_activity();
     let input_controls_active = input_activity.has_play_control_activity();
     let full_controls_active = input_activity.has_full_control_activity();
@@ -1405,13 +1412,18 @@ fn run_native_play(
     let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
     let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
     println!(
-        "{{\"rendered_frames\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_segments\":[{}],\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
+        "{{\"rendered_frames\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_segments\":[{}],\"initial_raw_frame\":{},\"initial_window_frame\":{},\"final_raw_frame\":{},\"final_window_size\":{{\"width\":{},\"height\":{}}},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
         rendered_frames,
         emulator.executed_steps(),
         autoplay_enabled,
         autoplay_script_completed,
         scripted_frames,
         native_script_segments_json(&script_segments),
+        NativeFrameStats::from_frame(&initial_raw_frame).json(),
+        NativeFrameStats::from_frame(&initial_frame).json(),
+        NativeFrameStats::from_frame(&final_raw_frame).json(),
+        final_window_size.0,
+        final_window_size.1,
         input_activity.json(),
         final_native_playable_candidate,
         observed_native_playable_candidate,
@@ -1429,6 +1441,30 @@ fn run_native_play(
         emulator.probe_json()
     );
     Ok(())
+}
+
+fn native_play_window_frame(frame: &NativeDisplayFrame) -> NativeDisplayFrame {
+    let width = frame.width.max(NATIVE_PLAY_MIN_WINDOW_WIDTH);
+    let height = frame.height.max(NATIVE_PLAY_MIN_WINDOW_HEIGHT);
+    if width == frame.width && height == frame.height {
+        return frame.clone();
+    }
+
+    let mut pixels = vec![0; width.saturating_mul(height)];
+    let copy_width = frame.width.min(width);
+    let copy_height = frame.height.min(height);
+    for y in 0..copy_height {
+        let source_start = y.saturating_mul(frame.width);
+        let target_start = y.saturating_mul(width);
+        pixels[target_start..target_start + copy_width]
+            .copy_from_slice(&frame.pixels[source_start..source_start + copy_width]);
+    }
+
+    NativeDisplayFrame {
+        width,
+        height,
+        pixels,
+    }
 }
 
 fn run_native_health_check(
@@ -2276,10 +2312,10 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         NativeScriptSegment, default_native_play_script, native_control_sweep_script,
-        native_script_completed, next_scripted_action, parse_action_token,
-        parse_native_autoplay_tail, parse_native_script_segments,
+        native_play_window_frame, native_script_completed, next_scripted_action,
+        parse_action_token, parse_native_autoplay_tail, parse_native_script_segments,
     };
-    use bloodyroar2_gym::Action;
+    use bloodyroar2_gym::{Action, NativeDisplayFrame};
 
     #[test]
     fn parses_native_script_segments_by_index_and_name() {
@@ -2410,6 +2446,22 @@ mod tests {
                 Action::Guard
             ]
         );
+    }
+
+    #[test]
+    fn native_play_window_frame_pads_partial_boot_frame_to_full_window() {
+        let source = NativeDisplayFrame {
+            width: 512,
+            height: 240,
+            pixels: vec![0x00ff_ffff; 512 * 240],
+        };
+
+        let padded = native_play_window_frame(&source);
+
+        assert_eq!((padded.width, padded.height), (512, 480));
+        assert_eq!(padded.pixels.len(), 512 * 480);
+        assert_eq!(padded.pixels[0], 0x00ff_ffff);
+        assert_eq!(padded.pixels[512 * 240], 0);
     }
 
     #[test]
