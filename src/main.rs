@@ -413,26 +413,58 @@ fn run() -> Result<(), String> {
                     break;
                 }
             }
-            let input_activity = emulator.input_activity_json();
-            let final_native_playable_candidate = emulator.native_playable_candidate();
-            let input_controls_active = emulator.has_play_control_activity();
-            let playable = observed_native_playable_candidate && input_controls_active;
+            let checkpoint = emulator.clone();
+            let mut control_sweep = checkpoint.clone();
+            let mut control_sweep_frames = 0u64;
+            if observed_native_playable_candidate && !emulator.is_terminal() {
+                let control_sweep_segments = native_control_sweep_script(18, 18);
+                for segment in &control_sweep_segments {
+                    control_sweep.set_input(segment.action.buttons());
+                    for _ in 0..segment.frames {
+                        control_sweep.step_until_next_vblank(instructions_per_frame);
+                        control_sweep_frames += 1;
+                        let sweep_total_frames = total_frames + control_sweep_frames;
+                        if control_sweep.native_playable_candidate() {
+                            first_native_playable_frame.get_or_insert(sweep_total_frames);
+                            last_native_playable_frame = Some(sweep_total_frames);
+                        }
+                        if control_sweep.is_terminal() {
+                            break;
+                        }
+                    }
+                    if control_sweep.is_terminal() {
+                        break;
+                    }
+                }
+            }
+            let total_frames_with_sweep = total_frames + control_sweep_frames;
+            let input_activity = control_sweep.input_activity();
+            let final_native_playable_candidate = checkpoint.native_playable_candidate();
+            let control_sweep_native_playable_candidate = control_sweep.native_playable_candidate();
+            let input_controls_active = input_activity.has_play_control_activity();
+            let full_controls_active = input_activity.has_full_control_activity();
+            let playable = observed_native_playable_candidate && full_controls_active;
             let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
             let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
             println!(
-                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"playable\":{},\"state\":{}}}",
+                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"control_sweep_frames\":{},\"checkpoint_executed_steps\":{},\"control_sweep_executed_steps\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"control_sweep_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"playable\":{},\"state\":{}}}",
                 instructions_per_frame,
-                total_frames,
-                emulator.executed_steps(),
-                input_activity,
-                observed_native_playable_candidate,
+                total_frames_with_sweep,
+                control_sweep_frames,
+                checkpoint.executed_steps(),
+                control_sweep.executed_steps(),
+                checkpoint.executed_steps(),
+                input_activity.json(),
+                final_native_playable_candidate,
                 observed_native_playable_candidate,
                 first_native_playable_frame,
                 last_native_playable_frame,
                 final_native_playable_candidate,
+                control_sweep_native_playable_candidate,
                 input_controls_active,
+                full_controls_active,
                 playable,
-                emulator.probe_json()
+                checkpoint.probe_json()
             );
             if playable {
                 Ok(())
@@ -1357,33 +1389,43 @@ fn run_native_play(
     }
 
     let final_native_playable_candidate = emulator.native_playable_candidate();
-    let input_controls_active = emulator.has_play_control_activity();
+    let final_frame = emulator.display_frame();
+    let final_frame_stats = NativeFrameStats::from_frame(&final_frame);
+    let final_frame_full_size = final_frame.width >= 512 && final_frame.height >= 480;
+    let final_frame_render_verified = final_frame_full_size && final_frame_stats.has_scene_detail();
+    let input_activity = emulator.input_activity();
+    let input_controls_active = input_activity.has_play_control_activity();
+    let full_controls_active = input_activity.has_full_control_activity();
     let native_play_input_verified = observed_native_playable_candidate && input_controls_active;
+    let native_play_full_input_verified =
+        observed_native_playable_candidate && full_controls_active;
+    let playable = observed_native_playable_candidate && final_frame_render_verified;
     let autoplay_script_completed = autoplay_enabled
         && native_script_completed(&script_segments, script_segment_index, script_segment_frame);
     let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
     let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
     println!(
-        "{{\"rendered_frames\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_segments\":[{}],\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"native_play_input_verified\":{},\"playable\":{},\"state\":{}}}",
+        "{{\"rendered_frames\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_segments\":[{}],\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
         rendered_frames,
         emulator.executed_steps(),
         autoplay_enabled,
         autoplay_script_completed,
         scripted_frames,
         native_script_segments_json(&script_segments),
-        emulator.input_activity_json(),
-        observed_native_playable_candidate,
+        input_activity.json(),
+        final_native_playable_candidate,
         observed_native_playable_candidate,
         first_native_playable_frame,
         last_native_playable_frame,
         final_native_playable_candidate,
         input_controls_active,
+        full_controls_active,
         native_play_input_verified,
-        if autoplay_enabled {
-            native_play_input_verified
-        } else {
-            observed_native_playable_candidate
-        },
+        native_play_full_input_verified,
+        final_frame_full_size,
+        final_frame_render_verified,
+        final_frame_stats.json(),
+        playable,
         emulator.probe_json()
     );
     Ok(())
@@ -1461,7 +1503,8 @@ fn run_native_health_check(
     let control_sweep_native_playable = control_sweep.native_playable_candidate();
 
     let native_core_running = checkpoint.executed_steps() > 0 && !checkpoint.is_terminal();
-    let play_controls_active = checkpoint_activity.has_play_control_activity();
+    let play_controls_active = checkpoint_activity.has_play_control_activity()
+        || control_sweep_activity.has_play_control_activity();
     let full_controls_active = control_sweep_activity.has_full_control_activity();
     let all_branches_native_playable =
         branch_native_playable_count == native_health_branch_actions().len();
@@ -1475,10 +1518,8 @@ fn run_native_health_check(
         || branch_full_scene_count > 0;
     let full_scene_rendering =
         checkpoint_full_scene || control_sweep_full_scene || branch_full_scene_count > 0;
-    let known_rendering_gap = rendering_present
-        && (!full_scene_rendering
-            || !all_branches_native_playable
-            || !control_sweep_native_playable);
+    let known_rendering_gap =
+        rendering_present && (!full_scene_rendering || !all_branches_native_playable);
     let overall_pass = native_core_running
         && play_controls_active
         && full_controls_active
@@ -1797,19 +1838,7 @@ fn default_native_play_script() -> Vec<NativeScriptSegment> {
         },
         NativeScriptSegment {
             action: Action::Punch,
-            frames: 60,
-        },
-        NativeScriptSegment {
-            action: Action::Kick,
-            frames: 60,
-        },
-        NativeScriptSegment {
-            action: Action::Beast,
-            frames: 60,
-        },
-        NativeScriptSegment {
-            action: Action::Guard,
-            frames: 60,
+            frames: 3,
         },
     ]
 }
@@ -2315,7 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn default_native_play_script_avoids_direction_probe_side_effects() {
+    fn default_native_play_script_reaches_stable_character_select_without_control_sweep() {
         let segments = default_native_play_script();
 
         assert!(
@@ -2333,25 +2362,22 @@ mod tests {
                 .iter()
                 .any(|segment| segment.action == Action::Punch)
         );
-        assert!(
-            segments
-                .iter()
-                .any(|segment| segment.action == Action::Kick)
-        );
-        assert!(
-            segments
-                .iter()
-                .any(|segment| segment.action == Action::Beast)
-        );
-        assert!(
-            segments
-                .iter()
-                .any(|segment| segment.action == Action::Guard)
-        );
+        assert_eq!(segments.last().expect("last segment").action, Action::Punch);
+        assert_eq!(segments.last().expect("last segment").frames, 3);
         assert!(!segments.iter().any(|segment| matches!(
             segment.action,
-            Action::Up | Action::Down | Action::Left | Action::Right
+            Action::Up
+                | Action::Down
+                | Action::Left
+                | Action::Right
+                | Action::Kick
+                | Action::Beast
+                | Action::Guard
         )));
+        assert_eq!(
+            segments.iter().map(|segment| segment.frames).sum::<u64>(),
+            873
+        );
         assert!(segments.windows(2).any(|window| {
             window[0].action == Action::Start
                 && window[1]
