@@ -83,14 +83,15 @@ Run the Rust-native Apple Silicon play window with legally supplied local assets
 ```sh
 cargo run -- native-input-check assets/roms 500000
 cargo run -- native-health-check assets/roms 500000
-cargo run -- native-autoplay assets/roms 500000 2
 cargo run -- native-play assets/roms 500000 2
+cargo run -- native-autoplay assets/roms 500000 2
 ```
 
-`native-autoplay` opens the same macOS window, runs the built-in coin/start and
-fighter-control script until a playable candidate is observed, then falls back
-to keyboard control. Use `native-play` when you want fully manual input from
-boot.
+`native-play` opens the macOS window, runs the built-in coin/start boot script
+to bypass the two warning screens and black transition, then falls back to
+keyboard control. Use `native-manual` only when you want fully manual input from
+boot. `native-autoplay` uses the same window path and also accepts an explicit
+script tail for smoke and control-sweep validation.
 `native-health-check` is stricter than the autoplay smoke path: it verifies the
 CPU core, mapped controls, rendered frame statistics, and per-action branch
 stability. It exits non-zero when the native renderer still has a full-scene
@@ -110,8 +111,9 @@ Window controls:
 For automated smoke tests, pass an optional frame limit:
 
 ```sh
+cargo run -- native-play assets/roms 500000 2 900
 cargo run -- native-autoplay assets/roms 500000 2 1140
-cargo run -- native-play assets/roms 500000 2 700
+cargo run -- native-manual assets/roms 500000 2 700
 ```
 
 Install MAME if you also want an external compatibility reference:
