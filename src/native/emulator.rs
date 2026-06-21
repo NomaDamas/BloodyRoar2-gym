@@ -94,6 +94,7 @@ impl NativeEmulator {
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
         let mut recent_steps = Vec::new();
+        let mut stop_pc_hits_to_skip = config.stop_pc_skip;
         let start_steps = self.executed_steps;
 
         for _ in 0..count {
@@ -102,7 +103,16 @@ impl NativeEmulator {
             if let StepOutcome::Unsupported(instruction) = report.outcome {
                 *unsupported.entry(instruction).or_insert(0) += 1;
             }
-            let reached_stop_pc = config.stop_pc.is_some_and(|pc| report.start_pc == pc);
+            let reached_stop_pc = if config.stop_pc.is_some_and(|pc| report.start_pc == pc) {
+                if stop_pc_hits_to_skip > 0 {
+                    stop_pc_hits_to_skip -= 1;
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
             let reached_low_pc = config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
 
             if recent_limit > 0 {
@@ -129,6 +139,73 @@ impl NativeEmulator {
         })
     }
 
+    pub fn trace_until_next_vblank(
+        &mut self,
+        max_instructions: u64,
+        hot_limit: usize,
+        recent_limit: usize,
+        config: NativeTraceConfig,
+    ) -> (NativeTrace, bool) {
+        self.bus.set_access_trace_limit(recent_limit.max(32));
+        self.bus.set_access_trace_watch_ranges(config.watch_ranges);
+        self.bus.set_access_trace_watch_only(config.watch_only);
+        let mut pc_counts = BTreeMap::new();
+        let mut unsupported = BTreeMap::new();
+        let mut recent_steps = Vec::new();
+        let mut stop_pc_hits_to_skip = config.stop_pc_skip;
+        let start_steps = self.executed_steps;
+        let start_vblank = self.bus.vblank_count();
+        let max_instructions = max_instructions.max(1);
+
+        while self.executed_steps - start_steps < max_instructions
+            && self.bus.vblank_count() == start_vblank
+            && self.last_outcome == StepOutcome::Continue
+        {
+            let report = self.step_instruction();
+            *pc_counts.entry(report.start_pc).or_insert(0) += 1;
+            if let StepOutcome::Unsupported(instruction) = report.outcome {
+                *unsupported.entry(instruction).or_insert(0) += 1;
+            }
+            let reached_stop_pc = if config.stop_pc.is_some_and(|pc| report.start_pc == pc) {
+                if stop_pc_hits_to_skip > 0 {
+                    stop_pc_hits_to_skip -= 1;
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            let reached_low_pc = config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
+
+            if recent_limit > 0 {
+                recent_steps.push(report);
+                if recent_steps.len() > recent_limit {
+                    recent_steps.remove(0);
+                }
+            }
+
+            if report.outcome != StepOutcome::Continue || reached_stop_pc || reached_low_pc {
+                break;
+            }
+        }
+
+        let vblank_advanced = self.bus.vblank_count() != start_vblank;
+        (
+            NativeTrace::new(NativeTraceParts {
+                requested_steps: max_instructions,
+                executed_steps: self.executed_steps - start_steps,
+                pc_counts,
+                unsupported,
+                recent_steps,
+                hot_limit,
+                bus_access_trace_json: self.bus.access_trace_json(),
+                state_json: self.json(),
+            }),
+            vblank_advanced,
+        )
+    }
+
     pub fn trace_scripted_frames(
         &mut self,
         instructions_per_frame: u64,
@@ -143,6 +220,7 @@ impl NativeEmulator {
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
         let mut recent_steps = Vec::new();
+        let mut stop_pc_hits_to_skip = config.stop_pc_skip;
         let start_steps = self.executed_steps;
         let instructions_per_frame = instructions_per_frame.max(1);
         let requested_steps = segments.iter().fold(0u64, |total, (_, frames)| {
@@ -158,7 +236,17 @@ impl NativeEmulator {
                     if let StepOutcome::Unsupported(instruction) = report.outcome {
                         *unsupported.entry(instruction).or_insert(0) += 1;
                     }
-                    let reached_stop_pc = config.stop_pc.is_some_and(|pc| report.start_pc == pc);
+                    let reached_stop_pc = if config.stop_pc.is_some_and(|pc| report.start_pc == pc)
+                    {
+                        if stop_pc_hits_to_skip > 0 {
+                            stop_pc_hits_to_skip -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    };
                     let reached_low_pc =
                         config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
 
@@ -220,7 +308,7 @@ impl NativeEmulator {
     }
 
     pub fn display_frame(&self) -> NativeDisplayFrame {
-        let (width, height, pixels) = self.bus.display_rgb_frame();
+        let (width, height, pixels) = self.bus.io.gpu.actual_display_rgb_frame();
         NativeDisplayFrame {
             width,
             height,
@@ -337,12 +425,40 @@ impl NativeEmulator {
             self.bus.native_playable_candidate()
         )
     }
+
+    pub fn compact_probe_json(&self) -> String {
+        format!(
+            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"status\":{},\"status_hex\":\"0x{:08x}\",\"cause\":{},\"cause_hex\":\"0x{:08x}\",\"epc\":{},\"epc_hex\":\"0x{:08x}\",\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{}}},\"runtime\":{},\"input_activity\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            self.cpu.pc,
+            self.cpu.pc,
+            self.cpu.cycles,
+            self.cpu.halted,
+            self.cpu.cp0[12],
+            self.cpu.cp0[12],
+            self.cpu.cp0[13],
+            self.cpu.cp0[13],
+            self.cpu.cp0[14],
+            self.cpu.cp0[14],
+            self.cpu.regs[2],
+            self.cpu.regs[3],
+            self.cpu.regs[4],
+            self.cpu.regs[5],
+            self.cpu.regs[6],
+            self.bus.runtime_compact_probe_json(),
+            self.bus.input_activity().json(),
+            self.rom_compatibility.summary_json(),
+            self.executed_steps,
+            self.last_outcome,
+            self.bus.native_playable_candidate()
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct NativeTraceConfig {
     pub stop_pc: Option<u32>,
     pub stop_below_pc: Option<u32>,
+    pub stop_pc_skip: u64,
     pub watch_ranges: Vec<(u32, u32)>,
     pub watch_only: bool,
 }
@@ -426,6 +542,37 @@ impl NativeTrace {
             self.state_json
         )
     }
+
+    pub fn compact_json(&self) -> String {
+        let hot_pcs = self
+            .hot_pcs
+            .iter()
+            .map(NativeTracePc::json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let unsupported_instructions = self
+            .unsupported_instructions
+            .iter()
+            .map(NativeTraceInstruction::json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let recent_steps = self
+            .recent_steps
+            .iter()
+            .map(StepReport::json)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "{{\"requested_steps\":{},\"executed_steps\":{},\"unique_pcs\":{},\"hot_pcs\":[{}],\"unsupported_instructions\":[{}],\"recent_steps\":[{}]}}",
+            self.requested_steps,
+            self.executed_steps,
+            self.unique_pcs,
+            hot_pcs,
+            unsupported_instructions,
+            recent_steps
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -477,6 +624,7 @@ fn optional_step_json(report: Option<StepReport>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Bus, Cpu, NativeEmulator, StepOutcome};
+    use crate::native::io::GPU_GP0;
     use crate::native::romset::NativeRomCompatibilityReport;
 
     fn program(instructions: &[u32]) -> Vec<u8> {
@@ -492,6 +640,23 @@ mod tests {
 
     fn r_type(rs: u32, rt: u32, rd: u32, shamt: u32, function: u32) -> u32 {
         (rs << 21) | (rt << 16) | (rd << 11) | (shamt << 6) | function
+    }
+
+    fn gp0_fill_rect(emulator: &mut NativeEmulator, color: u32, x: u32, y: u32, w: u32, h: u32) {
+        emulator.bus.io.write_u32(GPU_GP0, 0x0200_0000 | color);
+        emulator.bus.io.write_u32(GPU_GP0, (y << 16) | x);
+        emulator.bus.io.write_u32(GPU_GP0, (h << 16) | w);
+    }
+
+    fn test_emulator() -> NativeEmulator {
+        NativeEmulator {
+            cpu: Cpu::default(),
+            bus: Bus::new(Vec::new(), 2 * 1024 * 1024),
+            rom_compatibility: NativeRomCompatibilityReport::missing_all_required_assets(),
+            last_outcome: StepOutcome::Continue,
+            executed_steps: 0,
+            last_step: None,
+        }
     }
 
     #[test]
@@ -523,5 +688,43 @@ mod tests {
         assert!(json.contains("\"last_step\":{\"start_pc\":532676612"));
         assert!(json.contains("\"cycles_elapsed\":1"));
         assert!(json.contains("\"last_outcome\":\"Halted\""));
+    }
+
+    #[test]
+    fn display_frame_uses_resolved_display_instead_of_sparse_raw_actual() {
+        let mut emulator = test_emulator();
+        let (width, height) = emulator.bus.io.gpu.display_dimensions();
+
+        for x in (0..width as u32).step_by(4) {
+            let color = if x % 8 == 0 { 0x00ff_ffff } else { 0x0000_40ff };
+            gp0_fill_rect(&mut emulator, color, x, 0, 4, height as u32);
+        }
+        emulator.bus.io.gpu.capture_vblank_presented_frame();
+
+        gp0_fill_rect(
+            &mut emulator,
+            0x0000_0000,
+            0,
+            0,
+            width as u32,
+            height as u32,
+        );
+        gp0_fill_rect(
+            &mut emulator,
+            0x00ff_ffff,
+            (width - 64) as u32,
+            (height - 20) as u32,
+            56,
+            12,
+        );
+
+        let raw = emulator.bus.io.gpu.raw_actual_display_rgb_frame();
+        let resolved = emulator.bus.io.gpu.actual_display_rgb_frame();
+        let frame = emulator.display_frame();
+
+        assert_ne!(raw.2, resolved.2);
+        assert_eq!(frame.width, resolved.0);
+        assert_eq!(frame.height, resolved.1);
+        assert_eq!(frame.pixels, resolved.2);
     }
 }

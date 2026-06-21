@@ -13,6 +13,26 @@ const CAUSE_EXCODE_MASK: u32 = 0x1f << 2;
 const CAUSE_IP_MASK: u32 = 0xff << 8;
 const CAUSE_IP2: u32 = 1 << 10;
 const EXCEPTION_VECTOR: u32 = 0x8000_0080;
+const BIOS_EXCEPTION_VECTOR_PHYSICAL: u32 = 0x0000_0080;
+const BIOS_EXCEPTION_HANDLER_PHYSICAL: u32 = 0x0000_0c80;
+const BIOS_EXCEPTION_VECTOR_TO_C80_STUB: [u32; 4] =
+    [0x3c1a_0000, 0x275a_0c80, 0x0340_0008, 0x0000_0000];
+const BIOS_EXCEPTION_C80_KERNEL_HANDLER_PREFIX: [u32; 12] = [
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x241a_0100,
+    0x8f5a_0008,
+    0x0000_0000,
+    0x8f5a_0000,
+    0x0000_0000,
+    0x235a_0008,
+    0xaf41_0004,
+    0xaf42_0008,
+];
+const BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_START: u32 = 0x0000_0c80;
+const BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_END: u32 = 0x0000_0cac;
 const GTE_FRACTIONAL_BITS: u32 = 12;
 const GTE_FLAG_ERROR: u32 = 1 << 31;
 const GTE_FLAG_ERROR_BITS: u32 = 0x7f87_e000;
@@ -21,6 +41,231 @@ const GTE_FLAG_SZ_OTZ_SATURATED: u32 = 1 << 18;
 const GTE_FLAG_IR0_SATURATED: u32 = 1 << 12;
 const GTE_FLAG_SX2_SATURATED: u32 = 1 << 14;
 const GTE_FLAG_SY2_SATURATED: u32 = 1 << 13;
+const BIOS_DELAY_LOOP_START: u32 = 0x1fc0_a9b8;
+const BIOS_DELAY_LOOP_EXIT: u32 = 0x1fc0_a9d0;
+const BIOS_DELAY_PROLOGUE_LOOP_START: u32 = 0x1fc0_a9a0;
+const BIOS_DELAY_LOOP_KSEG1_START: u32 = 0xbfc0_a9b8;
+const BIOS_DELAY_LOOP_KSEG1_EXIT: u32 = 0xbfc0_a9d0;
+const BIOS_DELAY_PROLOGUE_LOOP_KSEG1_START: u32 = 0xbfc0_a9a0;
+const BIOS_SHORT_DELAY_LOOP_START: u32 = 0x1fc0_34a4;
+const BIOS_SHORT_DELAY_LOOP_EXIT: u32 = 0x1fc0_34bc;
+const BIOS_SHORT_DELAY_LOOP_KSEG1_START: u32 = 0xbfc0_34a4;
+const BIOS_SHORT_DELAY_LOOP_KSEG1_EXIT: u32 = 0xbfc0_34bc;
+const BIOS_DELAY_LOOP_MIN_SKIP_ITERATIONS: u32 = 1;
+const BIOS_DELAY_PROLOGUE_LOOP_CYCLES_PER_ITERATION: u64 = 9;
+const BIOS_DELAY_PROLOGUE_LOOP_INSTRUCTIONS: [u32; 6] = [
+    0x8fa2_0000, // lw v0, 0(sp)
+    0x8fae_0000, // lw t6, 0(sp)
+    0x0000_0000, // nop
+    0x25cf_ffff, // addiu t7, t6, -1
+    0x1040_0007, // beq v0, zero, BIOS_DELAY_LOOP_EXIT
+    0xafaf_0000, // sw t7, 0(sp)
+];
+const BIOS_DELAY_LOOP_INSTRUCTIONS: [u32; 6] = [
+    0x8fa2_0000, // lw v0, 0(sp)
+    0x8fb8_0000, // lw t8, 0(sp)
+    0x0000_0000, // nop
+    0x2719_ffff, // addiu t9, t8, -1
+    0x1440_fffb, // bne v0, zero, BIOS_DELAY_LOOP_START
+    0xafb9_0000, // sw t9, 0(sp)
+];
+const WORD_COPY_LOOP_INSTRUCTIONS: [u32; 9] = [
+    0x8c87_0000, // lw a3, 0(a0)
+    0x0000_0000, // nop
+    0xaca7_0000, // sw a3, 0(a1)
+    0x0000_0000, // nop
+    0x2084_0004, // addiu a0, a0, 4
+    0x20a5_0004, // addiu a1, a1, 4
+    0x20c6_fffc, // addiu a2, a2, -4
+    0x1cc0_fff8, // bgtz a2, loop start
+    0x0000_0000, // nop
+];
+const BR2_BOOT_WORD_COPY_LOOP_START: u32 = 0x8001_011c;
+const WORD_COPY_LOOP_CYCLES_PER_WORD: u64 = 11;
+const ZERO_FILL_LOOP_INSTRUCTIONS: [u32; 5] = [
+    0xac40_0000, // sw zero, 0(v0)
+    0x2442_0004, // addiu v0, v0, 4
+    0x0043_082b, // sltu at, v0, v1
+    0x1420_fffc, // bne at, zero, loop start
+    0x0000_0000, // nop
+];
+const BR2_BOOT_ZERO_FILL_LOOP_START: u32 = 0x802c_bab4;
+const ZERO_FILL_LOOP_CYCLES_PER_WORD: u64 = 6;
+const BIOS_INIT_ZERO_FILL_LOOP_START: u32 = 0x1fc0_0424;
+const BIOS_INIT_ZERO_FILL_LOOP_EXIT: u32 = 0x1fc0_0434;
+const BIOS_INIT_ZERO_FILL_LOOP_CYCLES_PER_WORD: u64 = 5;
+const BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS: [u32; 4] = [
+    0x2042_0004, // addi v0, v0, 4
+    0x0043_082b, // sltu at, v0, v1
+    0x1420_fffd, // bne at, zero, loop start
+    0xac40_fffc, // sw zero, -4(v0)
+];
+const BIOS_BYTE_COPY_LOOP_START: u32 = 0x1fc0_4cd4;
+const BIOS_BYTE_COPY_LOOP_INSTRUCTIONS: [u32; 21] = [
+    0x922d_0000, // lbu t5, 0(s1)
+    0x2631_0004, // addiu s1, s1, 4
+    0xa20d_0000, // sb t5, 0(s0)
+    0x922e_ffff, // lbu t6, -1(s1)
+    0x0224_082b, // sltu at, s1, a0
+    0x01c3_7823, // subu t7, t6, v1
+    0xa20f_0001, // sb t7, 1(s0)
+    0x9202_0001, // lbu v0, 1(s0)
+    0x9238_fffc, // lbu t8, -4(s1)
+    0xa202_0001, // sb v0, 1(s0)
+    0x0058_c821, // addu t9, v0, t8
+    0xa219_0003, // sb t9, 3(s0)
+    0x9228_fffd, // lbu t0, -3(s1)
+    0x2610_0004, // addiu s0, s0, 4
+    0xa208_fffd, // sb t0, -3(s0)
+    0x9229_fffe, // lbu t1, -2(s1)
+    0x0000_0000, // nop
+    0xa209_fffe, // sb t1, -2(s0)
+    0x922a_ffff, // lbu t2, -1(s1)
+    0x1420_ffec, // bne at, zero, loop start
+    0xa20a_ffff, // sb t2, -1(s0)
+];
+const BIOS_BYTE_COPY_LOOP_CYCLES_PER_CHUNK: u64 = 35;
+const BR2_DRAW_SYNC_WAIT_LOOP_START: u32 = 0x802d_080c;
+const BR2_DRAW_SYNC_WAIT_LOOP_EXIT: u32 = 0x802d_081c;
+const BR2_DRAW_SYNC_FLAG_VIRTUAL: u32 = 0x803a_2210;
+const BR2_DRAW_SYNC_WAIT_LOOP_INSTRUCTIONS: [u32; 4] = [
+    0x8c62_2210, // lw v0, 0x2210(v1)
+    0x0000_0000, // nop
+    0x1440_fffd, // bne v0, zero, loop start
+    0x0000_0000, // nop
+];
+const BR2_FRAME_COUNTER_WAIT_LOOP_START: u32 = 0x8034_9fbc;
+const BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK: u32 = 0x8034_a004;
+const BR2_FRAME_COUNTER_WAIT_LOOP_GLOBAL_COUNTER: u32 = 0x8036_c0b4;
+const BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET: u32 = 0x10;
+const BR2_FRAME_COUNTER_WAIT_LOOP_MIN_COUNTER: u32 = 4;
+const BR2_FRAME_COUNTER_WAIT_LOOP_CYCLES_PER_ITERATION: u64 = 18;
+const BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS: [u32; 8] = [
+    0x8fa2_0010, // lw v0, 0x10(sp)
+    0x0000_0000, // nop
+    0x2442_ffff, // addiu v0, v0, -1
+    0xafa2_0010, // sw v0, 0x10(sp)
+    0x8fa2_0010, // lw v0, 0x10(sp)
+    0x0000_0000, // nop
+    0x1443_000b, // bne v0, v1, target check
+    0x0000_0000, // nop
+];
+const BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK_INSTRUCTIONS: [u32; 6] = [
+    0x3c02_8037, // lui v0, 0x8037
+    0x8c42_c0b4, // lw v0, -0x3f4c(v0)
+    0x0000_0000, // nop
+    0x0044_102a, // slt v0, v0, a0
+    0x1440_ffe9, // bne v0, zero, loop start
+    0x0000_0000, // nop
+];
+const BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT: u32 = 0x8035_df68;
+const BR2_IRQ_POLL_TIMEOUT_LOOP_START: u32 = 0x8035_df6c;
+const BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT: u32 = 0x8035_df8c;
+const BR2_IRQ_POLL_STATUS_ADDRESS: u32 = 0x1f80_1070;
+const BR2_IRQ_POLL_STATUS_MASK: u16 = 0x0080;
+const BR2_IRQ_POLL_TIMEOUT_LOOP_CYCLES_PER_ITERATION: u64 = 8;
+const BR2_IRQ_POLL_TIMEOUT_EXIT_CYCLES: u64 = 2;
+const BR2_IRQ_POLL_TIMEOUT_INITIAL_INSTRUCTION: u32 = 0x2463_ffff; // addiu v1, v1, -1
+const BR2_IRQ_POLL_TIMEOUT_LOOP_INSTRUCTIONS: [u32; 7] = [
+    0x1065_0007, // beq v1, a1, BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT
+    0x0000_0000, // nop
+    0x9482_0000, // lhu v0, 0(a0)
+    0x0000_0000, // nop
+    0x3042_0080, // andi v0, v0, 0x80
+    0x1040_fffa, // beq v0, zero, BR2_IRQ_POLL_TIMEOUT_LOOP_START
+    0x2463_ffff, // addiu v1, v1, -1
+];
+const BR2_BYTE_COPY_LOOP_START: u32 = 0x8030_6de0;
+const BR2_BYTE_COPY_LOOP_EXIT: u32 = 0x8030_6df8;
+const BR2_BYTE_COPY_LOOP_CYCLES_PER_BYTE: u64 = 8;
+const BR2_BYTE_COPY_LOOP_INSTRUCTIONS: [u32; 6] = [
+    0x90e2_0000, // lbu v0, 0(a3)
+    0x24e7_0001, // addiu a3, a3, 1
+    0x2463_ffff, // addiu v1, v1, -1
+    0xa082_0000, // sb v0, 0(a0)
+    0x1c60_fffb, // bgtz v1, loop start
+    0x2484_0001, // addiu a0, a0, 1
+];
+const BR2_BANKED_HALFWORD_COPY_LOOP_START: u32 = 0x8033_34f4;
+const BR2_BANKED_HALFWORD_COPY_LOOP_EXIT: u32 = 0x8033_352c;
+const BR2_BANKED_HALFWORD_COPY_MASK: u32 = 0x007f_ffff;
+const BR2_BANKED_HALFWORD_COPY_CYCLES_PER_HALFWORD: u64 = 13;
+const BR2_BANKED_HALFWORD_COPY_LOOP_INSTRUCTIONS: [(u32, u32); 11] = [
+    (0x00, 0x0233_1024), // and v0, s1, s3
+    (0x04, 0x1440_0004), // bne v0, zero, copy halfword
+    (0x08, 0x0000_0000), // nop
+    (0x18, 0x9462_0000), // lhu v0, 0(v1)
+    (0x1c, 0x2463_0002), // addiu v1, v1, 2
+    (0x20, 0x2631_0002), // addiu s1, s1, 2
+    (0x24, 0x2610_0002), // addiu s0, s0, 2
+    (0x28, 0xa642_0000), // sh v0, 0(s2)
+    (0x2c, 0x0214_102b), // sltu v0, s0, s4
+    (0x30, 0x1440_fff3), // bne v0, zero, loop start
+    (0x34, 0x2652_0002), // addiu s2, s2, 2
+];
+const BR2_POST_VS_TABLE_ACCUM_LOOP_START: u32 = 0x8035_6ef4;
+const BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT: u32 = 0x8035_6f20;
+const BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT: u32 = 0x8035_6f30;
+const BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION: u64 = 20;
+const BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS: u32 = 512;
+const BR2_POST_VS_TABLE_ACCUM_MAX_SKIP_ITERATIONS: u32 = 8_000_000;
+const BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS: [u32; 15] = [
+    0x8c42_0004, // lw v0, 4(v0)
+    0x0005_1880, // sll v1, a1, 2
+    0x0062_1821, // addu v1, v1, v0
+    0x8c62_0000, // lw v0, 0(v1)
+    0x0000_0000, // nop
+    0x0044_1021, // addu v0, v0, a0
+    0xac62_0000, // sw v0, 0(v1)
+    0x8c83_007c, // lw v1, 0x7c(a0)
+    0x0000_0000, // nop
+    0x00c3_1021, // addu v0, a2, v1
+    0x8c42_0000, // lw v0, 0(v0)
+    0x24a5_0001, // addiu a1, a1, 1
+    0x00a2_102a, // slt v0, a1, v0
+    0x1440_fff2, // bne v0, zero, loop start
+    0x00c3_1021, // addu v0, a2, v1
+];
+const BR2_REVERSE_POINTER_SCAN_LOOP_START: u32 = 0x8033_b1c0;
+const BR2_REVERSE_POINTER_SCAN_LOOP_EXIT: u32 = 0x8033_b1d8;
+const BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION: u64 = 7;
+const BR2_REVERSE_POINTER_SCAN_MIN_SKIP_ITERATIONS: u32 = 32;
+const BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS: u32 = 8192;
+const BR2_REVERSE_POINTER_SCAN_LOOP_INSTRUCTIONS: [u32; 6] = [
+    0x8d22_0000, // lw v0, 0(t1)
+    0x24a5_ffff, // addiu a1, a1, -1
+    0x18a0_0002, // blez a1, exit delay
+    0x2463_fffc, // addiu v1, v1, -4
+    0x1043_fffb, // beq v0, v1, loop start
+    0x2529_fffc, // addiu t1, t1, -4
+];
+const BR2_REVERSE_MISMATCH_SCAN_LOOP_START: u32 = 0x8033_b1b0;
+const BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION: u64 = 9;
+const BR2_REVERSE_MISMATCH_SCAN_MIN_SKIP_ITERATIONS: u32 = 32;
+const BR2_REVERSE_MISMATCH_SCAN_MAX_SKIP_ITERATIONS: u32 = 131_072;
+const BR2_REVERSE_MISMATCH_SCAN_LOOP_INSTRUCTIONS: [(u32, u32); 8] = [
+    (0x00, 0x8c82_0000), // lw v0, 0(a0)
+    (0x04, 0x2463_fffc), // addiu v1, v1, -4
+    (0x08, 0x1443_0009), // bne v0, v1, mismatch path
+    (0x0c, 0x2489_fffc), // addiu t1, a0, -4
+    (0x30, 0x1048_0003), // beq v0, t0, exit
+    (0x34, 0x24a5_ffff), // addiu a1, a1, -1
+    (0x38, 0x1ca0_fff1), // bgtz a1, loop start
+    (0x3c, 0x2484_fffc), // addiu a0, a0, -4
+];
+const BR2_SMALL_BYTE_COPY_LOOP_START: u32 = 0x8033_d83c;
+const BR2_SMALL_BYTE_COPY_LOOP_EXIT: u32 = 0x8033_d854;
+const BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE: u64 = 8;
+const BR2_SMALL_BYTE_COPY_MIN_SKIP_BYTES: u32 = 1;
+const BR2_SMALL_BYTE_COPY_MAX_SKIP_BYTES: u32 = 4096;
+const BR2_SMALL_BYTE_COPY_LOOP_INSTRUCTIONS: [u32; 6] = [
+    0x90a2_0000, // lbu v0, 0(a1)
+    0x24c6_ffff, // addiu a2, a2, -1
+    0x24a5_0001, // addiu a1, a1, 1
+    0xa062_0000, // sb v0, 0(v1)
+    0x1cc0_fffb, // bgtz a2, loop start
+    0x2463_0001, // addiu v1, v1, 1
+];
 
 #[derive(Clone, Debug)]
 pub struct Cpu {
@@ -168,12 +413,143 @@ impl Cpu {
         let start_pc = self.pc;
         let cycles_before = self.cycles;
         bus.set_trace_context(start_pc, cycles_before);
+        if self.try_hle_br2_post_vs_bios_irq_return(bus) {
+            self.cycles += 1;
+            self.regs[0] = 0;
+            let report =
+                self.step_report_from(start_pc, None, cycles_before, StepOutcome::Continue);
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
         self.refresh_interrupts(bus);
         if self.delay_slot_branch_pc.is_none() && self.interrupt_pending() {
+            if self.try_hle_blank_bios_irq_handler(bus) {
+                self.cycles += 1;
+                self.regs[0] = 0;
+                let report =
+                    self.step_report_from(start_pc, None, cycles_before, StepOutcome::Continue);
+                bus.tick(report.cycles_elapsed);
+                bus.clear_trace_context();
+                return report;
+            }
             self.cycles += 1;
             let outcome = self.raise_exception(self.pc, None, Exception::Interrupt);
             self.regs[0] = 0;
             let report = self.step_report_from(start_pc, None, cycles_before, outcome);
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) = self.try_fast_forward_bios_delay_loop(start_pc, cycles_before, bus) {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_bios_delay_prologue_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_bios_byte_copy_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_bios_init_zero_fill_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_draw_sync_wait_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_frame_counter_wait_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_irq_poll_timeout_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) = self.try_fast_forward_br2_byte_copy_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_banked_halfword_copy_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_post_vs_table_accum_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_reverse_mismatch_scan_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_reverse_pointer_scan_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) =
+            self.try_fast_forward_br2_small_byte_copy_loop(start_pc, cycles_before, bus)
+        {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) = self.try_fast_forward_word_copy_loop(start_pc, cycles_before, bus) {
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) = self.try_fast_forward_zero_fill_loop(start_pc, cycles_before, bus) {
             bus.tick(report.cycles_elapsed);
             bus.clear_trace_context();
             return report;
@@ -303,6 +679,1010 @@ impl Cpu {
             cycles_elapsed: self.cycles.saturating_sub(cycles_before),
             outcome,
         }
+    }
+
+    fn try_fast_forward_bios_delay_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        let (loop_start, exit_pc) = bios_delay_loop_for_alias(self.pc)?;
+        if self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BIOS_DELAY_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            let address = loop_start + (index as u32) * 4;
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let stack_address = self.regs[29];
+        if stack_address & 0x03 != 0 {
+            return None;
+        }
+        let counter = bus.read_u32(stack_address);
+        if counter < BIOS_DELAY_LOOP_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        let iterations = u64::from(counter).saturating_add(1);
+        let skipped_cycles = iterations.saturating_mul(BIOS_DELAY_LOOP_INSTRUCTIONS.len() as u64);
+        self.regs[2] = 0;
+        self.regs[24] = 0;
+        self.regs[25] = u32::MAX;
+        bus.write_u32(stack_address, u32::MAX);
+        self.pc = exit_pc;
+        self.next_pc = exit_pc.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(skipped_cycles);
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BIOS_DELAY_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_bios_delay_prologue_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        let exit_pc = bios_delay_prologue_loop_exit_for_alias(self.pc)?;
+        if self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        let loop_start = bios_delay_prologue_loop_base_for_alias(self.pc)?;
+        for (index, expected) in BIOS_DELAY_PROLOGUE_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = loop_start + (index as u32) * 4;
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let stack_address = self.regs[29];
+        if stack_address & 0x03 != 0 {
+            return None;
+        }
+        let counter = bus.read_u32(stack_address);
+        if counter < BIOS_DELAY_LOOP_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        let skipped_cycles =
+            u64::from(counter).saturating_mul(BIOS_DELAY_PROLOGUE_LOOP_CYCLES_PER_ITERATION);
+        self.regs[2] = 0;
+        self.regs[14] = 0;
+        self.regs[15] = u32::MAX;
+        bus.write_u32(stack_address, u32::MAX);
+        self.pc = exit_pc;
+        self.next_pc = exit_pc.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(skipped_cycles);
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BIOS_DELAY_PROLOGUE_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_bios_byte_copy_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        let loop_start = match self.pc {
+            BIOS_BYTE_COPY_LOOP_START => BIOS_BYTE_COPY_LOOP_START,
+            0xbfc0_4cd4 => 0xbfc0_4cd4,
+            _ => return None,
+        };
+        if self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BIOS_BYTE_COPY_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            let address = loop_start.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let source = self.regs[17];
+        let destination = self.regs[16];
+        let limit = self.regs[4];
+        if source >= limit {
+            return None;
+        }
+        let remaining = limit.wrapping_sub(source);
+        let chunks = remaining.checked_add(3)?.checked_div(4)?;
+        let byte_count = chunks.checked_mul(4)?;
+        let copied = bus.try_copy_bytes(source, destination, byte_count)?;
+        let last = copied.get(copied.len().checked_sub(4)?..)?;
+        let last_0 = last[0] as u32;
+        let last_1 = last[1] as u32;
+        let last_2 = last[2] as u32;
+        let last_3 = last[3] as u32;
+        let transformed_1 = last_3.wrapping_sub(self.regs[3]) & 0xff;
+
+        self.regs[1] = 0;
+        self.regs[2] = transformed_1;
+        self.regs[8] = last_1;
+        self.regs[9] = last_2;
+        self.regs[10] = last_3;
+        self.regs[13] = last_0;
+        self.regs[14] = last_3;
+        self.regs[15] = transformed_1;
+        self.regs[16] = destination.wrapping_add(byte_count);
+        self.regs[17] = source.wrapping_add(byte_count);
+        self.regs[24] = last_0;
+        self.regs[25] = transformed_1.wrapping_add(last_0) & 0xff;
+        self.pc = loop_start.wrapping_add((BIOS_BYTE_COPY_LOOP_INSTRUCTIONS.len() as u32) * 4);
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self
+            .cycles
+            .saturating_add(u64::from(chunks).saturating_mul(BIOS_BYTE_COPY_LOOP_CYCLES_PER_CHUNK));
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BIOS_BYTE_COPY_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_bios_init_zero_fill_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BIOS_INIT_ZERO_FILL_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = self.pc.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let destination = self.regs[2];
+        let end = self.regs[3];
+        if destination >= end {
+            return None;
+        }
+        let byte_count = end.wrapping_sub(destination);
+        let words = bus.try_fill_aligned_words(destination, byte_count, 0)?;
+
+        self.regs[1] = 0;
+        self.regs[2] = end;
+        self.pc = BIOS_INIT_ZERO_FILL_LOOP_EXIT;
+        self.next_pc = BIOS_INIT_ZERO_FILL_LOOP_EXIT.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(
+            u64::from(words).saturating_mul(BIOS_INIT_ZERO_FILL_LOOP_CYCLES_PER_WORD),
+        );
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_draw_sync_wait_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_DRAW_SYNC_WAIT_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BR2_DRAW_SYNC_WAIT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = self.pc.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        if self.regs[3].wrapping_add(0x2210) != BR2_DRAW_SYNC_FLAG_VIRTUAL {
+            return None;
+        }
+        if bus.read_u32(BR2_DRAW_SYNC_FLAG_VIRTUAL) == 0 {
+            return None;
+        }
+
+        let skipped_cycles = bus.cycles_until_next_vblank().max(1);
+        self.regs[2] = 0;
+        self.pc = BR2_DRAW_SYNC_WAIT_LOOP_EXIT;
+        self.next_pc = BR2_DRAW_SYNC_WAIT_LOOP_EXIT.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(skipped_cycles);
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_DRAW_SYNC_WAIT_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_frame_counter_wait_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_FRAME_COUNTER_WAIT_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address =
+                BR2_FRAME_COUNTER_WAIT_LOOP_START.wrapping_add((index as u32).wrapping_mul(4));
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+        for (index, expected) in BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let frame_counter = bus.read_u32(BR2_FRAME_COUNTER_WAIT_LOOP_GLOBAL_COUNTER);
+        let target_frame = self.regs[4];
+        if frame_counter >= target_frame {
+            return None;
+        }
+
+        let stack_counter_address =
+            self.regs[29].wrapping_add(BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET);
+        if stack_counter_address & 0x03 != 0 {
+            return None;
+        }
+        let stack_counter = bus.read_u32(stack_counter_address);
+        if stack_counter < BR2_FRAME_COUNTER_WAIT_LOOP_MIN_COUNTER {
+            return None;
+        }
+
+        let skipped_cycles = bus.cycles_until_next_vblank().max(1);
+        let skipped_iterations = (skipped_cycles
+            / BR2_FRAME_COUNTER_WAIT_LOOP_CYCLES_PER_ITERATION)
+            .max(1)
+            .min(u64::from(stack_counter.saturating_sub(1)));
+        if skipped_iterations == 0 {
+            return None;
+        }
+        bus.write_u32(
+            stack_counter_address,
+            stack_counter.saturating_sub(skipped_iterations as u32),
+        );
+        self.pc = BR2_FRAME_COUNTER_WAIT_LOOP_START;
+        self.next_pc = BR2_FRAME_COUNTER_WAIT_LOOP_START.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(skipped_cycles);
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_irq_poll_timeout_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if (self.pc != BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT
+            && self.pc != BR2_IRQ_POLL_TIMEOUT_LOOP_START)
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        if bus.read_u32(BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT)
+            != BR2_IRQ_POLL_TIMEOUT_INITIAL_INSTRUCTION
+        {
+            return None;
+        }
+        for (index, expected) in BR2_IRQ_POLL_TIMEOUT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_IRQ_POLL_TIMEOUT_LOOP_START.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        if self.regs[4] != BR2_IRQ_POLL_STATUS_ADDRESS || self.regs[5] != u32::MAX {
+            return None;
+        }
+        if bus.read_u16(BR2_IRQ_POLL_STATUS_ADDRESS) & BR2_IRQ_POLL_STATUS_MASK != 0 {
+            return None;
+        }
+        if self.regs[3] == u32::MAX || (self.regs[3] as i32) < 0 {
+            return None;
+        }
+
+        let mut skipped_cycles = 0u64;
+        let mut counter = self.regs[3];
+        let instruction = if self.pc == BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT {
+            if counter == 0 {
+                return None;
+            }
+            counter = counter.wrapping_sub(1);
+            skipped_cycles = skipped_cycles.saturating_add(1);
+            BR2_IRQ_POLL_TIMEOUT_INITIAL_INSTRUCTION
+        } else {
+            BR2_IRQ_POLL_TIMEOUT_LOOP_INSTRUCTIONS[0]
+        };
+
+        let iterations = u64::from(counter).saturating_add(1);
+        skipped_cycles = skipped_cycles
+            .saturating_add(
+                iterations.saturating_mul(BR2_IRQ_POLL_TIMEOUT_LOOP_CYCLES_PER_ITERATION),
+            )
+            .saturating_add(BR2_IRQ_POLL_TIMEOUT_EXIT_CYCLES);
+
+        self.regs[2] = 0;
+        self.regs[3] = u32::MAX;
+        self.pc = BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT;
+        self.next_pc = BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(skipped_cycles);
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(instruction),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_byte_copy_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_BYTE_COPY_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BR2_BYTE_COPY_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            let address = BR2_BYTE_COPY_LOOP_START.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let byte_count = self.regs[3];
+        if byte_count == 0 || byte_count as i32 <= 0 {
+            return None;
+        }
+
+        let source = self.regs[7];
+        let destination = self.regs[4];
+        let copied = bus.try_copy_bytes(source, destination, byte_count)?;
+        let last = copied.last().copied()? as u32;
+        self.regs[2] = last;
+        self.regs[3] = 0;
+        self.regs[4] = destination.wrapping_add(byte_count);
+        self.regs[7] = source.wrapping_add(byte_count);
+        self.pc = BR2_BYTE_COPY_LOOP_EXIT;
+        self.next_pc = BR2_BYTE_COPY_LOOP_EXIT.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(
+            u64::from(byte_count).saturating_mul(BR2_BYTE_COPY_LOOP_CYCLES_PER_BYTE),
+        );
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_BYTE_COPY_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_banked_halfword_copy_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_BANKED_HALFWORD_COPY_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (offset, expected) in BR2_BANKED_HALFWORD_COPY_LOOP_INSTRUCTIONS {
+            if bus.read_u32(BR2_BANKED_HALFWORD_COPY_LOOP_START.wrapping_add(offset)) != expected {
+                return None;
+            }
+        }
+
+        let copied_halfbytes = self.regs[16];
+        let copy_limit = self.regs[20];
+        if copied_halfbytes >= copy_limit {
+            return None;
+        }
+        if self.regs[19] != BR2_BANKED_HALFWORD_COPY_MASK {
+            return None;
+        }
+
+        let remaining_halfbytes = copy_limit.wrapping_sub(copied_halfbytes);
+        let halfwords = remaining_halfbytes.checked_add(1)?.checked_div(2)?;
+        let byte_count = halfwords.checked_mul(2)?;
+        let first_masked_source = self.regs[17] & self.regs[19];
+        let last_masked_source = first_masked_source.checked_add(byte_count.checked_sub(2)?)?;
+        if first_masked_source == 0 || last_masked_source > self.regs[19] {
+            return None;
+        }
+
+        let source = self.regs[3];
+        let destination = self.regs[18];
+        let last_halfword = bus.try_copy_halfwords(source, destination, halfwords)?;
+
+        self.regs[2] = 0;
+        self.regs[3] = source.wrapping_add(byte_count);
+        self.regs[16] = copied_halfbytes.wrapping_add(byte_count);
+        self.regs[17] = self.regs[17].wrapping_add(byte_count);
+        self.regs[18] = destination.wrapping_add(byte_count);
+        self.pc = BR2_BANKED_HALFWORD_COPY_LOOP_EXIT;
+        self.next_pc = BR2_BANKED_HALFWORD_COPY_LOOP_EXIT.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(
+            u64::from(halfwords).saturating_mul(BR2_BANKED_HALFWORD_COPY_CYCLES_PER_HALFWORD),
+        );
+        self.regs[0] = 0;
+        let _ = last_halfword;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_BANKED_HALFWORD_COPY_LOOP_INSTRUCTIONS[0].1),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_post_vs_table_accum_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if !matches!(
+            self.pc,
+            BR2_POST_VS_TABLE_ACCUM_LOOP_START | BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT
+        ) || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_POST_VS_TABLE_ACCUM_LOOP_START.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let (start_index, limit, table_meta_offset) =
+            if self.pc == BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT {
+                let table_meta_offset = self.regs[3];
+                if bus.read_u32(self.regs[4].wrapping_add(0x7c)) != table_meta_offset {
+                    return None;
+                }
+                let limit = match self.pending_load {
+                    Some((2, value)) => value,
+                    None => self.regs[2],
+                    _ => return None,
+                };
+                (self.regs[5].wrapping_add(1), limit, table_meta_offset)
+            } else {
+                if self.pending_load.is_some() {
+                    return None;
+                }
+                let table_meta_offset = bus.read_u32(self.regs[4].wrapping_add(0x7c));
+                let count_address = self.regs[6].wrapping_add(table_meta_offset);
+                if self.regs[2] != count_address {
+                    return None;
+                }
+                (self.regs[5], bus.read_u32(count_address), table_meta_offset)
+            };
+
+        let count_address = self.regs[6].wrapping_add(table_meta_offset);
+        let remaining = br2_signed_loop_remaining(start_index, limit)?;
+        if remaining < BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        let table_base = bus.read_u32(count_address.wrapping_add(4));
+        let first_target = table_base.wrapping_add(start_index.wrapping_shl(2));
+
+        let mut max_iterations = remaining.min(BR2_POST_VS_TABLE_ACCUM_MAX_SKIP_ITERATIONS);
+        if self.vblank_irq_can_preempt(bus) {
+            let cycles_until_vblank = bus.cycles_until_next_vblank();
+            if cycles_until_vblank <= BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION {
+                return None;
+            }
+            let irq_limited_iterations =
+                ((cycles_until_vblank - 1) / BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION) as u32;
+            max_iterations = max_iterations.min(irq_limited_iterations);
+        }
+        if max_iterations < BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        let skipped_iterations;
+        let ram_iterations = max_iterations;
+        if br2_ram_word_range(first_target, ram_iterations, bus.ram_len()) {
+            skipped_iterations = ram_iterations;
+            for index in 0..skipped_iterations {
+                let target = first_target.wrapping_add(index.wrapping_shl(2));
+                let value = bus.read_u32(target).wrapping_add(self.regs[4]);
+                bus.write_u32(target, value);
+            }
+        } else {
+            if !br2_expansion_noop_address(first_target) {
+                return None;
+            }
+            skipped_iterations = max_iterations;
+        }
+
+        let final_index = start_index.wrapping_add(skipped_iterations);
+        let completed_loop = skipped_iterations == remaining;
+        self.regs[2] = count_address;
+        self.regs[3] = table_meta_offset;
+        self.regs[5] = final_index;
+        self.pc = if completed_loop {
+            BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT
+        } else {
+            BR2_POST_VS_TABLE_ACCUM_LOOP_START
+        };
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(
+            u64::from(skipped_iterations)
+                .saturating_mul(BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION),
+        );
+        self.regs[0] = 0;
+        self.pending_load = None;
+        self.load_commit_register = None;
+        self.load_commit_value = None;
+        self.load_commit_cancelled = false;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_reverse_mismatch_scan_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_REVERSE_MISMATCH_SCAN_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (offset, expected) in BR2_REVERSE_MISMATCH_SCAN_LOOP_INSTRUCTIONS.iter().copied() {
+            if bus.read_u32(BR2_REVERSE_MISMATCH_SCAN_LOOP_START + offset) != expected {
+                return None;
+            }
+        }
+
+        let mut current_pointer = self.regs[4];
+        let mut expected_pointer = self.regs[3];
+        let mut count = self.regs[5];
+        let sentinel = self.regs[8];
+        if count <= 1 || !br2_ram_word_range(current_pointer, 1, bus.ram_len()) {
+            return None;
+        }
+
+        let mut max_iterations = count
+            .saturating_sub(1)
+            .min(BR2_REVERSE_MISMATCH_SCAN_MAX_SKIP_ITERATIONS);
+        if self.vblank_irq_can_preempt(bus) {
+            let cycles_until_vblank = bus.cycles_until_next_vblank();
+            if cycles_until_vblank <= BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION {
+                return None;
+            }
+            let irq_limited_iterations =
+                ((cycles_until_vblank - 1) / BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION) as u32;
+            max_iterations = max_iterations.min(irq_limited_iterations);
+        }
+        if max_iterations < BR2_REVERSE_MISMATCH_SCAN_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        let mut skipped_iterations = 0u32;
+        let mut last_loaded = self.regs[2];
+        for _ in 0..max_iterations {
+            if !br2_ram_word_range(current_pointer, 1, bus.ram_len()) {
+                return None;
+            }
+
+            let loaded = bus.read_u32(current_pointer);
+            let next_expected = expected_pointer.wrapping_sub(4);
+            if loaded == next_expected || loaded == sentinel {
+                break;
+            }
+
+            last_loaded = loaded;
+            expected_pointer = next_expected;
+            current_pointer = current_pointer.wrapping_sub(4);
+            count = count.wrapping_sub(1);
+            skipped_iterations = skipped_iterations.saturating_add(1);
+        }
+
+        if skipped_iterations < BR2_REVERSE_MISMATCH_SCAN_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        self.regs[2] = last_loaded;
+        self.regs[3] = expected_pointer;
+        self.regs[4] = current_pointer;
+        self.regs[5] = count;
+        self.regs[9] = current_pointer.wrapping_sub(4);
+        self.pc = BR2_REVERSE_MISMATCH_SCAN_LOOP_START;
+        self.next_pc = BR2_REVERSE_MISMATCH_SCAN_LOOP_START.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(
+            u64::from(skipped_iterations)
+                .saturating_mul(BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION),
+        );
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_REVERSE_MISMATCH_SCAN_LOOP_INSTRUCTIONS[0].1),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_reverse_pointer_scan_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_REVERSE_POINTER_SCAN_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BR2_REVERSE_POINTER_SCAN_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_REVERSE_POINTER_SCAN_LOOP_START.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let mut count = self.regs[5];
+        let mut current_pointer = self.regs[9];
+        let mut expected_pointer = self.regs[3];
+        if count == 0 || !br2_ram_word_range(current_pointer, 1, bus.ram_len()) {
+            return None;
+        }
+
+        let mut max_iterations = count.min(BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS);
+        if self.vblank_irq_can_preempt(bus) {
+            let cycles_until_vblank = bus.cycles_until_next_vblank();
+            if cycles_until_vblank <= BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION {
+                return None;
+            }
+            let irq_limited_iterations =
+                ((cycles_until_vblank - 1) / BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION) as u32;
+            max_iterations = max_iterations.min(irq_limited_iterations);
+        }
+        if max_iterations < BR2_REVERSE_POINTER_SCAN_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        let mut skipped_iterations = 0u32;
+        let mut last_loaded = self.regs[2];
+        let mut loop_continues = true;
+        for _ in 0..max_iterations {
+            if !br2_ram_word_range(current_pointer, 1, bus.ram_len()) {
+                return None;
+            }
+            last_loaded = bus.read_u32(current_pointer);
+            count = count.wrapping_sub(1);
+            expected_pointer = expected_pointer.wrapping_sub(4);
+            current_pointer = current_pointer.wrapping_sub(4);
+            skipped_iterations = skipped_iterations.saturating_add(1);
+
+            loop_continues = (count as i32) > 0 && last_loaded == expected_pointer;
+            if !loop_continues {
+                break;
+            }
+        }
+
+        if skipped_iterations < BR2_REVERSE_POINTER_SCAN_MIN_SKIP_ITERATIONS {
+            return None;
+        }
+
+        self.regs[2] = last_loaded;
+        self.regs[3] = expected_pointer;
+        self.regs[5] = count;
+        self.regs[9] = current_pointer;
+        self.pc = if loop_continues {
+            BR2_REVERSE_POINTER_SCAN_LOOP_START
+        } else {
+            BR2_REVERSE_POINTER_SCAN_LOOP_EXIT
+        };
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(
+            u64::from(skipped_iterations)
+                .saturating_mul(BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION),
+        );
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_REVERSE_POINTER_SCAN_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_br2_small_byte_copy_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_SMALL_BYTE_COPY_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in BR2_SMALL_BYTE_COPY_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_SMALL_BYTE_COPY_LOOP_START + (index as u32) * 4;
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let source = self.regs[5];
+        let destination = self.regs[3];
+        let count = self.regs[6];
+        if count < BR2_SMALL_BYTE_COPY_MIN_SKIP_BYTES {
+            return None;
+        }
+
+        let mut byte_count = count.min(BR2_SMALL_BYTE_COPY_MAX_SKIP_BYTES);
+        if self.vblank_irq_can_preempt(bus) {
+            let cycles_until_vblank = bus.cycles_until_next_vblank();
+            if cycles_until_vblank <= BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE {
+                return None;
+            }
+            let irq_limited_bytes =
+                ((cycles_until_vblank - 1) / BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE) as u32;
+            byte_count = byte_count.min(irq_limited_bytes);
+        }
+        if byte_count < BR2_SMALL_BYTE_COPY_MIN_SKIP_BYTES {
+            return None;
+        }
+
+        let copied = bus.try_copy_bytes(source, destination, byte_count)?;
+        let last = copied.last().copied()? as u32;
+        let remaining = count.wrapping_sub(byte_count);
+        self.regs[2] = last;
+        self.regs[3] = destination.wrapping_add(byte_count);
+        self.regs[5] = source.wrapping_add(byte_count);
+        self.regs[6] = remaining;
+        self.pc = if remaining == 0 {
+            BR2_SMALL_BYTE_COPY_LOOP_EXIT
+        } else {
+            BR2_SMALL_BYTE_COPY_LOOP_START
+        };
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(
+            u64::from(byte_count).saturating_mul(BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE),
+        );
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_SMALL_BYTE_COPY_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_word_copy_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_BOOT_WORD_COPY_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in WORD_COPY_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            let address = self.pc.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let byte_count = self.regs[6];
+        if byte_count as i32 <= 0 {
+            return None;
+        }
+
+        let source = self.regs[4];
+        let destination = self.regs[5];
+        let (words, last_word) = bus.try_copy_aligned_words(source, destination, byte_count)?;
+        let copied_bytes = words.saturating_mul(4);
+        self.regs[4] = source.wrapping_add(copied_bytes);
+        self.regs[5] = destination.wrapping_add(copied_bytes);
+        self.regs[6] = 0;
+        self.regs[7] = last_word;
+        self.pc = self
+            .pc
+            .wrapping_add((WORD_COPY_LOOP_INSTRUCTIONS.len() as u32) * 4);
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self
+            .cycles
+            .saturating_add(u64::from(words).saturating_mul(WORD_COPY_LOOP_CYCLES_PER_WORD));
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(WORD_COPY_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
+    fn try_fast_forward_zero_fill_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if self.pc != BR2_BOOT_ZERO_FILL_LOOP_START
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+        {
+            return None;
+        }
+
+        for (index, expected) in ZERO_FILL_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            let address = self.pc.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return None;
+            }
+        }
+
+        let destination = self.regs[2];
+        let end = self.regs[3];
+        if destination >= end {
+            return None;
+        }
+        let byte_count = end.wrapping_sub(destination);
+        let words = bus.try_fill_aligned_words(destination, byte_count, 0)?;
+        self.regs[1] = 0;
+        self.regs[2] = end;
+        self.pc = self
+            .pc
+            .wrapping_add((ZERO_FILL_LOOP_INSTRUCTIONS.len() as u32) * 4);
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self
+            .cycles
+            .saturating_add(u64::from(words).saturating_mul(ZERO_FILL_LOOP_CYCLES_PER_WORD));
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(ZERO_FILL_LOOP_INSTRUCTIONS[0]),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
     }
 
     fn execute(
@@ -758,8 +2138,7 @@ impl Cpu {
                 StepOutcome::Continue
             }
             0x10 if (instruction & 0x3f) == 0x10 => {
-                let mode_bits = self.cp0[CP0_STATUS] & 0x3f;
-                self.cp0[CP0_STATUS] = (self.cp0[CP0_STATUS] & !0x0f) | ((mode_bits >> 2) & 0x0f);
+                self.cp0[CP0_STATUS] = rfe_status(self.cp0[CP0_STATUS]);
                 bus.set_cache_isolated(self.cp0[CP0_STATUS] & STATUS_ISOLATE_CACHE != 0);
                 StepOutcome::Continue
             }
@@ -1253,6 +2632,52 @@ impl Cpu {
         enabled && unmasked
     }
 
+    fn try_hle_blank_bios_irq_handler(&mut self, bus: &mut Bus) -> bool {
+        let pending = bus.io.irq.status & bus.io.irq.mask;
+        if pending == 0 {
+            return false;
+        }
+        if !bios_exception_vector_points_to_blank_c80_handler(bus) {
+            return false;
+        }
+
+        bus.acknowledge_hle_bios_irq_sources(pending);
+        self.cp0[CP0_CAUSE] &= !CAUSE_IP2;
+        true
+    }
+
+    fn try_hle_br2_post_vs_bios_irq_return(&mut self, bus: &mut Bus) -> bool {
+        if !(BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_START..=BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_END)
+            .contains(&self.pc)
+            || self.delay_slot_branch_pc.is_some()
+            || self.cp0[CP0_EPC] != BR2_POST_VS_TABLE_ACCUM_LOOP_START
+            || self.cp0[CP0_CAUSE] & CAUSE_IP2 == 0
+            || !bios_exception_c80_handler_has_kernel_prefix(bus)
+        {
+            return false;
+        }
+
+        let pending = bus.io.irq.status & bus.io.irq.mask;
+        if pending != 0 {
+            bus.acknowledge_hle_bios_irq_sources(pending);
+        }
+        self.cp0[CP0_CAUSE] &= !CAUSE_IP2;
+        self.cp0[CP0_STATUS] = rfe_status(self.cp0[CP0_STATUS]);
+        self.pc = self.cp0[CP0_EPC];
+        self.next_pc = self.pc.wrapping_add(4);
+        self.pending_load = None;
+        self.load_commit_register = None;
+        self.load_commit_value = None;
+        self.load_commit_cancelled = false;
+        true
+    }
+
+    fn vblank_irq_can_preempt(&self, bus: &Bus) -> bool {
+        self.cp0[CP0_STATUS] & STATUS_IE != 0
+            && self.cp0[CP0_STATUS] & CAUSE_IP2 != 0
+            && bus.io.irq.mask & 1 != 0
+    }
+
     fn raise_exception(
         &mut self,
         current_pc: u32,
@@ -1321,6 +2746,40 @@ enum Exception {
     Overflow = 12,
 }
 
+fn bios_exception_vector_points_to_blank_c80_handler(bus: &Bus) -> bool {
+    for (index, expected) in BIOS_EXCEPTION_VECTOR_TO_C80_STUB
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let address = BIOS_EXCEPTION_VECTOR_PHYSICAL + (index as u32) * 4;
+        if bus.read_ram_u32_physical(address) != Some(expected) {
+            return false;
+        }
+    }
+
+    (0..8).all(|index| {
+        let address = BIOS_EXCEPTION_HANDLER_PHYSICAL + index * 4;
+        bus.read_ram_u32_physical(address) == Some(0)
+    })
+}
+
+fn bios_exception_c80_handler_has_kernel_prefix(bus: &Bus) -> bool {
+    BIOS_EXCEPTION_C80_KERNEL_HANDLER_PREFIX
+        .iter()
+        .copied()
+        .enumerate()
+        .all(|(index, expected)| {
+            let address = BIOS_EXCEPTION_HANDLER_PHYSICAL + (index as u32) * 4;
+            bus.read_ram_u32_physical(address) == Some(expected)
+        })
+}
+
+fn rfe_status(status: u32) -> u32 {
+    let mode_bits = status & 0x3f;
+    (status & !0x0f) | ((mode_bits >> 2) & 0x0f)
+}
+
 fn rs(instruction: u32) -> usize {
     ((instruction >> 21) & 0x1f) as usize
 }
@@ -1371,6 +2830,33 @@ fn jump_target(pc: u32, instruction: u32) -> u32 {
 
 fn branch_target(pc: u32, instruction: u32) -> u32 {
     pc.wrapping_add(sign_extend_16(instruction) << 2)
+}
+
+fn br2_signed_loop_remaining(start_index: u32, limit: u32) -> Option<u32> {
+    let start_index = start_index as i32;
+    let limit = limit as i32;
+    (start_index < limit).then_some((i64::from(limit) - i64::from(start_index)) as u32)
+}
+
+fn br2_expansion_noop_address(address: u32) -> bool {
+    let start = address & 0x1fff_ffff;
+    (0x0080_0000..0x1f80_0000).contains(&start)
+}
+
+fn br2_ram_word_range(address: u32, words: u32, ram_len: usize) -> bool {
+    if words == 0 || ram_len == 0 {
+        return false;
+    }
+    let Some(last_byte_offset) = words
+        .checked_sub(1)
+        .and_then(|last_word| last_word.checked_mul(4))
+        .and_then(|last_word_offset| last_word_offset.checked_add(3))
+    else {
+        return false;
+    };
+    let start = address & 0x1fff_ffff;
+    let end = address.wrapping_add(last_byte_offset) & 0x1fff_ffff;
+    start <= end && (end as usize) < ram_len
 }
 
 fn packed_gte_matrix(registers: &[u32; 32], base: usize) -> [[i16; 3]; 3] {
@@ -1530,6 +3016,39 @@ fn instruction_cycle_cost(instruction: u32) -> u64 {
     }
 }
 
+fn bios_delay_loop_for_alias(pc: u32) -> Option<(u32, u32)> {
+    match pc {
+        BIOS_DELAY_LOOP_START => Some((BIOS_DELAY_LOOP_START, BIOS_DELAY_LOOP_EXIT)),
+        BIOS_DELAY_LOOP_KSEG1_START => {
+            Some((BIOS_DELAY_LOOP_KSEG1_START, BIOS_DELAY_LOOP_KSEG1_EXIT))
+        }
+        BIOS_SHORT_DELAY_LOOP_START => {
+            Some((BIOS_SHORT_DELAY_LOOP_START, BIOS_SHORT_DELAY_LOOP_EXIT))
+        }
+        BIOS_SHORT_DELAY_LOOP_KSEG1_START => Some((
+            BIOS_SHORT_DELAY_LOOP_KSEG1_START,
+            BIOS_SHORT_DELAY_LOOP_KSEG1_EXIT,
+        )),
+        _ => None,
+    }
+}
+
+fn bios_delay_prologue_loop_base_for_alias(pc: u32) -> Option<u32> {
+    match pc {
+        BIOS_DELAY_PROLOGUE_LOOP_START => Some(BIOS_DELAY_PROLOGUE_LOOP_START),
+        BIOS_DELAY_PROLOGUE_LOOP_KSEG1_START => Some(BIOS_DELAY_PROLOGUE_LOOP_KSEG1_START),
+        _ => None,
+    }
+}
+
+fn bios_delay_prologue_loop_exit_for_alias(pc: u32) -> Option<u32> {
+    match pc {
+        BIOS_DELAY_PROLOGUE_LOOP_START => Some(BIOS_DELAY_LOOP_EXIT),
+        BIOS_DELAY_PROLOGUE_LOOP_KSEG1_START => Some(BIOS_DELAY_LOOP_KSEG1_EXIT),
+        _ => None,
+    }
+}
+
 fn optional_u32_json(value: Option<u32>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
@@ -1580,12 +3099,114 @@ fn store_word_right(bus: &mut Bus, address: u32, value: u32) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::{
-        CAUSE_BD, CAUSE_IP2, CP0_CAUSE, CP0_EPC, CP0_STATUS, Cpu, GTE_FLAG_DIVIDE_OVERFLOW,
-        GTE_FLAG_ERROR, GTE_FLAG_SX2_SATURATED, GTE_FLAG_SY2_SATURATED, GTE_FRACTIONAL_BITS,
-        StepOutcome, gte_leading_zero_count, gte_sxy,
+        BIOS_BYTE_COPY_LOOP_INSTRUCTIONS, BIOS_BYTE_COPY_LOOP_START, BIOS_DELAY_LOOP_EXIT,
+        BIOS_DELAY_LOOP_INSTRUCTIONS, BIOS_DELAY_PROLOGUE_LOOP_INSTRUCTIONS,
+        BIOS_DELAY_PROLOGUE_LOOP_START, BIOS_EXCEPTION_C80_KERNEL_HANDLER_PREFIX,
+        BIOS_EXCEPTION_VECTOR_TO_C80_STUB, BIOS_INIT_ZERO_FILL_LOOP_EXIT,
+        BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS, BIOS_INIT_ZERO_FILL_LOOP_START,
+        BIOS_SHORT_DELAY_LOOP_EXIT, BIOS_SHORT_DELAY_LOOP_START,
+        BR2_BANKED_HALFWORD_COPY_LOOP_EXIT, BR2_BANKED_HALFWORD_COPY_LOOP_INSTRUCTIONS,
+        BR2_BANKED_HALFWORD_COPY_LOOP_START, BR2_BANKED_HALFWORD_COPY_MASK,
+        BR2_BOOT_WORD_COPY_LOOP_START, BR2_BOOT_ZERO_FILL_LOOP_START, BR2_BYTE_COPY_LOOP_EXIT,
+        BR2_BYTE_COPY_LOOP_INSTRUCTIONS, BR2_BYTE_COPY_LOOP_START, BR2_DRAW_SYNC_FLAG_VIRTUAL,
+        BR2_DRAW_SYNC_WAIT_LOOP_EXIT, BR2_DRAW_SYNC_WAIT_LOOP_INSTRUCTIONS,
+        BR2_DRAW_SYNC_WAIT_LOOP_START, BR2_FRAME_COUNTER_WAIT_LOOP_GLOBAL_COUNTER,
+        BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS, BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET,
+        BR2_FRAME_COUNTER_WAIT_LOOP_START, BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK,
+        BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK_INSTRUCTIONS, BR2_IRQ_POLL_STATUS_ADDRESS,
+        BR2_IRQ_POLL_STATUS_MASK, BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT,
+        BR2_IRQ_POLL_TIMEOUT_INITIAL_INSTRUCTION, BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT,
+        BR2_IRQ_POLL_TIMEOUT_LOOP_INSTRUCTIONS, BR2_IRQ_POLL_TIMEOUT_LOOP_START,
+        BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT,
+        BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS, BR2_POST_VS_TABLE_ACCUM_LOOP_START,
+        BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT, BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS,
+        BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION,
+        BR2_REVERSE_MISMATCH_SCAN_LOOP_INSTRUCTIONS, BR2_REVERSE_MISMATCH_SCAN_LOOP_START,
+        BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION, BR2_REVERSE_POINTER_SCAN_LOOP_EXIT,
+        BR2_REVERSE_POINTER_SCAN_LOOP_INSTRUCTIONS, BR2_REVERSE_POINTER_SCAN_LOOP_START,
+        BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS, BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE,
+        BR2_SMALL_BYTE_COPY_LOOP_EXIT, BR2_SMALL_BYTE_COPY_LOOP_INSTRUCTIONS,
+        BR2_SMALL_BYTE_COPY_LOOP_START, CAUSE_BD, CAUSE_IP2, CP0_CAUSE, CP0_EPC, CP0_STATUS, Cpu,
+        EXCEPTION_VECTOR, GTE_FLAG_DIVIDE_OVERFLOW, GTE_FLAG_ERROR, GTE_FLAG_SX2_SATURATED,
+        GTE_FLAG_SY2_SATURATED, GTE_FRACTIONAL_BITS, StepOutcome, gte_leading_zero_count, gte_sxy,
     };
     use crate::native::bus::Bus;
+    use crate::native::io::{DMA_INTERRUPT, DMA_SPU_CHCR};
+
+    fn install_br2_irq_poll_timeout_loop(bus: &mut Bus) {
+        bus.write_u32(
+            BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT,
+            BR2_IRQ_POLL_TIMEOUT_INITIAL_INSTRUCTION,
+        );
+        for (index, instruction) in BR2_IRQ_POLL_TIMEOUT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(
+                BR2_IRQ_POLL_TIMEOUT_LOOP_START + (index as u32) * 4,
+                instruction,
+            );
+        }
+    }
+
+    fn install_br2_post_vs_table_accum_loop(bus: &mut Bus) {
+        for (index, instruction) in BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(
+                BR2_POST_VS_TABLE_ACCUM_LOOP_START + (index as u32) * 4,
+                instruction,
+            );
+        }
+    }
+
+    fn install_br2_reverse_pointer_scan_loop(bus: &mut Bus) {
+        for (index, instruction) in BR2_REVERSE_POINTER_SCAN_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(
+                BR2_REVERSE_POINTER_SCAN_LOOP_START + (index as u32) * 4,
+                instruction,
+            );
+        }
+    }
+
+    fn install_br2_reverse_mismatch_scan_loop(bus: &mut Bus) {
+        for (offset, instruction) in BR2_REVERSE_MISMATCH_SCAN_LOOP_INSTRUCTIONS.iter().copied() {
+            bus.write_u32(BR2_REVERSE_MISMATCH_SCAN_LOOP_START + offset, instruction);
+        }
+    }
+
+    fn install_br2_small_byte_copy_loop(bus: &mut Bus) {
+        for (index, instruction) in BR2_SMALL_BYTE_COPY_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(
+                BR2_SMALL_BYTE_COPY_LOOP_START + (index as u32) * 4,
+                instruction,
+            );
+        }
+    }
+
+    fn install_bios_c80_kernel_handler_prefix(bus: &mut Bus) {
+        for (index, instruction) in BIOS_EXCEPTION_C80_KERNEL_HANDLER_PREFIX
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(0x0000_0c80 + (index as u32) * 4, instruction);
+        }
+    }
 
     fn program(instructions: &[u32]) -> Vec<u8> {
         instructions
@@ -1693,6 +3314,1181 @@ mod tests {
         assert_eq!(delay.next_pc, 0x1fc0_0010);
         assert_eq!(cpu.regs[9], 1);
         assert_eq!(cpu.regs[10], 0);
+    }
+
+    #[test]
+    fn fast_forwards_bios_decrement_delay_loop() {
+        let mut rom = vec![0; 0xa9d0 + 4];
+        let loop_offset = 0xa9b8usize;
+        for (index, instruction) in [
+            i_type(0x23, 29, 2, 0),   // lw v0, 0(sp)
+            i_type(0x23, 29, 24, 0),  // lw t8, 0(sp)
+            0,                        // nop
+            i_type(0x09, 24, 25, -1), // addiu t9, t8, -1
+            i_type(0x05, 2, 0, -5),   // bne v0, zero, loop start
+            i_type(0x2b, 29, 25, 0),  // sw t9, 0(sp)
+        ]
+        .iter()
+        .enumerate()
+        {
+            let offset = loop_offset + index * 4;
+            rom[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x1fc0_a9b8;
+        cpu.next_pc = 0x1fc0_a9bc;
+        cpu.regs[29] = 0x8001_0000;
+        bus.write_u32(cpu.regs[29], 100);
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x1fc0_a9b8);
+        assert_eq!(report.cycles_elapsed, 606);
+        assert_eq!(cpu.pc, 0x1fc0_a9d0);
+        assert_eq!(cpu.next_pc, 0x1fc0_a9d4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.regs[24], 0);
+        assert_eq!(cpu.regs[25], u32::MAX);
+        assert_eq!(bus.read_u32(cpu.regs[29]), u32::MAX);
+    }
+
+    #[test]
+    fn fast_forwards_bios_decrement_delay_loop_from_kseg1_alias() {
+        let mut rom = vec![0; 0xa9d0 + 4];
+        let loop_offset = 0xa9b8usize;
+        for (index, instruction) in [
+            i_type(0x23, 29, 2, 0),   // lw v0, 0(sp)
+            i_type(0x23, 29, 24, 0),  // lw t8, 0(sp)
+            0,                        // nop
+            i_type(0x09, 24, 25, -1), // addiu t9, t8, -1
+            i_type(0x05, 2, 0, -5),   // bne v0, zero, loop start
+            i_type(0x2b, 29, 25, 0),  // sw t9, 0(sp)
+        ]
+        .iter()
+        .enumerate()
+        {
+            let offset = loop_offset + index * 4;
+            rom[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+        cpu.pc = 0xbfc0_a9b8;
+        cpu.next_pc = 0xbfc0_a9bc;
+        cpu.regs[29] = 0x8001_0000;
+        bus.write_u32(cpu.regs[29], 100);
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0xbfc0_a9b8);
+        assert_eq!(report.cycles_elapsed, 606);
+        assert_eq!(cpu.pc, 0xbfc0_a9d0);
+        assert_eq!(cpu.next_pc, 0xbfc0_a9d4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.regs[24], 0);
+        assert_eq!(cpu.regs[25], u32::MAX);
+        assert_eq!(bus.read_u32(cpu.regs[29]), u32::MAX);
+    }
+
+    #[test]
+    fn fast_forwards_bios_short_decrement_delay_loop() {
+        let loop_offset = (BIOS_SHORT_DELAY_LOOP_START - 0x1fc0_0000) as usize;
+        let mut rom = vec![0; loop_offset + BIOS_DELAY_LOOP_INSTRUCTIONS.len() * 4];
+        for (index, instruction) in BIOS_DELAY_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            let offset = loop_offset + index * 4;
+            rom[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+        cpu.pc = BIOS_SHORT_DELAY_LOOP_START;
+        cpu.next_pc = BIOS_SHORT_DELAY_LOOP_START + 4;
+        cpu.regs[29] = 0x8001_0000;
+        bus.write_u32(cpu.regs[29], 100);
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BIOS_SHORT_DELAY_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 606);
+        assert_eq!(cpu.pc, BIOS_SHORT_DELAY_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BIOS_SHORT_DELAY_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.regs[24], 0);
+        assert_eq!(cpu.regs[25], u32::MAX);
+        assert_eq!(bus.read_u32(cpu.regs[29]), u32::MAX);
+    }
+
+    #[test]
+    fn fast_forwards_bios_delay_prologue_loop() {
+        let mut rom = vec![0; 0xa9d0 + 4];
+        let loop_offset = (BIOS_DELAY_PROLOGUE_LOOP_START - 0x1fc0_0000) as usize;
+        for (index, instruction) in BIOS_DELAY_PROLOGUE_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let offset = loop_offset + index * 4;
+            rom[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+        cpu.pc = BIOS_DELAY_PROLOGUE_LOOP_START;
+        cpu.next_pc = BIOS_DELAY_PROLOGUE_LOOP_START + 4;
+        cpu.regs[29] = 0x8001_0000;
+        bus.write_u32(cpu.regs[29], 100);
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BIOS_DELAY_PROLOGUE_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 900);
+        assert_eq!(cpu.pc, BIOS_DELAY_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BIOS_DELAY_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.regs[14], 0);
+        assert_eq!(cpu.regs[15], u32::MAX);
+        assert_eq!(bus.read_u32(cpu.regs[29]), u32::MAX);
+    }
+
+    #[test]
+    fn fast_forwards_bios_byte_copy_loop() {
+        let loop_offset = (BIOS_BYTE_COPY_LOOP_START - 0x1fc0_0000) as usize;
+        let mut rom = vec![0; loop_offset + BIOS_BYTE_COPY_LOOP_INSTRUCTIONS.len() * 4];
+        for (index, instruction) in BIOS_BYTE_COPY_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            let offset = loop_offset + index * 4;
+            rom[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+        let source = 0x8001_0000;
+        let destination = 0x8001_1000;
+        for index in 0..12 {
+            bus.write_u8(source + index, (index + 1) as u8);
+        }
+        cpu.pc = BIOS_BYTE_COPY_LOOP_START;
+        cpu.next_pc = BIOS_BYTE_COPY_LOOP_START + 4;
+        cpu.regs[3] = 1;
+        cpu.regs[4] = source + 12;
+        cpu.regs[16] = destination;
+        cpu.regs[17] = source;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BIOS_BYTE_COPY_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 105);
+        assert_eq!(
+            cpu.pc,
+            BIOS_BYTE_COPY_LOOP_START + (BIOS_BYTE_COPY_LOOP_INSTRUCTIONS.len() as u32) * 4
+        );
+        assert_eq!(cpu.next_pc, cpu.pc + 4);
+        assert_eq!(cpu.regs[1], 0);
+        assert_eq!(cpu.regs[2], 11);
+        assert_eq!(cpu.regs[8], 10);
+        assert_eq!(cpu.regs[9], 11);
+        assert_eq!(cpu.regs[10], 12);
+        assert_eq!(cpu.regs[16], destination + 12);
+        assert_eq!(cpu.regs[17], source + 12);
+        assert_eq!(cpu.regs[25], 20);
+        for index in 0..12 {
+            assert_eq!(bus.read_u8(destination + index), (index + 1) as u8);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_bios_init_zero_fill_loop() {
+        let loop_offset = (BIOS_INIT_ZERO_FILL_LOOP_START - 0x1fc0_0000) as usize;
+        let mut rom = vec![0; loop_offset + BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS.len() * 4];
+        for (index, instruction) in BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let offset = loop_offset + index * 4;
+            rom[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+        cpu.pc = BIOS_INIT_ZERO_FILL_LOOP_START;
+        cpu.next_pc = BIOS_INIT_ZERO_FILL_LOOP_START + 4;
+        cpu.regs[2] = 0xa000_9000;
+        cpu.regs[3] = 0xa000_9020;
+        for index in 0..8 {
+            bus.write_u32(0x8000_9000 + index * 4, 0xffff_ffff);
+        }
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BIOS_INIT_ZERO_FILL_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 40);
+        assert_eq!(cpu.pc, BIOS_INIT_ZERO_FILL_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BIOS_INIT_ZERO_FILL_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[1], 0);
+        assert_eq!(cpu.regs[2], 0xa000_9020);
+        for index in 0..8 {
+            assert_eq!(bus.read_u32(0x8000_9000 + index * 4), 0);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_br2_draw_sync_wait_loop_to_next_vblank() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in BR2_DRAW_SYNC_WAIT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(
+                BR2_DRAW_SYNC_WAIT_LOOP_START + (index as u32) * 4,
+                instruction,
+            );
+        }
+        bus.write_u32(BR2_DRAW_SYNC_FLAG_VIRTUAL, 1);
+        bus.tick(565_900);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_DRAW_SYNC_WAIT_LOOP_START;
+        cpu.next_pc = BR2_DRAW_SYNC_WAIT_LOOP_START + 4;
+        cpu.regs[3] = BR2_DRAW_SYNC_FLAG_VIRTUAL - 0x2210;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_DRAW_SYNC_WAIT_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 100);
+        assert_eq!(cpu.pc, BR2_DRAW_SYNC_WAIT_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_DRAW_SYNC_WAIT_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(bus.vblank_count(), 1);
+        assert_eq!(bus.read_u32(BR2_DRAW_SYNC_FLAG_VIRTUAL), 0);
+    }
+
+    #[test]
+    fn fast_forwards_br2_frame_counter_wait_loop_to_next_vblank() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_FRAME_COUNTER_WAIT_LOOP_START + (index as u32) * 4;
+            bus.write_u32(address, instruction);
+        }
+        for (index, instruction) in BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK + (index as u32) * 4;
+            bus.write_u32(address, instruction);
+        }
+        bus.write_u32(BR2_FRAME_COUNTER_WAIT_LOOP_GLOBAL_COUNTER, 31);
+        bus.tick(565_820);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_FRAME_COUNTER_WAIT_LOOP_START;
+        cpu.next_pc = BR2_FRAME_COUNTER_WAIT_LOOP_START + 4;
+        cpu.regs[4] = 32;
+        cpu.regs[29] = 0x8001_0000;
+        bus.write_u32(cpu.regs[29] + BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET, 100);
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_FRAME_COUNTER_WAIT_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 180);
+        assert_eq!(cpu.pc, BR2_FRAME_COUNTER_WAIT_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_FRAME_COUNTER_WAIT_LOOP_START + 4);
+        assert_eq!(bus.vblank_count(), 1);
+        assert_eq!(
+            bus.read_u32(cpu.regs[29] + BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET),
+            90
+        );
+    }
+
+    #[test]
+    fn fast_forwards_br2_irq_poll_timeout_loop_from_compare() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_irq_poll_timeout_loop(&mut bus);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_IRQ_POLL_TIMEOUT_LOOP_START;
+        cpu.next_pc = BR2_IRQ_POLL_TIMEOUT_LOOP_START + 4;
+        cpu.regs[3] = 3;
+        cpu.regs[4] = BR2_IRQ_POLL_STATUS_ADDRESS;
+        cpu.regs[5] = u32::MAX;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_IRQ_POLL_TIMEOUT_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 34);
+        assert_eq!(cpu.pc, BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.regs[3], u32::MAX);
+    }
+
+    #[test]
+    fn fast_forwards_br2_irq_poll_timeout_loop_from_initial_decrement() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_irq_poll_timeout_loop(&mut bus);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT;
+        cpu.next_pc = BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT + 4;
+        cpu.regs[3] = 4;
+        cpu.regs[4] = BR2_IRQ_POLL_STATUS_ADDRESS;
+        cpu.regs[5] = u32::MAX;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT);
+        assert_eq!(report.cycles_elapsed, 35);
+        assert_eq!(cpu.pc, BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_IRQ_POLL_TIMEOUT_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.regs[3], u32::MAX);
+    }
+
+    #[test]
+    fn br2_irq_poll_timeout_loop_does_not_fast_forward_when_irq_bit_is_set() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_irq_poll_timeout_loop(&mut bus);
+        bus.io.irq.status = u32::from(BR2_IRQ_POLL_STATUS_MASK);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_IRQ_POLL_TIMEOUT_LOOP_START;
+        cpu.next_pc = BR2_IRQ_POLL_TIMEOUT_LOOP_START + 4;
+        cpu.regs[3] = 3;
+        cpu.regs[4] = BR2_IRQ_POLL_STATUS_ADDRESS;
+        cpu.regs[5] = u32::MAX;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_IRQ_POLL_TIMEOUT_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, BR2_IRQ_POLL_TIMEOUT_LOOP_START + 4);
+        assert_eq!(cpu.next_pc, BR2_IRQ_POLL_TIMEOUT_LOOP_START + 8);
+        assert_eq!(cpu.regs[3], 3);
+    }
+
+    #[test]
+    fn fast_forwards_br2_byte_copy_loop() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in BR2_BYTE_COPY_LOOP_INSTRUCTIONS.iter().copied().enumerate() {
+            bus.write_u32(BR2_BYTE_COPY_LOOP_START + (index as u32) * 4, instruction);
+        }
+        let source = 0x8001_0000;
+        let destination = 0x8001_1000;
+        for index in 0..7 {
+            bus.write_u8(source + index, (0xa0 + index) as u8);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_BYTE_COPY_LOOP_START;
+        cpu.next_pc = BR2_BYTE_COPY_LOOP_START + 4;
+        cpu.regs[3] = 7;
+        cpu.regs[4] = destination;
+        cpu.regs[7] = source;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_BYTE_COPY_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 56);
+        assert_eq!(cpu.pc, BR2_BYTE_COPY_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_BYTE_COPY_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0xa6);
+        assert_eq!(cpu.regs[3], 0);
+        assert_eq!(cpu.regs[4], destination + 7);
+        assert_eq!(cpu.regs[7], source + 7);
+        for index in 0..7 {
+            assert_eq!(bus.read_u8(destination + index), (0xa0 + index) as u8);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_br2_banked_halfword_copy_loop() {
+        let mut banked = vec![0; 0x0080_0000];
+        for (index, value) in [0x1122u16, 0x3344, 0x5566, 0x7788]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let offset = 2 + index * 2;
+            banked[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut bus = Bus::with_banked_roms(Vec::new(), banked, 4 * 1024 * 1024);
+        for (offset, instruction) in BR2_BANKED_HALFWORD_COPY_LOOP_INSTRUCTIONS {
+            bus.write_u32(BR2_BANKED_HALFWORD_COPY_LOOP_START + offset, instruction);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_BANKED_HALFWORD_COPY_LOOP_START;
+        cpu.next_pc = BR2_BANKED_HALFWORD_COPY_LOOP_START + 4;
+        cpu.regs[3] = 0x1f00_0002;
+        cpu.regs[16] = 0;
+        cpu.regs[17] = 2;
+        cpu.regs[18] = 0x8001_0001;
+        cpu.regs[19] = BR2_BANKED_HALFWORD_COPY_MASK;
+        cpu.regs[20] = 8;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_BANKED_HALFWORD_COPY_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 52);
+        assert_eq!(cpu.pc, BR2_BANKED_HALFWORD_COPY_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_BANKED_HALFWORD_COPY_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.regs[3], 0x1f00_000a);
+        assert_eq!(cpu.regs[16], 8);
+        assert_eq!(cpu.regs[17], 10);
+        assert_eq!(cpu.regs[18], 0x8001_0009);
+        assert_eq!(bus.read_u16(0x8001_0001), 0x1122);
+        assert_eq!(bus.read_u16(0x8001_0003), 0x3344);
+        assert_eq!(bus.read_u16(0x8001_0005), 0x5566);
+        assert_eq!(bus.read_u16(0x8001_0007), 0x7788);
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_unmapped_table_accum_loop() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let start_index = 100u32;
+        let limit = 5_000u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, 0x8300_0000);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 98_000);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], count_address);
+        assert_eq!(cpu.regs[3], table_meta_offset);
+        assert_eq!(cpu.regs[5], limit);
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_unmapped_table_accum_loop_across_noop_expansion() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x8300_0000;
+        let expansion_noop_words = (0x1f80_0000 - 0x0300_0000) / 4;
+        let start_index = expansion_noop_words - 2_048;
+        let limit = start_index + 5_000;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            5_000 * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+    }
+
+    #[test]
+    fn fast_forwards_br2_reverse_mismatch_scan_loop_in_place() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_reverse_mismatch_scan_loop(&mut bus);
+        let pointer = 0x803a_4000;
+        let expected = 0x003a_4000;
+        let sentinel = 0xfeed_face;
+        let count = 96u32;
+        for index in 0..count {
+            bus.write_u32(pointer - index * 4, 0x1000_0000 + index);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_REVERSE_MISMATCH_SCAN_LOOP_START;
+        cpu.next_pc = BR2_REVERSE_MISMATCH_SCAN_LOOP_START + 4;
+        cpu.regs[3] = expected;
+        cpu.regs[4] = pointer;
+        cpu.regs[5] = count;
+        cpu.regs[8] = sentinel;
+
+        let report = cpu.step_report(&mut bus);
+
+        let skipped = count - 1;
+        assert_eq!(report.start_pc, BR2_REVERSE_MISMATCH_SCAN_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(skipped) * BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_REVERSE_MISMATCH_SCAN_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_REVERSE_MISMATCH_SCAN_LOOP_START + 4);
+        assert_eq!(cpu.regs[2], 0x1000_0000 + skipped - 1);
+        assert_eq!(cpu.regs[3], expected - skipped * 4);
+        assert_eq!(cpu.regs[4], pointer - skipped * 4);
+        assert_eq!(cpu.regs[5], 1);
+        assert_eq!(cpu.regs[9], pointer - skipped * 4 - 4);
+    }
+
+    #[test]
+    fn fast_forwards_br2_reverse_mismatch_scan_loop_until_sentinel() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_reverse_mismatch_scan_loop(&mut bus);
+        let pointer = 0x803a_6000;
+        let expected = 0x003a_6000;
+        let sentinel = 0xfeed_face;
+        let sentinel_index = 64u32;
+        for index in 0..128 {
+            let value = if index == sentinel_index {
+                sentinel
+            } else {
+                0x2000_0000 + index
+            };
+            bus.write_u32(pointer - index * 4, value);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_REVERSE_MISMATCH_SCAN_LOOP_START;
+        cpu.next_pc = BR2_REVERSE_MISMATCH_SCAN_LOOP_START + 4;
+        cpu.regs[3] = expected;
+        cpu.regs[4] = pointer;
+        cpu.regs[5] = 128;
+        cpu.regs[8] = sentinel;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_REVERSE_MISMATCH_SCAN_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(sentinel_index) * BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_REVERSE_MISMATCH_SCAN_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_REVERSE_MISMATCH_SCAN_LOOP_START + 4);
+        assert_eq!(cpu.regs[2], 0x2000_0000 + sentinel_index - 1);
+        assert_eq!(cpu.regs[3], expected - sentinel_index * 4);
+        assert_eq!(cpu.regs[4], pointer - sentinel_index * 4);
+        assert_eq!(cpu.regs[5], 128 - sentinel_index);
+        assert_eq!(bus.read_u32(cpu.regs[4]), sentinel);
+    }
+
+    #[test]
+    fn fast_forwards_br2_small_byte_copy_loop_to_exit() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_small_byte_copy_loop(&mut bus);
+        let source = 0x8001_0000;
+        let destination = 0x8001_1000;
+        let count = 20u32;
+        for index in 0..count {
+            bus.write_u8(source + index, (0xa0 + index) as u8);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_SMALL_BYTE_COPY_LOOP_START;
+        cpu.next_pc = BR2_SMALL_BYTE_COPY_LOOP_START + 4;
+        cpu.regs[3] = destination;
+        cpu.regs[5] = source;
+        cpu.regs[6] = count;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_SMALL_BYTE_COPY_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(count) * BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE
+        );
+        assert_eq!(cpu.pc, BR2_SMALL_BYTE_COPY_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_SMALL_BYTE_COPY_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0xa0 + count - 1);
+        assert_eq!(cpu.regs[3], destination + count);
+        assert_eq!(cpu.regs[5], source + count);
+        assert_eq!(cpu.regs[6], 0);
+        for index in 0..count {
+            assert_eq!(bus.read_u8(destination + index), (0xa0 + index) as u8);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_br2_single_byte_copy_loop_to_exit() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_small_byte_copy_loop(&mut bus);
+        let source = 0x8001_0100;
+        let destination = 0x8001_1100;
+        bus.write_u8(source, 0x7b);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_SMALL_BYTE_COPY_LOOP_START;
+        cpu.next_pc = BR2_SMALL_BYTE_COPY_LOOP_START + 4;
+        cpu.regs[3] = destination;
+        cpu.regs[5] = source;
+        cpu.regs[6] = 1;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_SMALL_BYTE_COPY_LOOP_START);
+        assert_eq!(report.cycles_elapsed, BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE);
+        assert_eq!(cpu.pc, BR2_SMALL_BYTE_COPY_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_SMALL_BYTE_COPY_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0x7b);
+        assert_eq!(cpu.regs[3], destination + 1);
+        assert_eq!(cpu.regs[5], source + 1);
+        assert_eq!(cpu.regs[6], 0);
+        assert_eq!(bus.read_u8(destination), 0x7b);
+    }
+
+    #[test]
+    fn fast_forwards_br2_small_byte_copy_loop_in_capped_chunks() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_small_byte_copy_loop(&mut bus);
+        let source = 0x8001_2000;
+        let destination = 0x8001_4000;
+        let count = 4_500u32;
+        for index in 0..count {
+            bus.write_u8(source + index, (index & 0xff) as u8);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_SMALL_BYTE_COPY_LOOP_START;
+        cpu.next_pc = BR2_SMALL_BYTE_COPY_LOOP_START + 4;
+        cpu.regs[3] = destination;
+        cpu.regs[5] = source;
+        cpu.regs[6] = count;
+
+        let report = cpu.step_report(&mut bus);
+
+        let copied = 4096u32;
+        assert_eq!(report.start_pc, BR2_SMALL_BYTE_COPY_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(copied) * BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE
+        );
+        assert_eq!(cpu.pc, BR2_SMALL_BYTE_COPY_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_SMALL_BYTE_COPY_LOOP_START + 4);
+        assert_eq!(cpu.regs[2], ((copied - 1) & 0xff));
+        assert_eq!(cpu.regs[3], destination + copied);
+        assert_eq!(cpu.regs[5], source + copied);
+        assert_eq!(cpu.regs[6], count - copied);
+        assert_eq!(
+            bus.read_u8(destination + copied - 1),
+            ((copied - 1) & 0xff) as u8
+        );
+    }
+
+    #[test]
+    fn fast_forwards_br2_reverse_pointer_scan_loop_until_mismatch() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_reverse_pointer_scan_loop(&mut bus);
+        let pointer = 0x803a_2000;
+        let expected = 0x003a_2000;
+        let iterations = 96u32;
+        for index in 0..iterations {
+            bus.write_u32(pointer - index * 4, expected - (index + 1) * 4);
+        }
+        bus.write_u32(pointer - iterations * 4, 0x1234_5678);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_REVERSE_POINTER_SCAN_LOOP_START;
+        cpu.next_pc = BR2_REVERSE_POINTER_SCAN_LOOP_START + 4;
+        cpu.regs[3] = expected;
+        cpu.regs[5] = iterations + 8;
+        cpu.regs[9] = pointer;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_REVERSE_POINTER_SCAN_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(iterations + 1) * BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_REVERSE_POINTER_SCAN_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_REVERSE_POINTER_SCAN_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], 0x1234_5678);
+        assert_eq!(cpu.regs[3], expected - (iterations + 1) * 4);
+        assert_eq!(cpu.regs[5], 7);
+        assert_eq!(cpu.regs[9], pointer - (iterations + 1) * 4);
+    }
+
+    #[test]
+    fn fast_forwards_br2_reverse_pointer_scan_loop_in_capped_chunks() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_reverse_pointer_scan_loop(&mut bus);
+        let pointer = 0x803a_8000;
+        let expected = 0x003a_8000;
+        let count = 9_000u32;
+        for index in 0..BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS {
+            bus.write_u32(pointer - index * 4, expected - (index + 1) * 4);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_REVERSE_POINTER_SCAN_LOOP_START;
+        cpu.next_pc = BR2_REVERSE_POINTER_SCAN_LOOP_START + 4;
+        cpu.regs[3] = expected;
+        cpu.regs[5] = count;
+        cpu.regs[9] = pointer;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_REVERSE_POINTER_SCAN_LOOP_START);
+        assert_eq!(cpu.pc, BR2_REVERSE_POINTER_SCAN_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_REVERSE_POINTER_SCAN_LOOP_START + 4);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS)
+                * BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION
+        );
+        assert_eq!(
+            cpu.regs[3],
+            expected - BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS * 4
+        );
+        assert_eq!(
+            cpu.regs[5],
+            count - BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS
+        );
+        assert_eq!(
+            cpu.regs[9],
+            pointer - BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS * 4
+        );
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_tail_with_pending_limit_load() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let current_index = 100u32;
+        let limit = 5_000u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, 0x8300_0000);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[3] = table_meta_offset;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = current_index;
+        cpu.regs[6] = 0x10;
+        cpu.pending_load = Some((2, limit));
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT);
+        assert_eq!(report.cycles_elapsed, 97_980);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], count_address);
+        assert_eq!(cpu.regs[3], table_meta_offset);
+        assert_eq!(cpu.regs[5], limit);
+        assert_eq!(cpu.pending_load, None);
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_mapped_table_accum_loop_and_preserves_writes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_2000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x8003_0000;
+        let start_index = 4u32;
+        let limit = 5_000u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        bus.write_u32(table_base + start_index * 4, 0x10);
+        bus.write_u32(table_base + (start_index + 1) * 4, 0x20);
+        bus.write_u32(table_base + (limit - 1) * 4, 0x30);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], count_address);
+        assert_eq!(cpu.regs[3], table_meta_offset);
+        assert_eq!(cpu.regs[5], limit);
+        assert_eq!(bus.read_u32(table_base + start_index * 4), owner + 0x10);
+        assert_eq!(
+            bus.read_u32(table_base + (start_index + 1) * 4),
+            owner + 0x20
+        );
+        assert_eq!(bus.read_u32(table_base + (limit - 1) * 4), owner + 0x30);
+    }
+
+    #[test]
+    fn takes_pending_interrupt_before_br2_post_vs_fast_forward() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x8003_0000;
+        let start_index = 100u32;
+        let limit = 5_000u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        bus.io.irq.status = 1;
+        bus.io.irq.mask = 1;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.cp0[CP0_STATUS] = 1 | CAUSE_IP2;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(report.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+        assert_eq!(cpu.next_pc, EXCEPTION_VECTOR + 4);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, CAUSE_IP2);
+        assert_eq!(cpu.cp0[CP0_EPC], BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+    }
+
+    #[test]
+    fn hle_acknowledges_vblank_irq_when_bios_c80_handler_is_blank() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in BIOS_EXCEPTION_VECTOR_TO_C80_STUB
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(EXCEPTION_VECTOR + (index as u32) * 4, instruction);
+        }
+        bus.io.irq.status = 9;
+        bus.io.irq.mask = 9;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.cp0[CP0_STATUS] = 1 | CAUSE_IP2;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(bus.io.irq.status, 0);
+    }
+
+    #[test]
+    fn hle_acknowledges_dma_irq_when_bios_c80_handler_is_blank() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in BIOS_EXCEPTION_VECTOR_TO_C80_STUB
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(EXCEPTION_VECTOR + (index as u32) * 4, instruction);
+        }
+        bus.write_u32(DMA_INTERRUPT, (1 << 23) | (1 << 20));
+        bus.write_u32(DMA_SPU_CHCR, 1 << 24);
+        bus.io.irq.mask = 1 << 3;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.cp0[CP0_STATUS] = 1 | CAUSE_IP2;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(bus.io.irq.status & (1 << 3), 0);
+        assert!(!bus.io.dma.irq_pending());
+    }
+
+    #[test]
+    fn hle_returns_from_br2_post_vs_bios_irq_handler() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_bios_c80_kernel_handler_prefix(&mut bus);
+        bus.io.irq.status = 1;
+        bus.io.irq.mask = 9;
+        bus.write_u32(DMA_INTERRUPT, (1 << 23) | (1 << 20));
+        bus.write_u32(DMA_SPU_CHCR, 1 << 24);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_0c94;
+        cpu.next_pc = 0x0000_0c98;
+        cpu.cp0[CP0_STATUS] = 0x4000_0404;
+        cpu.cp0[CP0_CAUSE] = CAUSE_IP2;
+        cpu.cp0[CP0_EPC] = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_0c94);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4);
+        assert_eq!(cpu.cp0[CP0_STATUS], 0x4000_0401);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(bus.io.irq.status & 9, 0);
+        assert!(!bus.io.dma.irq_pending());
+    }
+
+    #[test]
+    fn caps_br2_post_vs_fast_forward_before_vblank_irq() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x8003_0000;
+        let start_index = 100u32;
+        let limit = 5_000u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        bus.io.irq.mask = 1;
+        bus.tick(550_000);
+
+        let cycles_until_vblank = bus.cycles_until_next_vblank();
+        let expected_iterations =
+            ((cycles_until_vblank - 1) / BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION) as u32;
+        assert!(expected_iterations >= BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.cp0[CP0_STATUS] = 1 | CAUSE_IP2;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(expected_iterations) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4);
+        assert_eq!(cpu.regs[5], start_index + expected_iterations);
+        assert_eq!(bus.vblank_count(), 0);
+        assert_eq!(bus.io.irq.status & 1, 0);
+    }
+
+    #[test]
+    fn caps_br2_post_vs_noop_expansion_before_vblank_irq() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x8300_0000;
+        let start_index = 0u32;
+        let limit = 0x0303_0303u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        bus.io.irq.mask = 1;
+        bus.tick(550_000);
+
+        let cycles_until_vblank = bus.cycles_until_next_vblank();
+        let expected_iterations =
+            ((cycles_until_vblank - 1) / BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION) as u32;
+        assert!(expected_iterations >= BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.cp0[CP0_STATUS] = 1 | CAUSE_IP2;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(expected_iterations) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4);
+        assert_eq!(cpu.regs[5], start_index + expected_iterations);
+        assert_eq!(bus.vblank_count(), 0);
+        assert_eq!(bus.io.irq.status & 1, 0);
+    }
+
+    #[test]
+    fn br2_post_vs_table_accum_loop_skips_noop_expansion_without_touching_scratchpad() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, 5_000);
+        bus.write_u32(count_address + 4, 0x9f7f_fdf0);
+        bus.write_u32(0x1f80_0000, 0xfeed_beef);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = 0;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            5_000 * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], 5_000);
+        assert_eq!(bus.read_u32(0x1f80_0000), 0xfeed_beef);
+    }
+
+    #[test]
+    fn fast_forwards_br2_boot_word_copy_loop() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        for (index, instruction) in [
+            i_type(0x23, 4, 7, 0),  // lw a3, 0(a0)
+            0,                      // nop
+            i_type(0x2b, 5, 7, 0),  // sw a3, 0(a1)
+            0,                      // nop
+            i_type(0x08, 4, 4, 4),  // addi a0, a0, 4
+            i_type(0x08, 5, 5, 4),  // addi a1, a1, 4
+            i_type(0x08, 6, 6, -4), // addi a2, a2, -4
+            i_type(0x07, 6, 0, -8), // bgtz a2, loop start
+            0,                      // nop
+        ]
+        .iter()
+        .enumerate()
+        {
+            bus.write_u32(
+                BR2_BOOT_WORD_COPY_LOOP_START + (index as u32) * 4,
+                *instruction,
+            );
+        }
+        for (index, value) in [0x1122_3344, 0x5566_7788, 0x99aa_bbcc, 0xddee_ff00]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(0x8000_1000 + (index as u32) * 4, value);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_BOOT_WORD_COPY_LOOP_START;
+        cpu.next_pc = BR2_BOOT_WORD_COPY_LOOP_START + 4;
+        cpu.regs[4] = 0x8000_1000;
+        cpu.regs[5] = 0x8000_2000;
+        cpu.regs[6] = 16;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_BOOT_WORD_COPY_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 44);
+        assert_eq!(cpu.pc, BR2_BOOT_WORD_COPY_LOOP_START + 36);
+        assert_eq!(cpu.next_pc, BR2_BOOT_WORD_COPY_LOOP_START + 40);
+        assert_eq!(cpu.regs[4], 0x8000_1010);
+        assert_eq!(cpu.regs[5], 0x8000_2010);
+        assert_eq!(cpu.regs[6], 0);
+        assert_eq!(cpu.regs[7], 0xddee_ff00);
+        assert_eq!(bus.read_u32(0x8000_2000), 0x1122_3344);
+        assert_eq!(bus.read_u32(0x8000_2004), 0x5566_7788);
+        assert_eq!(bus.read_u32(0x8000_2008), 0x99aa_bbcc);
+        assert_eq!(bus.read_u32(0x8000_200c), 0xddee_ff00);
+    }
+
+    #[test]
+    fn fast_forwards_br2_boot_zero_fill_loop() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in [
+            i_type(0x2b, 2, 0, 0),    // sw zero, 0(v0)
+            i_type(0x09, 2, 2, 4),    // addiu v0, v0, 4
+            r_type(2, 3, 1, 0, 0x2b), // sltu at, v0, v1
+            i_type(0x05, 1, 0, -4),   // bne at, zero, loop start
+            0,                        // nop
+        ]
+        .iter()
+        .enumerate()
+        {
+            bus.write_u32(
+                BR2_BOOT_ZERO_FILL_LOOP_START + (index as u32) * 4,
+                *instruction,
+            );
+        }
+        for index in 0..4 {
+            bus.write_u32(0x8001_0000 + index * 4, 0xffff_ffff);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_BOOT_ZERO_FILL_LOOP_START;
+        cpu.next_pc = BR2_BOOT_ZERO_FILL_LOOP_START + 4;
+        cpu.regs[1] = 1;
+        cpu.regs[2] = 0x8001_0000;
+        cpu.regs[3] = 0x8001_0010;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_BOOT_ZERO_FILL_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 24);
+        assert_eq!(cpu.pc, BR2_BOOT_ZERO_FILL_LOOP_START + 20);
+        assert_eq!(cpu.next_pc, BR2_BOOT_ZERO_FILL_LOOP_START + 24);
+        assert_eq!(cpu.regs[1], 0);
+        assert_eq!(cpu.regs[2], 0x8001_0010);
+        for index in 0..4 {
+            assert_eq!(bus.read_u32(0x8001_0000 + index * 4), 0);
+        }
     }
 
     #[test]

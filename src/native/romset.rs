@@ -527,6 +527,18 @@ impl NativeRomCompatibilityReport {
             && !self.has_duplicate_required_assets()
     }
 
+    pub fn native_runtime_usable(&self) -> bool {
+        !self.has_duplicate_required_assets()
+            && !self
+                .missing_required_assets
+                .iter()
+                .any(|asset| native_runtime_required_asset_missing(asset))
+            && !self
+                .mismatched_assets
+                .iter()
+                .any(|mismatch| !native_runtime_allowed_mismatch(mismatch))
+    }
+
     pub fn has_duplicate_required_assets(&self) -> bool {
         self.duplicate_assets
             .iter()
@@ -542,10 +554,11 @@ impl NativeRomCompatibilityReport {
             .join(",");
         let known_variants = self.known_variants_json();
         format!(
-            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"known_variants\":[{}],\"missing_required_assets\":[{}],\"mismatched_assets\":[{}],\"unknown_asset_count\":{},\"duplicate_required_assets\":{}}}",
+            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"native_runtime_usable\":{},\"known_variants\":[{}],\"missing_required_assets\":[{}],\"mismatched_assets\":[{}],\"unknown_asset_count\":{},\"duplicate_required_assets\":{}}}",
             self.game_id,
             escape_json(self.manifest_source),
             self.compatible(),
+            self.native_runtime_usable(),
             known_variants,
             json_string_array(&self.missing_required_assets),
             mismatched_assets,
@@ -586,10 +599,11 @@ impl NativeRomCompatibilityReport {
             .join(",");
         let known_variants = self.known_variants_json();
         format!(
-            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"known_variants\":[{}],\"present_assets\":[{}],\"present_bios_assets\":[{}],\"present_game_assets\":[{}],\"missing_required_assets\":[{}],\"unknown_assets\":[{}],\"mismatched_assets\":[{}],\"asset_matches\":[{}],\"has_duplicate_required_assets\":{},\"duplicate_assets\":[{}],\"expectations\":[{}]}}",
+            "{{\"game_id\":\"{}\",\"manifest_source\":\"{}\",\"compatible\":{},\"native_runtime_usable\":{},\"known_variants\":[{}],\"present_assets\":[{}],\"present_bios_assets\":[{}],\"present_game_assets\":[{}],\"missing_required_assets\":[{}],\"unknown_assets\":[{}],\"mismatched_assets\":[{}],\"asset_matches\":[{}],\"has_duplicate_required_assets\":{},\"duplicate_assets\":[{}],\"expectations\":[{}]}}",
             self.game_id,
             escape_json(self.manifest_source),
             self.compatible(),
+            self.native_runtime_usable(),
             known_variants,
             present_assets,
             present_bios_assets,
@@ -625,6 +639,19 @@ impl NativeRomCompatibilityReport {
             Vec::new()
         }
     }
+}
+
+fn native_runtime_required_asset_missing(asset: &str) -> bool {
+    !matches!(
+        normalized_file_name(asset).as_str(),
+        "et01.ic652" | "78081g503.ic655" | "at28c16_world" | "et03"
+    )
+}
+
+fn native_runtime_allowed_mismatch(mismatch: &NativeRomAssetMismatch) -> bool {
+    mismatch.name.eq_ignore_ascii_case("flash1.024")
+        && mismatch.actual_size == mismatch.expected_size
+        && mismatch.actual_crc32 == ZINC_JP_FLASH1_CRC32
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2079,6 +2106,71 @@ mod tests {
         assert_eq!(report.present_assets.len(), 14);
         assert!(report.missing_required_assets.is_empty());
         assert!(report.mismatched_assets.is_empty());
+    }
+
+    #[test]
+    fn native_runtime_accepts_zinc_jp_flash_variant_without_security_dumps() {
+        let mut entries = Vec::new();
+        let mut entry_metadata = Vec::new();
+
+        for expectation in BLOODY_ROAR_2_REQUIRED_ASSETS {
+            if matches!(
+                expectation.name,
+                "et01.ic652" | "78081g503.ic655" | "at28c16_world" | "et03"
+            ) {
+                continue;
+            }
+            let crc32 = if expectation.name == "flash1.024" {
+                ZINC_JP_FLASH1_CRC32
+            } else {
+                expectation.expected_crc32.unwrap_or(0)
+            };
+            entries.push(expectation.name.to_string());
+            entry_metadata.push(NativeRomEntry {
+                name: expectation.name.to_string(),
+                uncompressed_size: expectation.expected_size,
+                compressed_size: expectation.expected_size,
+                crc32,
+                compression_method: 0,
+            });
+        }
+
+        let romset = NativeRomSet {
+            path: PathBuf::from("fixture.zip"),
+            entries,
+            entry_metadata,
+        };
+
+        let report = romset.bloody_roar_2_compatibility();
+
+        assert!(!report.compatible());
+        assert!(report.native_runtime_usable());
+        assert_eq!(
+            report.known_variants(),
+            vec!["zinc_jp_bundle_flash_variant"]
+        );
+        assert!(
+            report
+                .summary_json()
+                .contains("\"native_runtime_usable\":true")
+        );
+    }
+
+    #[test]
+    fn native_runtime_rejects_missing_program_flash() {
+        let romset = inspect_fixture(
+            "missing-runtime-required-asset",
+            fixture_required_assets_zip(Some("flash0.021")),
+        );
+        let report = romset.bloody_roar_2_compatibility();
+
+        assert!(!report.compatible());
+        assert!(!report.native_runtime_usable());
+        assert!(
+            report
+                .summary_json()
+                .contains("\"native_runtime_usable\":false")
+        );
     }
 
     #[test]

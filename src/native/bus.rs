@@ -5,8 +5,9 @@ use crate::action::ActionButtons;
 use crate::native::io::{
     DMA_GPU_BCR, DMA_GPU_CHCR, DMA_GPU_MADR, DMA_MDEC_IN_BCR, DMA_MDEC_IN_CHCR, DMA_MDEC_IN_MADR,
     DMA_MDEC_OUT_BCR, DMA_MDEC_OUT_CHCR, DMA_MDEC_OUT_MADR, DMA_OTC_BCR, DMA_OTC_CHCR,
-    DMA_OTC_MADR, GPU_GP0, GpuCommandSource, IO_REGION_END, IO_REGION_START, Io,
-    NativeGpuDisplayCandidate, NativeGpuDrawCapture, gp0_command_word_count, io_access_for,
+    DMA_OTC_MADR, DMA_REGION_END, DMA_REGION_START, GPU_GP0, GpuCommandSource, IO_REGION_END,
+    IO_REGION_START, IRQ_STATUS, Io, NativeGpuDisplayCandidate, NativeGpuDrawCapture,
+    gp0_command_word_count, io_access_for,
 };
 use crate::native::platform::{NativePlatformOps, PreferredNativePlatform};
 
@@ -21,6 +22,7 @@ const DMA_LINKED_LIST_MODE: u32 = 1 << 10;
 const DMA_MDEC_COMPLETION_DELAY_CYCLES: u64 = 1_024;
 const DMA_GPU_COMPLETION_DELAY_CYCLES: u64 = 4_096;
 const DMA_OTC_COMPLETION_DELAY_CYCLES: u64 = 512;
+const VBLANK_CYCLES: u64 = 566_000;
 const GPU_LINKED_LIST_NODE_LIMIT: u32 = 65_536;
 const BR2_DRAW_SYNC_FLAG_VIRTUAL: u32 = 0x803a_2210;
 const BR2_DRAW_SYNC_FLAG_PHYSICAL: u32 = 0x003a_2210;
@@ -33,6 +35,12 @@ const GPU_LINKED_LIST_NONEMPTY_NODE_SAMPLE_LIMIT: usize = 32;
 const PRIMITIVE_PACKET_SCAN_SAMPLE_LIMIT: usize = 24;
 const PRIMITIVE_PACKET_MAX_WORDS: u32 = 64;
 const DMA_ACTIVITY_RECENT_LIMIT: usize = 64;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW: u64 = 1;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT: usize = 8;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT: u32 = 32;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_LINKED_NODES: u32 = 512;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS: u32 = 8;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeInputActivity {
@@ -73,6 +81,104 @@ impl NativeInputActivity {
 
     pub fn has_full_control_activity(self) -> bool {
         self.has_direction_activity() && self.has_play_control_activity()
+    }
+
+    pub fn saturating_added(self, other: Self) -> Self {
+        Self {
+            p1_input_reads: self.p1_input_reads.saturating_add(other.p1_input_reads),
+            p1_up_active_reads: self
+                .p1_up_active_reads
+                .saturating_add(other.p1_up_active_reads),
+            p1_down_active_reads: self
+                .p1_down_active_reads
+                .saturating_add(other.p1_down_active_reads),
+            p1_left_active_reads: self
+                .p1_left_active_reads
+                .saturating_add(other.p1_left_active_reads),
+            p1_right_active_reads: self
+                .p1_right_active_reads
+                .saturating_add(other.p1_right_active_reads),
+            p1_start_active_reads: self
+                .p1_start_active_reads
+                .saturating_add(other.p1_start_active_reads),
+            p1_punch_active_reads: self
+                .p1_punch_active_reads
+                .saturating_add(other.p1_punch_active_reads),
+            p1_kick_active_reads: self
+                .p1_kick_active_reads
+                .saturating_add(other.p1_kick_active_reads),
+            p1_beast_active_reads: self
+                .p1_beast_active_reads
+                .saturating_add(other.p1_beast_active_reads),
+            p3_input_reads: self.p3_input_reads.saturating_add(other.p3_input_reads),
+            p3_guard_active_reads: self
+                .p3_guard_active_reads
+                .saturating_add(other.p3_guard_active_reads),
+            system_input_reads: self
+                .system_input_reads
+                .saturating_add(other.system_input_reads),
+            system_coin_active_reads: self
+                .system_coin_active_reads
+                .saturating_add(other.system_coin_active_reads),
+            system_start_active_reads: self
+                .system_start_active_reads
+                .saturating_add(other.system_start_active_reads),
+            coin_register_reads: self
+                .coin_register_reads
+                .saturating_add(other.coin_register_reads),
+            coin_register_active_reads: self
+                .coin_register_active_reads
+                .saturating_add(other.coin_register_active_reads),
+        }
+    }
+
+    pub fn saturating_subtracted(self, baseline: Self) -> Self {
+        Self {
+            p1_input_reads: self.p1_input_reads.saturating_sub(baseline.p1_input_reads),
+            p1_up_active_reads: self
+                .p1_up_active_reads
+                .saturating_sub(baseline.p1_up_active_reads),
+            p1_down_active_reads: self
+                .p1_down_active_reads
+                .saturating_sub(baseline.p1_down_active_reads),
+            p1_left_active_reads: self
+                .p1_left_active_reads
+                .saturating_sub(baseline.p1_left_active_reads),
+            p1_right_active_reads: self
+                .p1_right_active_reads
+                .saturating_sub(baseline.p1_right_active_reads),
+            p1_start_active_reads: self
+                .p1_start_active_reads
+                .saturating_sub(baseline.p1_start_active_reads),
+            p1_punch_active_reads: self
+                .p1_punch_active_reads
+                .saturating_sub(baseline.p1_punch_active_reads),
+            p1_kick_active_reads: self
+                .p1_kick_active_reads
+                .saturating_sub(baseline.p1_kick_active_reads),
+            p1_beast_active_reads: self
+                .p1_beast_active_reads
+                .saturating_sub(baseline.p1_beast_active_reads),
+            p3_input_reads: self.p3_input_reads.saturating_sub(baseline.p3_input_reads),
+            p3_guard_active_reads: self
+                .p3_guard_active_reads
+                .saturating_sub(baseline.p3_guard_active_reads),
+            system_input_reads: self
+                .system_input_reads
+                .saturating_sub(baseline.system_input_reads),
+            system_coin_active_reads: self
+                .system_coin_active_reads
+                .saturating_sub(baseline.system_coin_active_reads),
+            system_start_active_reads: self
+                .system_start_active_reads
+                .saturating_sub(baseline.system_start_active_reads),
+            coin_register_reads: self
+                .coin_register_reads
+                .saturating_sub(baseline.coin_register_reads),
+            coin_register_active_reads: self
+                .coin_register_active_reads
+                .saturating_sub(baseline.coin_register_active_reads),
+        }
     }
 
     pub fn json(self) -> String {
@@ -191,6 +297,24 @@ struct DmaActivitySample {
     cycles: u64,
 }
 
+#[derive(Clone, Debug)]
+struct UnlinkedPrimitiveReplayStats {
+    attempts: u64,
+    conditional_replays: u64,
+    forced_replays: u64,
+    skipped: u64,
+    total_packets: u64,
+    total_words: u64,
+    last_vblank: Option<u64>,
+    last_reason: &'static str,
+    last_candidate_headers: usize,
+    last_linked_nodes: u32,
+    last_linked_nonempty_nodes: u32,
+    last_linked_words: u32,
+    last_packets: usize,
+    last_words: usize,
+}
+
 impl DmaActivitySample {
     fn json(&self) -> String {
         format!(
@@ -219,6 +343,95 @@ impl DmaActivitySample {
             optional_u32_hex_json(self.pc),
             self.vblank,
             self.cycles
+        )
+    }
+}
+
+impl Default for UnlinkedPrimitiveReplayStats {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            conditional_replays: 0,
+            forced_replays: 0,
+            skipped: 0,
+            total_packets: 0,
+            total_words: 0,
+            last_vblank: None,
+            last_reason: "never",
+            last_candidate_headers: 0,
+            last_linked_nodes: 0,
+            last_linked_nonempty_nodes: 0,
+            last_linked_words: 0,
+            last_packets: 0,
+            last_words: 0,
+        }
+    }
+}
+
+impl UnlinkedPrimitiveReplayStats {
+    fn record_skip(
+        &mut self,
+        vblank: u64,
+        reason: &'static str,
+        candidate_headers: usize,
+        linked: &GpuLinkedListDmaRunStats,
+    ) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.skipped = self.skipped.saturating_add(1);
+        self.last_vblank = Some(vblank);
+        self.last_reason = reason;
+        self.last_candidate_headers = candidate_headers;
+        self.last_linked_nodes = linked.last_nodes;
+        self.last_linked_nonempty_nodes = linked.last_nonempty_nodes;
+        self.last_linked_words = linked.last_words;
+        self.last_packets = 0;
+        self.last_words = 0;
+    }
+
+    fn record_replay(
+        &mut self,
+        vblank: u64,
+        reason: &'static str,
+        candidate_headers: usize,
+        linked: &GpuLinkedListDmaRunStats,
+        packets: usize,
+        words: usize,
+    ) {
+        self.attempts = self.attempts.saturating_add(1);
+        if reason == "forced" {
+            self.forced_replays = self.forced_replays.saturating_add(1);
+        } else {
+            self.conditional_replays = self.conditional_replays.saturating_add(1);
+        }
+        self.total_packets = self.total_packets.saturating_add(packets as u64);
+        self.total_words = self.total_words.saturating_add(words as u64);
+        self.last_vblank = Some(vblank);
+        self.last_reason = reason;
+        self.last_candidate_headers = candidate_headers;
+        self.last_linked_nodes = linked.last_nodes;
+        self.last_linked_nonempty_nodes = linked.last_nonempty_nodes;
+        self.last_linked_words = linked.last_words;
+        self.last_packets = packets;
+        self.last_words = words;
+    }
+
+    fn json(&self) -> String {
+        format!(
+            "{{\"attempts\":{},\"conditional_replays\":{},\"forced_replays\":{},\"skipped\":{},\"total_packets\":{},\"total_words\":{},\"last_vblank\":{},\"last_reason\":\"{}\",\"last_candidate_headers\":{},\"last_linked_nodes\":{},\"last_linked_nonempty_nodes\":{},\"last_linked_words\":{},\"last_packets\":{},\"last_words\":{}}}",
+            self.attempts,
+            self.conditional_replays,
+            self.forced_replays,
+            self.skipped,
+            self.total_packets,
+            self.total_words,
+            optional_u64_json(self.last_vblank),
+            self.last_reason,
+            self.last_candidate_headers,
+            self.last_linked_nodes,
+            self.last_linked_nonempty_nodes,
+            self.last_linked_words,
+            self.last_packets,
+            self.last_words
         )
     }
 }
@@ -476,6 +689,13 @@ impl PrimitiveRamWriteStats {
 
     fn header_write_vblank(&self, address: u32) -> Option<u64> {
         self.header_write_vblank_by_address.get(&address).copied()
+    }
+
+    fn header_addresses_written_since(&self, min_vblank: u64) -> Vec<(u64, u32)> {
+        self.header_write_vblank_by_address
+            .iter()
+            .filter_map(|(address, vblank)| (*vblank >= min_vblank).then_some((*vblank, *address)))
+            .collect()
     }
 
     fn json(&self) -> String {
@@ -782,6 +1002,7 @@ pub struct Bus {
     draw_sync_last_game_write_pc: Option<u32>,
     gpu_linked_list_dma: GpuLinkedListDmaStats,
     primitive_ram_writes: PrimitiveRamWriteStats,
+    unlinked_primitive_replay: UnlinkedPrimitiveReplayStats,
     dma_activity: Vec<DmaActivitySample>,
     banked_rom_reads: RefCell<BankedRomReadStats>,
     board_asset_status: NativeBoardAssetStatus,
@@ -835,6 +1056,7 @@ impl Bus {
             draw_sync_last_game_write_pc: None,
             gpu_linked_list_dma: GpuLinkedListDmaStats::default(),
             primitive_ram_writes: PrimitiveRamWriteStats::default(),
+            unlinked_primitive_replay: UnlinkedPrimitiveReplayStats::default(),
             dma_activity: Vec::new(),
             banked_rom_reads: RefCell::new(BankedRomReadStats::default()),
             board_asset_status,
@@ -945,7 +1167,9 @@ impl Bus {
 
         if let Some(io_address) = mapped_io_address(address, 1) {
             self.io.write_u8(io_address, value);
-            self.sync_dma_irq();
+            if io_address == IRQ_STATUS {
+                self.raise_dma_irq_if_pending();
+            }
             self.record_access_trace("write", "io", address, 1, value as u32);
             return;
         }
@@ -975,7 +1199,9 @@ impl Bus {
 
         if let Some(io_address) = mapped_io_address(address, 2) {
             self.io.write_u16(io_address, value);
-            self.sync_dma_irq();
+            if io_address == IRQ_STATUS {
+                self.raise_dma_irq_if_pending();
+            }
             self.record_access_trace("write", "io", address, 2, value as u32);
             return;
         }
@@ -1003,20 +1229,126 @@ impl Bus {
                     value,
                     GpuCommandSource::cpu_io(address, self.trace_pc.get()),
                 );
-                self.sync_dma_irq();
                 self.record_access_trace("write", "io", address, 4, value);
                 return;
             }
+            let dma_state_may_change = dma_io_address(io_address);
             self.io.write_u32(io_address, value);
             self.record_dma_register_write(io_address, value);
             self.process_dma_transfer(io_address, value);
-            self.sync_dma_irq();
+            if dma_state_may_change {
+                self.sync_dma_irq();
+            } else if io_address == IRQ_STATUS {
+                self.raise_dma_irq_if_pending();
+            }
             self.record_access_trace("write", "io", address, 4, value);
             return;
         }
 
         let bytes = PreferredNativePlatform::write_le_u32(value);
         self.write_bytes(address, &bytes);
+    }
+
+    pub fn try_copy_aligned_words(
+        &mut self,
+        source: u32,
+        destination: u32,
+        byte_count: u32,
+    ) -> Option<(u32, u32)> {
+        if byte_count == 0
+            || byte_count & 0x03 != 0
+            || source & 0x03 != 0
+            || destination & 0x03 != 0
+        {
+            return None;
+        }
+        let byte_len = byte_count as usize;
+        if !self.word_copy_readable_range(source, byte_len)
+            || !self.word_copy_writable_range(destination, byte_len)
+        {
+            return None;
+        }
+
+        let words = byte_count / 4;
+        let mut last_word = 0;
+        for index in 0..words {
+            let offset = index.saturating_mul(4);
+            let value = self.read_u32(source.wrapping_add(offset));
+            self.write_u32(destination.wrapping_add(offset), value);
+            last_word = value;
+        }
+
+        Some((words, last_word))
+    }
+
+    pub fn try_copy_bytes(
+        &mut self,
+        source: u32,
+        destination: u32,
+        byte_count: u32,
+    ) -> Option<Vec<u8>> {
+        if byte_count == 0 || self.cache_isolated() && cacheable_address(destination) {
+            return None;
+        }
+        let byte_len = byte_count as usize;
+        if !self.word_copy_readable_range(source, byte_len)
+            || !self.word_copy_writable_range(destination, byte_len)
+        {
+            return None;
+        }
+
+        let bytes = self.read_bytes(source, byte_len);
+        self.write_bytes(destination, &bytes);
+        Some(bytes)
+    }
+
+    pub fn try_copy_halfwords(
+        &mut self,
+        source: u32,
+        destination: u32,
+        halfword_count: u32,
+    ) -> Option<u16> {
+        if halfword_count == 0 || self.cache_isolated() && cacheable_address(destination) {
+            return None;
+        }
+        let byte_len = (halfword_count as usize).checked_mul(2)?;
+        if !self.word_copy_readable_range(source, byte_len)
+            || !self.word_copy_writable_range(destination, byte_len)
+        {
+            return None;
+        }
+
+        let mut last = 0;
+        for index in 0..halfword_count {
+            let offset = index.saturating_mul(2);
+            let value = self.read_u16(source.wrapping_add(offset));
+            self.write_u16(destination.wrapping_add(offset), value);
+            last = value;
+        }
+
+        Some(last)
+    }
+
+    pub fn try_fill_aligned_words(
+        &mut self,
+        destination: u32,
+        byte_count: u32,
+        value: u32,
+    ) -> Option<u32> {
+        if byte_count == 0 || byte_count & 0x03 != 0 || destination & 0x03 != 0 {
+            return None;
+        }
+        let byte_len = byte_count as usize;
+        if !self.word_copy_writable_range(destination, byte_len) {
+            return None;
+        }
+
+        let words = byte_count / 4;
+        for index in 0..words {
+            self.write_u32(destination.wrapping_add(index.saturating_mul(4)), value);
+        }
+
+        Some(words)
     }
 
     pub fn rom_len(&self) -> usize {
@@ -1035,6 +1367,24 @@ impl Bus {
         self.banked_roms.len()
     }
 
+    fn word_copy_readable_range(&self, address: u32, byte_len: usize) -> bool {
+        ram_offset(address, self.ram.len(), byte_len).is_some()
+            || scratchpad_offset(address, self.scratchpad.len(), byte_len).is_some()
+            || rom_offset(address, self.rom.len(), byte_len).is_some()
+            || banked_rom_offset(
+                address,
+                self.banked_roms.len(),
+                byte_len,
+                self.zn_board.rom_bank,
+            )
+            .is_some()
+    }
+
+    fn word_copy_writable_range(&self, address: u32, byte_len: usize) -> bool {
+        ram_offset(address, self.ram.len(), byte_len).is_some()
+            || scratchpad_offset(address, self.scratchpad.len(), byte_len).is_some()
+    }
+
     pub fn set_cache_isolated(&mut self, isolated: bool) {
         if self.cache_isolated != isolated {
             self.cache_isolation_transitions = self.cache_isolation_transitions.saturating_add(1);
@@ -1047,11 +1397,12 @@ impl Bus {
     }
 
     pub fn tick(&mut self, cycles: u64) {
-        self.io.tick(cycles);
+        let timer_irqs = self.io.tick(cycles);
+        self.io.irq.status |= timer_irqs;
         self.tick_pending_dma(cycles);
         self.vblank_cycle_accumulator = self.vblank_cycle_accumulator.saturating_add(cycles);
-        while self.vblank_cycle_accumulator >= 566_000 {
-            self.vblank_cycle_accumulator -= 566_000;
+        while self.vblank_cycle_accumulator >= VBLANK_CYCLES {
+            self.vblank_cycle_accumulator -= VBLANK_CYCLES;
             self.vblank_count = self.vblank_count.saturating_add(1);
             self.primitive_ram_writes.advance_vblank();
             self.io.gpu.capture_vblank_presented_frame();
@@ -1064,6 +1415,10 @@ impl Bus {
         self.vblank_count
     }
 
+    pub fn cycles_until_next_vblank(&self) -> u64 {
+        VBLANK_CYCLES.saturating_sub(self.vblank_cycle_accumulator)
+    }
+
     pub fn zn_board_json(&self) -> String {
         format!(
             "{{\"state\":{},\"assets\":{}}}",
@@ -1074,7 +1429,7 @@ impl Bus {
 
     pub fn native_sync_json(&self) -> String {
         format!(
-            "{{\"br2_draw_sync_flag\":{},\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"vblank_draw_sync_clears\":{},\"game_set_writes\":{},\"game_clear_writes\":{},\"game_other_writes\":{},\"last_game_write_value\":{},\"last_game_write_pc\":{},\"cache\":{},\"banked_rom_reads\":{},\"dma_activity\":[{}],\"gpu_linked_list_dma\":{},\"primitive_ram_writes\":{},\"primitive_packet_scan\":{}}}",
+            "{{\"br2_draw_sync_flag\":{},\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"vblank_draw_sync_clears\":{},\"game_set_writes\":{},\"game_clear_writes\":{},\"game_other_writes\":{},\"last_game_write_value\":{},\"last_game_write_pc\":{},\"cache\":{},\"banked_rom_reads\":{},\"dma_activity\":[{}],\"gpu_linked_list_dma\":{},\"primitive_ram_writes\":{},\"unlinked_primitive_replay\":{},\"primitive_packet_scan\":{}}}",
             self.read_ram_u32_physical(BR2_DRAW_SYNC_FLAG_PHYSICAL)
                 .unwrap_or(0),
             self.vblank_count,
@@ -1090,7 +1445,53 @@ impl Bus {
             self.dma_activity_json(),
             self.gpu_linked_list_dma.json(),
             self.primitive_ram_writes.json(),
+            self.unlinked_primitive_replay.json(),
             self.primitive_packet_scan_json()
+        )
+    }
+
+    fn native_sync_compact_json(&self) -> String {
+        format!(
+            "{{\"br2_draw_sync_flag\":{},\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"vblank_draw_sync_clears\":{},\"game_set_writes\":{},\"game_clear_writes\":{},\"game_other_writes\":{},\"last_game_write_value\":{},\"last_game_write_pc\":{},\"cache_isolated\":{},\"cache_isolation_transitions\":{},\"dma_irq_pending\":{},\"pending_dma_completion_cycles\":[{}],\"banked_rom_reads\":{},\"gpu_linked_list_dma\":{{\"calls\":{},\"last_start_hex\":\"0x{:08x}\",\"last_nodes\":{},\"last_words\":{},\"last_nonempty_nodes\":{},\"last_terminated\":{},\"last_hit_node_limit\":{},\"node_limit_hits\":{}}},\"primitive_ram_writes\":{{\"writes\":{},\"command_like_writes\":{},\"header_like_writes\":{},\"current_vblank_header_like_writes\":{},\"last_vblank_header_like_writes\":{}}},\"unlinked_primitive_replay\":{{\"attempts\":{},\"conditional_replays\":{},\"forced_replays\":{},\"skipped\":{},\"last_reason\":\"{}\",\"last_packets\":{},\"last_words\":{}}}}}",
+            self.read_ram_u32_physical(BR2_DRAW_SYNC_FLAG_PHYSICAL)
+                .unwrap_or(0),
+            self.vblank_count,
+            self.vblank_cycle_accumulator,
+            self.vblank_draw_sync_clears,
+            self.draw_sync_game_set_writes,
+            self.draw_sync_game_clear_writes,
+            self.draw_sync_game_other_writes,
+            optional_u32_json(self.draw_sync_last_game_write_value),
+            optional_u32_hex_json(self.draw_sync_last_game_write_pc),
+            self.cache_isolated,
+            self.cache_isolation_transitions,
+            self.io.dma.irq_pending(),
+            self.pending_dma_completion_cycles
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            self.banked_rom_reads.borrow().json(),
+            self.gpu_linked_list_dma.calls,
+            self.gpu_linked_list_dma.last_start,
+            self.gpu_linked_list_dma.last_nodes,
+            self.gpu_linked_list_dma.last_words,
+            self.gpu_linked_list_dma.last_nonempty_nodes,
+            self.gpu_linked_list_dma.last_terminated,
+            self.gpu_linked_list_dma.last_hit_node_limit,
+            self.gpu_linked_list_dma.node_limit_hits,
+            self.primitive_ram_writes.writes,
+            self.primitive_ram_writes.command_like_writes,
+            self.primitive_ram_writes.header_like_writes,
+            self.primitive_ram_writes.current_vblank_header_like_writes,
+            self.primitive_ram_writes.last_vblank_header_like_writes,
+            self.unlinked_primitive_replay.attempts,
+            self.unlinked_primitive_replay.conditional_replays,
+            self.unlinked_primitive_replay.forced_replays,
+            self.unlinked_primitive_replay.skipped,
+            self.unlinked_primitive_replay.last_reason,
+            self.unlinked_primitive_replay.last_packets,
+            self.unlinked_primitive_replay.last_words
         )
     }
 
@@ -1272,6 +1673,31 @@ impl Bus {
         true
     }
 
+    fn primitive_packet_has_playfield_draw_bounds(&self, address: u32, word_count: u32) -> bool {
+        let mut commands = Vec::with_capacity(word_count as usize);
+        for index in 0..word_count {
+            let Some(command) = self.read_ram_u32_physical(address + 4 + index * 4) else {
+                return false;
+            };
+            commands.push(command);
+        }
+
+        let mut offset = 0usize;
+        while offset < commands.len() {
+            let Some(command_words) = gp0_command_word_count(&commands[offset..]) else {
+                return false;
+            };
+            if command_words == 0 || offset + command_words > commands.len() {
+                return false;
+            }
+            if gp0_command_has_playfield_draw_bounds(&commands[offset..offset + command_words]) {
+                return true;
+            }
+            offset += command_words;
+        }
+        false
+    }
+
     fn cache_json(&self) -> String {
         format!(
             "{{\"control\":{},\"control_hex\":\"0x{:08x}\",\"isolated\":{},\"isolation_transitions\":{},\"isolated_write_count\":{},\"isolated_write_bytes\":{},\"isolated_last_address\":{},\"isolated_last_address_hex\":{},\"isolated_last_width\":{},\"isolated_last_value\":{},\"isolated_last_value_hex\":\"0x{:08x}\"}}",
@@ -1304,6 +1730,16 @@ impl Bus {
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
             self.native_sync_json()
+        )
+    }
+
+    pub fn runtime_compact_probe_json(&self) -> String {
+        format!(
+            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"native_sync\":{}}}",
+            self.io.runtime_compact_probe_json(),
+            self.zn_board.runtime_probe_json(),
+            self.board_asset_status.json(),
+            self.native_sync_compact_json()
         )
     }
 
@@ -1443,6 +1879,22 @@ impl Bus {
     }
 
     fn sync_dma_irq(&mut self) {
+        if self.io.dma.irq_pending() {
+            self.io.irq.status |= 1 << 3;
+        } else {
+            self.io.irq.status &= !(1 << 3);
+        }
+    }
+
+    pub fn acknowledge_hle_bios_irq_sources(&mut self, pending: u32) {
+        if pending & (1 << 3) != 0 {
+            self.io.dma.acknowledge_pending_irq_flags();
+        }
+        self.io.irq.status &= !pending;
+        self.sync_dma_irq();
+    }
+
+    fn raise_dma_irq_if_pending(&mut self) {
         if self.io.dma.irq_pending() {
             self.io.irq.status |= 1 << 3;
         }
@@ -1647,8 +2099,10 @@ impl Bus {
             self.process_gpu_read_dma(channel.madr, channel.bcr, control);
         } else if control & DMA_LINKED_LIST_MODE != 0 {
             self.process_gpu_linked_list_dma(channel.madr);
+            self.io.gpu.capture_vblank_presented_frame();
         } else {
             self.process_gpu_block_dma(channel.madr, channel.bcr, control);
+            self.io.gpu.capture_vblank_presented_frame();
         }
         self.schedule_dma_completion(DMA_GPU_CHANNEL, DMA_GPU_COMPLETION_DELAY_CYCLES);
     }
@@ -1708,6 +2162,30 @@ impl Bus {
                 }
             }
         }
+        let replay_decision = self.unlinked_primitive_replay_decision(&stats);
+        if replay_decision.enabled {
+            let linked_nodes = stats
+                .visited_nodes
+                .iter()
+                .map(|address| address & 0x00ff_fffc)
+                .collect::<HashSet<_>>();
+            let (packets, words) = self.replay_recent_unlinked_primitive_packets(&linked_nodes);
+            self.unlinked_primitive_replay.record_replay(
+                self.vblank_count,
+                replay_decision.reason,
+                replay_decision.candidate_headers,
+                &stats,
+                packets,
+                words,
+            );
+        } else {
+            self.unlinked_primitive_replay.record_skip(
+                self.vblank_count,
+                replay_decision.reason,
+                replay_decision.candidate_headers,
+                &stats,
+            );
+        }
         self.record_gpu_linked_list_dma_activity(start_address, &stats);
         self.gpu_linked_list_dma.merge_last(stats);
     }
@@ -1717,6 +2195,164 @@ impl Bus {
             command,
             GpuCommandSource::dma_linked_list(command_address, self.trace_pc.get()),
         );
+    }
+
+    fn unlinked_primitive_replay_decision(
+        &self,
+        stats: &GpuLinkedListDmaRunStats,
+    ) -> UnlinkedPrimitiveReplayDecision {
+        let min_vblank = self
+            .vblank_count
+            .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
+        let recent_header_count = self
+            .primitive_ram_writes
+            .header_addresses_written_since(min_vblank)
+            .len();
+
+        if std::env::var_os("BR2_NATIVE_DISABLE_UNLINKED_PRIMITIVE_REPLAY").is_some() {
+            return UnlinkedPrimitiveReplayDecision::disabled("disabled", recent_header_count);
+        }
+
+        if std::env::var_os("BR2_NATIVE_ENABLE_UNLINKED_PRIMITIVE_REPLAY").is_some() {
+            return UnlinkedPrimitiveReplayDecision::enabled("forced", recent_header_count);
+        }
+
+        if std::env::var_os("BR2_NATIVE_AUTO_UNLINKED_PRIMITIVE_REPLAY").is_none() {
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "disabled_by_default",
+                recent_header_count,
+            );
+        }
+
+        if self.unlinked_primitive_replay.last_vblank == Some(self.vblank_count)
+            && self.unlinked_primitive_replay.last_packets > 0
+        {
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "already_replayed_this_vblank",
+                recent_header_count,
+            );
+        }
+
+        let recent_header_writes = self
+            .primitive_ram_writes
+            .current_vblank_header_like_writes
+            .saturating_add(self.primitive_ram_writes.last_vblank_header_like_writes);
+        let recent_draw_writes = recent_draw_primitive_writes(&self.primitive_ram_writes);
+        let has_recent_primitive_stream = recent_header_count as u64
+            >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS
+            || recent_header_writes >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS;
+        let has_any_recent_headers = recent_header_count > 0 || recent_header_writes > 0;
+        let has_recent_draw_stream =
+            recent_draw_writes >= u64::from(BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS);
+
+        if stats.last_nodes < BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_LINKED_NODES {
+            if stats.last_nonempty_nodes <= BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT
+                && has_recent_draw_stream
+                && (has_recent_primitive_stream || has_any_recent_headers)
+            {
+                return UnlinkedPrimitiveReplayDecision::enabled(
+                    "short_linked_list_recent_primitive_stream",
+                    recent_header_count,
+                );
+            }
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "linked_list_too_short",
+                recent_header_count,
+            );
+        }
+
+        if stats.last_nonempty_nodes > BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT {
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "linked_list_not_sparse",
+                recent_header_count,
+            );
+        }
+
+        let linked_draw_packets = draw_primitive_count(&stats.command_opcode_counts);
+        if linked_draw_packets < BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS {
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "not_enough_linked_draw_packets",
+                recent_header_count,
+            );
+        }
+
+        if recent_header_writes < BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS {
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "not_enough_recent_headers",
+                recent_header_count,
+            );
+        }
+
+        if recent_header_count == 0 {
+            return UnlinkedPrimitiveReplayDecision::disabled("no_recent_headers", 0);
+        }
+
+        UnlinkedPrimitiveReplayDecision::enabled(
+            "sparse_recent_primitive_headers",
+            recent_header_count,
+        )
+    }
+
+    fn replay_recent_unlinked_primitive_packets(
+        &mut self,
+        linked_nodes: &HashSet<u32>,
+    ) -> (usize, usize) {
+        let min_vblank = self
+            .vblank_count
+            .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
+        let mut packet_addresses = self
+            .primitive_ram_writes
+            .header_addresses_written_since(min_vblank);
+        let mut seen = packet_addresses
+            .iter()
+            .map(|(_, address)| *address)
+            .collect::<HashSet<_>>();
+        for (vblank, address) in self.primitive_ram_writes.header_addresses_written_since(0) {
+            if seen.contains(&address) {
+                continue;
+            }
+            let Some(sample) = self.primitive_packet_candidate_sample(address, linked_nodes) else {
+                continue;
+            };
+            if !sample.linked
+                && looks_like_draw_primitive_opcode((sample.first_command >> 24) as u8)
+                && self.primitive_packet_has_playfield_draw_bounds(address, sample.word_count)
+            {
+                packet_addresses.push((vblank, address));
+                seen.insert(address);
+            }
+        }
+        packet_addresses.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+        });
+
+        let mut replayed_packets = 0usize;
+        let mut replayed_words = 0usize;
+        for (_, address) in packet_addresses {
+            if replayed_packets >= BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT {
+                break;
+            }
+            let Some(sample) = self.primitive_packet_candidate_sample(address, linked_nodes) else {
+                continue;
+            };
+            if sample.linked {
+                continue;
+            }
+            let opcode = (sample.first_command >> 24) as u8;
+            if !looks_like_draw_primitive_opcode(opcode) {
+                continue;
+            }
+
+            for index in 0..sample.word_count {
+                let command_address = sample.address + 4 + index * 4;
+                if let Some(command) = self.read_ram_u32_physical(command_address) {
+                    self.write_gpu_dma_linked_list_word(command_address, command);
+                    replayed_words = replayed_words.saturating_add(1);
+                }
+            }
+            replayed_packets = replayed_packets.saturating_add(1);
+        }
+        (replayed_packets, replayed_words)
     }
 
     fn process_gpu_block_dma(&mut self, start_address: u32, bcr: u32, control: u32) {
@@ -1800,7 +2436,7 @@ impl Bus {
         vec![0; len]
     }
 
-    fn read_ram_u32_physical(&self, physical: u32) -> Option<u32> {
+    pub fn read_ram_u32_physical(&self, physical: u32) -> Option<u32> {
         let offset = physical as usize;
         let bytes = self.ram.get(offset..offset.checked_add(4)?)?;
         Some(PreferredNativePlatform::read_le_u32(bytes))
@@ -2055,6 +2691,107 @@ fn reverse_gpu_linked_list_command_groups() -> bool {
     std::env::var_os("BR2_NATIVE_REVERSE_GPU_LINKED_LIST_COMMANDS").is_some()
 }
 
+fn looks_like_draw_primitive_opcode(opcode: u8) -> bool {
+    matches!(opcode, 0x20..=0x7f)
+}
+
+fn gp0_command_has_playfield_draw_bounds(words: &[u32]) -> bool {
+    let Some(points) = gp0_command_vertex_words(words) else {
+        return false;
+    };
+    if points.is_empty() {
+        return false;
+    }
+
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    let mut has_visible_x = false;
+    for word in points {
+        let (x, y) = gp0_signed_xy(word);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+        has_visible_x |= (-64..=576).contains(&x);
+    }
+
+    has_visible_x && max_y >= 72 && min_y <= 430 && min_y < 420
+}
+
+fn gp0_command_vertex_words(words: &[u32]) -> Option<Vec<u32>> {
+    let opcode = (*words.first()? >> 24) as u8;
+    let vertices = match opcode {
+        0x20..=0x23 if words.len() >= 4 => vec![words[1], words[2], words[3]],
+        0x24..=0x27 if words.len() >= 7 => vec![words[1], words[3], words[5]],
+        0x28..=0x2b if words.len() >= 5 => vec![words[1], words[2], words[3], words[4]],
+        0x2c..=0x2f if words.len() >= 9 => vec![words[1], words[3], words[5], words[7]],
+        0x30..=0x33 if words.len() >= 6 => vec![words[1], words[3], words[5]],
+        0x34..=0x37 if words.len() >= 9 => vec![words[1], words[4], words[7]],
+        0x38..=0x3b if words.len() >= 8 => vec![words[1], words[3], words[5], words[7]],
+        0x3c..=0x3f if words.len() >= 12 => vec![words[1], words[4], words[7], words[10]],
+        0x40..=0x47 if words.len() >= 3 => vec![words[1], words[2]],
+        0x50..=0x57 if words.len() >= 4 => vec![words[1], words[3]],
+        0x60..=0x7f if words.len() >= 2 => vec![words[1]],
+        _ => Vec::new(),
+    };
+    Some(vertices)
+}
+
+fn gp0_signed_xy(value: u32) -> (i32, i32) {
+    (
+        sign_extend_11_bits(value & 0x07ff),
+        sign_extend_11_bits((value >> 16) & 0x07ff),
+    )
+}
+
+fn sign_extend_11_bits(value: u32) -> i32 {
+    if value & 0x0400 != 0 {
+        (value as i32) | !0x07ff
+    } else {
+        value as i32
+    }
+}
+
+fn draw_primitive_count(counts: &[u32; 256]) -> u32 {
+    counts
+        .iter()
+        .enumerate()
+        .filter(|(opcode, _)| looks_like_draw_primitive_opcode(*opcode as u8))
+        .fold(0u32, |total, (_, count)| total.saturating_add(*count))
+}
+
+fn recent_draw_primitive_writes(stats: &PrimitiveRamWriteStats) -> u64 {
+    (0x20usize..=0x7f)
+        .map(|opcode| {
+            stats.current_vblank_opcode_counts[opcode]
+                .saturating_add(stats.last_vblank_opcode_counts[opcode])
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnlinkedPrimitiveReplayDecision {
+    enabled: bool,
+    reason: &'static str,
+    candidate_headers: usize,
+}
+
+impl UnlinkedPrimitiveReplayDecision {
+    fn enabled(reason: &'static str, candidate_headers: usize) -> Self {
+        Self {
+            enabled: true,
+            reason,
+            candidate_headers,
+        }
+    }
+
+    fn disabled(reason: &'static str, candidate_headers: usize) -> Self {
+        Self {
+            enabled: false,
+            reason,
+            candidate_headers,
+        }
+    }
+}
+
 fn gpu_linked_list_command_ranges(commands: &[(u32, u32)]) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut offset = 0;
@@ -2245,11 +2982,11 @@ impl ZnBoard {
         let physical = physical_address(address);
         match physical {
             0x1fa0_0000 => self.read_player1_input(),
-            0x1fa0_0100 => 0xffff_ffff,
+            0x1fa0_0100 => active_low_player2_input(),
             0x1fa0_0200 => active_low_service_input(),
             0x1fa0_0300 => self.read_system_input(),
             0x1fa1_0000 => self.read_player3_input(),
-            0x1fa1_0100 => 0xffff_ffff,
+            0x1fa1_0100 => active_low_player4_input(),
             0x1fa1_0200 => 0x0000_0069,
             0x1fa1_0300 => self.znsecsel as u32,
             0x1fa2_0000 => self.read_coin_register(),
@@ -2453,14 +3190,22 @@ fn active_low_player1_input(input: ActionButtons) -> u32 {
     clear_bit_if(&mut value, 0x0000_0010, input.punch);
     clear_bit_if(&mut value, 0x0000_0020, input.kick);
     clear_bit_if(&mut value, 0x0000_0040, input.beast);
-    clear_bit_if(&mut value, 0x0000_0100, input.start);
+    clear_bit_if(&mut value, 0x0000_0080, input.guard);
     value
+}
+
+fn active_low_player2_input() -> u32 {
+    0xffff_ffff
 }
 
 fn active_low_player3_input(input: ActionButtons) -> u32 {
     let mut value = 0xffff_ffff;
     clear_bit_if(&mut value, 0x0000_0010, input.guard);
     value
+}
+
+fn active_low_player4_input() -> u32 {
+    0xffff_ffff
 }
 
 fn active_low_service_input() -> u32 {
@@ -2539,6 +3284,10 @@ fn mapped_io_address(address: u32, access_len: usize) -> Option<u32> {
         .then_some(physical)
 }
 
+fn dma_io_address(address: u32) -> bool {
+    (DMA_REGION_START..=DMA_REGION_END).contains(&address)
+}
+
 fn cache_control_address(address: u32) -> bool {
     address == 0xfffe_0130 || physical_address(address) == 0x1ffe_0130
 }
@@ -2574,6 +3323,10 @@ fn optional_str_json(value: Option<&str>) -> String {
 }
 
 fn optional_u32_json(value: Option<u32>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn optional_u64_json(value: Option<u64>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
@@ -2672,16 +3425,17 @@ fn looks_like_gp0_command_opcode(opcode: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BR2_DRAW_SYNC_FLAG_VIRTUAL, Bus, DMA_GPU_COMPLETION_DELAY_CYCLES,
-        DMA_MDEC_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT, GPU_LINKED_LIST_NODE_LIMIT,
-        NativeInputActivity, gpu_linked_list_command_ranges,
+        BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS, Bus,
+        DMA_GPU_COMPLETION_DELAY_CYCLES, DMA_MDEC_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT,
+        GPU_LINKED_LIST_NODE_LIMIT, NativeInputActivity, draw_primitive_count,
+        gpu_linked_list_command_ranges,
     };
     use crate::action::ActionButtons;
     use crate::native::io::{
         DMA_GPU_BCR, DMA_GPU_CHCR, DMA_GPU_MADR, DMA_INTERRUPT, DMA_MDEC_IN_BCR, DMA_MDEC_IN_CHCR,
         DMA_MDEC_IN_MADR, DMA_MDEC_OUT_BCR, DMA_MDEC_OUT_CHCR, DMA_MDEC_OUT_MADR, DMA_OTC_BCR,
         DMA_OTC_CHCR, DMA_OTC_MADR, DMA_SPU_CHCR, GPU_GP0, IRQ_MASK, IRQ_STATUS, MDEC_COMMAND,
-        SIO_DATA, SPU_REGION_START,
+        SIO_DATA, SPU_REGION_START, TIMER1_COUNTER, TIMER1_MODE, TIMER1_TARGET,
     };
 
     #[test]
@@ -2742,9 +3496,10 @@ mod tests {
         assert_eq!(bus.io.controller.p1_state & 0x0010, 0);
         assert_eq!(bus.io.controller.p1_state & 0x4000, 0);
         let p1 = bus.read_u16(0x1fa0_0000);
-        assert_eq!(p1 & 0x0111, 0);
+        assert_eq!(p1 & 0x0091, 0);
+        assert_eq!(p1 & 0x0100, 0x0100);
         assert_eq!(bus.read_u8(0x1fa0_0200), 0xff);
-        assert_eq!(bus.read_u8(0x1fa0_0300) & 0x31, 0);
+        assert_eq!(bus.read_u8(0x1fa0_0300) & 0x11, 0);
         assert_eq!(bus.read_u8(0x1fa1_0000) & 0x10, 0);
         let board_json = bus.zn_board_json();
         assert!(board_json.contains("\"p1_up_active_reads\":1"));
@@ -2787,6 +3542,40 @@ mod tests {
         assert!(json.contains("\"has_direction_activity\":true"));
         assert!(json.contains("\"has_play_control_activity\":true"));
         assert!(json.contains("\"has_full_control_activity\":true"));
+    }
+
+    #[test]
+    fn input_activity_merges_and_diffs_branch_reads_safely() {
+        let baseline = NativeInputActivity {
+            p1_input_reads: 8,
+            p1_up_active_reads: 2,
+            p1_punch_active_reads: 1,
+            system_coin_active_reads: 1,
+            ..NativeInputActivity::default()
+        };
+        let branch = NativeInputActivity {
+            p1_input_reads: 13,
+            p1_up_active_reads: 2,
+            p1_down_active_reads: 4,
+            p1_punch_active_reads: 3,
+            system_coin_active_reads: 1,
+            p3_guard_active_reads: 5,
+            ..NativeInputActivity::default()
+        };
+
+        let delta = branch.saturating_subtracted(baseline);
+        assert_eq!(delta.p1_input_reads, 5);
+        assert_eq!(delta.p1_up_active_reads, 0);
+        assert_eq!(delta.p1_down_active_reads, 4);
+        assert_eq!(delta.p1_punch_active_reads, 2);
+        assert_eq!(delta.system_coin_active_reads, 0);
+        assert_eq!(delta.p3_guard_active_reads, 5);
+
+        let merged = baseline.saturating_added(delta);
+        assert_eq!(merged.p1_input_reads, 13);
+        assert_eq!(merged.p1_down_active_reads, 4);
+        assert_eq!(merged.p1_punch_active_reads, 3);
+        assert_eq!(merged.p3_guard_active_reads, 5);
     }
 
     #[test]
@@ -2939,6 +3728,24 @@ mod tests {
     }
 
     #[test]
+    fn bus_tick_raises_timer_irq_on_target() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        bus.write_u16(TIMER1_COUNTER, 0);
+        bus.write_u16(TIMER1_TARGET, 2);
+        bus.write_u16(TIMER1_MODE, (1 << 3) | (1 << 4) | (1 << 6));
+
+        bus.tick(128);
+        assert_eq!(bus.read_u16(TIMER1_COUNTER), 1);
+        assert_eq!(bus.io.irq.status & (1 << 5), 0);
+
+        bus.tick(128);
+        assert_eq!(bus.io.irq.status & (1 << 5), 1 << 5);
+        assert_eq!(bus.read_u16(TIMER1_COUNTER), 2);
+        assert_ne!(bus.read_u16(TIMER1_MODE) & (1 << 11), 0);
+    }
+
+    #[test]
     fn vblank_clears_bloody_roar_draw_sync_flag() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
 
@@ -2976,6 +3783,44 @@ mod tests {
 
         assert_eq!(bus.io.irq.status & (1 << 3), 1 << 3);
         assert!(bus.io.dma.irq_pending());
+    }
+
+    #[test]
+    fn bus_clears_dma_irq_status_when_dma_source_is_acknowledged_late() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        bus.write_u32(DMA_INTERRUPT, (1 << 23) | (1 << 20));
+        bus.write_u32(DMA_SPU_CHCR, 1 << 24);
+
+        assert_eq!(bus.io.irq.status & (1 << 3), 1 << 3);
+        bus.write_u32(IRQ_STATUS, !(1 << 3));
+        assert_eq!(bus.io.irq.status & (1 << 3), 1 << 3);
+
+        bus.write_u32(DMA_INTERRUPT, (1 << 28) | (1 << 23) | (1 << 20));
+
+        assert!(!bus.io.dma.irq_pending());
+        assert_eq!(bus.io.irq.status & (1 << 3), 0);
+    }
+
+    #[test]
+    fn bus_blank_bios_irq_acknowledges_dma_source_flag() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        bus.write_u32(DMA_INTERRUPT, (1 << 23) | (1 << 20));
+        bus.write_u32(DMA_SPU_CHCR, 1 << 24);
+
+        assert!(bus.io.dma.irq_pending());
+        assert_eq!(bus.io.irq.status & (1 << 3), 1 << 3);
+
+        bus.acknowledge_hle_bios_irq_sources(1 << 3);
+
+        assert!(!bus.io.dma.irq_pending());
+        assert_eq!(bus.io.irq.status & (1 << 3), 0);
+        assert_eq!(
+            bus.io.dma.interrupt & ((1 << 23) | (1 << 20)),
+            (1 << 23) | (1 << 20)
+        );
+        assert_eq!(bus.io.dma.interrupt & (1 << 28), 0);
     }
 
     #[test]
@@ -3121,6 +3966,41 @@ mod tests {
         assert!(sync_json.contains("\"linked_candidates\":1"));
         assert!(sync_json.contains("\"unlinked_candidates\":1"));
         assert!(sync_json.contains("\"address_hex\":\"0x003a1100\""));
+    }
+
+    #[test]
+    fn gpu_linked_list_dma_skips_recent_unlinked_br2_primitive_packets_by_default() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.write_u32(0x003a_1000, 0x01ff_ffff);
+        bus.write_u32(0x003a_1004, 0xe100_0400);
+
+        for index in 0..BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS {
+            let base = 0x0038_1000 + (index as u32) * 0x20;
+            bus.write_u32(base, 0x05ff_ffff);
+            bus.write_u32(base + 4, 0x2800_ff00);
+            bus.write_u32(base + 8, 0x0000_0000);
+            bus.write_u32(base + 12, 0x0000_0008);
+            bus.write_u32(base + 16, 0x0008_0000);
+            bus.write_u32(base + 20, 0x0008_0008);
+        }
+
+        bus.write_u32(DMA_GPU_MADR, 0x003a_1000);
+        bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
+
+        assert_eq!(bus.io.gpu.commands_seen, 1);
+        let sync_json = bus.native_sync_json();
+        assert!(sync_json.contains("\"conditional_replays\":0"));
+        assert!(sync_json.contains("\"last_reason\":\"disabled_by_default\""));
+    }
+
+    #[test]
+    fn gpu_unlinked_replay_counts_all_gp0_draw_primitive_opcodes() {
+        let mut counts = [0u32; 256];
+        counts[0x29] = 3;
+        counts[0x39] = 5;
+        counts[0xe1] = 99;
+
+        assert_eq!(draw_primitive_count(&counts), 8);
     }
 
     #[test]

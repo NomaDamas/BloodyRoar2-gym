@@ -10,6 +10,7 @@ pub mod romset;
 pub use backend::NativeBackend;
 pub use bus::NativeInputActivity;
 pub use emulator::{NativeDisplayFrame, NativeEmulator, NativeTraceConfig};
+pub use framebuffer::png_from_rgb888_pixels;
 pub use io::NativeGpuDisplayCandidate;
 pub use platform::{
     GenericNativePlatform, NativePlatformInfo, native_platform_json, preferred_platform_info,

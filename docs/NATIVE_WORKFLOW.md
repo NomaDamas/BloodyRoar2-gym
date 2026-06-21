@@ -214,12 +214,16 @@ but the native renderer or branch stability is not yet complete.
 Open the native macOS play window:
 
 ```sh
-cargo run --release -- native-autoplay assets/roms 500000 2
-cargo run --release -- native-play assets/roms 500000 2
+cargo run --release -- native-autoplay assets/roms 500000 fit
+cargo run --release -- native-play assets/roms 500000 fit
 ```
 
-`native-autoplay` runs the built-in coin/start/control script first, then returns
-control to the keyboard. Use `native-play` when you want manual input from boot.
+`native-play` and `native-autoplay` bounded-fast-forward the built-in
+match-entry script first, continue any remaining scripted input in the visible
+window, then return control to the keyboard. The bounded phase uses a full
+vblank-sized instruction budget so it does not mistake partial warning,
+transition, or stale frames for progress. Use `native-manual` when you want
+manual input from boot.
 
 Controls:
 
@@ -235,14 +239,20 @@ Controls:
 For non-interactive smoke validation, pass a frame limit:
 
 ```sh
-cargo run --release -- native-autoplay assets/roms 500000 2 1140
-cargo run --release -- native-play assets/roms 500000 2 700
+cargo run --release -- native-autoplay assets/roms 500000 fit 1800
+cargo run --release -- native-play assets/roms 500000 fit 1800
+cargo run --release -- native-play-snapshot assets/roms 500000 tmp/native-validation/smoke --complete-script --fast-forward-frames 2400
 ```
+
+`native-play-snapshot` is intentionally stricter than the quick GUI path: it
+fails unless the final window frame satisfies gameplay-scene heuristics. A
+character transition, black letterbox, or red/salmon corrupted frame is a
+rendering gap, not a native playable pass.
 
 Capture a deterministic visual artifact for review:
 
 ```sh
-cargo run --release -- native-scripted-dump assets/roms 500000 tmp/native-validation/final-native-play-check noop:300 coin:30 noop:120 start:300 noop:120 punch:60 kick:60 beast:60 guard:60
+cargo run --release -- native-scripted-dump assets/roms 500000 tmp/native-validation/final-native-play-check noop:300 coin:30 noop:120 start:300 noop:120 punch:30 noop:60 punch:30 noop:300 start:30 noop:300
 ```
 
 Inspect `tmp/native-validation/final-native-play-check.actual-display.png`.

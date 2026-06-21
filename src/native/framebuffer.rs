@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 pub const VRAM_WIDTH: usize = 1024;
 pub const VRAM_HEIGHT: usize = 1024;
 pub const PSX_VRAM_HEIGHT: usize = 512;
@@ -15,6 +17,8 @@ pub struct NativeFrameBuffer {
 pub struct PixelWriteOptions {
     pub set_mask_bit: bool,
     pub check_mask_bit: bool,
+    pub semi_transparent: bool,
+    pub semi_transparency_mode: u8,
 }
 
 impl Default for NativeFrameBuffer {
@@ -97,6 +101,15 @@ impl NativeFrameBuffer {
             return false;
         }
 
+        let color = if options.semi_transparent {
+            blend_rgb555(
+                color,
+                self.raw_pixels[index],
+                options.semi_transparency_mode,
+            )
+        } else {
+            color
+        };
         let color = if options.set_mask_bit {
             color | 0x8000
         } else {
@@ -1160,6 +1173,8 @@ impl TextureDrawOptions {
         PixelWriteOptions {
             set_mask_bit: self.set_mask_bit,
             check_mask_bit: self.check_mask_bit,
+            semi_transparent: false,
+            semi_transparency_mode: 0,
         }
     }
 }
@@ -1225,6 +1240,23 @@ fn stepped_positions(max: usize, step: usize) -> impl Iterator<Item = usize> {
             Some(Some(value))
         })
         .flatten()
+}
+
+pub fn png_from_rgb888_pixels(width: usize, height: usize, pixels: &[u32]) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut rows = Vec::with_capacity(height.saturating_mul(width.saturating_mul(3) + 1));
+    for y in 0..height {
+        rows.push(0);
+        let row = y.saturating_mul(width);
+        for x in 0..width {
+            let color = pixels.get(row + x).copied().unwrap_or_default();
+            rows.push(((color >> 16) & 0xff) as u8);
+            rows.push(((color >> 8) & 0xff) as u8);
+            rows.push((color & 0xff) as u8);
+        }
+    }
+    png_rgb(width, height, &rows)
 }
 
 fn png_rgb(width: usize, height: usize, filtered_rgb_rows: &[u8]) -> Vec<u8> {

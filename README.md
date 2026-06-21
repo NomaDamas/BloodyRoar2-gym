@@ -83,15 +83,17 @@ Run the Rust-native Apple Silicon play window with legally supplied local assets
 ```sh
 cargo run -- native-input-check assets/roms 500000
 cargo run -- native-health-check assets/roms 500000
-cargo run -- native-play assets/roms 500000 2
-cargo run -- native-autoplay assets/roms 500000 2
+cargo run -- native-play assets/roms 500000 fit
+cargo run -- native-autoplay assets/roms 500000 fit
 ```
 
-`native-play` opens the macOS window, runs the built-in coin/start boot script
-to bypass the two warning screens and black transition, then falls back to
-keyboard control. Use `native-manual` only when you want fully manual input from
-boot. `native-autoplay` uses the same window path and also accepts an explicit
-script tail for smoke and control-sweep validation.
+`native-play` opens the macOS window after a bounded native fast-forward through
+the warning screens, black transitions, and menu confirmation. The fast-forward
+uses the requested vblank instruction budget so it does not stall on fake
+partial frames; if any scripted input remains, it continues in the window before
+falling back to keyboard control. Use `native-manual` only when you want fully
+manual input from boot. `native-autoplay` uses the same default script and also
+accepts an explicit script tail for smoke and control-sweep validation.
 `native-health-check` is stricter than the autoplay smoke path: it verifies the
 CPU core, mapped controls, rendered frame statistics, and per-action branch
 stability. It exits non-zero when the native renderer still has a full-scene
@@ -111,10 +113,16 @@ Window controls:
 For automated smoke tests, pass an optional frame limit:
 
 ```sh
-cargo run -- native-play assets/roms 500000 2 900
-cargo run -- native-autoplay assets/roms 500000 2 1140
+cargo run -- native-play assets/roms 500000 fit 1800
+cargo run -- native-autoplay assets/roms 500000 fit 1800
 cargo run -- native-manual assets/roms 500000 2 700
+cargo run -- native-play-snapshot assets/roms 500000 tmp/native-validation/smoke --complete-script --fast-forward-frames 2400
 ```
+
+`native-play-snapshot` exits non-zero unless the final rendered window frame
+meets the stricter gameplay-scene criteria. Warning screens, black letterboxed
+transitions, and red/salmon single-palette corruption are not counted as
+playable native rendering.
 
 Install MAME if you also want an external compatibility reference:
 
@@ -182,7 +190,7 @@ cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
 cargo run -- native-input-check assets/roms 500000
 cargo run -- native-health-check assets/roms 500000
-cargo run -- native-play assets/roms 500000 2
+cargo run -- native-play assets/roms 500000 fit
 cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
 ```
 
