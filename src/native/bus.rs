@@ -2986,6 +2986,7 @@ struct ZnBoard {
     rom_bank: u8,
     znsecsel: u8,
     coin: u8,
+    coin_input_latched: bool,
     sound_irq_latch: u8,
     at28c16: [u8; 2048],
     input: ActionButtons,
@@ -3028,6 +3029,7 @@ impl ZnBoard {
             rom_bank: 0,
             znsecsel: 0,
             coin: 0,
+            coin_input_latched: false,
             sound_irq_latch: 0,
             at28c16,
             input: ActionButtons::default(),
@@ -3192,6 +3194,10 @@ impl ZnBoard {
     }
 
     fn set_input(&mut self, input: ActionButtons) {
+        if input.coin && !self.coin_input_latched {
+            self.coin = self.coin.wrapping_add(1);
+        }
+        self.coin_input_latched = input.coin;
         self.input = input;
     }
 
@@ -3593,11 +3599,40 @@ mod tests {
         assert_eq!(bus.read_u8(0x1fa0_0300) & 0x11, 0);
         assert_eq!(bus.read_u8(0x1fa0_0300) & 0x20, 0x20);
         assert_eq!(bus.read_u8(0x1fa1_0000) & 0x10, 0);
+        assert_eq!(bus.read_u8(0x1fa2_0000), 1);
         let board_json = bus.zn_board_json();
         assert!(board_json.contains("\"p1_up_active_reads\":1"));
         assert!(board_json.contains("\"p1_start_active_reads\":1"));
         assert!(board_json.contains("\"p1_punch_active_reads\":1"));
         assert!(board_json.contains("\"p3_guard_active_reads\":1"));
+    }
+
+    #[test]
+    fn board_coin_register_counts_insert_edges() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        assert_eq!(bus.read_u8(0x1fa2_0000), 0);
+
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        assert_eq!(bus.read_u8(0x1fa2_0000), 1);
+
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        assert_eq!(bus.read_u8(0x1fa2_0000), 1);
+
+        bus.set_input(ActionButtons::default());
+        assert_eq!(bus.read_u8(0x1fa2_0000), 1);
+
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        assert_eq!(bus.read_u8(0x1fa2_0000), 2);
     }
 
     #[test]

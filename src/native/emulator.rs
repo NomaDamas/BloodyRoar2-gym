@@ -308,7 +308,7 @@ impl NativeEmulator {
     }
 
     pub fn display_frame(&self) -> NativeDisplayFrame {
-        let (width, height, pixels) = self.bus.io.gpu.actual_display_rgb_frame();
+        let (width, height, pixels) = self.bus.io.stable_display_rgb_frame();
         NativeDisplayFrame {
             width,
             height,

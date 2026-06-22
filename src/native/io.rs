@@ -880,6 +880,10 @@ impl Io {
         self.gpu.display_rgb_frame()
     }
 
+    pub fn stable_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
+        self.gpu.stable_display_rgb_frame()
+    }
+
     fn read(&self, address: u32, access_len: usize) -> u32 {
         if !io_access_for(address, access_len).is_some_and(IoAccess::readable) {
             return 0;
@@ -1520,6 +1524,10 @@ impl Gpu {
             return (output.width, output.height, self.display_output_rgb(output));
         }
 
+        self.stable_display_rgb_frame()
+    }
+
+    pub fn stable_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
         let resolved = self.display_resolve();
         let (width, height) = self.display_dimensions();
         if resolved.promoted && self.should_present_resolved_display(resolved) {
@@ -9126,9 +9134,13 @@ mod tests {
         let playability = io.gpu.native_playability_json();
         let compact_playability = io.gpu.native_playability_compact_json();
         let (frame_width, frame_height, frame) = io.gpu.display_rgb_frame();
+        let (stable_width, stable_height, stable_frame) = io.gpu.stable_display_rgb_frame();
 
         assert_eq!((frame_width, frame_height), (width, height * 2));
         assert_eq!(frame, cached_frame);
+        assert_eq!((stable_width, stable_height), (width, height));
+        assert!(stable_frame.iter().any(|pixel| *pixel != 0));
+        assert_ne!(stable_frame, cached_frame);
         assert!(
             playability.contains("\"actual_display_source\":\"cached_gp1_display_area_fields\""),
             "{playability}"
