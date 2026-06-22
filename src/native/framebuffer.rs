@@ -517,8 +517,16 @@ impl NativeFrameBuffer {
         for row in 0..height {
             for col in 0..width {
                 stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
-                let u = uv.u.wrapping_add(col as u8);
-                let v = uv.v.wrapping_add(row as u8);
+                let u = if options.texture_flip_x {
+                    uv.u.wrapping_sub(col as u8)
+                } else {
+                    uv.u.wrapping_add(col as u8)
+                };
+                let v = if options.texture_flip_y {
+                    uv.v.wrapping_sub(row as u8)
+                } else {
+                    uv.v.wrapping_add(row as u8)
+                };
                 let (u, v) = texture_window.apply(u, v);
                 if let Some(color) = source.sample_texture(texture_page, clut, u, v) {
                     let color = options.apply_color(color);
@@ -556,20 +564,22 @@ impl NativeFrameBuffer {
     }
 
     fn sample_texture(&self, texture_page: u16, clut: u16, u: u8, v: u8) -> Option<u16> {
+        let color = self.sample_texture_raw(texture_page, clut, u, v);
+        (color != 0).then_some(color)
+    }
+
+    fn sample_texture_raw(&self, texture_page: u16, clut: u16, u: u8, v: u8) -> u16 {
         let page_x = ((texture_page & 0x0f) as i32) * 64;
-        let page_y = (((texture_page >> 4) & 0x01) as i32) * 256;
+        let page_y = texture_page_y(texture_page) as i32;
         let mode = (texture_page >> 7) & 0x03;
         let u = u as i32;
         let v = v as i32;
 
-        let color = match mode {
+        match mode {
             0 => {
                 let packed = self.raw_pixel(page_x + u / 4, page_y + v);
                 let index = ((packed >> ((u & 3) * 4)) & 0x0f) as i32;
-                self.raw_pixel(
-                    ((clut & 0x3f) as i32) * 16 + index,
-                    ((clut >> 6) & 0x03ff) as i32,
-                )
+                self.raw_pixel(((clut & 0x3f) as i32) * 16 + index, clut_y(clut) as i32)
             }
             1 => {
                 let packed = self.raw_pixel(page_x + u / 2, page_y + v);
@@ -578,15 +588,50 @@ impl NativeFrameBuffer {
                 } else {
                     packed >> 8
                 } as i32;
-                self.raw_pixel(
-                    ((clut & 0x3f) as i32) * 16 + index,
-                    ((clut >> 6) & 0x03ff) as i32,
-                )
+                self.raw_pixel(((clut & 0x3f) as i32) * 16 + index, clut_y(clut) as i32)
             }
             _ => self.raw_pixel(page_x + u, page_y + v),
-        };
+        }
+    }
 
-        (color & 0x7fff != 0).then_some(color)
+    pub fn decoded_texture_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
+        let (width, height) = texture_page_dimensions(texture_page);
+        let mut pixels = Vec::with_capacity(width.saturating_mul(height));
+        for y in 0..height {
+            for x in 0..width {
+                let color = self.sample_texture_raw(texture_page, clut, x as u8, y as u8);
+                pixels.push(rgb555_to_rgb888(color));
+            }
+        }
+        png_from_rgb888_pixels(width, height, &pixels)
+    }
+
+    pub fn texture_palette_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
+        let palette_entries = texture_palette_entries(texture_page);
+        if palette_entries == 0 {
+            return png_from_rgb888_pixels(1, 1, &[0]);
+        }
+
+        let columns = palette_entries.min(16);
+        let rows = palette_entries.div_ceil(columns);
+        let cell_size = 8usize;
+        let width = columns * cell_size;
+        let height = rows * cell_size;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = clut_y(clut) as i32;
+        let mut pixels = vec![0; width.saturating_mul(height)];
+        for index in 0..palette_entries {
+            let color = rgb555_to_rgb888(self.raw_pixel(clut_x + index as i32, clut_y));
+            let cell_x = (index % columns) * cell_size;
+            let cell_y = (index / columns) * cell_size;
+            for y in 0..cell_size {
+                let row_start = (cell_y + y) * width;
+                for x in 0..cell_size {
+                    pixels[row_start + cell_x + x] = color;
+                }
+            }
+        }
+        png_from_rgb888_pixels(width, height, &pixels)
     }
 
     fn set_textured_pixel(
@@ -607,7 +652,8 @@ impl NativeFrameBuffer {
         if options.check_mask_bit && self.raw_pixels[index] & 0x8000 != 0 {
             return false;
         }
-        let color = if options.semi_transparent {
+        let semi_transparent = options.semi_transparent && color & 0x8000 != 0;
+        let color = if semi_transparent {
             blend_rgb555(
                 color,
                 self.raw_pixels[index],
@@ -616,7 +662,16 @@ impl NativeFrameBuffer {
         } else {
             color
         };
-        self.write_raw_pixel_index(index, color, options.pixel_write_options())
+        self.write_raw_pixel_index(
+            index,
+            color,
+            PixelWriteOptions {
+                set_mask_bit: options.set_mask_bit,
+                check_mask_bit: options.check_mask_bit,
+                semi_transparent: false,
+                semi_transparency_mode: 0,
+            },
+        )
     }
 
     pub fn png_base64(
@@ -1148,6 +1203,8 @@ pub struct TextureDrawOptions {
     pub semi_transparency_mode: u8,
     pub set_mask_bit: bool,
     pub check_mask_bit: bool,
+    pub texture_flip_x: bool,
+    pub texture_flip_y: bool,
 }
 
 impl TextureDrawOptions {
@@ -1159,6 +1216,8 @@ impl TextureDrawOptions {
             semi_transparency_mode: 0,
             set_mask_bit: false,
             check_mask_bit: false,
+            texture_flip_x: false,
+            texture_flip_y: false,
         }
     }
 
@@ -1167,15 +1226,6 @@ impl TextureDrawOptions {
             return color;
         }
         modulate_rgb555(color, self.primitive_color)
-    }
-
-    fn pixel_write_options(self) -> PixelWriteOptions {
-        PixelWriteOptions {
-            set_mask_bit: self.set_mask_bit,
-            check_mask_bit: self.check_mask_bit,
-            semi_transparent: false,
-            semi_transparency_mode: 0,
-        }
     }
 }
 
@@ -1346,6 +1396,26 @@ fn modulate_rgb555(color: u16, primitive_color: u32) -> u16 {
     (color & 0x8000) | r | (g << 5) | (b << 10)
 }
 
+fn clut_y(clut: u16) -> u16 {
+    (clut >> 6) & 0x03ff
+}
+
+fn texture_page_y(texture_page: u16) -> u16 {
+    ((texture_page & 0x0010) << 4) | ((texture_page & 0x0800) >> 2)
+}
+
+fn texture_page_dimensions(_texture_page: u16) -> (usize, usize) {
+    (256, 256)
+}
+
+fn texture_palette_entries(texture_page: u16) -> usize {
+    match (texture_page >> 7) & 0x03 {
+        0 => 16,
+        1 => 256,
+        _ => 0,
+    }
+}
+
 fn modulate_channel(value_5bit: u16, primitive_8bit: u32) -> u16 {
     ((u32::from(value_5bit) * primitive_8bit) >> 7).min(0x1f) as u16
 }
@@ -1405,7 +1475,10 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeFrameBuffer, PSX_VRAM_HEIGHT, Point, VRAM_HEIGHT, VRAM_WIDTH};
+    use super::{
+        NativeFrameBuffer, PSX_VRAM_HEIGHT, Point, TextureCoordinate, TextureDrawOptions,
+        TextureWindow, VRAM_HEIGHT, VRAM_WIDTH,
+    };
 
     #[test]
     fn framebuffer_exports_png_base64() {
@@ -1473,6 +1546,70 @@ mod tests {
         assert_eq!(pixels, vec![0x00ff_0000, 0x0000_ff00]);
         assert_eq!(stats.nonzero_pixels, 2);
         assert_ne!(pixels[1], framebuffer.pixel(0, PSX_VRAM_HEIGHT as i32));
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_zn_extended_clut_rows() {
+        let mut framebuffer = NativeFrameBuffer::default();
+
+        framebuffer.set_raw_pixel(0, 0, 0x0001);
+        framebuffer.set_raw_pixel(1, 1, 0x001f);
+        framebuffer.set_raw_pixel(1, PSX_VRAM_HEIGHT as i32 + 1, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            0,
+            0x8040,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_zn_extended_texture_page_y() {
+        let mut framebuffer = NativeFrameBuffer::default();
+
+        framebuffer.set_raw_pixel(0, 0, 0x03e0);
+        framebuffer.set_raw_pixel(0, PSX_VRAM_HEIGHT as i32, 0x001f);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            0x0900,
+            0,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_textured_rect_honors_zn_sprite_flip_bits() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.texture_flip_x = true;
+        options.texture_flip_y = true;
+
+        framebuffer.set_raw_pixel(2, 2, 0x001f);
+        framebuffer.set_raw_pixel(1, 2, 0x03e0);
+        framebuffer.set_raw_pixel(2, 1, 0x7c00);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (2, 2),
+            0x0100,
+            0,
+            TextureCoordinate { u: 2, v: 2 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+        assert_eq!(framebuffer.pixel(9, 8), 0x0000_ff00);
+        assert_eq!(framebuffer.pixel(8, 9), 0x0000_00ff);
     }
 
     #[test]

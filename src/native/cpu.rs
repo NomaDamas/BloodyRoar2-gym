@@ -33,6 +33,54 @@ const BIOS_EXCEPTION_C80_KERNEL_HANDLER_PREFIX: [u32; 12] = [
 ];
 const BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_START: u32 = 0x0000_0c80;
 const BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_END: u32 = 0x0000_0cac;
+const BIOS_IRQ_DISPATCH_LOOP_HLE_START: u32 = 0x0000_1b7c;
+const BIOS_IRQ_DISPATCH_LOOP_HLE_END: u32 = 0x0000_1bf0;
+const BIOS_IRQ_DISPATCH_LOOP_SIGNATURE: [(u32, u32); 8] = [
+    (0x0000_1b7c, 0x8e19_0004),
+    (0x0000_1b80, 0x0000_0000),
+    (0x0000_1b84, 0x1639_0017),
+    (0x0000_1b88, 0x0000_0000),
+    (0x0000_1be4, 0x2610_001c),
+    (0x0000_1be8, 0x0214_082b),
+    (0x0000_1bec, 0x1420_ffe3),
+    (0x0000_1bf0, 0x0000_0000),
+];
+const BIOS_EXCEPTION_CONTEXT_POINTER_PHYSICAL: u32 = 0x0000_0108;
+const BIOS_EXCEPTION_CONTEXT_POINTER_ADJUST: u32 = 8;
+const BIOS_EXCEPTION_CONTEXT_GPR_OFFSETS: [(usize, u32); 29] = [
+    (1, 0x04),
+    (2, 0x08),
+    (3, 0x0c),
+    (4, 0x10),
+    (5, 0x14),
+    (6, 0x18),
+    (7, 0x1c),
+    (8, 0x20),
+    (9, 0x24),
+    (10, 0x28),
+    (11, 0x2c),
+    (12, 0x30),
+    (13, 0x34),
+    (14, 0x38),
+    (15, 0x3c),
+    (16, 0x40),
+    (17, 0x44),
+    (18, 0x48),
+    (19, 0x4c),
+    (20, 0x50),
+    (21, 0x54),
+    (22, 0x58),
+    (23, 0x5c),
+    (24, 0x60),
+    (25, 0x64),
+    (27, 0x6c),
+    (28, 0x70),
+    (29, 0x74),
+    (30, 0x78),
+];
+const BIOS_EXCEPTION_CONTEXT_RA_OFFSET: u32 = 0x7c;
+const BIOS_EXCEPTION_CONTEXT_LO_OFFSET: u32 = 0x84;
+const BIOS_EXCEPTION_CONTEXT_HI_OFFSET: u32 = 0x88;
 const GTE_FRACTIONAL_BITS: u32 = 12;
 const GTE_FLAG_ERROR: u32 = 1 << 31;
 const GTE_FLAG_ERROR_BITS: u32 = 0x7f87_e000;
@@ -319,6 +367,8 @@ pub struct StepReport {
     pub end_pc: u32,
     pub next_pc: u32,
     pub instruction: Option<u32>,
+    pub end_sp: u32,
+    pub end_ra: u32,
     pub cycles_before: u64,
     pub cycles_after: u64,
     pub cycles_elapsed: u64,
@@ -332,6 +382,8 @@ impl StepReport {
             end_pc: cpu.pc,
             next_pc: cpu.next_pc,
             instruction: None,
+            end_sp: cpu.regs[29],
+            end_ra: cpu.regs[31],
             cycles_before: cpu.cycles,
             cycles_after: cpu.cycles,
             cycles_elapsed: 0,
@@ -341,7 +393,7 @@ impl StepReport {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"start_pc\":{},\"start_pc_hex\":\"0x{:08x}\",\"end_pc\":{},\"end_pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"instruction\":{},\"instruction_hex\":{},\"cycles_before\":{},\"cycles_after\":{},\"cycles_elapsed\":{},\"outcome\":\"{:?}\"}}",
+            "{{\"start_pc\":{},\"start_pc_hex\":\"0x{:08x}\",\"end_pc\":{},\"end_pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"instruction\":{},\"instruction_hex\":{},\"end_sp\":{},\"end_sp_hex\":\"0x{:08x}\",\"end_ra\":{},\"end_ra_hex\":\"0x{:08x}\",\"cycles_before\":{},\"cycles_after\":{},\"cycles_elapsed\":{},\"outcome\":\"{:?}\"}}",
             self.start_pc,
             self.start_pc,
             self.end_pc,
@@ -350,6 +402,10 @@ impl StepReport {
             self.next_pc,
             optional_u32_json(self.instruction),
             optional_u32_hex_json(self.instruction),
+            self.end_sp,
+            self.end_sp,
+            self.end_ra,
+            self.end_ra,
             self.cycles_before,
             self.cycles_after,
             self.cycles_elapsed,
@@ -413,7 +469,7 @@ impl Cpu {
         let start_pc = self.pc;
         let cycles_before = self.cycles;
         bus.set_trace_context(start_pc, cycles_before);
-        if self.try_hle_br2_post_vs_bios_irq_return(bus) {
+        if self.try_hle_br2_bios_irq_return(bus) {
             self.cycles += 1;
             self.regs[0] = 0;
             let report =
@@ -662,6 +718,20 @@ impl Cpu {
         )
     }
 
+    pub fn gte_projected_vertices(&self) -> u64 {
+        self.gte_projected_vertices
+    }
+
+    pub fn gte_command_counts_summary_json(&self) -> String {
+        self.gte_command_counts_json()
+    }
+
+    pub fn native_3d_gameplay_signal(&self) -> bool {
+        let projection_commands =
+            self.gte_command_counts[0x01].saturating_add(self.gte_command_counts[0x30]);
+        self.gte_projected_vertices >= 3 && projection_commands > 0
+    }
+
     fn step_report_from(
         &self,
         start_pc: u32,
@@ -674,6 +744,8 @@ impl Cpu {
             end_pc: self.pc,
             next_pc: self.next_pc,
             instruction,
+            end_sp: self.regs[29],
+            end_ra: self.regs[31],
             cycles_before,
             cycles_after: self.cycles,
             cycles_elapsed: self.cycles.saturating_sub(cycles_before),
@@ -1274,8 +1346,13 @@ impl Cpu {
         let table_base = bus.read_u32(count_address.wrapping_add(4));
         let first_target = table_base.wrapping_add(start_index.wrapping_shl(2));
 
+        let target_is_ram = br2_ram_word_range(first_target, remaining, bus.ram_len());
+        let target_is_expansion_noop = br2_expansion_noop_address(first_target);
+        let can_skip_noop_expansion_across_vblank = target_is_expansion_noop && !target_is_ram;
         let mut max_iterations = remaining.min(BR2_POST_VS_TABLE_ACCUM_MAX_SKIP_ITERATIONS);
-        if self.vblank_irq_can_preempt(bus) {
+        if can_skip_noop_expansion_across_vblank {
+            max_iterations = remaining;
+        } else if self.vblank_irq_can_preempt(bus) {
             let cycles_until_vblank = bus.cycles_until_next_vblank();
             if cycles_until_vblank <= BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION {
                 return None;
@@ -1298,7 +1375,7 @@ impl Cpu {
                 bus.write_u32(target, value);
             }
         } else {
-            if !br2_expansion_noop_address(first_target) {
+            if !target_is_expansion_noop {
                 return None;
             }
             skipped_iterations = max_iterations;
@@ -2646,14 +2723,23 @@ impl Cpu {
         true
     }
 
-    fn try_hle_br2_post_vs_bios_irq_return(&mut self, bus: &mut Bus) -> bool {
-        if !(BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_START..=BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_END)
+    fn try_hle_br2_bios_irq_return(&mut self, bus: &mut Bus) -> bool {
+        if self.delay_slot_branch_pc.is_some() || self.cp0[CP0_CAUSE] & CAUSE_IP2 == 0 {
+            return false;
+        }
+        let post_vs_c80_return = (BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_START
+            ..=BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_END)
             .contains(&self.pc)
-            || self.delay_slot_branch_pc.is_some()
-            || self.cp0[CP0_EPC] != BR2_POST_VS_TABLE_ACCUM_LOOP_START
-            || self.cp0[CP0_CAUSE] & CAUSE_IP2 == 0
-            || !bios_exception_c80_handler_has_kernel_prefix(bus)
-        {
+            && self.cp0[CP0_EPC] == BR2_POST_VS_TABLE_ACCUM_LOOP_START
+            && bios_exception_c80_handler_has_kernel_prefix(bus);
+        let draw_sync_dispatch_return =
+            (BIOS_IRQ_DISPATCH_LOOP_HLE_START..=BIOS_IRQ_DISPATCH_LOOP_HLE_END).contains(&self.pc)
+                && self.cp0[CP0_EPC] == BR2_DRAW_SYNC_WAIT_LOOP_EXIT
+                && bios_irq_dispatch_loop_has_signature(bus);
+        if !post_vs_c80_return && !draw_sync_dispatch_return {
+            return false;
+        }
+        if draw_sync_dispatch_return && !self.restore_bios_exception_context(bus) {
             return false;
         }
 
@@ -2669,6 +2755,37 @@ impl Cpu {
         self.load_commit_register = None;
         self.load_commit_value = None;
         self.load_commit_cancelled = false;
+        true
+    }
+
+    fn restore_bios_exception_context(&mut self, bus: &Bus) -> bool {
+        let Some(context_base) = bios_exception_context_base_physical(bus) else {
+            return false;
+        };
+        for (register, offset) in BIOS_EXCEPTION_CONTEXT_GPR_OFFSETS {
+            let Some(value) = bus.read_ram_u32_physical(context_base.wrapping_add(offset)) else {
+                return false;
+            };
+            self.regs[register] = value;
+        }
+        let Some(ra) =
+            bus.read_ram_u32_physical(context_base.wrapping_add(BIOS_EXCEPTION_CONTEXT_RA_OFFSET))
+        else {
+            return false;
+        };
+        let Some(lo) =
+            bus.read_ram_u32_physical(context_base.wrapping_add(BIOS_EXCEPTION_CONTEXT_LO_OFFSET))
+        else {
+            return false;
+        };
+        let Some(hi) =
+            bus.read_ram_u32_physical(context_base.wrapping_add(BIOS_EXCEPTION_CONTEXT_HI_OFFSET))
+        else {
+            return false;
+        };
+        self.regs[31] = ra;
+        self.hi = hi;
+        self.lo = lo;
         true
     }
 
@@ -2773,6 +2890,27 @@ fn bios_exception_c80_handler_has_kernel_prefix(bus: &Bus) -> bool {
             let address = BIOS_EXCEPTION_HANDLER_PHYSICAL + (index as u32) * 4;
             bus.read_ram_u32_physical(address) == Some(expected)
         })
+}
+
+fn bios_irq_dispatch_loop_has_signature(bus: &Bus) -> bool {
+    BIOS_IRQ_DISPATCH_LOOP_SIGNATURE
+        .iter()
+        .copied()
+        .all(|(address, expected)| bus.read_ram_u32_physical(address) == Some(expected))
+}
+
+fn bios_exception_context_base_physical(bus: &Bus) -> Option<u32> {
+    let context_pointer_address =
+        bus.read_ram_u32_physical(BIOS_EXCEPTION_CONTEXT_POINTER_PHYSICAL)?;
+    let context_pointer =
+        bus.read_ram_u32_physical(psx_physical_address(context_pointer_address))?;
+    Some(psx_physical_address(
+        context_pointer.wrapping_add(BIOS_EXCEPTION_CONTEXT_POINTER_ADJUST),
+    ))
+}
+
+fn psx_physical_address(address: u32) -> u32 {
+    address & 0x1fff_ffff
 }
 
 fn rfe_status(status: u32) -> u32 {
@@ -3105,8 +3243,11 @@ mod tests {
         BIOS_BYTE_COPY_LOOP_INSTRUCTIONS, BIOS_BYTE_COPY_LOOP_START, BIOS_DELAY_LOOP_EXIT,
         BIOS_DELAY_LOOP_INSTRUCTIONS, BIOS_DELAY_PROLOGUE_LOOP_INSTRUCTIONS,
         BIOS_DELAY_PROLOGUE_LOOP_START, BIOS_EXCEPTION_C80_KERNEL_HANDLER_PREFIX,
-        BIOS_EXCEPTION_VECTOR_TO_C80_STUB, BIOS_INIT_ZERO_FILL_LOOP_EXIT,
-        BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS, BIOS_INIT_ZERO_FILL_LOOP_START,
+        BIOS_EXCEPTION_CONTEXT_HI_OFFSET, BIOS_EXCEPTION_CONTEXT_LO_OFFSET,
+        BIOS_EXCEPTION_CONTEXT_POINTER_ADJUST, BIOS_EXCEPTION_CONTEXT_POINTER_PHYSICAL,
+        BIOS_EXCEPTION_CONTEXT_RA_OFFSET, BIOS_EXCEPTION_VECTOR_TO_C80_STUB,
+        BIOS_INIT_ZERO_FILL_LOOP_EXIT, BIOS_INIT_ZERO_FILL_LOOP_INSTRUCTIONS,
+        BIOS_INIT_ZERO_FILL_LOOP_START, BIOS_IRQ_DISPATCH_LOOP_SIGNATURE,
         BIOS_SHORT_DELAY_LOOP_EXIT, BIOS_SHORT_DELAY_LOOP_START,
         BR2_BANKED_HALFWORD_COPY_LOOP_EXIT, BR2_BANKED_HALFWORD_COPY_LOOP_INSTRUCTIONS,
         BR2_BANKED_HALFWORD_COPY_LOOP_START, BR2_BANKED_HALFWORD_COPY_MASK,
@@ -3206,6 +3347,29 @@ mod tests {
         {
             bus.write_u32(0x0000_0c80 + (index as u32) * 4, instruction);
         }
+    }
+
+    fn install_bios_irq_dispatch_loop_signature(bus: &mut Bus) {
+        for (address, instruction) in BIOS_IRQ_DISPATCH_LOOP_SIGNATURE {
+            bus.write_u32(address, instruction);
+        }
+    }
+
+    fn install_bios_exception_context(bus: &mut Bus, sp: u32, ra: u32) {
+        let context_pointer_slot = 0xa000_e1ec;
+        let context_pointer = 0xa000_e1f4;
+        let context_base = context_pointer + BIOS_EXCEPTION_CONTEXT_POINTER_ADJUST;
+        bus.write_u32(
+            BIOS_EXCEPTION_CONTEXT_POINTER_PHYSICAL,
+            context_pointer_slot,
+        );
+        bus.write_u32(context_pointer_slot, context_pointer);
+        bus.write_u32(context_base + 0x40, 0x1111_0000);
+        bus.write_u32(context_base + 0x48, 0x2222_0000);
+        bus.write_u32(context_base + 0x74, sp);
+        bus.write_u32(context_base + BIOS_EXCEPTION_CONTEXT_RA_OFFSET, ra);
+        bus.write_u32(context_base + BIOS_EXCEPTION_CONTEXT_LO_OFFSET, 0x3333_0000);
+        bus.write_u32(context_base + BIOS_EXCEPTION_CONTEXT_HI_OFFSET, 0x4444_0000);
     }
 
     fn program(instructions: &[u32]) -> Vec<u8> {
@@ -4276,6 +4440,45 @@ mod tests {
     }
 
     #[test]
+    fn hle_returns_from_br2_draw_sync_bios_irq_dispatch_loop() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_bios_irq_dispatch_loop_signature(&mut bus);
+        install_bios_exception_context(&mut bus, 0x803f_ff70, 0x802d_07d0);
+        bus.io.irq.status = 1;
+        bus.io.irq.mask = 9;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_1b84;
+        cpu.next_pc = 0x0000_1b88;
+        cpu.regs[16] = 0x0000_1234;
+        cpu.regs[18] = 0x0000_5678;
+        cpu.regs[29] = 0x0000_8b30;
+        cpu.regs[31] = 0x0000_18d0;
+        cpu.hi = 0xaaaa_aaaa;
+        cpu.lo = 0xbbbb_bbbb;
+        cpu.cp0[CP0_STATUS] = 0x4000_0404;
+        cpu.cp0[CP0_CAUSE] = CAUSE_IP2;
+        cpu.cp0[CP0_EPC] = BR2_DRAW_SYNC_WAIT_LOOP_EXIT;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_1b84);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, BR2_DRAW_SYNC_WAIT_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_DRAW_SYNC_WAIT_LOOP_EXIT + 4);
+        assert_eq!(cpu.cp0[CP0_STATUS], 0x4000_0401);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(cpu.regs[16], 0x1111_0000);
+        assert_eq!(cpu.regs[18], 0x2222_0000);
+        assert_eq!(cpu.regs[29], 0x803f_ff70);
+        assert_eq!(cpu.regs[31], 0x802d_07d0);
+        assert_eq!(cpu.lo, 0x3333_0000);
+        assert_eq!(cpu.hi, 0x4444_0000);
+        assert_eq!(bus.io.irq.status & 9, 0);
+    }
+
+    #[test]
     fn caps_br2_post_vs_fast_forward_before_vblank_irq() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_post_vs_table_accum_loop(&mut bus);
@@ -4354,13 +4557,13 @@ mod tests {
         assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
         assert_eq!(
             report.cycles_elapsed,
-            u64::from(expected_iterations) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+            u64::from(limit) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
         );
-        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
-        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4);
-        assert_eq!(cpu.regs[5], start_index + expected_iterations);
-        assert_eq!(bus.vblank_count(), 0);
-        assert_eq!(bus.io.irq.status & 1, 0);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+        assert!(bus.vblank_count() > 0);
+        assert_eq!(bus.io.irq.status & 1, 1);
     }
 
     #[test]
@@ -4517,6 +4720,20 @@ mod tests {
             first.1,
             "{\"pc\":2147483776,\"next_pc\":2147483780,\"cycles\":4,\"halted\":true,\"status\":0,\"cause\":36,\"epc\":532676620,\"r2\":42,\"r3\":0,\"r4\":7,\"r5\":0,\"r6\":0,\"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r16\":0,\"r29\":0,\"r31\":0,\"gte_command_counts\":[]}"
         );
+    }
+
+    #[test]
+    fn native_3d_gameplay_signal_requires_real_projection_activity() {
+        let mut cpu = Cpu::default();
+
+        assert_eq!(cpu.gte_projected_vertices(), 0);
+        assert!(!cpu.native_3d_gameplay_signal());
+
+        cpu.gte_projected_vertices = 3;
+        assert!(!cpu.native_3d_gameplay_signal());
+
+        cpu.gte_command_counts[0x30] = 1;
+        assert!(cpu.native_3d_gameplay_signal());
     }
 
     #[test]

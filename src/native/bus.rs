@@ -36,7 +36,7 @@ const PRIMITIVE_PACKET_SCAN_SAMPLE_LIMIT: usize = 24;
 const PRIMITIVE_PACKET_MAX_WORDS: u32 = 64;
 const DMA_ACTIVITY_RECENT_LIMIT: usize = 64;
 const BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW: u64 = 1;
-const BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT: usize = 8;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT: usize = 512;
 const BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT: u32 = 32;
 const BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_LINKED_NODES: u32 = 512;
 const BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS: u32 = 8;
@@ -447,6 +447,13 @@ struct PrimitivePacketCandidateSample {
     header_write_vblank: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrimitiveReplayCandidate {
+    address: u32,
+    vblank: u64,
+    priority: u8,
+}
+
 #[derive(Clone, Debug)]
 struct GpuLinkedListDmaRunSummary {
     call: u64,
@@ -691,10 +698,12 @@ impl PrimitiveRamWriteStats {
         self.header_write_vblank_by_address.get(&address).copied()
     }
 
-    fn header_addresses_written_since(&self, min_vblank: u64) -> Vec<(u64, u32)> {
-        self.header_write_vblank_by_address
+    fn recent_header_addresses_written_since(&self, min_vblank: u64) -> Vec<(u64, u32)> {
+        self.recent_header_like_writes
             .iter()
-            .filter_map(|(address, vblank)| (*vblank >= min_vblank).then_some((*vblank, *address)))
+            .filter_map(|sample| {
+                (sample.vblank >= min_vblank).then_some((sample.vblank, sample.address))
+            })
             .collect()
     }
 
@@ -1404,8 +1413,9 @@ impl Bus {
         while self.vblank_cycle_accumulator >= VBLANK_CYCLES {
             self.vblank_cycle_accumulator -= VBLANK_CYCLES;
             self.vblank_count = self.vblank_count.saturating_add(1);
-            self.primitive_ram_writes.advance_vblank();
+            self.process_vblank_unlinked_primitive_replay();
             self.io.gpu.capture_vblank_presented_frame();
+            self.primitive_ram_writes.advance_vblank();
             self.io.irq.status |= 1;
             self.complete_draw_sync_on_vblank();
         }
@@ -1745,6 +1755,10 @@ impl Bus {
 
     pub fn native_playability_json(&self) -> String {
         self.io.native_playability_json()
+    }
+
+    pub fn native_playability_compact_json(&self) -> String {
+        self.io.native_playability_compact_json()
     }
 
     pub fn native_playable_candidate(&self) -> bool {
@@ -2162,30 +2176,7 @@ impl Bus {
                 }
             }
         }
-        let replay_decision = self.unlinked_primitive_replay_decision(&stats);
-        if replay_decision.enabled {
-            let linked_nodes = stats
-                .visited_nodes
-                .iter()
-                .map(|address| address & 0x00ff_fffc)
-                .collect::<HashSet<_>>();
-            let (packets, words) = self.replay_recent_unlinked_primitive_packets(&linked_nodes);
-            self.unlinked_primitive_replay.record_replay(
-                self.vblank_count,
-                replay_decision.reason,
-                replay_decision.candidate_headers,
-                &stats,
-                packets,
-                words,
-            );
-        } else {
-            self.unlinked_primitive_replay.record_skip(
-                self.vblank_count,
-                replay_decision.reason,
-                replay_decision.candidate_headers,
-                &stats,
-            );
-        }
+        self.try_unlinked_primitive_replay(&stats);
         self.record_gpu_linked_list_dma_activity(start_address, &stats);
         self.gpu_linked_list_dma.merge_last(stats);
     }
@@ -2206,7 +2197,7 @@ impl Bus {
             .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
         let recent_header_count = self
             .primitive_ram_writes
-            .header_addresses_written_since(min_vblank)
+            .recent_header_addresses_written_since(min_vblank)
             .len();
 
         if std::env::var_os("BR2_NATIVE_DISABLE_UNLINKED_PRIMITIVE_REPLAY").is_some() {
@@ -2215,13 +2206,6 @@ impl Bus {
 
         if std::env::var_os("BR2_NATIVE_ENABLE_UNLINKED_PRIMITIVE_REPLAY").is_some() {
             return UnlinkedPrimitiveReplayDecision::enabled("forced", recent_header_count);
-        }
-
-        if std::env::var_os("BR2_NATIVE_AUTO_UNLINKED_PRIMITIVE_REPLAY").is_none() {
-            return UnlinkedPrimitiveReplayDecision::disabled(
-                "disabled_by_default",
-                recent_header_count,
-            );
         }
 
         if self.unlinked_primitive_replay.last_vblank == Some(self.vblank_count)
@@ -2238,12 +2222,21 @@ impl Bus {
             .current_vblank_header_like_writes
             .saturating_add(self.primitive_ram_writes.last_vblank_header_like_writes);
         let recent_draw_writes = recent_draw_primitive_writes(&self.primitive_ram_writes);
+        let linked_nodes = stats
+            .visited_nodes
+            .iter()
+            .map(|address| address & 0x00ff_fffc)
+            .collect::<HashSet<_>>();
+        let recent_draw_candidates =
+            self.recent_unlinked_draw_packet_candidates(&linked_nodes, min_vblank);
         let has_recent_primitive_stream = recent_header_count as u64
             >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS
-            || recent_header_writes >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS;
+            || recent_header_writes >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS
+            || recent_draw_candidates >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS;
         let has_any_recent_headers = recent_header_count > 0 || recent_header_writes > 0;
-        let has_recent_draw_stream =
-            recent_draw_writes >= u64::from(BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS);
+        let has_recent_draw_stream = recent_draw_writes
+            >= u64::from(BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS)
+            || recent_draw_candidates >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS;
 
         if stats.last_nodes < BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_LINKED_NODES {
             if stats.last_nonempty_nodes <= BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT
@@ -2293,6 +2286,81 @@ impl Bus {
         )
     }
 
+    fn recent_unlinked_draw_packet_candidates(
+        &self,
+        linked_nodes: &HashSet<u32>,
+        min_vblank: u64,
+    ) -> u32 {
+        self.primitive_ram_writes
+            .recent_header_addresses_written_since(min_vblank)
+            .into_iter()
+            .filter(|(_, address)| {
+                let Some(sample) = self.primitive_packet_candidate_sample(*address, linked_nodes)
+                else {
+                    return false;
+                };
+                !sample.linked
+                    && looks_like_draw_primitive_opcode((sample.first_command >> 24) as u8)
+            })
+            .count()
+            .min(u32::MAX as usize) as u32
+    }
+
+    fn process_vblank_unlinked_primitive_replay(&mut self) {
+        if self.primitive_ram_writes.current_vblank_header_like_writes == 0
+            && self.primitive_ram_writes.last_vblank_header_like_writes == 0
+        {
+            return;
+        }
+        let stats = self.last_gpu_linked_list_run_for_replay();
+        self.try_unlinked_primitive_replay(&stats);
+    }
+
+    fn last_gpu_linked_list_run_for_replay(&self) -> GpuLinkedListDmaRunStats {
+        let mut stats = GpuLinkedListDmaRunStats::started(
+            self.gpu_linked_list_dma.last_start,
+            self.gpu_linked_list_dma.last_first_node,
+        );
+        stats.last_nodes = self.gpu_linked_list_dma.last_nodes;
+        stats.last_words = self.gpu_linked_list_dma.last_words;
+        stats.last_nonempty_nodes = self.gpu_linked_list_dma.last_nonempty_nodes;
+        stats.last_max_node_words = self.gpu_linked_list_dma.last_max_node_words;
+        stats.last_min_command_address = self.gpu_linked_list_dma.last_min_command_address;
+        stats.last_max_command_address = self.gpu_linked_list_dma.last_max_command_address;
+        stats.command_opcode_counts = self.gpu_linked_list_dma.last_command_opcode_counts;
+        stats.visited_nodes = self.gpu_linked_list_dma.last_visited_nodes.clone();
+        stats.terminated = self.gpu_linked_list_dma.last_terminated;
+        stats.hit_node_limit = self.gpu_linked_list_dma.last_hit_node_limit;
+        stats
+    }
+
+    fn try_unlinked_primitive_replay(&mut self, stats: &GpuLinkedListDmaRunStats) {
+        let replay_decision = self.unlinked_primitive_replay_decision(stats);
+        if replay_decision.enabled {
+            let linked_nodes = stats
+                .visited_nodes
+                .iter()
+                .map(|address| address & 0x00ff_fffc)
+                .collect::<HashSet<_>>();
+            let (packets, words) = self.replay_recent_unlinked_primitive_packets(&linked_nodes);
+            self.unlinked_primitive_replay.record_replay(
+                self.vblank_count,
+                replay_decision.reason,
+                replay_decision.candidate_headers,
+                stats,
+                packets,
+                words,
+            );
+        } else {
+            self.unlinked_primitive_replay.record_skip(
+                self.vblank_count,
+                replay_decision.reason,
+                replay_decision.candidate_headers,
+                stats,
+            );
+        }
+    }
+
     fn replay_recent_unlinked_primitive_packets(
         &mut self,
         linked_nodes: &HashSet<u32>,
@@ -2300,37 +2368,14 @@ impl Bus {
         let min_vblank = self
             .vblank_count
             .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
-        let mut packet_addresses = self
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for (vblank, address) in self
             .primitive_ram_writes
-            .header_addresses_written_since(min_vblank);
-        let mut seen = packet_addresses
-            .iter()
-            .map(|(_, address)| *address)
-            .collect::<HashSet<_>>();
-        for (vblank, address) in self.primitive_ram_writes.header_addresses_written_since(0) {
+            .recent_header_addresses_written_since(min_vblank)
+        {
             if seen.contains(&address) {
                 continue;
-            }
-            let Some(sample) = self.primitive_packet_candidate_sample(address, linked_nodes) else {
-                continue;
-            };
-            if !sample.linked
-                && looks_like_draw_primitive_opcode((sample.first_command >> 24) as u8)
-                && self.primitive_packet_has_playfield_draw_bounds(address, sample.word_count)
-            {
-                packet_addresses.push((vblank, address));
-                seen.insert(address);
-            }
-        }
-        packet_addresses.sort_unstable_by(|left, right| {
-            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
-        });
-
-        let mut replayed_packets = 0usize;
-        let mut replayed_words = 0usize;
-        for (_, address) in packet_addresses {
-            if replayed_packets >= BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT {
-                break;
             }
             let Some(sample) = self.primitive_packet_candidate_sample(address, linked_nodes) else {
                 continue;
@@ -2339,7 +2384,51 @@ impl Bus {
                 continue;
             }
             let opcode = (sample.first_command >> 24) as u8;
-            if !looks_like_draw_primitive_opcode(opcode) {
+            let recent = vblank >= min_vblank;
+            let draw = looks_like_draw_primitive_opcode(opcode);
+            let textured = looks_like_textured_primitive_opcode(opcode);
+            let playfield =
+                draw && self.primitive_packet_has_playfield_draw_bounds(address, sample.word_count);
+            if !recent && !playfield {
+                continue;
+            }
+            let priority = match (textured, playfield, draw, recent) {
+                (true, true, _, _) => 0,
+                (true, false, _, true) => 1,
+                (false, true, _, _) => 2,
+                (false, false, true, true) => 3,
+                (false, false, false, true) => 4,
+                _ => continue,
+            };
+            candidates.push(PrimitiveReplayCandidate {
+                address,
+                vblank,
+                priority,
+            });
+            seen.insert(address);
+        }
+        candidates.sort_unstable_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| right.vblank.cmp(&left.vblank))
+                .then_with(|| left.address.cmp(&right.address))
+        });
+
+        let mut replayed_packets = 0usize;
+        let mut replayed_words = 0usize;
+        for candidate in candidates {
+            if replayed_packets >= BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT {
+                break;
+            }
+            let address = candidate.address;
+            let Some(sample) = self.primitive_packet_candidate_sample(address, linked_nodes) else {
+                continue;
+            };
+            if sample.linked {
+                continue;
+            }
+            let opcode = (sample.first_command >> 24) as u8;
+            if !looks_like_draw_primitive_opcode(opcode) && candidate.priority > 3 {
                 continue;
             }
 
@@ -2693,6 +2782,10 @@ fn reverse_gpu_linked_list_command_groups() -> bool {
 
 fn looks_like_draw_primitive_opcode(opcode: u8) -> bool {
     matches!(opcode, 0x20..=0x7f)
+}
+
+fn looks_like_textured_primitive_opcode(opcode: u8) -> bool {
+    matches!(opcode, 0x24..=0x27 | 0x2c..=0x2f | 0x34..=0x37 | 0x3c..=0x3f | 0x64..=0x67 | 0x74..=0x77 | 0x7c..=0x7f)
 }
 
 fn gp0_command_has_playfield_draw_bounds(words: &[u32]) -> bool {
@@ -3190,7 +3283,6 @@ fn active_low_player1_input(input: ActionButtons) -> u32 {
     clear_bit_if(&mut value, 0x0000_0010, input.punch);
     clear_bit_if(&mut value, 0x0000_0020, input.kick);
     clear_bit_if(&mut value, 0x0000_0040, input.beast);
-    clear_bit_if(&mut value, 0x0000_0080, input.guard);
     value
 }
 
@@ -3216,7 +3308,6 @@ fn active_low_system_input(input: ActionButtons) -> u32 {
     let mut value = 0xffff_ffff;
     clear_bit_if(&mut value, 0x0000_0001, input.start);
     clear_bit_if(&mut value, 0x0000_0010, input.coin);
-    clear_bit_if(&mut value, 0x0000_0020, input.coin);
     value
 }
 
@@ -3425,10 +3516,10 @@ fn looks_like_gp0_command_opcode(opcode: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS, Bus,
-        DMA_GPU_COMPLETION_DELAY_CYCLES, DMA_MDEC_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT,
-        GPU_LINKED_LIST_NODE_LIMIT, NativeInputActivity, draw_primitive_count,
-        gpu_linked_list_command_ranges,
+        BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS,
+        BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS, Bus, DMA_GPU_COMPLETION_DELAY_CYCLES,
+        DMA_MDEC_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT, GPU_LINKED_LIST_NODE_LIMIT,
+        NativeInputActivity, draw_primitive_count, gpu_linked_list_command_ranges,
     };
     use crate::action::ActionButtons;
     use crate::native::io::{
@@ -3496,10 +3587,11 @@ mod tests {
         assert_eq!(bus.io.controller.p1_state & 0x0010, 0);
         assert_eq!(bus.io.controller.p1_state & 0x4000, 0);
         let p1 = bus.read_u16(0x1fa0_0000);
-        assert_eq!(p1 & 0x0091, 0);
-        assert_eq!(p1 & 0x0100, 0x0100);
+        assert_eq!(p1 & 0x0011, 0);
+        assert_eq!(p1 & 0x0080, 0x0080);
         assert_eq!(bus.read_u8(0x1fa0_0200), 0xff);
         assert_eq!(bus.read_u8(0x1fa0_0300) & 0x11, 0);
+        assert_eq!(bus.read_u8(0x1fa0_0300) & 0x20, 0x20);
         assert_eq!(bus.read_u8(0x1fa1_0000) & 0x10, 0);
         let board_json = bus.zn_board_json();
         assert!(board_json.contains("\"p1_up_active_reads\":1"));
@@ -3969,7 +4061,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_linked_list_dma_skips_recent_unlinked_br2_primitive_packets_by_default() {
+    fn gpu_linked_list_dma_replays_recent_unlinked_br2_primitive_packets_by_default() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.write_u32(0x003a_1000, 0x01ff_ffff);
         bus.write_u32(0x003a_1004, 0xe100_0400);
@@ -3978,19 +4070,57 @@ mod tests {
             let base = 0x0038_1000 + (index as u32) * 0x20;
             bus.write_u32(base, 0x05ff_ffff);
             bus.write_u32(base + 4, 0x2800_ff00);
-            bus.write_u32(base + 8, 0x0000_0000);
-            bus.write_u32(base + 12, 0x0000_0008);
-            bus.write_u32(base + 16, 0x0008_0000);
-            bus.write_u32(base + 20, 0x0008_0008);
+            bus.write_u32(base + 8, 0x0050_0000);
+            bus.write_u32(base + 12, 0x0050_0008);
+            bus.write_u32(base + 16, 0x0058_0000);
+            bus.write_u32(base + 20, 0x0058_0008);
         }
 
         bus.write_u32(DMA_GPU_MADR, 0x003a_1000);
         bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
 
-        assert_eq!(bus.io.gpu.commands_seen, 1);
+        assert!(bus.io.gpu.commands_seen > 1);
         let sync_json = bus.native_sync_json();
-        assert!(sync_json.contains("\"conditional_replays\":0"));
-        assert!(sync_json.contains("\"last_reason\":\"disabled_by_default\""));
+        assert!(sync_json.contains("\"conditional_replays\":1"));
+        assert!(
+            sync_json.contains("\"last_reason\":\"short_linked_list_recent_primitive_stream\"")
+        );
+    }
+
+    #[test]
+    fn gpu_vblank_replays_recent_unlinked_textured_primitives_without_later_dma() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.write_u32(0x003a_1000, 0x01ff_ffff);
+        bus.write_u32(0x003a_1004, 0xe100_0400);
+        bus.write_u32(DMA_GPU_MADR, 0x003a_1000);
+        bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
+        let commands_before = bus.io.gpu.commands_seen;
+
+        for index in 0..BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS {
+            let base = 0x0038_2000 + index * 0x40;
+            bus.write_u32(base, 0x09ff_ffff);
+            bus.write_u32(base + 4, 0x2d40_4040);
+            bus.write_u32(base + 8, 0x0050_0000);
+            bus.write_u32(base + 12, 0x0000_0000);
+            bus.write_u32(base + 16, 0x0050_0008);
+            bus.write_u32(base + 20, 0x0001_0000);
+            bus.write_u32(base + 24, 0x0058_0000);
+            bus.write_u32(base + 28, 0x0000_0100);
+            bus.write_u32(base + 32, 0x0058_0008);
+            bus.write_u32(base + 36, 0x0000_0101);
+        }
+
+        bus.tick(566_000);
+
+        assert!(bus.io.gpu.commands_seen > commands_before);
+        assert!(
+            bus.io_json()
+                .contains("\"gpu_textured_triangle_commands\":16")
+        );
+        let sync_json = bus.native_sync_json();
+        assert!(
+            sync_json.contains("\"last_reason\":\"short_linked_list_recent_primitive_stream\"")
+        );
     }
 
     #[test]

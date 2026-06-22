@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bloodyroar2_gym::{
-    ACTION_SPACE, Action, BloodyRoar2Env, MameConfig, MameRuntime, NativeDisplayFrame,
-    NativeEmulator, NativeInputActivity, NativeRomSet, NativeTraceConfig, NullBackend, ZincConfig,
-    ZincRuntime, action_space_json, api_index_json, observation_space_json, png_from_rgb888_pixels,
+    ACTION_SPACE, Action, ActionButtons, BloodyRoar2Env, MameConfig, MameRuntime,
+    NativeDisplayFrame, NativeEmulator, NativeInputActivity, NativeRomSet, NativeTraceConfig,
+    NullBackend, ZincConfig, ZincRuntime, action_space_json, api_index_json,
+    observation_space_json, png_from_rgb888_pixels,
 };
 use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
 
@@ -14,6 +15,8 @@ const NATIVE_PLAY_MIN_WINDOW_WIDTH: usize = 640;
 const NATIVE_PLAY_MIN_WINDOW_HEIGHT: usize = 480;
 const NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES: u64 = 2_400;
 const NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME: u64 = 500_000;
+const NATIVE_PLAY_GUI_INPUT_SLICE_INSTRUCTIONS: u64 = 1_000;
+const NATIVE_PLAY_INPUT_LATCH_POLLS: u8 = 45;
 const NATIVE_VBLANK_TRACE_MAX_INSTRUCTIONS: u64 = 100_000;
 
 fn main() -> ExitCode {
@@ -217,8 +220,7 @@ fn run() -> Result<(), String> {
             let mut emulator =
                 NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
             emulator.step_instructions(count);
-            std::fs::write(&output, emulator.screenshot_png())
-                .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+            write_output_file(&output, emulator.screenshot_png())?;
             println!(
                 "{{\"output\":\"{}\",\"state\":{}}}",
                 output.display(),
@@ -243,8 +245,7 @@ fn run() -> Result<(), String> {
             let mut emulator =
                 NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
             emulator.step_instructions(count);
-            std::fs::write(&output, emulator.display_png())
-                .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+            write_output_file(&output, emulator.display_png())?;
             println!(
                 "{{\"output\":\"{}\",\"state\":{}}}",
                 output.display(),
@@ -269,8 +270,7 @@ fn run() -> Result<(), String> {
             let mut emulator =
                 NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
             emulator.step_instructions(count);
-            std::fs::write(&output, emulator.vram_png())
-                .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+            write_output_file(&output, emulator.vram_png())?;
             println!(
                 "{{\"output\":\"{}\",\"state\":{}}}",
                 output.display(),
@@ -300,32 +300,14 @@ fn run() -> Result<(), String> {
             let mut emulator =
                 NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
             emulator.step_instructions(count);
-            std::fs::write(&actual_display_output, emulator.actual_display_png()).map_err(
-                |error| {
-                    format!(
-                        "failed to write {}: {error}",
-                        actual_display_output.display()
-                    )
-                },
-            )?;
-            std::fs::write(
+            write_output_file(&actual_display_output, emulator.actual_display_png())?;
+            write_output_file(
                 &raw_actual_display_output,
                 emulator.raw_actual_display_png(),
-            )
-            .map_err(|error| {
-                format!(
-                    "failed to write {}: {error}",
-                    raw_actual_display_output.display()
-                )
-            })?;
-            std::fs::write(&display_output, emulator.display_png()).map_err(|error| {
-                format!("failed to write {}: {error}", display_output.display())
-            })?;
-            std::fs::write(&observation_output, emulator.screenshot_png()).map_err(|error| {
-                format!("failed to write {}: {error}", observation_output.display())
-            })?;
-            std::fs::write(&vram_output, emulator.vram_png())
-                .map_err(|error| format!("failed to write {}: {error}", vram_output.display()))?;
+            )?;
+            write_output_file(&display_output, emulator.display_png())?;
+            write_output_file(&observation_output, emulator.screenshot_png())?;
+            write_output_file(&vram_output, emulator.vram_png())?;
             println!(
                 "{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"state\":{}}}",
                 escape_json(&actual_display_output.display().to_string()),
@@ -412,7 +394,7 @@ fn run() -> Result<(), String> {
                 instructions_per_frame.max(1),
                 scale,
                 max_frames,
-                native_match_entry_script(),
+                default_native_play_script(),
                 true,
                 true,
             )
@@ -490,13 +472,19 @@ fn run() -> Result<(), String> {
             let mut first_native_playable_frame = checkpoint_run.first_native_playable_frame;
             let mut last_native_playable_frame = checkpoint_run.last_native_playable_frame;
             let checkpoint = emulator.clone();
+            let checkpoint_frame = checkpoint.display_frame();
+            let checkpoint_frame_stats = NativeFrameStats::from_frame(&checkpoint_frame);
+            let checkpoint_frame_checksum = native_frame_checksum(&checkpoint_frame);
             let mut control_sweep = checkpoint.clone();
             let mut control_sweep_frames = 0u64;
             let mut control_sweep_missed_vblank_frames = 0u64;
             let checkpoint_activity = checkpoint.input_activity();
             let mut control_sweep_activity = NativeInputActivity::default();
             let mut control_sweep_native_playable_candidate = false;
-            if observed_native_playable_candidate && !emulator.is_terminal() {
+            let mut branch_action_reads = 0usize;
+            let mut branch_visual_changes = 0usize;
+            let mut branches = Vec::new();
+            if !emulator.is_terminal() {
                 for &action in native_health_branch_actions() {
                     let mut branch = checkpoint.clone();
                     let branch_segments = [
@@ -523,6 +511,31 @@ fn run() -> Result<(), String> {
                     );
                     control_sweep_native_playable_candidate |=
                         control_sweep.native_playable_candidate();
+                    let branch_activity = control_sweep.input_activity();
+                    let branch_delta = branch_activity.saturating_subtracted(checkpoint_activity);
+                    let action_read = native_action_activity_observed(branch_delta, action);
+                    let branch_frame = control_sweep.display_frame();
+                    let branch_frame_stats = NativeFrameStats::from_frame(&branch_frame);
+                    let branch_frame_checksum = native_frame_checksum(&branch_frame);
+                    let visual_changed = branch_frame_checksum != checkpoint_frame_checksum;
+                    if action_read {
+                        branch_action_reads += 1;
+                    }
+                    if visual_changed {
+                        branch_visual_changes += 1;
+                    }
+                    branches.push(format!(
+                        "{{\"action_index\":{},\"action\":\"{}\",\"action_activity_observed\":{},\"visual_changed\":{},\"frame_checksum\":{},\"native_playable_candidate\":{},\"run\":{},\"input_delta\":{},\"frame\":{}}}",
+                        action.index(),
+                        action.name(),
+                        action_read,
+                        visual_changed,
+                        branch_frame_checksum,
+                        control_sweep.native_playable_candidate(),
+                        branch_run.json(),
+                        branch_delta.json(),
+                        branch_frame_stats.json()
+                    ));
                     if let Some(first) = branch_run.first_native_playable_frame {
                         first_native_playable_frame
                             .get_or_insert(total_frames.saturating_add(first));
@@ -537,11 +550,22 @@ fn run() -> Result<(), String> {
             let final_native_playable_candidate = checkpoint.native_playable_candidate();
             let input_controls_active = input_activity.has_play_control_activity();
             let full_controls_active = input_activity.has_full_control_activity();
-            let playable = observed_native_playable_candidate && full_controls_active;
+            let all_branch_actions_read =
+                branch_action_reads == native_health_branch_actions().len();
+            let branch_visual_response = branch_visual_changes > 0;
+            let manual_checkpoint_ready =
+                checkpoint_frame_stats.has_visible_content() && !checkpoint.is_terminal();
+            let manual_controls_operable = manual_checkpoint_ready
+                && all_branch_actions_read
+                && branch_visual_response
+                && full_controls_active;
+            let native_playability_confirmed =
+                final_native_playable_candidate || control_sweep_native_playable_candidate;
+            let playable = manual_controls_operable && native_playability_confirmed;
             let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
             let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
             println!(
-                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"control_sweep_frames\":{},\"control_sweep_missed_vblank_frames\":{},\"checkpoint_executed_steps\":{},\"control_sweep_executed_steps\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"control_sweep_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"playable\":{},\"state\":{}}}",
+                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"control_sweep_frames\":{},\"control_sweep_missed_vblank_frames\":{},\"checkpoint_executed_steps\":{},\"control_sweep_executed_steps\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"control_sweep_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"branch_action_reads\":{},\"branch_count\":{},\"branch_visual_response\":{},\"branch_visual_changes\":{},\"manual_checkpoint_ready\":{},\"manual_controls_operable\":{},\"native_playability_confirmed\":{},\"checkpoint_frame_checksum\":{},\"checkpoint_frame\":{},\"playable\":{},\"branches\":[{}],\"state\":{}}}",
                 instructions_per_frame,
                 total_frames_with_sweep,
                 checkpoint_run.missed_vblank_frames,
@@ -559,14 +583,25 @@ fn run() -> Result<(), String> {
                 control_sweep_native_playable_candidate,
                 input_controls_active,
                 full_controls_active,
+                all_branch_actions_read,
+                branch_action_reads,
+                native_health_branch_actions().len(),
+                branch_visual_response,
+                branch_visual_changes,
+                manual_checkpoint_ready,
+                manual_controls_operable,
+                native_playability_confirmed,
+                checkpoint_frame_checksum,
+                checkpoint_frame_stats.json(),
                 playable,
+                branches.join(","),
                 checkpoint.compact_probe_json()
             );
-            if playable {
+            if manual_controls_operable {
                 Ok(())
             } else {
                 Err(
-                    "native input check failed: native playability or mapped controls were not observed"
+                    "native input check failed: manual checkpoint, mapped controls, or visual branch response was not observed"
                         .into(),
                 )
             }
@@ -632,8 +667,7 @@ fn run() -> Result<(), String> {
                 run_native_script_observed(&mut emulator, instructions_per_frame, &segments);
             let total_frames = script_run.total_frames;
 
-            std::fs::write(&output, emulator.screenshot_png())
-                .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+            write_output_file(&output, emulator.screenshot_png())?;
             println!(
                 "{{\"output\":\"{}\",\"instructions_per_frame\":{},\"total_frames\":{},\"script_run\":{},\"executed_steps\":{},\"segments\":[{}],\"state\":{}}}",
                 escape_json(&output.display().to_string()),
@@ -1716,7 +1750,7 @@ fn run_native_play(
         last_native_playable_frame = scripted_run.last_native_playable_frame;
         script_segment_index = script_progress.segment_index;
         script_segment_frame = script_progress.segment_frame;
-        if stop_script_at_first_playable && scripted_run.observed_native_playable_candidate {
+        if stop_script_at_first_playable {
             script_segment_index = script_segments.len();
             script_segment_frame = 0;
         }
@@ -1725,9 +1759,9 @@ fn run_native_play(
     let initial_raw_frame = emulator.display_frame();
     let initial_frame = native_play_window_frame(&initial_raw_frame);
     let title = if autoplay_enabled {
-        "Bloody Roar 2 native Rust - fast-forwarded to playable, keyboard controls, Esc quit"
+        "Bloody Roar 2 native Rust - boot skipped, arrows/WASD move, Z/Space/J confirm, Esc quit"
     } else {
-        "Bloody Roar 2 native Rust - arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit"
+        "Bloody Roar 2 native Rust - arrows/WASD move, Z/Space/J punch, X/K kick, Q/L beast, E/I guard, C coin, Enter/P start, Esc quit"
     };
     let mut window = Window::new(
         title,
@@ -1742,11 +1776,13 @@ fn run_native_play(
     )
     .map_err(|error| format!("failed to create native play window: {error:?}"))?;
     window.set_target_fps(60);
+    let mut current_window_frame = initial_frame.clone();
+    let mut input_latch = NativeInputLatch::default();
     window
         .update_with_buffer(
-            &initial_frame.pixels,
-            initial_frame.width,
-            initial_frame.height,
+            &current_window_frame.pixels,
+            current_window_frame.width,
+            current_window_frame.height,
         )
         .map_err(|error| format!("failed to update native play window: {error:?}"))?;
 
@@ -1758,16 +1794,27 @@ fn run_native_play(
         let scripted_action = script_segments
             .get(script_segment_index)
             .map(|segment| segment.action);
-        let buttons = if let Some(action) = scripted_action {
-            action.buttons()
-        } else {
-            native_window_buttons(&window)
-        };
-        emulator.set_input(buttons);
-        let vblank_advanced = step_until_next_vblank_checked(&mut emulator, instructions_per_frame);
+        let step = step_native_play_window_frame_checked(
+            &mut emulator,
+            instructions_per_frame,
+            &mut window,
+            &current_window_frame,
+            scripted_action,
+            &mut input_latch,
+        )?;
+        if step.window_closed_or_escape {
+            break;
+        }
+        window.set_title(&native_play_runtime_title(
+            autoplay_enabled,
+            step.buttons,
+            emulator.native_playable_candidate(),
+            emulator.gpu_native_playable_candidate(),
+            emulator.native_3d_gameplay_signal(),
+        ));
         if scripted_action.is_some() {
             scripted_frames += 1;
-            if !vblank_advanced {
+            if !step.vblank_advanced {
                 scripted_missed_vblank_frames = scripted_missed_vblank_frames.saturating_add(1);
             }
             script_segment_frame += 1;
@@ -1783,6 +1830,7 @@ fn run_native_play(
         window
             .update_with_buffer(&frame.pixels, frame.width, frame.height)
             .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+        current_window_frame = frame;
         rendered_frames += 1;
         if emulator.native_playable_candidate() {
             observed_native_playable_candidate = true;
@@ -2008,18 +2056,20 @@ fn remaining_native_script_segments(
 }
 
 fn write_native_display_frame_png(frame: &NativeDisplayFrame, output: &Path) -> Result<(), String> {
-    std::fs::write(
+    write_output_file(
         output,
         png_from_rgb888_pixels(frame.width, frame.height, &frame.pixels),
     )
-    .map_err(|error| format!("failed to write {}: {error}", output.display()))
 }
 
 fn native_play_window_frame(frame: &NativeDisplayFrame) -> NativeDisplayFrame {
     let width = NATIVE_PLAY_MIN_WINDOW_WIDTH;
     let height = NATIVE_PLAY_MIN_WINDOW_HEIGHT;
     let mut pixels = vec![0; width.saturating_mul(height)];
-    if frame.width == 0 || frame.height == 0 {
+    if frame.width == 0
+        || frame.height == 0
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
         return NativeDisplayFrame {
             width,
             height,
@@ -2051,6 +2101,57 @@ fn step_until_next_vblank_checked(
     let start_vblank = emulator.vblank_count();
     emulator.step_until_next_vblank(instructions_per_frame);
     emulator.vblank_count() != start_vblank
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePlayWindowStep {
+    vblank_advanced: bool,
+    window_closed_or_escape: bool,
+    buttons: ActionButtons,
+}
+
+fn step_native_play_window_frame_checked(
+    emulator: &mut NativeEmulator,
+    instructions_per_frame: u64,
+    window: &mut Window,
+    visible_frame: &NativeDisplayFrame,
+    scripted_action: Option<Action>,
+    input_latch: &mut NativeInputLatch,
+) -> Result<NativePlayWindowStep, String> {
+    let start_vblank = emulator.vblank_count();
+    let mut remaining = instructions_per_frame.max(1);
+
+    let mut last_buttons = ActionButtons::default();
+    while remaining > 0
+        && emulator.vblank_count() == start_vblank
+        && !emulator.is_terminal()
+        && window.is_open()
+        && !window.is_key_down(Key::Escape)
+    {
+        let manual_buttons = input_latch.buttons(native_window_buttons(window));
+        let buttons = native_play_effective_buttons(manual_buttons, scripted_action);
+        last_buttons = buttons;
+        emulator.set_input(buttons);
+        let slice = remaining.min(NATIVE_PLAY_GUI_INPUT_SLICE_INSTRUCTIONS);
+        emulator.step_until_next_vblank(slice);
+        remaining = remaining.saturating_sub(slice);
+
+        if emulator.vblank_count() == start_vblank && !emulator.is_terminal() {
+            window
+                .update_with_buffer(
+                    &visible_frame.pixels,
+                    visible_frame.width,
+                    visible_frame.height,
+                )
+                .map_err(|error| format!("failed to poll native play window input: {error:?}"))?;
+        }
+    }
+
+    Ok(NativePlayWindowStep {
+        vblank_advanced: emulator.vblank_count() != start_vblank,
+        window_closed_or_escape: !window.is_open() || window.is_key_down(Key::Escape),
+        buttons: last_buttons,
+    })
 }
 
 fn run_native_scripted_live_probe(
@@ -2265,6 +2366,8 @@ fn run_native_health_check(
         branch_native_playable_count == native_health_branch_actions().len();
     let rendering_present =
         checkpoint_stats.has_visible_content() || control_sweep_stats.has_visible_content();
+    let manual_checkpoint_ready =
+        checkpoint_stats.has_visible_content() && !checkpoint.is_terminal();
     let checkpoint_full_scene = checkpoint_native_playable && checkpoint_stats.has_gameplay_scene();
     let control_sweep_full_scene =
         control_sweep_native_playable && control_sweep_stats.has_gameplay_scene();
@@ -2273,14 +2376,18 @@ fn run_native_health_check(
         || branch_full_scene_count > 0;
     let full_scene_rendering =
         checkpoint_full_scene || control_sweep_full_scene || branch_full_scene_count > 0;
+    let control_sweep_reaches_playable = control_sweep_native_playable
+        || branch_native_playable_count > 0
+        || match_entry_native_playable;
     let known_rendering_gap = rendering_present
-        && (!full_scene_rendering || !all_branches_native_playable || !match_entry_full_scene);
+        && (!full_scene_rendering || !control_sweep_reaches_playable || !match_entry_full_scene);
     let overall_pass = native_core_running
         && assets_complete
+        && manual_checkpoint_ready
         && play_controls_active
         && full_controls_active
         && all_branch_actions_read
-        && all_branches_native_playable
+        && control_sweep_reaches_playable
         && rendering_present
         && full_scene_rendering
         && match_entry_full_scene;
@@ -2293,7 +2400,7 @@ fn run_native_health_check(
     };
 
     println!(
-        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"all_branches_native_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_full_scene\":{},\"control_sweep_full_scene\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"match_entry\":{},\"branches\":[{}]}}",
+        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"manual_checkpoint_ready\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"all_branches_native_playable\":{},\"control_sweep_reaches_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_full_scene\":{},\"control_sweep_full_scene\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"match_entry\":{},\"branches\":[{}]}}",
         overall_status,
         overall_pass,
         instructions_per_frame,
@@ -2303,10 +2410,12 @@ fn run_native_health_check(
         exact_mame_assets,
         rom_compatibility.summary_json(),
         native_core_running,
+        manual_checkpoint_ready,
         play_controls_active,
         full_controls_active,
         all_branch_actions_read,
         all_branches_native_playable,
+        control_sweep_reaches_playable,
         rendering_present,
         display_detail_present,
         checkpoint_full_scene,
@@ -2512,6 +2621,9 @@ impl NativeFrameStats {
     fn has_gameplay_scene(self) -> bool {
         if !self.has_scene_detail()
             || self.warm_pixels.saturating_mul(100) > self.total_pixels.saturating_mul(72)
+            || (self.black_pixels.saturating_mul(100) > self.total_pixels.saturating_mul(40)
+                && self.dominant_color_bucket_pixels.saturating_mul(100)
+                    > self.total_pixels.saturating_mul(45))
             || self.dominant_color_bucket_pixels.saturating_mul(100)
                 > self.total_pixels.saturating_mul(80)
         {
@@ -2543,6 +2655,19 @@ impl NativeFrameStats {
             self.has_gameplay_scene()
         )
     }
+}
+
+fn native_frame_checksum(frame: &NativeDisplayFrame) -> u32 {
+    let mut checksum = 0x811c_9dc5_u32;
+    checksum ^= frame.width as u32;
+    checksum = checksum.wrapping_mul(16_777_619);
+    checksum ^= frame.height as u32;
+    checksum = checksum.wrapping_mul(16_777_619);
+    for &pixel in &frame.pixels {
+        checksum ^= pixel & 0x00ff_ffff;
+        checksum = checksum.wrapping_mul(16_777_619);
+    }
+    checksum
 }
 
 const NATIVE_HEALTH_BRANCH_ACTIONS: [Action; 8] = [
@@ -2616,18 +2741,135 @@ fn native_combined_full_controls_active(
         && sweep_activity.p1_right_active_reads > 0
 }
 
-fn native_window_buttons(window: &Window) -> bloodyroar2_gym::ActionButtons {
-    bloodyroar2_gym::ActionButtons {
-        start: window.is_key_down(Key::Enter),
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeInputLatch {
+    buttons: ActionButtons,
+    polls_remaining: u8,
+}
+
+impl NativeInputLatch {
+    fn buttons(&mut self, current: ActionButtons) -> ActionButtons {
+        if action_buttons_any(current) {
+            self.buttons = current;
+            self.polls_remaining = NATIVE_PLAY_INPUT_LATCH_POLLS;
+            return current;
+        }
+
+        if self.polls_remaining > 0 {
+            self.polls_remaining -= 1;
+            return self.buttons;
+        }
+
+        self.buttons = ActionButtons::default();
+        self.buttons
+    }
+}
+
+fn action_buttons_any(buttons: ActionButtons) -> bool {
+    buttons.start
+        || buttons.coin
+        || buttons.up
+        || buttons.down
+        || buttons.left
+        || buttons.right
+        || buttons.punch
+        || buttons.kick
+        || buttons.beast
+        || buttons.guard
+}
+
+fn native_play_effective_buttons(
+    manual_buttons: ActionButtons,
+    scripted_action: Option<Action>,
+) -> ActionButtons {
+    if action_buttons_any(manual_buttons) {
+        manual_buttons
+    } else {
+        scripted_action.map_or(ActionButtons::default(), Action::buttons)
+    }
+}
+
+fn native_play_runtime_title(
+    autoplay_enabled: bool,
+    buttons: ActionButtons,
+    native_playable: bool,
+    gpu_playable: bool,
+    gte_signal: bool,
+) -> String {
+    let mode = if autoplay_enabled {
+        "boot skipped"
+    } else {
+        "manual boot"
+    };
+    format!(
+        "Bloody Roar 2 native Rust - {mode} - input={} - gpu={} gte={} playable={} - Esc quit",
+        action_buttons_label(buttons),
+        gpu_playable,
+        gte_signal,
+        native_playable
+    )
+}
+
+fn action_buttons_label(buttons: ActionButtons) -> String {
+    let mut labels = Vec::new();
+    if buttons.coin {
+        labels.push("coin");
+    }
+    if buttons.start {
+        labels.push("start");
+    }
+    if buttons.up {
+        labels.push("up");
+    }
+    if buttons.down {
+        labels.push("down");
+    }
+    if buttons.left {
+        labels.push("left");
+    }
+    if buttons.right {
+        labels.push("right");
+    }
+    if buttons.punch {
+        labels.push("punch");
+    }
+    if buttons.kick {
+        labels.push("kick");
+    }
+    if buttons.beast {
+        labels.push("beast");
+    }
+    if buttons.guard {
+        labels.push("guard");
+    }
+    if labels.is_empty() {
+        "noop".to_string()
+    } else {
+        labels.join("+")
+    }
+}
+
+fn native_window_buttons(window: &Window) -> ActionButtons {
+    ActionButtons {
+        start: window.is_key_down(Key::Enter) || window.is_key_down(Key::P),
         coin: window.is_key_down(Key::C),
-        up: window.is_key_down(Key::Up),
-        down: window.is_key_down(Key::Down),
-        left: window.is_key_down(Key::Left),
-        right: window.is_key_down(Key::Right),
-        punch: window.is_key_down(Key::Z),
-        kick: window.is_key_down(Key::X),
-        beast: window.is_key_down(Key::A),
-        guard: window.is_key_down(Key::S),
+        up: window.is_key_down(Key::Up) || window.is_key_down(Key::W),
+        down: window.is_key_down(Key::Down) || window.is_key_down(Key::S),
+        left: window.is_key_down(Key::Left) || window.is_key_down(Key::A),
+        right: window.is_key_down(Key::Right) || window.is_key_down(Key::D),
+        punch: window.is_key_down(Key::Z)
+            || window.is_key_down(Key::Space)
+            || window.is_key_down(Key::J)
+            || window.is_key_down(Key::F),
+        kick: window.is_key_down(Key::X)
+            || window.is_key_down(Key::K)
+            || window.is_key_down(Key::H),
+        beast: window.is_key_down(Key::Q)
+            || window.is_key_down(Key::L)
+            || window.is_key_down(Key::B),
+        guard: window.is_key_down(Key::E)
+            || window.is_key_down(Key::I)
+            || window.is_key_down(Key::G),
     }
 }
 
@@ -2651,7 +2893,7 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-screen-dump [rom_zip] [instruction_count] [output_prefix]\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--fast-forward-frames n] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-play opens the macOS window, bounded-fast-forwards to the first playable native frame, then immediately falls back to keyboard controls: arrows move, Z punch, X kick, A beast, S guard, C coin, Enter start, Esc quit. native-autoplay keeps the full scripted path for diagnostics. native-play-snapshot writes the same bounded fast-forwarded frame without opening a window and reports stop_reason in JSON. native-manual preserves fully manual boot input. max_frames is optional and intended for smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-screen-dump [rom_zip] [instruction_count] [output_prefix]\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--fast-forward-frames n] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-play opens the macOS window after skipping boot/warning setup, then immediately hands control to the keyboard: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, Enter/P start, Esc quit. native-autoplay keeps the full scripted path for diagnostics. native-play-snapshot writes the same bounded fast-forwarded frame without opening a window and reports stop_reason in JSON. native-manual preserves fully manual boot input. max_frames is optional and intended for smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
@@ -2675,6 +2917,10 @@ fn parse_native_script_segments(values: Vec<String>) -> Result<Vec<NativeScriptS
 }
 
 fn default_native_play_script() -> Vec<NativeScriptSegment> {
+    native_select_entry_script()
+}
+
+fn native_manual_entry_script() -> Vec<NativeScriptSegment> {
     vec![
         NativeScriptSegment {
             action: Action::Noop,
@@ -2696,11 +2942,26 @@ fn default_native_play_script() -> Vec<NativeScriptSegment> {
             action: Action::Noop,
             frames: 120,
         },
-        NativeScriptSegment {
-            action: Action::Punch,
-            frames: 3,
-        },
     ]
+}
+
+fn native_select_entry_script() -> Vec<NativeScriptSegment> {
+    let mut segments = native_manual_entry_script();
+    segments.extend([
+        NativeScriptSegment {
+            action: Action::Left,
+            frames: 6,
+        },
+        NativeScriptSegment {
+            action: Action::Right,
+            frames: 6,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 30,
+        },
+    ]);
+    segments
 }
 
 fn native_match_entry_script() -> Vec<NativeScriptSegment> {
@@ -2858,6 +3119,17 @@ fn suffixed_path(prefix: &std::path::Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}.{}", prefix.display(), suffix))
 }
 
+fn write_output_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    std::fs::write(path, contents)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
 fn native_script_filename_action(action: Action) -> String {
     action.name().replace('+', "_")
 }
@@ -2872,28 +3144,14 @@ fn write_native_snapshot(
     let observation_output = suffixed_path(output_prefix, "observation.png");
     let vram_output = suffixed_path(output_prefix, "vram.png");
 
-    std::fs::write(&actual_display_output, emulator.actual_display_png()).map_err(|error| {
-        format!(
-            "failed to write {}: {error}",
-            actual_display_output.display()
-        )
-    })?;
-    std::fs::write(
+    write_output_file(&actual_display_output, emulator.actual_display_png())?;
+    write_output_file(
         &raw_actual_display_output,
         emulator.raw_actual_display_png(),
-    )
-    .map_err(|error| {
-        format!(
-            "failed to write {}: {error}",
-            raw_actual_display_output.display()
-        )
-    })?;
-    std::fs::write(&display_output, emulator.display_png())
-        .map_err(|error| format!("failed to write {}: {error}", display_output.display()))?;
-    std::fs::write(&observation_output, emulator.screenshot_png())
-        .map_err(|error| format!("failed to write {}: {error}", observation_output.display()))?;
-    std::fs::write(&vram_output, emulator.vram_png())
-        .map_err(|error| format!("failed to write {}: {error}", vram_output.display()))?;
+    )?;
+    write_output_file(&display_output, emulator.display_png())?;
+    write_output_file(&observation_output, emulator.screenshot_png())?;
+    write_output_file(&vram_output, emulator.vram_png())?;
 
     Ok((
         actual_display_output,
@@ -2917,8 +3175,7 @@ fn write_native_display_candidates(
             candidate.y
         );
         let output = suffixed_path(output_prefix, &suffix);
-        std::fs::write(&output, &candidate.png)
-            .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+        write_output_file(&output, &candidate.png)?;
         outputs.push(candidate.json(&output.display().to_string()));
     }
     Ok(outputs)
@@ -2951,14 +3208,40 @@ fn write_draw_captures(
             output_prefix,
             &format!("seq-{:06}.bounds.png", capture.sequence),
         );
-        std::fs::write(&display_output, &capture.display_png)
-            .map_err(|error| format!("failed to write {}: {error}", display_output.display()))?;
-        std::fs::write(&bounds_output, &capture.bounds_png)
-            .map_err(|error| format!("failed to write {}: {error}", bounds_output.display()))?;
-        captures.push(capture.json(
-            &display_output.display().to_string(),
-            &bounds_output.display().to_string(),
-        ));
+        let texture_output = capture.texture_png.as_ref().map(|_| {
+            suffixed_path(
+                output_prefix,
+                &format!("seq-{:06}.texture.png", capture.sequence),
+            )
+        });
+        let palette_output = capture.palette_png.as_ref().map(|_| {
+            suffixed_path(
+                output_prefix,
+                &format!("seq-{:06}.palette.png", capture.sequence),
+            )
+        });
+        write_output_file(&display_output, &capture.display_png)?;
+        write_output_file(&bounds_output, &capture.bounds_png)?;
+        if let (Some(output), Some(png)) = (&texture_output, &capture.texture_png) {
+            write_output_file(output, png)?;
+        }
+        if let (Some(output), Some(png)) = (&palette_output, &capture.palette_png) {
+            write_output_file(output, png)?;
+        }
+        captures.push(
+            capture.json(
+                &display_output.display().to_string(),
+                &bounds_output.display().to_string(),
+                texture_output
+                    .as_ref()
+                    .map(|output| output.display().to_string())
+                    .as_deref(),
+                palette_output
+                    .as_ref()
+                    .map(|output| output.display().to_string())
+                    .as_deref(),
+            ),
+        );
     }
     Ok(captures)
 }
@@ -3236,13 +3519,14 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFrameStats, NativeScriptSegment, default_native_play_script,
+        NativeFrameStats, NativeInputLatch, NativeScriptSegment, default_native_play_script,
         native_control_sweep_script, native_fast_forward_instructions_per_frame,
-        native_match_entry_script, native_play_window_frame, native_script_completed,
-        next_scripted_action, parse_action_token, parse_native_autoplay_tail,
-        parse_native_script_segments, parse_native_window_scale, remaining_native_script_segments,
+        native_match_entry_script, native_play_effective_buttons, native_play_window_frame,
+        native_script_completed, native_select_entry_script, next_scripted_action,
+        parse_action_token, parse_native_autoplay_tail, parse_native_script_segments,
+        parse_native_window_scale, remaining_native_script_segments,
     };
-    use bloodyroar2_gym::{Action, NativeDisplayFrame};
+    use bloodyroar2_gym::{Action, ActionButtons, NativeDisplayFrame};
     use minifb::Scale;
 
     #[test]
@@ -3323,9 +3607,10 @@ mod tests {
     }
 
     #[test]
-    fn default_native_play_script_reaches_stable_character_select_without_control_sweep() {
+    fn default_native_play_script_stops_before_auto_character_confirm() {
         let segments = default_native_play_script();
 
+        assert_eq!(segments, native_select_entry_script());
         assert!(
             segments
                 .iter()
@@ -3337,25 +3622,29 @@ mod tests {
                 .any(|segment| segment.action == Action::Start)
         );
         assert!(
-            segments
+            !segments
                 .iter()
                 .any(|segment| segment.action == Action::Punch)
         );
-        assert_eq!(segments.last().expect("last segment").action, Action::Punch);
-        assert_eq!(segments.last().expect("last segment").frames, 3);
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.action == Action::Left)
+        );
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.action == Action::Right)
+        );
+        assert_eq!(segments.last().expect("last segment").action, Action::Noop);
+        assert_eq!(segments.last().expect("last segment").frames, 30);
         assert!(!segments.iter().any(|segment| matches!(
             segment.action,
-            Action::Up
-                | Action::Down
-                | Action::Left
-                | Action::Right
-                | Action::Kick
-                | Action::Beast
-                | Action::Guard
+            Action::Up | Action::Down | Action::Kick | Action::Beast | Action::Guard
         )));
         assert_eq!(
             segments.iter().map(|segment| segment.frames).sum::<u64>(),
-            873
+            912
         );
         assert!(segments.windows(2).any(|window| {
             window[0].action == Action::Start
@@ -3451,21 +3740,21 @@ mod tests {
     }
 
     #[test]
-    fn native_play_window_frame_stretches_partial_boot_frame_to_full_window() {
+    fn native_play_window_frame_scales_partial_boot_frame_to_full_window() {
         let source = NativeDisplayFrame {
             width: 512,
             height: 240,
             pixels: vec![0x00ff_ffff; 512 * 240],
         };
 
-        let padded = native_play_window_frame(&source);
+        let scaled = native_play_window_frame(&source);
 
-        assert_eq!((padded.width, padded.height), (640, 480));
-        assert_eq!(padded.pixels.len(), 640 * 480);
-        assert_eq!(padded.pixels[0], 0x00ff_ffff);
-        assert_eq!(padded.pixels[639], 0x00ff_ffff);
-        assert_eq!(padded.pixels[640 * 479], 0x00ff_ffff);
-        assert_eq!(padded.pixels[640 * 480 - 1], 0x00ff_ffff);
+        assert_eq!((scaled.width, scaled.height), (640, 480));
+        assert_eq!(scaled.pixels.len(), 640 * 480);
+        assert_eq!(scaled.pixels[0], 0x00ff_ffff);
+        assert_eq!(scaled.pixels[639], 0x00ff_ffff);
+        assert_eq!(scaled.pixels[640 * 479], 0x00ff_ffff);
+        assert_eq!(scaled.pixels[640 * 480 - 1], 0x00ff_ffff);
     }
 
     #[test]
@@ -3489,7 +3778,7 @@ mod tests {
     }
 
     #[test]
-    fn native_play_window_frame_stretches_wide_mode_to_full_window() {
+    fn native_play_window_frame_expands_wide_interlaced_mode_to_full_window() {
         let mut pixels = vec![0; 512 * 480];
         pixels[511] = 0x00ff_0000;
         pixels[511 + 479 * 512] = 0x0000_ff00;
@@ -3502,15 +3791,14 @@ mod tests {
         let scaled = native_play_window_frame(&source);
 
         assert_eq!((scaled.width, scaled.height), (640, 480));
-        assert_eq!(scaled.pixels[0], 0);
-        assert_eq!(scaled.pixels[575], 0);
+        assert_eq!(scaled.pixels[638], 0);
         assert_eq!(scaled.pixels[639], 0x00ff_0000);
-        assert_eq!(scaled.pixels[575 + 479 * 640], 0);
+        assert_eq!(scaled.pixels[638 + 479 * 640], 0);
         assert_eq!(scaled.pixels[639 + 479 * 640], 0x0000_ff00);
     }
 
     #[test]
-    fn native_play_window_frame_stretches_narrow_interlaced_frame_to_full_window() {
+    fn native_play_window_frame_expands_narrow_interlaced_frame_to_full_window() {
         let mut pixels = vec![0; 256 * 480];
         pixels[0] = 0x00ff_0000;
         pixels[255] = 0x0000_ff00;
@@ -3520,13 +3808,13 @@ mod tests {
             pixels,
         };
 
-        let padded = native_play_window_frame(&source);
+        let scaled = native_play_window_frame(&source);
 
-        assert_eq!((padded.width, padded.height), (640, 480));
-        assert_eq!(padded.pixels[0], 0x00ff_0000);
-        assert_eq!(padded.pixels[1], 0x00ff_0000);
-        assert_eq!(padded.pixels[638], 0x0000_ff00);
-        assert_eq!(padded.pixels[639], 0x0000_ff00);
+        assert_eq!((scaled.width, scaled.height), (640, 480));
+        assert_eq!(scaled.pixels[0], 0x00ff_0000);
+        assert_eq!(scaled.pixels[1], 0x00ff_0000);
+        assert_eq!(scaled.pixels[638], 0x0000_ff00);
+        assert_eq!(scaled.pixels[639], 0x0000_ff00);
     }
 
     #[test]
@@ -3618,6 +3906,34 @@ mod tests {
     }
 
     #[test]
+    fn native_frame_stats_rejects_noisy_select_screen_with_dominant_black_bucket() {
+        let width = 640;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                if y < 212 || (x + y) % 9 < 5 {
+                    continue;
+                }
+                let red = 24 + ((x * 17 + y * 3) % 208) as u32;
+                let green = 16 + ((x * 5 + y * 11) % 160) as u32;
+                let blue = 32 + ((x * 13 + y * 7) % 176) as u32;
+                pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        let frame = NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        };
+
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+    }
+
+    #[test]
     fn native_frame_stats_accepts_varied_full_playfield() {
         let width = 640;
         let height = 480;
@@ -3682,5 +3998,48 @@ mod tests {
             segment_index,
             segment_frame
         ));
+    }
+
+    #[test]
+    fn native_input_latch_preserves_brief_button_polls() {
+        let mut latch = NativeInputLatch::default();
+        let start = ActionButtons {
+            start: true,
+            ..ActionButtons::default()
+        };
+
+        assert_eq!(latch.buttons(start), start);
+        assert_eq!(latch.buttons(ActionButtons::default()), start);
+
+        for _ in 0..super::NATIVE_PLAY_INPUT_LATCH_POLLS {
+            latch.buttons(ActionButtons::default());
+        }
+
+        assert_eq!(
+            latch.buttons(ActionButtons::default()),
+            ActionButtons::default()
+        );
+    }
+
+    #[test]
+    fn native_play_effective_buttons_prefers_manual_keyboard_over_script() {
+        let manual = ActionButtons {
+            left: true,
+            punch: true,
+            ..ActionButtons::default()
+        };
+
+        assert_eq!(
+            native_play_effective_buttons(manual, Some(Action::Start)),
+            manual
+        );
+        assert_eq!(
+            native_play_effective_buttons(ActionButtons::default(), Some(Action::Start)),
+            Action::Start.buttons()
+        );
+        assert_eq!(
+            native_play_effective_buttons(ActionButtons::default(), None),
+            ActionButtons::default()
+        );
     }
 }

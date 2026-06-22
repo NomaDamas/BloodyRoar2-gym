@@ -357,18 +357,73 @@ impl NativeEmulator {
     }
 
     pub fn native_playable_candidate(&self) -> bool {
+        self.gpu_native_playable_candidate() && self.native_3d_gameplay_signal()
+    }
+
+    pub fn gpu_native_playable_candidate(&self) -> bool {
         self.bus.native_playable_candidate()
     }
 
-    pub fn json(&self) -> String {
+    pub fn native_3d_gameplay_signal(&self) -> bool {
+        self.cpu.native_3d_gameplay_signal()
+    }
+
+    fn native_playability_json(&self) -> String {
+        let gpu_playable_candidate = self.gpu_native_playable_candidate();
+        let gte_gameplay_signal = self.native_3d_gameplay_signal();
+        let playable_candidate = gpu_playable_candidate && gte_gameplay_signal;
+        let classification = if playable_candidate {
+            "native_playable_candidate"
+        } else if !gpu_playable_candidate {
+            "gpu_not_playable_candidate"
+        } else {
+            "missing_native_3d_gte_signal"
+        };
+
         format!(
-            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"projected_vertices\":{},\"gpu\":{}}}",
+            playable_candidate,
+            classification,
+            gpu_playable_candidate,
+            gte_gameplay_signal,
+            self.cpu.gte_projected_vertices(),
+            self.bus.native_playability_json()
+        )
+    }
+
+    fn native_playability_compact_json(&self) -> String {
+        let gpu_playable_candidate = self.gpu_native_playable_candidate();
+        let gte_gameplay_signal = self.native_3d_gameplay_signal();
+        let playable_candidate = gpu_playable_candidate && gte_gameplay_signal;
+        let classification = if playable_candidate {
+            "native_playable_candidate"
+        } else if !gpu_playable_candidate {
+            "gpu_not_playable_candidate"
+        } else {
+            "missing_native_3d_gte_signal"
+        };
+
+        format!(
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"projected_vertices\":{},\"gpu\":{}}}",
+            playable_candidate,
+            classification,
+            gpu_playable_candidate,
+            gte_gameplay_signal,
+            self.cpu.gte_projected_vertices(),
+            self.bus.native_playability_compact_json()
+        )
+    }
+
+    pub fn json(&self) -> String {
+        let playable = self.native_playable_candidate();
+        format!(
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
             self.cpu.gte_json(),
             self.bus.io_json(),
             self.bus.zn_board_json(),
             self.bus.native_sync_json(),
-            self.bus.native_playability_json(),
+            self.native_playability_json(),
             native_platform_json(),
             self.rom_compatibility.summary_json(),
             self.bus.rom_len(),
@@ -378,19 +433,22 @@ impl NativeEmulator {
             self.executed_steps,
             optional_step_json(self.last_step),
             self.last_outcome,
-            self.bus.native_playable_candidate()
+            self.gpu_native_playable_candidate(),
+            self.native_3d_gameplay_signal(),
+            playable
         )
     }
 
     pub fn diagnostic_json(&self) -> String {
+        let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
             self.cpu.gte_json(),
             self.bus.io_compact_json(),
             self.bus.zn_board_json(),
             self.bus.native_sync_json(),
-            self.bus.native_playability_json(),
+            self.native_playability_json(),
             native_platform_json(),
             self.rom_compatibility.summary_json(),
             self.bus.rom_len(),
@@ -400,13 +458,16 @@ impl NativeEmulator {
             self.executed_steps,
             optional_step_json(self.last_step),
             self.last_outcome,
-            self.bus.native_playable_candidate()
+            self.gpu_native_playable_candidate(),
+            self.native_3d_gameplay_signal(),
+            playable
         )
     }
 
     pub fn probe_json(&self) -> String {
+        let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"status\":{},\"status_hex\":\"0x{:08x}\",\"cause\":{},\"cause_hex\":\"0x{:08x}\",\"epc\":{},\"epc_hex\":\"0x{:08x}\"}},\"runtime\":{},\"native_playability\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"status\":{},\"status_hex\":\"0x{:08x}\",\"cause\":{},\"cause_hex\":\"0x{:08x}\",\"epc\":{},\"epc_hex\":\"0x{:08x}\"}},\"gte\":{{\"projected_vertices\":{},\"gameplay_signal\":{}}},\"runtime\":{},\"native_playability\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.pc,
             self.cpu.pc,
             self.cpu.cycles,
@@ -417,18 +478,22 @@ impl NativeEmulator {
             self.cpu.cp0[13],
             self.cpu.cp0[14],
             self.cpu.cp0[14],
+            self.cpu.gte_projected_vertices(),
+            self.native_3d_gameplay_signal(),
             self.bus.runtime_probe_json(),
-            self.bus.native_playability_json(),
+            self.native_playability_json(),
             self.rom_compatibility.summary_json(),
             self.executed_steps,
             self.last_outcome,
-            self.bus.native_playable_candidate()
+            self.gpu_native_playable_candidate(),
+            playable
         )
     }
 
     pub fn compact_probe_json(&self) -> String {
+        let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"status\":{},\"status_hex\":\"0x{:08x}\",\"cause\":{},\"cause_hex\":\"0x{:08x}\",\"epc\":{},\"epc_hex\":\"0x{:08x}\",\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{}}},\"runtime\":{},\"input_activity\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"status\":{},\"status_hex\":\"0x{:08x}\",\"cause\":{},\"cause_hex\":\"0x{:08x}\",\"epc\":{},\"epc_hex\":\"0x{:08x}\",\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{}}},\"gte\":{{\"projected_vertices\":{},\"gameplay_signal\":{},\"command_counts\":[{}]}},\"runtime\":{},\"native_playability\":{},\"input_activity\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.pc,
             self.cpu.pc,
             self.cpu.cycles,
@@ -444,12 +509,17 @@ impl NativeEmulator {
             self.cpu.regs[4],
             self.cpu.regs[5],
             self.cpu.regs[6],
+            self.cpu.gte_projected_vertices(),
+            self.native_3d_gameplay_signal(),
+            self.cpu.gte_command_counts_summary_json(),
             self.bus.runtime_compact_probe_json(),
+            self.native_playability_compact_json(),
             self.bus.input_activity().json(),
             self.rom_compatibility.summary_json(),
             self.executed_steps,
             self.last_outcome,
-            self.bus.native_playable_candidate()
+            self.gpu_native_playable_candidate(),
+            playable
         )
     }
 }
