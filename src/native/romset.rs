@@ -1,14 +1,18 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::{CStr, c_char, c_int, c_uint, c_ulong, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::backend::BackendError;
 use crate::native::bus::NativeBoardAssets;
 
+const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
 const EOCD_SIGNATURE: u32 = 0x0605_4b50;
 const CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD: u16 = 0x0001;
+const ZIP_STORED_METHOD: u16 = 0;
+const ZIP_DEFLATED_METHOD: u16 = 8;
 const BLOODY_ROAR_2_GAME_ID: &str = "bldyror2";
 const CAT702_ET01_CRC32: u32 = 0xa7dd_922e;
 const CAT702_ET03_CRC32: u32 = 0x779b_0bfd;
@@ -661,15 +665,16 @@ pub struct NativeRomEntry {
     pub compressed_size: u64,
     pub crc32: u32,
     pub compression_method: u16,
+    pub local_header_offset: Option<u64>,
 }
 
 impl NativeRomEntry {
     pub fn compression_method_name(&self) -> &'static str {
         match self.compression_method {
-            0 => "stored",
+            ZIP_STORED_METHOD => "stored",
             1 => "shrunk",
             6 => "imploded",
-            8 => "deflated",
+            ZIP_DEFLATED_METHOD => "deflated",
             9 => "deflate64",
             12 => "bzip2",
             14 => "lzma",
@@ -681,13 +686,14 @@ impl NativeRomEntry {
 
     fn json(&self) -> String {
         format!(
-            "{{\"name\":\"{}\",\"uncompressed_size\":{},\"compressed_size\":{},\"crc32\":\"{:08x}\",\"compression_method\":{},\"compression_method_name\":\"{}\"}}",
+            "{{\"name\":\"{}\",\"uncompressed_size\":{},\"compressed_size\":{},\"crc32\":\"{:08x}\",\"compression_method\":{},\"compression_method_name\":\"{}\",\"local_header_offset\":{}}}",
             escape_json(&self.name),
             self.uncompressed_size,
             self.compressed_size,
             self.crc32,
             self.compression_method,
-            self.compression_method_name()
+            self.compression_method_name(),
+            optional_u64_json(self.local_header_offset)
         )
     }
 }
@@ -697,6 +703,8 @@ pub struct NativeRomSet {
     pub path: PathBuf,
     pub entries: Vec<String>,
     pub entry_metadata: Vec<NativeRomEntry>,
+    archive_bytes: Option<Vec<u8>>,
+    entry_bytes_cache: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 impl NativeRomSet {
@@ -728,6 +736,8 @@ impl NativeRomSet {
             path,
             entries,
             entry_metadata,
+            archive_bytes: Some(bytes),
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -765,6 +775,7 @@ impl NativeRomSet {
                 compressed_size: bytes.len() as u64,
                 crc32: crc32(&bytes),
                 compression_method: 0,
+                local_header_offset: None,
             });
         }
 
@@ -777,6 +788,8 @@ impl NativeRomSet {
             path,
             entries,
             entry_metadata,
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -980,15 +993,76 @@ impl NativeRomSet {
     }
 
     fn load_entry_bytes(&self, entry: &NativeRomEntry) -> Result<Vec<u8>, BackendError> {
-        if self.path.is_dir() {
-            return read_scanned_entry_bytes(&self.path, &entry.name);
+        let cache_key = format!("entry:{}", normalized_asset_name(&entry.name));
+        if let Some(bytes) = self.cached_entry_bytes(&cache_key) {
+            return Ok(bytes);
         }
 
-        if let Some((archive_name, inner_entry)) = split_scanned_zip_entry(&entry.name) {
-            return unzip_nested_entry(&self.path, archive_name, inner_entry);
-        }
+        let bytes = if self.path.is_dir() {
+            read_scanned_entry_bytes(&self.path, &entry.name)?
+        } else if let Some((archive_name, inner_entry)) = split_scanned_zip_entry(&entry.name) {
+            if let Some(archive_bytes) = self.archive_bytes.as_deref() {
+                self.load_nested_zip_entry_from_archive(archive_bytes, archive_name, inner_entry)?
+            } else {
+                read_nested_zip_entry(&self.path, archive_name, inner_entry)?
+            }
+        } else if let Some(archive_bytes) = self.archive_bytes.as_deref() {
+            read_zip_entry_from_bytes(&self.path, archive_bytes, entry)?
+        } else {
+            read_zip_entry(&self.path, entry)?
+        };
 
-        unzip_entry(&self.path, &entry.name)
+        self.cache_entry_bytes(cache_key, &bytes);
+        Ok(bytes)
+    }
+
+    fn load_nested_zip_entry_from_archive(
+        &self,
+        outer_archive: &[u8],
+        archive_entry: &str,
+        inner_entry: &str,
+    ) -> Result<Vec<u8>, BackendError> {
+        let archive_cache_key = format!("archive:{}", normalized_asset_name(archive_entry));
+        let nested_archive = if let Some(bytes) = self.cached_entry_bytes(&archive_cache_key) {
+            bytes
+        } else {
+            let outer_entries = parse_zip_entries(outer_archive)?;
+            let outer_entry = outer_entries
+                .iter()
+                .find(|entry| {
+                    normalized_asset_name(&entry.name) == normalized_asset_name(archive_entry)
+                })
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "nested archive {archive_entry} is missing from {}",
+                        self.path.display()
+                    ))
+                })?;
+            let bytes = read_zip_entry_from_bytes(&self.path, outer_archive, outer_entry)?;
+            self.cache_entry_bytes(archive_cache_key, &bytes);
+            bytes
+        };
+
+        let nested_entries = parse_zip_entries(&nested_archive)?;
+        let nested_entry = nested_entries
+            .iter()
+            .find(|entry| asset_names_match(&entry.name, inner_entry))
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "nested ZIP entry {inner_entry} is missing from {archive_entry}"
+                ))
+            })?;
+        read_zip_entry_from_bytes(&self.path, &nested_archive, nested_entry)
+    }
+
+    fn cached_entry_bytes(&self, cache_key: &str) -> Option<Vec<u8>> {
+        self.entry_bytes_cache.borrow().get(cache_key).cloned()
+    }
+
+    fn cache_entry_bytes(&self, cache_key: String, bytes: &[u8]) {
+        self.entry_bytes_cache
+            .borrow_mut()
+            .insert(cache_key, bytes.to_vec());
     }
 
     fn load_exact_8_asset(&self, manifest_name: &str) -> Option<[u8; 8]> {
@@ -1351,7 +1425,7 @@ fn parse_zip_entries_with_nested_archives(
             continue;
         }
 
-        let Ok(nested_bytes) = unzip_entry(path, &entry.name) else {
+        let Ok(nested_bytes) = read_zip_entry_from_bytes(path, bytes, &entry) else {
             continue;
         };
         let Ok(nested_entries) = parse_zip_entries(&nested_bytes) else {
@@ -1406,6 +1480,7 @@ fn parse_central_directory_entry(
     let file_name_len = read_u16(bytes, offset + 28)? as usize;
     let extra_len = read_u16(bytes, offset + 30)? as usize;
     let comment_len = read_u16(bytes, offset + 32)? as usize;
+    let local_header_offset_32 = read_u32(bytes, offset + 42)?;
     let name_start = offset + 46;
     let extra_start = name_start
         .checked_add(file_name_len)
@@ -1424,10 +1499,11 @@ fn parse_central_directory_entry(
     }
 
     let name = String::from_utf8_lossy(&bytes[name_start..extra_start]).to_string();
-    let (uncompressed_size, compressed_size) = zip64_sizes(
+    let (uncompressed_size, compressed_size, local_header_offset) = zip64_entry_metadata(
         &bytes[extra_start..comment_start],
         uncompressed_size_32,
         compressed_size_32,
+        local_header_offset_32,
     )?;
 
     Ok((
@@ -1437,20 +1513,27 @@ fn parse_central_directory_entry(
             compressed_size,
             crc32,
             compression_method,
+            local_header_offset: Some(local_header_offset),
         },
         next_offset,
     ))
 }
 
-fn zip64_sizes(
+fn zip64_entry_metadata(
     extra: &[u8],
     uncompressed_size_32: u32,
     compressed_size_32: u32,
-) -> Result<(u64, u64), BackendError> {
+    local_header_offset_32: u32,
+) -> Result<(u64, u64, u64), BackendError> {
     let needs_uncompressed = uncompressed_size_32 == u32::MAX;
     let needs_compressed = compressed_size_32 == u32::MAX;
-    if !needs_uncompressed && !needs_compressed {
-        return Ok((uncompressed_size_32 as u64, compressed_size_32 as u64));
+    let needs_local_header_offset = local_header_offset_32 == u32::MAX;
+    if !needs_uncompressed && !needs_compressed && !needs_local_header_offset {
+        return Ok((
+            uncompressed_size_32 as u64,
+            compressed_size_32 as u64,
+            local_header_offset_32 as u64,
+        ));
     }
 
     let mut offset = 0;
@@ -1475,82 +1558,374 @@ fn zip64_sizes(
                 uncompressed_size_32 as u64
             };
             let compressed_size = if needs_compressed {
-                read_u64(extra, data_offset)?
+                let value = read_u64(extra, data_offset)?;
+                data_offset += 8;
+                value
             } else {
                 compressed_size_32 as u64
             };
-            return Ok((uncompressed_size, compressed_size));
+            let local_header_offset = if needs_local_header_offset {
+                read_u64(extra, data_offset)?
+            } else {
+                local_header_offset_32 as u64
+            };
+            return Ok((uncompressed_size, compressed_size, local_header_offset));
         }
 
         offset = data_end;
     }
 
     Err(BackendError::new(
-        "ZIP64 entry uses 32-bit size placeholders without ZIP64 size metadata",
+        "ZIP64 entry uses 32-bit placeholders without ZIP64 metadata",
     ))
 }
 
-fn unzip_entry(path: &Path, entry: &str) -> Result<Vec<u8>, BackendError> {
-    let status = Command::new("unzip")
-        .arg("-p")
-        .arg(path)
-        .arg(entry)
-        .output()
-        .map_err(|error| BackendError::new(format!("failed to run unzip: {error}")))?;
-
-    if !status.status.success() {
-        return Err(BackendError::new(format!(
-            "failed to extract {entry} from {}",
+fn read_zip_entry(path: &Path, entry: &NativeRomEntry) -> Result<Vec<u8>, BackendError> {
+    let archive = fs::read(path).map_err(|error| {
+        BackendError::new(format!(
+            "failed to read ZIP archive {}: {error}",
             path.display()
+        ))
+    })?;
+    read_zip_entry_from_bytes(path, &archive, entry)
+}
+
+fn read_zip_entry_from_bytes(
+    archive_path: &Path,
+    archive: &[u8],
+    entry: &NativeRomEntry,
+) -> Result<Vec<u8>, BackendError> {
+    let compressed_data = zip_entry_compressed_data(archive_path, archive, entry)?;
+    let expected_len = usize::try_from(entry.uncompressed_size).map_err(|_| {
+        BackendError::new(format!(
+            "ZIP entry {} in {} is too large to address on this platform",
+            entry.name,
+            archive_path.display()
+        ))
+    })?;
+
+    let data = match entry.compression_method {
+        ZIP_STORED_METHOD => {
+            if entry.compressed_size != entry.uncompressed_size {
+                return Err(BackendError::new(format!(
+                    "stored ZIP entry {} in {} has mismatched compressed/uncompressed sizes",
+                    entry.name,
+                    archive_path.display()
+                )));
+            }
+            compressed_data.to_vec()
+        }
+        ZIP_DEFLATED_METHOD => {
+            inflate_raw_deflate(compressed_data, expected_len).map_err(|error| {
+                BackendError::new(format!(
+                    "failed to inflate ZIP entry {} in {}: {error}",
+                    entry.name,
+                    archive_path.display()
+                ))
+            })?
+        }
+        _ => {
+            return Err(BackendError::new(format!(
+                "ZIP entry {} in {} uses {}; native ROM loading supports stored and deflated entries without per-run extraction",
+                entry.name,
+                archive_path.display(),
+                entry.compression_method_name()
+            )));
+        }
+    };
+
+    if data.len() != expected_len {
+        return Err(BackendError::new(format!(
+            "ZIP entry {} in {} decoded to {} bytes, expected {}",
+            entry.name,
+            archive_path.display(),
+            data.len(),
+            expected_len
+        )));
+    }
+    if crc32(&data) != entry.crc32 {
+        return Err(BackendError::new(format!(
+            "ZIP entry {} in {} failed CRC validation",
+            entry.name,
+            archive_path.display()
         )));
     }
 
-    Ok(status.stdout)
+    Ok(data)
 }
 
-fn unzip_nested_entry(
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inflate_raw_deflate(compressed_data: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
+    zlib_inflate_raw_deflate(compressed_data, expected_len)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn inflate_raw_deflate(_compressed_data: &[u8], _expected_len: usize) -> Result<Vec<u8>, String> {
+    Err("deflated ZIP entries require zlib support on this platform".to_string())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn zlib_inflate_raw_deflate(
+    compressed_data: &[u8],
+    expected_len: usize,
+) -> Result<Vec<u8>, String> {
+    if compressed_data.len() > c_uint::MAX as usize {
+        return Err("compressed stream is too large for zlib".to_string());
+    }
+    if expected_len > c_uint::MAX as usize {
+        return Err("decoded stream is too large for zlib".to_string());
+    }
+
+    let mut output = vec![0; expected_len];
+    let mut stream = ZStream {
+        next_in: compressed_data.as_ptr(),
+        avail_in: compressed_data.len() as c_uint,
+        total_in: 0,
+        next_out: output.as_mut_ptr(),
+        avail_out: output.len() as c_uint,
+        total_out: 0,
+        msg: std::ptr::null_mut(),
+        state: std::ptr::null_mut(),
+        zalloc: None,
+        zfree: None,
+        opaque: std::ptr::null_mut(),
+        data_type: 0,
+        adler: 0,
+        reserved: 0,
+    };
+
+    // ZIP stores method 8 payloads as raw deflate streams without a zlib header.
+    let init_status = unsafe {
+        inflateInit2_(
+            &mut stream,
+            -MAX_WBITS,
+            zlibVersion(),
+            std::mem::size_of::<ZStream>() as c_int,
+        )
+    };
+    if init_status != Z_OK {
+        return Err(format_zlib_error("inflateInit2", init_status, &stream));
+    }
+
+    let inflate_status = unsafe { inflate(&mut stream, Z_NO_FLUSH) };
+    let inflate_error = (inflate_status != Z_STREAM_END)
+        .then(|| format_zlib_error("inflate", inflate_status, &stream));
+    let end_status = unsafe { inflateEnd(&mut stream) };
+    if let Some(error) = inflate_error {
+        return Err(error);
+    }
+    if end_status != Z_OK {
+        return Err(format_zlib_error("inflateEnd", end_status, &stream));
+    }
+    if stream.total_in as usize != compressed_data.len() {
+        return Err(format!(
+            "zlib consumed {} of {} compressed bytes",
+            stream.total_in,
+            compressed_data.len()
+        ));
+    }
+    if stream.total_out as usize != expected_len {
+        return Err(format!(
+            "zlib produced {} of {expected_len} expected bytes",
+            stream.total_out
+        ));
+    }
+
+    Ok(output)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn format_zlib_error(operation: &str, status: c_int, stream: &ZStream) -> String {
+    let message = if stream.msg.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(stream.msg) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    if message.is_empty() {
+        format!("{operation} returned zlib status {status}")
+    } else {
+        format!("{operation} returned zlib status {status}: {message}")
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const Z_NO_FLUSH: c_int = 0;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const Z_OK: c_int = 0;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const Z_STREAM_END: c_int = 1;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAX_WBITS: c_int = 15;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+type ZAllocFunc = Option<unsafe extern "C" fn(*mut c_void, c_uint, c_uint) -> *mut c_void>;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+type ZFreeFunc = Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[repr(C)]
+struct ZStream {
+    next_in: *const u8,
+    avail_in: c_uint,
+    total_in: c_ulong,
+    next_out: *mut u8,
+    avail_out: c_uint,
+    total_out: c_ulong,
+    msg: *mut c_char,
+    state: *mut c_void,
+    zalloc: ZAllocFunc,
+    zfree: ZFreeFunc,
+    opaque: *mut c_void,
+    data_type: c_int,
+    adler: c_ulong,
+    reserved: c_ulong,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[link(name = "z")]
+unsafe extern "C" {
+    fn zlibVersion() -> *const c_char;
+    fn inflateInit2_(
+        stream: *mut ZStream,
+        window_bits: c_int,
+        version: *const c_char,
+        stream_size: c_int,
+    ) -> c_int;
+    fn inflate(stream: *mut ZStream, flush: c_int) -> c_int;
+    fn inflateEnd(stream: *mut ZStream) -> c_int;
+}
+
+fn zip_entry_compressed_data<'a>(
+    archive_path: &Path,
+    archive: &'a [u8],
+    entry: &NativeRomEntry,
+) -> Result<&'a [u8], BackendError> {
+    let data_start = zip_entry_data_start(archive_path, archive, entry)?;
+    let data_len = usize::try_from(entry.compressed_size).map_err(|_| {
+        BackendError::new(format!(
+            "ZIP entry {} in {} is too large to address on this platform",
+            entry.name,
+            archive_path.display()
+        ))
+    })?;
+    let data_end = data_start
+        .checked_add(data_len)
+        .ok_or_else(|| BackendError::new("ZIP entry data range overflow"))?;
+    archive.get(data_start..data_end).ok_or_else(|| {
+        BackendError::new(format!(
+            "ZIP entry {} in {} points outside the archive",
+            entry.name,
+            archive_path.display()
+        ))
+    })
+}
+
+fn zip_entry_data_start(
+    archive_path: &Path,
+    archive: &[u8],
+    entry: &NativeRomEntry,
+) -> Result<usize, BackendError> {
+    let local_header_offset = entry.local_header_offset.ok_or_else(|| {
+        BackendError::new(format!(
+            "ZIP entry {} in {} has no local header offset",
+            entry.name,
+            archive_path.display()
+        ))
+    })?;
+    let offset = usize::try_from(local_header_offset).map_err(|_| {
+        BackendError::new(format!(
+            "ZIP entry {} local header offset is too large",
+            entry.name
+        ))
+    })?;
+    if read_u32(archive, offset)? != LOCAL_FILE_HEADER_SIGNATURE {
+        return Err(BackendError::new(format!(
+            "invalid ZIP local file header for {} in {}",
+            entry.name,
+            archive_path.display()
+        )));
+    }
+    let name_len = read_u16(archive, offset + 26)? as usize;
+    let extra_len = read_u16(archive, offset + 28)? as usize;
+    offset
+        .checked_add(30)
+        .and_then(|value| value.checked_add(name_len))
+        .and_then(|value| value.checked_add(extra_len))
+        .ok_or_else(|| BackendError::new("ZIP local file header length overflow"))
+}
+
+fn read_nested_zip_entry(
     path: &Path,
     archive_entry: &str,
     inner_entry: &str,
 ) -> Result<Vec<u8>, BackendError> {
-    let archive_bytes = unzip_entry(path, archive_entry)?;
-    let temp_path = std::env::temp_dir().join(format!(
-        "bloodyroar2-nested-zip-{}-{}.zip",
-        std::process::id(),
-        monotonic_temp_suffix()
-    ));
-    fs::write(&temp_path, archive_bytes).map_err(|error| {
+    let outer_archive = fs::read(path).map_err(|error| {
         BackendError::new(format!(
-            "failed to stage nested ZIP {} from {}: {error}",
-            archive_entry,
+            "failed to read ZIP archive {}: {error}",
             path.display()
         ))
     })?;
-
-    let result = unzip_entry(&temp_path, inner_entry);
-    let _ = fs::remove_file(&temp_path);
-    result
+    read_nested_zip_entry_from_bytes(path, &outer_archive, archive_entry, inner_entry)
 }
 
-fn monotonic_temp_suffix() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
+fn read_nested_zip_entry_from_bytes(
+    path: &Path,
+    outer_archive: &[u8],
+    archive_entry: &str,
+    inner_entry: &str,
+) -> Result<Vec<u8>, BackendError> {
+    let outer_entries = parse_zip_entries(&outer_archive)?;
+    let outer_entry = outer_entries
+        .iter()
+        .find(|entry| asset_names_match(&entry.name, archive_entry))
+        .ok_or_else(|| {
+            BackendError::new(format!(
+                "nested archive {archive_entry} is missing from {}",
+                path.display()
+            ))
+        })?;
+    let nested_archive = read_zip_entry_from_bytes(path, outer_archive, outer_entry)?;
+    let nested_entries = parse_zip_entries(&nested_archive)?;
+    let nested_entry = nested_entries
+        .iter()
+        .find(|entry| asset_names_match(&entry.name, inner_entry))
+        .ok_or_else(|| {
+            BackendError::new(format!(
+                "nested ZIP entry {inner_entry} is missing from {archive_entry}"
+            ))
+        })?;
+    read_zip_entry_from_bytes(path, &nested_archive, nested_entry)
 }
 
 fn read_scanned_entry_bytes(root: &Path, entry_name: &str) -> Result<Vec<u8>, BackendError> {
     if let Some((archive_name, inner_entry)) = split_scanned_zip_entry(entry_name) {
         if let Some((nested_archive, nested_inner_entry)) = split_scanned_zip_entry(inner_entry) {
-            return unzip_nested_entry(
+            return read_nested_zip_entry(
                 &root.join(archive_name),
                 nested_archive,
                 nested_inner_entry,
             );
         }
-        return unzip_entry(&root.join(archive_name), inner_entry);
+        let archive_path = root.join(archive_name);
+        let archive = fs::read(&archive_path).map_err(|error| {
+            BackendError::new(format!(
+                "failed to read ZIP archive {}: {error}",
+                archive_path.display()
+            ))
+        })?;
+        let entries = parse_zip_entries(&archive)?;
+        let entry = entries
+            .iter()
+            .find(|entry| asset_names_match(&entry.name, inner_entry))
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "ZIP entry {inner_entry} is missing from {}",
+                    archive_path.display()
+                ))
+            })?;
+        return read_zip_entry_from_bytes(&archive_path, &archive, entry);
     }
 
     fs::read(root.join(entry_name)).map_err(|error| {
@@ -1660,6 +2035,7 @@ mod tests {
                     compressed_size: 4,
                     crc32: 0x1234_abcd,
                     compression_method: 0,
+                    local_header_offset: Some(0),
                 },
                 NativeRomEntry {
                     name: "gfx/texture.bin".to_string(),
@@ -1667,6 +2043,7 @@ mod tests {
                     compressed_size: 13,
                     crc32: 0xfeed_beef,
                     compression_method: 8,
+                    local_header_offset: Some(47),
                 },
             ]
         );
@@ -1694,6 +2071,62 @@ mod tests {
         let bytes = romset
             .load_manifest_asset("flash0.021")
             .expect("load nested flash0 entry");
+        assert_eq!(bytes, vec![0x11, 0x22, 0x33, 0x44]);
+        let _ = fs::remove_file(zip_path);
+    }
+
+    #[test]
+    fn read_zip_entry_inflates_deflated_data_without_external_unzip() {
+        let data = b"hello deflated zip";
+        let compressed_data = [
+            0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x48, 0x49, 0x4d, 0xcb, 0x49, 0x2c, 0x49, 0x4d,
+            0x51, 0xa8, 0xca, 0x2c, 0x00, 0x00,
+        ];
+        let zip = fixture_single_entry_zip(
+            "deflated.txt",
+            ZIP_DEFLATED_METHOD,
+            crc32(data),
+            data.len() as u32,
+            &compressed_data,
+        );
+        let entries = parse_zip_entries(&zip).expect("parse deflated fixture");
+        let bytes = read_zip_entry_from_bytes(Path::new("fixture.zip"), &zip, &entries[0])
+            .expect("inflate deflated fixture");
+
+        assert_eq!(bytes, data);
+    }
+
+    #[test]
+    fn inspect_expands_deflated_nested_zip_entries() {
+        let inner_zip = fixture_stored_zip(&[("flash0.021", &[0x11, 0x22, 0x33, 0x44])]);
+        assert_eq!(inner_zip.len(), 122);
+        assert_eq!(crc32(&inner_zip), 0x35a1_475c);
+        let deflated_inner_zip = [
+            0x0b, 0xf0, 0x66, 0x66, 0x11, 0x61, 0x80, 0x81, 0x8b, 0x73, 0x3f, 0x95, 0xb3, 0x00,
+            0x69, 0x10, 0xe6, 0x02, 0xe2, 0xb4, 0x9c, 0xc4, 0xe2, 0x0c, 0x03, 0x3d, 0x03, 0x23,
+            0x43, 0x41, 0x25, 0x63, 0x97, 0x00, 0x6f, 0x46, 0x26, 0x11, 0x06, 0xdc, 0xaa, 0x51,
+            0x01, 0x42, 0x6f, 0x80, 0x37, 0x2b, 0x1b, 0x48, 0x84, 0x11, 0x08, 0x2d, 0x80, 0xb4,
+            0x0e, 0x58, 0x1e, 0x00,
+        ];
+        let outer_zip = fixture_single_entry_zip(
+            "BloodRoar2/roms/bldyror2.zip",
+            ZIP_DEFLATED_METHOD,
+            crc32(&inner_zip),
+            inner_zip.len() as u32,
+            &deflated_inner_zip,
+        );
+        let zip_path = temp_zip_path("deflated-nested");
+        fs::write(&zip_path, outer_zip).expect("write deflated nested ZIP fixture");
+        let romset = NativeRomSet::inspect(&zip_path).expect("inspect deflated nested ZIP fixture");
+
+        assert!(
+            romset
+                .entries
+                .contains(&"BloodRoar2/roms/bldyror2.zip/flash0.021".to_string())
+        );
+        let bytes = romset
+            .load_manifest_asset("flash0.021")
+            .expect("load deflated nested flash0 entry");
         assert_eq!(bytes, vec![0x11, 0x22, 0x33, 0x44]);
         let _ = fs::remove_file(zip_path);
     }
@@ -1895,6 +2328,7 @@ mod tests {
                         compressed_size: 13,
                         crc32: 0xfeed_beef,
                         compression_method: 8,
+                        local_header_offset: Some(47),
                     },
                     NativeRomEntry {
                         name: "GFX\\TEXTURE.BIN".to_string(),
@@ -1902,6 +2336,7 @@ mod tests {
                         compressed_size: 14,
                         crc32: 0xcafe_babe,
                         compression_method: 8,
+                        local_header_offset: Some(105),
                     },
                 ],
             }]
@@ -1980,7 +2415,10 @@ mod tests {
                 compressed_size: 2_097_152,
                 crc32: 0xfa76_02e1,
                 compression_method: 0,
+                local_header_offset: None,
             }],
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         };
 
         let report = romset.bloody_roar_2_compatibility();
@@ -2015,7 +2453,10 @@ mod tests {
                 compressed_size: 4,
                 crc32: 0x1234_5678,
                 compression_method: 0,
+                local_header_offset: None,
             }],
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         };
 
         let report = romset.bloody_roar_2_compatibility();
@@ -2048,6 +2489,7 @@ mod tests {
                 compressed_size: expectation.expected_size,
                 crc32: expectation.expected_crc32.unwrap_or(0),
                 compression_method: 0,
+                local_header_offset: None,
             });
         }
         entries.push("FLASH0.021".to_string());
@@ -2057,12 +2499,15 @@ mod tests {
             compressed_size: 2_097_152,
             crc32: 0xfa76_02e1,
             compression_method: 0,
+            local_header_offset: None,
         });
 
         let romset = NativeRomSet {
             path: PathBuf::from("fixture.zip"),
             entries,
             entry_metadata,
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         };
         let report = romset.bloody_roar_2_compatibility();
 
@@ -2091,6 +2536,7 @@ mod tests {
                 compressed_size: expectation.expected_size,
                 crc32: expectation.expected_crc32.unwrap_or(0),
                 compression_method: 0,
+                local_header_offset: None,
             });
         }
 
@@ -2098,6 +2544,8 @@ mod tests {
             path: PathBuf::from("fixture.zip"),
             entries,
             entry_metadata,
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         };
 
         let report = romset.bloody_roar_2_compatibility();
@@ -2132,6 +2580,7 @@ mod tests {
                 compressed_size: expectation.expected_size,
                 crc32,
                 compression_method: 0,
+                local_header_offset: None,
             });
         }
 
@@ -2139,6 +2588,8 @@ mod tests {
             path: PathBuf::from("fixture.zip"),
             entries,
             entry_metadata,
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         };
 
         let report = romset.bloody_roar_2_compatibility();
@@ -2184,7 +2635,10 @@ mod tests {
                 compressed_size: 524_288,
                 crc32: 0x910f_3a8b,
                 compression_method: 0,
+                local_header_offset: None,
             }],
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
         };
 
         let report = romset.bloody_roar_2_compatibility();
@@ -2439,6 +2893,30 @@ mod tests {
         }
 
         finish_zip(zip, central_directory, entries.len() as u16)
+    }
+
+    fn fixture_single_entry_zip(
+        name: &str,
+        compression_method: u16,
+        crc32: u32,
+        uncompressed_size: u32,
+        compressed_data: &[u8],
+    ) -> Vec<u8> {
+        let mut zip = Vec::new();
+        let mut central_directory = Vec::new();
+
+        push_entry(
+            &mut zip,
+            &mut central_directory,
+            name,
+            compression_method,
+            crc32,
+            compressed_data.len() as u32,
+            uncompressed_size,
+            compressed_data,
+        );
+
+        finish_zip(zip, central_directory, 1)
     }
 
     fn finish_zip(mut zip: Vec<u8>, central_directory: Vec<u8>, entry_count: u16) -> Vec<u8> {
