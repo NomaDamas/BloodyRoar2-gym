@@ -2208,6 +2208,20 @@ impl Bus {
             return UnlinkedPrimitiveReplayDecision::enabled("forced", recent_header_count);
         }
 
+        if std::env::var_os("BR2_NATIVE_AUTO_UNLINKED_PRIMITIVE_REPLAY").is_none() {
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "disabled_by_default",
+                recent_header_count,
+            );
+        }
+
+        if self.native_playable_candidate() {
+            return UnlinkedPrimitiveReplayDecision::disabled(
+                "native_playable_display_ready",
+                recent_header_count,
+            );
+        }
+
         if self.unlinked_primitive_replay.last_vblank == Some(self.vblank_count)
             && self.unlinked_primitive_replay.last_packets > 0
         {
@@ -4096,7 +4110,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_linked_list_dma_replays_recent_unlinked_br2_primitive_packets_by_default() {
+    fn gpu_linked_list_dma_skips_unlinked_br2_primitive_packets_by_default() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.write_u32(0x003a_1000, 0x01ff_ffff);
         bus.write_u32(0x003a_1004, 0xe100_0400);
@@ -4114,16 +4128,14 @@ mod tests {
         bus.write_u32(DMA_GPU_MADR, 0x003a_1000);
         bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
 
-        assert!(bus.io.gpu.commands_seen > 1);
+        assert_eq!(bus.io.gpu.commands_seen, 1);
         let sync_json = bus.native_sync_json();
-        assert!(sync_json.contains("\"conditional_replays\":1"));
-        assert!(
-            sync_json.contains("\"last_reason\":\"short_linked_list_recent_primitive_stream\"")
-        );
+        assert!(sync_json.contains("\"conditional_replays\":0"));
+        assert!(sync_json.contains("\"last_reason\":\"disabled_by_default\""));
     }
 
     #[test]
-    fn gpu_vblank_replays_recent_unlinked_textured_primitives_without_later_dma() {
+    fn gpu_vblank_skips_recent_unlinked_textured_primitives_by_default() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.write_u32(0x003a_1000, 0x01ff_ffff);
         bus.write_u32(0x003a_1004, 0xe100_0400);
@@ -4147,15 +4159,14 @@ mod tests {
 
         bus.tick(566_000);
 
-        assert!(bus.io.gpu.commands_seen > commands_before);
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
         assert!(
             bus.io_json()
-                .contains("\"gpu_textured_triangle_commands\":16")
+                .contains("\"gpu_textured_triangle_commands\":0")
         );
         let sync_json = bus.native_sync_json();
-        assert!(
-            sync_json.contains("\"last_reason\":\"short_linked_list_recent_primitive_stream\"")
-        );
+        assert!(sync_json.contains("\"conditional_replays\":0"));
+        assert!(sync_json.contains("\"last_reason\":\"disabled_by_default\""));
     }
 
     #[test]
