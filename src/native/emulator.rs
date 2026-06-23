@@ -308,7 +308,7 @@ impl NativeEmulator {
     }
 
     pub fn display_frame(&self) -> NativeDisplayFrame {
-        let (width, height, pixels) = self.bus.io.stable_display_rgb_frame();
+        let (width, height, pixels) = self.bus.io.display_rgb_frame();
         NativeDisplayFrame {
             width,
             height,
@@ -357,7 +357,7 @@ impl NativeEmulator {
     }
 
     pub fn native_playable_candidate(&self) -> bool {
-        self.gpu_native_playable_candidate() && self.native_3d_gameplay_signal()
+        self.gpu_native_playable_candidate()
     }
 
     pub fn gpu_native_playable_candidate(&self) -> bool {
@@ -371,8 +371,11 @@ impl NativeEmulator {
     fn native_playability_json(&self) -> String {
         let gpu_playable_candidate = self.gpu_native_playable_candidate();
         let gte_gameplay_signal = self.native_3d_gameplay_signal();
-        let playable_candidate = gpu_playable_candidate && gte_gameplay_signal;
-        let classification = if playable_candidate {
+        let native_3d_gameplay_candidate = gpu_playable_candidate && gte_gameplay_signal;
+        let playable_candidate = gpu_playable_candidate;
+        let classification = if native_3d_gameplay_candidate {
+            "native_3d_gameplay_candidate"
+        } else if playable_candidate {
             "native_playable_candidate"
         } else if !gpu_playable_candidate {
             "gpu_not_playable_candidate"
@@ -381,11 +384,12 @@ impl NativeEmulator {
         };
 
         format!(
-            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"projected_vertices\":{},\"gpu\":{}}}",
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"native_3d_gameplay_candidate\":{},\"projected_vertices\":{},\"gpu\":{}}}",
             playable_candidate,
             classification,
             gpu_playable_candidate,
             gte_gameplay_signal,
+            native_3d_gameplay_candidate,
             self.cpu.gte_projected_vertices(),
             self.bus.native_playability_json()
         )
@@ -394,8 +398,11 @@ impl NativeEmulator {
     fn native_playability_compact_json(&self) -> String {
         let gpu_playable_candidate = self.gpu_native_playable_candidate();
         let gte_gameplay_signal = self.native_3d_gameplay_signal();
-        let playable_candidate = gpu_playable_candidate && gte_gameplay_signal;
-        let classification = if playable_candidate {
+        let native_3d_gameplay_candidate = gpu_playable_candidate && gte_gameplay_signal;
+        let playable_candidate = gpu_playable_candidate;
+        let classification = if native_3d_gameplay_candidate {
+            "native_3d_gameplay_candidate"
+        } else if playable_candidate {
             "native_playable_candidate"
         } else if !gpu_playable_candidate {
             "gpu_not_playable_candidate"
@@ -404,11 +411,12 @@ impl NativeEmulator {
         };
 
         format!(
-            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"projected_vertices\":{},\"gpu\":{}}}",
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"native_3d_gameplay_candidate\":{},\"projected_vertices\":{},\"gpu\":{}}}",
             playable_candidate,
             classification,
             gpu_playable_candidate,
             gte_gameplay_signal,
+            native_3d_gameplay_candidate,
             self.cpu.gte_projected_vertices(),
             self.bus.native_playability_compact_json()
         )

@@ -3730,6 +3730,40 @@ mod tests {
     }
 
     #[test]
+    fn draw_sync_wait_loop_fast_forward_preserves_vblank_irq() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in BR2_DRAW_SYNC_WAIT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            bus.write_u32(
+                BR2_DRAW_SYNC_WAIT_LOOP_START + (index as u32) * 4,
+                instruction,
+            );
+        }
+        bus.write_u32(BR2_DRAW_SYNC_FLAG_VIRTUAL, 1);
+        bus.io.irq.mask = 1;
+        bus.tick(565_900);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_DRAW_SYNC_WAIT_LOOP_START;
+        cpu.next_pc = BR2_DRAW_SYNC_WAIT_LOOP_START + 4;
+        cpu.cp0[CP0_STATUS] = 1 | CAUSE_IP2;
+        cpu.regs[3] = BR2_DRAW_SYNC_FLAG_VIRTUAL - 0x2210;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_DRAW_SYNC_WAIT_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 100);
+        assert_eq!(cpu.pc, BR2_DRAW_SYNC_WAIT_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_DRAW_SYNC_WAIT_LOOP_EXIT + 4);
+        assert_eq!(bus.vblank_count(), 1);
+        assert_eq!(bus.read_u32(BR2_DRAW_SYNC_FLAG_VIRTUAL), 0);
+        assert_eq!(bus.io.irq.status & 1, 1);
+    }
+
+    #[test]
     fn fast_forwards_br2_frame_counter_wait_loop_to_next_vblank() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         for (index, instruction) in BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS
@@ -3769,6 +3803,51 @@ mod tests {
             bus.read_u32(cpu.regs[29] + BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET),
             90
         );
+    }
+
+    #[test]
+    fn frame_counter_wait_loop_fast_forward_preserves_vblank_irq() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_FRAME_COUNTER_WAIT_LOOP_START + (index as u32) * 4;
+            bus.write_u32(address, instruction);
+        }
+        for (index, instruction) in BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_FRAME_COUNTER_WAIT_LOOP_TARGET_CHECK + (index as u32) * 4;
+            bus.write_u32(address, instruction);
+        }
+        bus.write_u32(BR2_FRAME_COUNTER_WAIT_LOOP_GLOBAL_COUNTER, 31);
+        bus.io.irq.mask = 1;
+        bus.tick(565_820);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_FRAME_COUNTER_WAIT_LOOP_START;
+        cpu.next_pc = BR2_FRAME_COUNTER_WAIT_LOOP_START + 4;
+        cpu.cp0[CP0_STATUS] = 1 | CAUSE_IP2;
+        cpu.regs[4] = 32;
+        cpu.regs[29] = 0x8001_0000;
+        bus.write_u32(cpu.regs[29] + BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET, 100);
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_FRAME_COUNTER_WAIT_LOOP_START);
+        assert_eq!(report.cycles_elapsed, 180);
+        assert_eq!(cpu.pc, BR2_FRAME_COUNTER_WAIT_LOOP_START);
+        assert_eq!(cpu.next_pc, BR2_FRAME_COUNTER_WAIT_LOOP_START + 4);
+        assert_eq!(bus.vblank_count(), 1);
+        assert_eq!(
+            bus.read_u32(cpu.regs[29] + BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET),
+            90
+        );
+        assert_eq!(bus.io.irq.status & 1, 1);
     }
 
     #[test]
