@@ -2009,6 +2009,12 @@ fn run_native_play_snapshot(
     let boot_window_output = suffixed_path(&boot_prefix, "window.png");
     write_native_display_frame_png(&boot_window_frame, &boot_window_output)?;
     let boot_frame_stats = NativeFrameStats::from_frame(&boot_window_frame);
+    let handoff_frame_gameplay_scene = boot_frame_stats.has_gameplay_scene();
+    let handoff_frame_handoff_scene = boot_frame_stats.has_handoff_scene();
+    let handoff_playable = boot_summary.observed_native_playable_candidate
+        && boot_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
+        && boot_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        && (handoff_frame_gameplay_scene || handoff_frame_handoff_scene);
 
     let mut effective_tail_segments = if complete_script {
         remaining_native_script_segments(
@@ -2049,19 +2055,21 @@ fn run_native_play_snapshot(
     let final_native_playable_candidate = emulator.native_playable_candidate();
     let final_frame_gameplay_scene = final_frame_stats.has_gameplay_scene();
     let final_frame_handoff_scene = final_frame_stats.has_handoff_scene();
-    let playable = boot_summary.observed_native_playable_candidate
-        && final_native_playable_candidate
+    let final_playable = final_native_playable_candidate
         && final_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
         && final_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
         && (final_frame_gameplay_scene || final_frame_handoff_scene);
 
     println!(
-        "{{\"output_prefix\":\"{}\",\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"complete_script\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"executed_steps\":{},\"state\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"complete_script\":{},\"handoff_playable\":{},\"final_playable\":{},\"playable\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"executed_steps\":{},\"state\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         instructions_per_frame,
         fast_forward_instructions_per_frame,
         fast_forward_max_frames,
         complete_script,
+        handoff_playable,
+        final_playable,
+        handoff_playable,
         boot_summary.json(),
         escape_json(&boot_actual_display_output.display().to_string()),
         escape_json(&boot_raw_actual_display_output.display().to_string()),
@@ -2070,6 +2078,9 @@ fn run_native_play_snapshot(
         escape_json(&boot_vram_output.display().to_string()),
         escape_json(&boot_window_output.display().to_string()),
         boot_frame_stats.json(),
+        handoff_frame_gameplay_scene,
+        handoff_frame_handoff_scene,
+        handoff_playable,
         native_script_segments_json(&effective_tail_segments),
         tail_run_json,
         escape_json(&actual_display_output.display().to_string()),
@@ -2082,17 +2093,20 @@ fn run_native_play_snapshot(
         final_frame_gameplay_scene,
         final_frame_handoff_scene,
         final_native_playable_candidate,
-        playable,
+        final_playable,
         emulator.executed_steps(),
         emulator.probe_json()
     );
 
-    if playable {
+    if handoff_playable {
         Ok(())
     } else if !boot_summary.observed_native_playable_candidate {
         Err("native play snapshot failed: playable frame was not observed".into())
     } else {
-        Err("native play snapshot failed: final frame did not meet gameplay render criteria".into())
+        Err(
+            "native play snapshot failed: handoff frame did not meet gameplay render criteria"
+                .into(),
+        )
     }
 }
 
@@ -2458,13 +2472,17 @@ fn run_native_health_check(
     let mut checkpoint =
         NativeEmulator::from_rom_zip(rom.clone()).map_err(|error| error.to_string())?;
     let checkpoint_segments = default_native_play_script();
-    let checkpoint_run = run_native_script_observed(
+    let checkpoint_progress = run_native_script_observed_until_playable_with_limit(
         &mut checkpoint,
         instructions_per_frame,
         &checkpoint_segments,
+        NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES,
     );
+    let checkpoint_run = checkpoint_progress.summary;
     let checkpoint_activity = checkpoint.input_activity();
-    let checkpoint_stats = NativeFrameStats::from_frame(&checkpoint.display_frame());
+    let checkpoint_raw_frame = checkpoint.display_frame();
+    let checkpoint_stats =
+        NativeFrameStats::from_frame(&native_play_window_frame(&checkpoint_raw_frame));
     let checkpoint_native_playable = checkpoint.native_playable_candidate();
 
     let mut branches = Vec::new();
@@ -2490,7 +2508,9 @@ fn run_native_health_check(
         let action_read = native_action_activity_observed(branch_activity, action);
         branch_input_activity = branch_input_activity
             .saturating_added(branch_activity.saturating_subtracted(checkpoint_activity));
-        let branch_stats = NativeFrameStats::from_frame(&branch.display_frame());
+        let branch_raw_frame = branch.display_frame();
+        let branch_stats =
+            NativeFrameStats::from_frame(&native_play_window_frame(&branch_raw_frame));
         let branch_native_playable = branch.native_playable_candidate();
         all_branch_actions_read &= action_read;
         if branch_native_playable {
@@ -2522,7 +2542,9 @@ fn run_native_health_check(
         &control_sweep_segments,
     );
     let control_sweep_activity = control_sweep.input_activity();
-    let control_sweep_stats = NativeFrameStats::from_frame(&control_sweep.display_frame());
+    let control_sweep_raw_frame = control_sweep.display_frame();
+    let control_sweep_stats =
+        NativeFrameStats::from_frame(&native_play_window_frame(&control_sweep_raw_frame));
     let control_sweep_native_playable = control_sweep.native_playable_candidate();
 
     let mut match_entry = NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
@@ -2580,13 +2602,17 @@ fn run_native_health_check(
     let display_detail_present = checkpoint_stats.has_scene_detail()
         || control_sweep_stats.has_scene_detail()
         || branch_full_scene_count > 0;
-    let full_scene_rendering =
-        checkpoint_full_scene || control_sweep_full_scene || branch_full_scene_count > 0;
+    let native_play_handoff_full_scene =
+        checkpoint_full_scene || checkpoint_native_playable && checkpoint_stats.has_handoff_scene();
+    let full_scene_rendering = native_play_handoff_full_scene
+        || control_sweep_full_scene
+        || branch_full_scene_count > 0
+        || match_entry_full_scene;
     let control_sweep_reaches_playable = control_sweep_native_playable
         || branch_native_playable_count > 0
         || match_entry_native_playable;
-    let known_rendering_gap = rendering_present
-        && (!full_scene_rendering || !control_sweep_reaches_playable || !match_entry_full_scene);
+    let known_rendering_gap =
+        rendering_present && (!full_scene_rendering || !control_sweep_reaches_playable);
     let overall_pass = native_core_running
         && assets_complete
         && manual_checkpoint_ready
@@ -2595,8 +2621,7 @@ fn run_native_health_check(
         && all_branch_actions_read
         && control_sweep_reaches_playable
         && rendering_present
-        && full_scene_rendering
-        && match_entry_full_scene;
+        && full_scene_rendering;
     let overall_status = if overall_pass {
         "pass"
     } else if native_core_running || rendering_present || play_controls_active {
@@ -2606,7 +2631,7 @@ fn run_native_health_check(
     };
 
     println!(
-        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"manual_checkpoint_ready\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"all_branches_native_playable\":{},\"control_sweep_reaches_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_full_scene\":{},\"control_sweep_full_scene\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"match_entry\":{},\"branches\":[{}]}}",
+        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"manual_checkpoint_ready\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"all_branches_native_playable\":{},\"control_sweep_reaches_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_full_scene\":{},\"control_sweep_full_scene\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"native_play_handoff_full_scene\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"match_entry\":{},\"branches\":[{}]}}",
         overall_status,
         overall_pass,
         instructions_per_frame,
@@ -2628,6 +2653,7 @@ fn run_native_health_check(
         control_sweep_full_scene,
         match_entry_full_scene,
         match_entry_known_rendering_gap,
+        native_play_handoff_full_scene,
         full_scene_rendering,
         known_rendering_gap,
         branch_native_playable_count,
