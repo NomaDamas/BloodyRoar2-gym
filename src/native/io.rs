@@ -1,6 +1,7 @@
 #![allow(clippy::collapsible_if, clippy::too_many_arguments)]
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 
 use crate::action::ActionButtons;
 use crate::native::framebuffer::{
@@ -98,6 +99,9 @@ const GPU_OVERLAP_DRAW_LIMIT: usize = 96;
 const GPU_DRAW_CAPTURE_LIMIT: usize = 64;
 const GPU_DISPLAY_AREA_HISTORY_LIMIT: usize = 32;
 const GPU_IMAGE_UPLOAD_RECT_LIMIT: usize = 128;
+const GP0_BEST_OBSERVATION_EAGER_COMMANDS: u64 = 64;
+const GP0_BEST_OBSERVATION_COMMAND_INTERVAL: u64 = 32_768;
+const GP0_BEST_OBSERVATION_DRAW_INTERVAL: u64 = 128;
 const STALE_PRESENTATION_CAPTURE_GRACE: u64 = 8;
 const DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS: u64 = 16;
 const DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS: u64 = 512;
@@ -1212,6 +1216,8 @@ pub struct Gpu {
     best_observation_window: Option<FrameBufferWindow>,
     best_observation_width: usize,
     best_observation_height: usize,
+    best_observation_last_probe_command: u64,
+    best_observation_last_probe_draw_sequence: u64,
     presented_frame_png: Option<Vec<u8>>,
     presented_frame_rgb: Option<Vec<u32>>,
     presented_frame_window: Option<FrameBufferWindow>,
@@ -1277,6 +1283,8 @@ impl Default for Gpu {
             best_observation_window: None,
             best_observation_width: 0,
             best_observation_height: 0,
+            best_observation_last_probe_command: 0,
+            best_observation_last_probe_draw_sequence: 0,
             presented_frame_png: None,
             presented_frame_rgb: None,
             presented_frame_window: None,
@@ -3141,7 +3149,7 @@ impl Gpu {
             }
             _ => {}
         }
-        self.capture_best_observation();
+        self.capture_best_observation_after_gp0(command);
     }
 
     fn draw_flat_triangle(
@@ -3967,6 +3975,40 @@ impl Gpu {
         self.best_observation_window = Some(candidate);
         self.best_observation_width = width;
         self.best_observation_height = height;
+    }
+
+    fn capture_best_observation_after_gp0(&mut self, command: u8) {
+        if !self.should_probe_best_observation_after_gp0(command) {
+            return;
+        }
+
+        self.best_observation_last_probe_command = self.commands_seen;
+        self.best_observation_last_probe_draw_sequence = self.draw_sequence;
+        self.capture_best_observation();
+    }
+
+    fn should_probe_best_observation_after_gp0(&self, command: u8) -> bool {
+        if !gp0_command_may_update_framebuffer(command) {
+            return false;
+        }
+        if self.commands_seen <= GP0_BEST_OBSERVATION_EAGER_COMMANDS {
+            return true;
+        }
+        if self.best_observation_last_probe_command == 0 {
+            return true;
+        }
+        if self
+            .commands_seen
+            .saturating_sub(self.best_observation_last_probe_command)
+            >= GP0_BEST_OBSERVATION_COMMAND_INTERVAL
+        {
+            return true;
+        }
+        self.draw_sequence > self.best_observation_last_probe_draw_sequence
+            && self
+                .draw_sequence
+                .saturating_sub(self.best_observation_last_probe_draw_sequence)
+                >= GP0_BEST_OBSERVATION_DRAW_INTERVAL
     }
 
     fn display_window_is_texture_atlas(&self, window: FrameBufferWindow) -> bool {
@@ -5580,6 +5622,10 @@ fn gp0_expected_words(fifo: &[u32]) -> Option<usize> {
     Some(expected)
 }
 
+fn gp0_command_may_update_framebuffer(command: u8) -> bool {
+    matches!(command, 0x02 | 0x20..=0x7f | 0x80 | 0xa0)
+}
+
 pub(crate) fn gp0_command_word_count(fifo: &[u32]) -> Option<usize> {
     gp0_expected_words(fifo)
 }
@@ -7149,30 +7195,47 @@ fn read_mdec_block(halfwords: &[u16], cursor: &mut usize, quant: &[u8; 64]) -> O
 
 fn idct_8x8(coefficients: &[i32; 64]) -> [i16; 64] {
     let mut block = [0_i16; 64];
-    for y in 0..8 {
-        for x in 0..8 {
-            let mut sum = 0.0_f64;
-            for v in 0..8 {
-                for u in 0..8 {
-                    let cu = if u == 0 {
-                        std::f64::consts::FRAC_1_SQRT_2
-                    } else {
-                        1.0
-                    };
-                    let cv = if v == 0 {
-                        std::f64::consts::FRAC_1_SQRT_2
-                    } else {
-                        1.0
-                    };
-                    let basis_x = (((2 * x + 1) * u) as f64 * std::f64::consts::PI / 16.0).cos();
-                    let basis_y = (((2 * y + 1) * v) as f64 * std::f64::consts::PI / 16.0).cos();
-                    sum += cu * cv * coefficients[v * 8 + u] as f64 * basis_x * basis_y;
-                }
-            }
-            block[y * 8 + x] = (sum / 4.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+    let basis = mdec_idct_basis();
+    for output_index in 0..64 {
+        let mut sum = 0.0_f64;
+        for coefficient_index in 0..64 {
+            sum += coefficients[coefficient_index] as f64 * basis[output_index][coefficient_index];
         }
+        block[output_index] = sum.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
     }
     block
+}
+
+fn mdec_idct_basis() -> &'static [[f64; 64]; 64] {
+    static BASIS: OnceLock<[[f64; 64]; 64]> = OnceLock::new();
+    BASIS.get_or_init(|| {
+        let mut basis = [[0.0_f64; 64]; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                let output_index = y * 8 + x;
+                for v in 0..8 {
+                    for u in 0..8 {
+                        let cu = if u == 0 {
+                            std::f64::consts::FRAC_1_SQRT_2
+                        } else {
+                            1.0
+                        };
+                        let cv = if v == 0 {
+                            std::f64::consts::FRAC_1_SQRT_2
+                        } else {
+                            1.0
+                        };
+                        let basis_x =
+                            (((2 * x + 1) * u) as f64 * std::f64::consts::PI / 16.0).cos();
+                        let basis_y =
+                            (((2 * y + 1) * v) as f64 * std::f64::consts::PI / 16.0).cos();
+                        basis[output_index][v * 8 + u] = cu * cv * basis_x * basis_y / 4.0;
+                    }
+                }
+            }
+        }
+        basis
+    })
 }
 
 fn sign_extend_10(value: u16) -> i16 {
@@ -7258,12 +7321,13 @@ mod tests {
         ACCESS_WIDTH_16, ACCESS_WIDTH_32, Controller, DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS,
         DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS, DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS,
         DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS, DMA_GPU_CHCR, DMA_INTERRUPT, DrawBounds,
-        GPU_GP0, GPU_GP1, GpuDrawTrace, IO_REGISTER_MAP, IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io,
-        IoAccess, IoDevice, MDEC_COMMAND, MDEC_STATUS, SIO_CONTROL, SIO_DATA,
-        SIO_STATUS_IRQ_REQUEST, SPU_REGION_START, VRAM_HEIGHT, VRAM_WIDTH,
-        has_native_full_scene_detail, io_register, io_register_range, is_detailed_observation,
-        is_io_register_address, is_sparse_display, resolved_display_candidate_has_scene_signal,
-        screen_observation_score, screen_observation_worth_saving,
+        GP0_BEST_OBSERVATION_DRAW_INTERVAL, GP0_BEST_OBSERVATION_EAGER_COMMANDS, GPU_GP0, GPU_GP1,
+        GpuDrawTrace, IO_REGISTER_MAP, IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io, IoAccess,
+        IoDevice, MDEC_COMMAND, MDEC_STATUS, SIO_CONTROL, SIO_DATA, SIO_STATUS_IRQ_REQUEST,
+        SPU_REGION_START, VRAM_HEIGHT, VRAM_WIDTH, has_native_full_scene_detail, io_register,
+        io_register_range, is_detailed_observation, is_io_register_address, is_sparse_display,
+        resolved_display_candidate_has_scene_signal, screen_observation_score,
+        screen_observation_worth_saving,
     };
     use crate::native::framebuffer::{
         FrameBufferStats, FrameBufferWindow, Point, TexturedDrawStats,
@@ -7815,6 +7879,45 @@ mod tests {
         assert_eq!(window.x, 496);
         assert_eq!(window.y, 256);
         assert_eq!(window.stats.bright_pixels, window.stats.pixel_count);
+    }
+
+    #[test]
+    fn gpu_best_observation_hot_path_ignores_non_framebuffer_gp0_commands() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(512, 16, width as i32, height as i32, 0x00ff_ffff);
+        for _ in 0..GP0_BEST_OBSERVATION_EAGER_COMMANDS {
+            io.write_u32(GPU_GP0, 0xe100_1000);
+        }
+
+        assert_eq!(io.gpu.best_observation_last_probe_command, 0);
+        assert!(io.gpu.best_observation_window.is_none());
+    }
+
+    #[test]
+    fn gpu_best_observation_hot_path_throttles_between_draw_probes() {
+        let mut io = Io::default();
+        io.gpu.commands_seen = GP0_BEST_OBSERVATION_EAGER_COMMANDS;
+        io.gpu.best_observation_last_probe_command = io.gpu.commands_seen;
+        io.gpu.best_observation_last_probe_draw_sequence = io.gpu.draw_sequence;
+
+        for x in 0..(GP0_BEST_OBSERVATION_DRAW_INTERVAL - 1) {
+            io.write_u32(GPU_GP0, 0x6800_00ff);
+            io.write_u32(GPU_GP0, x as u32);
+        }
+
+        assert_eq!(
+            io.gpu.best_observation_last_probe_command,
+            GP0_BEST_OBSERVATION_EAGER_COMMANDS
+        );
+
+        io.write_u32(GPU_GP0, 0x6800_00ff);
+        io.write_u32(GPU_GP0, GP0_BEST_OBSERVATION_DRAW_INTERVAL as u32);
+
+        assert!(io.gpu.best_observation_last_probe_command > GP0_BEST_OBSERVATION_EAGER_COMMANDS);
     }
 
     #[test]

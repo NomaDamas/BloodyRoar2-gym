@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::env;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_ulong, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ const ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD: u16 = 0x0001;
 const ZIP_STORED_METHOD: u16 = 0;
 const ZIP_DEFLATED_METHOD: u16 = 8;
 const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v3";
+const NATIVE_ROM_CACHE_ENV: &str = "BLOODYROAR2_NATIVE_ROM_CACHE_DIR";
+const DEFAULT_NATIVE_ROM_CACHE_ROOT: &str = ".runtime-cache/native-rom-cache";
 const BLOODY_ROAR_2_GAME_ID: &str = "bldyror2";
 const CAT702_ET01_CRC32: u32 = 0xa7dd_922e;
 const CAT702_ET03_CRC32: u32 = 0x779b_0bfd;
@@ -1169,9 +1172,7 @@ impl NativeRomCache {
         let cache_key = format!(
             "{NATIVE_ROM_CACHE_VERSION}-{identity_crc32:08x}-{source_len:016x}-{source_modified_ns:032x}"
         );
-        let base_dir = PathBuf::from("target")
-            .join("native-rom-cache")
-            .join(cache_key);
+        let base_dir = native_rom_cache_root().join(cache_key);
         let rom_dir = base_dir.join("roms");
         let ready_file = base_dir.join("READY");
 
@@ -1194,7 +1195,7 @@ impl NativeRomCache {
         name.push_str(&format!(".tmp-{}", process::id()));
         self.base_dir
             .parent()
-            .unwrap_or_else(|| Path::new("target/native-rom-cache"))
+            .unwrap_or_else(|| Path::new(DEFAULT_NATIVE_ROM_CACHE_ROOT))
             .join(name)
     }
 
@@ -1208,6 +1209,13 @@ impl NativeRomCache {
             written_assets.join(",")
         )
     }
+}
+
+fn native_rom_cache_root() -> PathBuf {
+    env::var_os(NATIVE_ROM_CACHE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_NATIVE_ROM_CACHE_ROOT))
 }
 
 fn materialize_cached_romset(
@@ -2294,7 +2302,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_cached_materializes_nested_zip_assets_once_under_target_cache() {
+    fn scan_cached_materializes_nested_zip_assets_once_under_runtime_cache() {
         let inner_zip = fixture_stored_zip(&[("flash0.021", &[0x11, 0x22, 0x33, 0x44])]);
         let outer_zip = fixture_stored_zip(&[("BloodRoar2/roms/bldyror2.zip", &inner_zip)]);
         let zip_path = temp_zip_path("runtime-cache");
@@ -2311,7 +2319,7 @@ mod tests {
             romset
                 .path
                 .to_string_lossy()
-                .contains("target/native-rom-cache")
+                .contains(DEFAULT_NATIVE_ROM_CACHE_ROOT)
         );
         assert_eq!(
             fs::read(romset.path.join("flash0.021")).expect("read cached flash0"),

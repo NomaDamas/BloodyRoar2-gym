@@ -1,5 +1,6 @@
 target/
 tmp/
+.runtime-cache/
 
 # Proprietary game dumps, BIOS files, extracted emulator bundles, and split archives.
 BloodRoar2*/

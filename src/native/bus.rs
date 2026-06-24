@@ -23,6 +23,7 @@ const DMA_MDEC_COMPLETION_DELAY_CYCLES: u64 = 1_024;
 const DMA_GPU_COMPLETION_DELAY_CYCLES: u64 = 4_096;
 const DMA_OTC_COMPLETION_DELAY_CYCLES: u64 = 512;
 const VBLANK_CYCLES: u64 = 566_000;
+const GPU_VBLANK_PRESENTATION_CAPTURE_INTERVAL: u64 = 4;
 const GPU_LINKED_LIST_NODE_LIMIT: u32 = 65_536;
 const BR2_DRAW_SYNC_FLAG_VIRTUAL: u32 = 0x803a_2210;
 const BR2_DRAW_SYNC_FLAG_PHYSICAL: u32 = 0x003a_2210;
@@ -1414,7 +1415,13 @@ impl Bus {
             self.vblank_cycle_accumulator -= VBLANK_CYCLES;
             self.vblank_count = self.vblank_count.saturating_add(1);
             self.process_vblank_unlinked_primitive_replay();
-            self.io.gpu.capture_vblank_presented_frame();
+            if self.vblank_count == 1
+                || self
+                    .vblank_count
+                    .is_multiple_of(GPU_VBLANK_PRESENTATION_CAPTURE_INTERVAL)
+            {
+                self.io.gpu.capture_vblank_presented_frame();
+            }
             self.primitive_ram_writes.advance_vblank();
             self.io.irq.status |= 1;
             self.complete_draw_sync_on_vblank();

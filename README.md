@@ -82,6 +82,7 @@ Run the Rust-native Apple Silicon play window with legally supplied local assets
 
 ```sh
 cargo run -- native-cache-prepare assets/BloodRoar2-combined.zip
+cargo run -- native-cache-path assets/BloodRoar2-combined.zip
 cargo run -- native-play assets/BloodRoar2-combined.zip 500000 fit
 cargo run -- native-input-check assets/roms 500000
 cargo run -- native-health-check assets/roms 500000
@@ -90,10 +91,12 @@ cargo run -- native-autoplay assets/roms 500000 fit
 ```
 
 ZIP inputs are not extracted by hand on every run. Native runtime startup
-materializes recognized ROM entries once under ignored `target/native-rom-cache`
-using a source-size/mtime fingerprint, then subsequent `native-play`,
-`serve-native`, and Gym reset paths reuse the cached ROM directory until the
-source archive changes or `target` is cleaned.
+materializes recognized ROM entries once under ignored
+`.runtime-cache/native-rom-cache` using a source-size/mtime fingerprint, then
+subsequent `native-play`, `serve-native`, and Gym reset paths reuse the cached
+ROM directory until the source archive changes or that cache is removed. Set
+`BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
+outside the repo.
 
 `native-play` opens the macOS window after a bounded native fast-forward through
 the warning screens, black transitions, and menu confirmation. The fast-forward
