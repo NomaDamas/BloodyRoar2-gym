@@ -713,6 +713,62 @@ pub struct NativeRomSet {
     entry_bytes_cache: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct NativeRomCachedScan {
+    pub romset: NativeRomSet,
+    pub cache: NativeRomCacheReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeRomCacheReport {
+    pub input_path: PathBuf,
+    pub resolved_path: PathBuf,
+    pub cache_root: Option<PathBuf>,
+    pub cache_base: Option<PathBuf>,
+    pub used_cache: bool,
+    pub cache_hit: bool,
+    pub materialized: bool,
+}
+
+impl NativeRomCacheReport {
+    fn direct(input_path: PathBuf, resolved_path: PathBuf) -> Self {
+        Self {
+            input_path,
+            resolved_path,
+            cache_root: None,
+            cache_base: None,
+            used_cache: false,
+            cache_hit: false,
+            materialized: false,
+        }
+    }
+
+    fn cached(input_path: PathBuf, cache: &NativeRomCache, cache_hit: bool) -> Self {
+        Self {
+            input_path,
+            resolved_path: cache.rom_dir.clone(),
+            cache_root: cache.base_dir.parent().map(Path::to_path_buf),
+            cache_base: Some(cache.base_dir.clone()),
+            used_cache: true,
+            cache_hit,
+            materialized: !cache_hit,
+        }
+    }
+
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"input_path\":\"{}\",\"resolved_path\":\"{}\",\"cache_root\":{},\"cache_base\":{},\"used_cache\":{},\"cache_hit\":{},\"materialized\":{}}}",
+            escape_json(&self.input_path.display().to_string()),
+            escape_json(&self.resolved_path.display().to_string()),
+            optional_path_json(self.cache_root.as_deref()),
+            optional_path_json(self.cache_base.as_deref()),
+            self.used_cache,
+            self.cache_hit,
+            self.materialized
+        )
+    }
+}
+
 impl NativeRomSet {
     pub fn scan(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
@@ -728,23 +784,34 @@ impl NativeRomSet {
     }
 
     pub fn scan_cached(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
+        Self::scan_cached_with_report(path).map(|scan| scan.romset)
+    }
+
+    pub fn scan_cached_with_report(
+        path: impl Into<PathBuf>,
+    ) -> Result<NativeRomCachedScan, BackendError> {
         let path = path.into();
         let metadata = fs::metadata(&path).map_err(|error| {
             BackendError::new(format!("failed to inspect {}: {error}", path.display()))
         })?;
 
         if metadata.is_dir() {
-            return Self::scan_dir(path);
+            let romset = Self::scan_dir(path.clone())?;
+            let cache = NativeRomCacheReport::direct(path, romset.path.clone());
+            return Ok(NativeRomCachedScan { romset, cache });
         }
 
         let cache = NativeRomCache::for_source(&path, &metadata);
         if let Some(romset) = Self::try_scan_cached_romset(&cache) {
-            return Ok(romset);
+            let cache = NativeRomCacheReport::cached(path, &cache, true);
+            return Ok(NativeRomCachedScan { romset, cache });
         }
 
         let source = Self::inspect(&path)?;
         materialize_cached_romset(&source, &cache)?;
-        Self::scan_dir(cache.rom_dir)
+        let romset = Self::scan_dir(cache.rom_dir.clone())?;
+        let cache = NativeRomCacheReport::cached(path, &cache, false);
+        Ok(NativeRomCachedScan { romset, cache })
     }
 
     pub fn inspect(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
@@ -2233,6 +2300,12 @@ fn optional_u64_json(value: Option<u64>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+fn optional_path_json(value: Option<&Path>) -> String {
+    value
+        .map(|path| format!("\"{}\"", escape_json(&path.display().to_string())))
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn optional_str_json(value: Option<&str>) -> String {
     value
         .map(|text| format!("\"{}\"", escape_json(text)))
@@ -2308,7 +2381,13 @@ mod tests {
         let zip_path = temp_zip_path("runtime-cache");
         fs::write(&zip_path, outer_zip).expect("write runtime cache ZIP fixture");
 
-        let romset = NativeRomSet::scan_cached(&zip_path).expect("scan cached ZIP fixture");
+        let first =
+            NativeRomSet::scan_cached_with_report(&zip_path).expect("scan cached ZIP fixture");
+        assert!(first.cache.used_cache);
+        assert!(!first.cache.cache_hit);
+        assert!(first.cache.materialized);
+        assert_eq!(first.cache.resolved_path, first.romset.path);
+        let romset = first.romset;
         let cache_base = romset
             .path
             .parent()
@@ -2327,8 +2406,12 @@ mod tests {
         );
         assert!(!romset.entries.iter().any(|entry| entry == "READY"));
 
-        let second = NativeRomSet::scan_cached(&zip_path).expect("reuse cached ZIP fixture");
-        assert_eq!(second.path, romset.path);
+        let second =
+            NativeRomSet::scan_cached_with_report(&zip_path).expect("reuse cached ZIP fixture");
+        assert!(second.cache.used_cache);
+        assert!(second.cache.cache_hit);
+        assert!(!second.cache.materialized);
+        assert_eq!(second.romset.path, romset.path);
 
         let _ = fs::remove_file(zip_path);
         let _ = fs::remove_dir_all(cache_base);

@@ -7,7 +7,7 @@ use crate::native::bus::{Bus, NativeInputActivity};
 use crate::native::cpu::{Cpu, StepOutcome, StepReport};
 use crate::native::io::{NativeGpuDisplayCandidate, NativeGpuDrawCapture};
 use crate::native::platform::native_platform_json;
-use crate::native::romset::{NativeRomCompatibilityReport, NativeRomSet};
+use crate::native::romset::{NativeRomCacheReport, NativeRomCompatibilityReport, NativeRomSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDisplayFrame {
@@ -29,6 +29,19 @@ pub struct NativeEmulator {
 impl NativeEmulator {
     pub fn from_rom_zip(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let romset = NativeRomSet::scan_cached(path.into())?;
+        Self::from_romset(romset)
+    }
+
+    pub fn from_rom_zip_with_cache_report(
+        path: impl Into<PathBuf>,
+    ) -> Result<(Self, NativeRomCacheReport), BackendError> {
+        let scan = NativeRomSet::scan_cached_with_report(path.into())?;
+        let cache = scan.cache;
+        let emulator = Self::from_romset(scan.romset)?;
+        Ok((emulator, cache))
+    }
+
+    pub fn from_romset(romset: NativeRomSet) -> Result<Self, BackendError> {
         let rom_compatibility = romset.compatibility_report();
         let boot_rom = romset.load_boot_rom()?;
         let banked_roms = romset.load_banked_roms()?;

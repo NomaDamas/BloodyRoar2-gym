@@ -82,19 +82,20 @@ Run the Rust-native Apple Silicon play window with legally supplied local assets
 
 ```sh
 cargo run -- native-cache-prepare assets/BloodRoar2-combined.zip
-cargo run -- native-cache-path assets/BloodRoar2-combined.zip
-cargo run -- native-play assets/BloodRoar2-combined.zip 500000 fit
-cargo run -- native-input-check assets/roms 500000
-cargo run -- native-health-check assets/roms 500000
-cargo run -- native-play assets/roms 500000 fit
-cargo run -- native-autoplay assets/roms 500000 fit
+CACHE_DIR=$(cargo run --quiet -- native-cache-path assets/BloodRoar2-combined.zip)
+cargo run -- native-play "$CACHE_DIR" 500000 fit
+cargo run -- native-input-check "$CACHE_DIR" 500000
+cargo run -- native-health-check "$CACHE_DIR" 500000
+cargo run -- native-autoplay "$CACHE_DIR" 500000 fit
 ```
 
 ZIP inputs are not extracted by hand on every run. Native runtime startup
 materializes recognized ROM entries once under ignored
-`.runtime-cache/native-rom-cache` using a source-size/mtime fingerprint, then
-subsequent `native-play`, `serve-native`, and Gym reset paths reuse the cached
-ROM directory until the source archive changes or that cache is removed. Set
+`.runtime-cache/native-rom-cache` using a source-size/mtime fingerprint.
+`native-cache-prepare` reports `cache_hit` and `materialized`, and
+`native-cache-path` prints the resolved ROM directory. For repeat play sessions,
+pass that directory to `native-play` so the runtime never reopens or rewrites the
+source ZIP unless you intentionally rebuild the cache. Set
 `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
 outside the repo.
 
