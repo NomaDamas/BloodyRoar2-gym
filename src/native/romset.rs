@@ -16,9 +16,10 @@ const CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD: u16 = 0x0001;
 const ZIP_STORED_METHOD: u16 = 0;
 const ZIP_DEFLATED_METHOD: u16 = 8;
-const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v3";
+const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v6";
 const NATIVE_ROM_CACHE_ENV: &str = "BLOODYROAR2_NATIVE_ROM_CACHE_DIR";
 const DEFAULT_NATIVE_ROM_CACHE_ROOT: &str = ".runtime-cache/native-rom-cache";
+const NATIVE_ROM_CACHE_LATEST_FILE: &str = "LATEST_ROM_DIR";
 const BLOODY_ROAR_2_GAME_ID: &str = "bldyror2";
 const CAT702_ET01_CRC32: u32 = 0xa7dd_922e;
 const CAT702_ET03_CRC32: u32 = 0x779b_0bfd;
@@ -803,15 +804,36 @@ impl NativeRomSet {
 
         let cache = NativeRomCache::for_source(&path, &metadata);
         if let Some(romset) = Self::try_scan_cached_romset(&cache) {
+            record_latest_cached_rom_dir(&cache)?;
             let cache = NativeRomCacheReport::cached(path, &cache, true);
             return Ok(NativeRomCachedScan { romset, cache });
         }
 
         let source = Self::inspect(&path)?;
         materialize_cached_romset(&source, &cache)?;
+        record_latest_cached_rom_dir(&cache)?;
         let romset = Self::scan_dir(cache.rom_dir.clone())?;
         let cache = NativeRomCacheReport::cached(path, &cache, false);
         Ok(NativeRomCachedScan { romset, cache })
+    }
+
+    pub fn latest_cached_rom_dir() -> Option<PathBuf> {
+        let latest_file = native_rom_cache_root().join(NATIVE_ROM_CACHE_LATEST_FILE);
+        let raw_path = fs::read_to_string(latest_file).ok()?;
+        let path = PathBuf::from(raw_path.trim());
+        let ready_file = path.parent()?.join("READY");
+        let ready = fs::read_to_string(ready_file).ok()?;
+        (path.is_dir() && ready.contains(&format!("version={NATIVE_ROM_CACHE_VERSION}\n")))
+            .then_some(path)
+    }
+
+    pub fn latest_cached_runtime_rom_dir() -> Option<PathBuf> {
+        let path = Self::latest_cached_rom_dir()?;
+        let romset = Self::scan_dir(path.clone()).ok()?;
+        romset
+            .compatibility_report()
+            .native_runtime_usable()
+            .then_some(path)
     }
 
     pub fn inspect(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
@@ -1285,6 +1307,29 @@ fn native_rom_cache_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_NATIVE_ROM_CACHE_ROOT))
 }
 
+fn record_latest_cached_rom_dir(cache: &NativeRomCache) -> Result<(), BackendError> {
+    let Some(cache_root) = cache.base_dir.parent() else {
+        return Ok(());
+    };
+
+    fs::create_dir_all(cache_root).map_err(|error| {
+        BackendError::new(format!(
+            "failed to create native ROM cache root {}: {error}",
+            cache_root.display()
+        ))
+    })?;
+    fs::write(
+        cache_root.join(NATIVE_ROM_CACHE_LATEST_FILE),
+        format!("{}\n", cache.rom_dir.display()),
+    )
+    .map_err(|error| {
+        BackendError::new(format!(
+            "failed to record latest native ROM cache under {}: {error}",
+            cache_root.display()
+        ))
+    })
+}
+
 fn materialize_cached_romset(
     source: &NativeRomSet,
     cache: &NativeRomCache,
@@ -1317,6 +1362,23 @@ fn materialize_cached_romset(
     })?;
 
     let mut written_assets = Vec::new();
+    for entry in source
+        .entry_metadata
+        .iter()
+        .filter(|entry| !entry.name.ends_with('/') && !is_zip_entry_name(&entry.name))
+    {
+        if manifest_entry_for_asset_name(&entry.name).is_some() {
+            continue;
+        }
+        let Ok(bytes) = source.load_entry_bytes(entry) else {
+            continue;
+        };
+        let Some(cache_name) = cached_expanded_entry_name(&entry.name) else {
+            continue;
+        };
+        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, &cache_name, &bytes)?;
+    }
+
     for manifest_entry in BLOODY_ROAR_2_MANIFEST.all_assets() {
         if source.find_entry(manifest_entry.name).is_none() {
             continue;
@@ -1333,10 +1395,20 @@ fn materialize_cached_romset(
 
     let board_assets = source.load_board_assets();
     if let Some(bytes) = board_assets.cat702_1 {
-        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et01.ic652", &bytes)?;
+        if !written_assets
+            .iter()
+            .any(|asset| asset_names_match(asset, "et01.ic652"))
+        {
+            write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et01.ic652", &bytes)?;
+        }
     }
     if let Some(bytes) = board_assets.cat702_2 {
-        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et03", &bytes)?;
+        if !written_assets
+            .iter()
+            .any(|asset| asset_names_match(asset, "et03"))
+        {
+            write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et03", &bytes)?;
+        }
     }
     if let Some(bytes) = board_assets.at28c16 {
         let name = if crc32(&bytes) == AT28C16_WORLD_CRC32 {
@@ -1344,7 +1416,12 @@ fn materialize_cached_romset(
         } else {
             "bldyror2.cfg"
         };
-        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, name, &bytes)?;
+        if !written_assets
+            .iter()
+            .any(|asset| asset_names_match(asset, name))
+        {
+            write_cached_rom_asset(&temp_rom_dir, &mut written_assets, name, &bytes)?;
+        }
     }
 
     if written_assets.is_empty() {
@@ -1392,6 +1469,14 @@ fn write_cached_rom_asset(
     }
 
     let output = cache_rom_dir.join(name);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            BackendError::new(format!(
+                "failed to create cached native ROM asset dir {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
     fs::write(&output, bytes).map_err(|error| {
         BackendError::new(format!(
             "failed to write cached native ROM asset {}: {error}",
@@ -1400,6 +1485,22 @@ fn write_cached_rom_asset(
     })?;
     written_assets.push(name.to_string());
     Ok(())
+}
+
+fn cached_expanded_entry_name(name: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for raw_part in name.replace('\\', "/").split('/') {
+        if raw_part.is_empty() || raw_part == "." || raw_part == ".." {
+            continue;
+        }
+        let mut part = raw_part.replace(':', "_");
+        if part.to_ascii_lowercase().ends_with(".zip") {
+            part.push_str(".contents");
+        }
+        parts.push(part);
+    }
+
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 fn collect_files_sorted(path: &Path) -> Result<Vec<PathBuf>, BackendError> {
@@ -2400,11 +2501,26 @@ mod tests {
                 .to_string_lossy()
                 .contains(DEFAULT_NATIVE_ROM_CACHE_ROOT)
         );
+        assert!(romset.path.join("flash0.021").exists());
         assert_eq!(
-            fs::read(romset.path.join("flash0.021")).expect("read cached flash0"),
+            fs::read(romset.path.join("flash0.021")).expect("read cached manifest flash0"),
             vec![0x11, 0x22, 0x33, 0x44]
         );
+        assert!(
+            !romset
+                .entries
+                .iter()
+                .any(|entry| entry.ends_with("flash0.021") && entry != "flash0.021"),
+            "recognized manifest assets should be materialized at the cache root only: {:?}",
+            romset.entries
+        );
+        assert!(
+            !romset.entries.iter().any(|entry| entry.contains(".zip/")),
+            "cached entries should be expanded files, not nested ZIP reads: {:?}",
+            romset.entries
+        );
         assert!(!romset.entries.iter().any(|entry| entry == "READY"));
+        assert!(NativeRomSet::latest_cached_rom_dir().is_some());
 
         let second =
             NativeRomSet::scan_cached_with_report(&zip_path).expect("reuse cached ZIP fixture");
@@ -2412,6 +2528,46 @@ mod tests {
         assert!(second.cache.cache_hit);
         assert!(!second.cache.materialized);
         assert_eq!(second.romset.path, romset.path);
+        assert!(NativeRomSet::latest_cached_rom_dir().is_some());
+
+        let _ = fs::remove_file(zip_path);
+        let _ = fs::remove_dir_all(cache_base);
+    }
+
+    #[test]
+    fn scan_cached_preserves_expanded_unknown_assets_from_nested_zip() {
+        let inner_zip = fixture_stored_zip(&[
+            ("flash0.021", &[0x11, 0x22, 0x33, 0x44]),
+            ("unknown-extra.bin", &[0xaa, 0xbb, 0xcc]),
+        ]);
+        let outer_zip = fixture_stored_zip(&[("BloodRoar2/roms/bldyror2.zip", &inner_zip)]);
+        let zip_path = temp_zip_path("runtime-cache-unknown-expanded");
+        fs::write(&zip_path, outer_zip).expect("write runtime cache ZIP fixture");
+
+        let romset = NativeRomSet::scan_cached(&zip_path)
+            .expect("scan cached ZIP fixture with unknown nested asset");
+        let cache_base = romset
+            .path
+            .parent()
+            .expect("cache rom dir parent")
+            .to_path_buf();
+
+        let expanded_unknown = "BloodRoar2/roms/bldyror2.zip.contents/unknown-extra.bin";
+        assert!(
+            romset.entries.iter().any(|entry| entry == expanded_unknown),
+            "{:?}",
+            romset.entries
+        );
+        assert_eq!(
+            fs::read(romset.path.join(expanded_unknown)).expect("read expanded unknown asset"),
+            vec![0xaa, 0xbb, 0xcc]
+        );
+        assert!(
+            romset
+                .compatibility_report()
+                .unknown_assets
+                .contains(&expanded_unknown.to_string())
+        );
 
         let _ = fs::remove_file(zip_path);
         let _ = fs::remove_dir_all(cache_base);

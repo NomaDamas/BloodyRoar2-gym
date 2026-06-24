@@ -102,7 +102,8 @@ impl NativeEmulator {
         config: NativeTraceConfig,
     ) -> NativeTrace {
         self.bus.set_access_trace_limit(recent_limit.max(32));
-        self.bus.set_access_trace_watch_ranges(config.watch_ranges);
+        self.bus
+            .set_access_trace_watch_ranges(config.watch_ranges.clone());
         self.bus.set_access_trace_watch_only(config.watch_only);
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
@@ -116,17 +117,14 @@ impl NativeEmulator {
             if let StepOutcome::Unsupported(instruction) = report.outcome {
                 *unsupported.entry(instruction).or_insert(0) += 1;
             }
-            let reached_stop_pc = if config.stop_pc.is_some_and(|pc| report.start_pc == pc) {
-                if stop_pc_hits_to_skip > 0 {
-                    stop_pc_hits_to_skip -= 1;
-                    false
-                } else {
-                    true
-                }
-            } else {
-                false
-            };
-            let reached_low_pc = config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
+            let reached_stop = config.reached_stop_condition(
+                report.start_pc,
+                &mut stop_pc_hits_to_skip,
+                self.bus.executable_pc_mapped(report.start_pc),
+                self.bus.access_trace_watch_access_hit(),
+                self.bus.access_trace_watch_data_hit(),
+                self.bus.access_trace_watch_write_hit(),
+            );
 
             if recent_limit > 0 {
                 recent_steps.push(report);
@@ -135,7 +133,7 @@ impl NativeEmulator {
                 }
             }
 
-            if report.outcome != StepOutcome::Continue || reached_stop_pc || reached_low_pc {
+            if report.outcome != StepOutcome::Continue || reached_stop {
                 break;
             }
         }
@@ -160,7 +158,8 @@ impl NativeEmulator {
         config: NativeTraceConfig,
     ) -> (NativeTrace, bool) {
         self.bus.set_access_trace_limit(recent_limit.max(32));
-        self.bus.set_access_trace_watch_ranges(config.watch_ranges);
+        self.bus
+            .set_access_trace_watch_ranges(config.watch_ranges.clone());
         self.bus.set_access_trace_watch_only(config.watch_only);
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
@@ -179,17 +178,14 @@ impl NativeEmulator {
             if let StepOutcome::Unsupported(instruction) = report.outcome {
                 *unsupported.entry(instruction).or_insert(0) += 1;
             }
-            let reached_stop_pc = if config.stop_pc.is_some_and(|pc| report.start_pc == pc) {
-                if stop_pc_hits_to_skip > 0 {
-                    stop_pc_hits_to_skip -= 1;
-                    false
-                } else {
-                    true
-                }
-            } else {
-                false
-            };
-            let reached_low_pc = config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
+            let reached_stop = config.reached_stop_condition(
+                report.start_pc,
+                &mut stop_pc_hits_to_skip,
+                self.bus.executable_pc_mapped(report.start_pc),
+                self.bus.access_trace_watch_access_hit(),
+                self.bus.access_trace_watch_data_hit(),
+                self.bus.access_trace_watch_write_hit(),
+            );
 
             if recent_limit > 0 {
                 recent_steps.push(report);
@@ -198,7 +194,7 @@ impl NativeEmulator {
                 }
             }
 
-            if report.outcome != StepOutcome::Continue || reached_stop_pc || reached_low_pc {
+            if report.outcome != StepOutcome::Continue || reached_stop {
                 break;
             }
         }
@@ -228,7 +224,8 @@ impl NativeEmulator {
         config: NativeTraceConfig,
     ) -> NativeTrace {
         self.bus.set_access_trace_limit(recent_limit.max(32));
-        self.bus.set_access_trace_watch_ranges(config.watch_ranges);
+        self.bus
+            .set_access_trace_watch_ranges(config.watch_ranges.clone());
         self.bus.set_access_trace_watch_only(config.watch_only);
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
@@ -249,19 +246,14 @@ impl NativeEmulator {
                     if let StepOutcome::Unsupported(instruction) = report.outcome {
                         *unsupported.entry(instruction).or_insert(0) += 1;
                     }
-                    let reached_stop_pc = if config.stop_pc.is_some_and(|pc| report.start_pc == pc)
-                    {
-                        if stop_pc_hits_to_skip > 0 {
-                            stop_pc_hits_to_skip -= 1;
-                            false
-                        } else {
-                            true
-                        }
-                    } else {
-                        false
-                    };
-                    let reached_low_pc =
-                        config.stop_below_pc.is_some_and(|pc| report.start_pc < pc);
+                    let reached_stop = config.reached_stop_condition(
+                        report.start_pc,
+                        &mut stop_pc_hits_to_skip,
+                        self.bus.executable_pc_mapped(report.start_pc),
+                        self.bus.access_trace_watch_access_hit(),
+                        self.bus.access_trace_watch_data_hit(),
+                        self.bus.access_trace_watch_write_hit(),
+                    );
 
                     if recent_limit > 0 {
                         recent_steps.push(report);
@@ -270,10 +262,7 @@ impl NativeEmulator {
                         }
                     }
 
-                    if self.last_outcome != StepOutcome::Continue
-                        || reached_stop_pc
-                        || reached_low_pc
-                    {
+                    if self.last_outcome != StepOutcome::Continue || reached_stop {
                         break 'script;
                     }
                 }
@@ -549,9 +538,50 @@ impl NativeEmulator {
 pub struct NativeTraceConfig {
     pub stop_pc: Option<u32>,
     pub stop_below_pc: Option<u32>,
+    pub stop_above_pc: Option<u32>,
+    pub stop_unmapped_pc: bool,
+    pub stop_watch_access: bool,
+    pub stop_watch_data: bool,
+    pub stop_watch_write: bool,
     pub stop_pc_skip: u64,
     pub watch_ranges: Vec<(u32, u32)>,
     pub watch_only: bool,
+}
+
+impl NativeTraceConfig {
+    fn reached_stop_condition(
+        &self,
+        pc: u32,
+        stop_pc_hits_to_skip: &mut u64,
+        pc_mapped_for_execution: bool,
+        watch_access_hit: bool,
+        watch_data_hit: bool,
+        watch_write_hit: bool,
+    ) -> bool {
+        let reached_stop_pc = if self.stop_pc.is_some_and(|stop_pc| pc == stop_pc) {
+            if *stop_pc_hits_to_skip > 0 {
+                *stop_pc_hits_to_skip -= 1;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        let reached_low_pc = self.stop_below_pc.is_some_and(|stop_pc| pc < stop_pc);
+        let reached_high_pc = self.stop_above_pc.is_some_and(|stop_pc| pc > stop_pc);
+        let reached_unmapped_pc = self.stop_unmapped_pc && !pc_mapped_for_execution;
+        let reached_watch_access = self.stop_watch_access && watch_access_hit;
+        let reached_watch_data = self.stop_watch_data && watch_data_hit;
+        let reached_watch_write = self.stop_watch_write && watch_write_hit;
+        reached_stop_pc
+            || reached_low_pc
+            || reached_high_pc
+            || reached_unmapped_pc
+            || reached_watch_access
+            || reached_watch_data
+            || reached_watch_write
+    }
 }
 
 #[derive(Clone, Debug)]

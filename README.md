@@ -82,30 +82,30 @@ Run the Rust-native Apple Silicon play window with legally supplied local assets
 
 ```sh
 cargo run -- native-cache-prepare assets/BloodRoar2-combined.zip
-CACHE_DIR=$(cargo run --quiet -- native-cache-path assets/BloodRoar2-combined.zip)
-cargo run -- native-play "$CACHE_DIR" 500000 fit
-cargo run -- native-input-check "$CACHE_DIR" 500000
-cargo run -- native-health-check "$CACHE_DIR" 500000
-cargo run -- native-autoplay "$CACHE_DIR" 500000 fit
+cargo run -- native-play
+cargo run -- native-input-check
+cargo run -- native-health-check
+cargo run -- native-autoplay
 ```
 
 ZIP inputs are not extracted by hand on every run. Native runtime startup
 materializes recognized ROM entries once under ignored
 `.runtime-cache/native-rom-cache` using a source-size/mtime fingerprint.
-`native-cache-prepare` reports `cache_hit` and `materialized`, and
-`native-cache-path` prints the resolved ROM directory. For repeat play sessions,
-pass that directory to `native-play` so the runtime never reopens or rewrites the
-source ZIP unless you intentionally rebuild the cache. Set
-`BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
+`native-cache-prepare` reports `cache_hit` and `materialized`, records the latest
+cache directory, and `native-cache-path` prints the resolved ROM directory. For
+repeat play sessions, omit the ROM argument: native commands use the latest cache
+directory first, then `assets/BloodRoar2-combined.zip`, then `assets/roms`. That
+keeps repeat runs off the source ZIP unless you intentionally rebuild the cache.
+Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
 outside the repo.
 
-`native-play` opens the macOS window after a bounded native fast-forward through
-the warning screens, black transitions, and menu confirmation. The fast-forward
-uses the requested vblank instruction budget so it does not stall on fake
-partial frames; if any scripted input remains, it continues in the window before
-falling back to keyboard control. Use `native-manual` only when you want fully
-manual input from boot. `native-autoplay` uses the same default script and also
-accepts an explicit script tail for smoke and control-sweep validation.
+`native-play` uses the cached ROM directory and opens a manual macOS window. It
+does not run the default coin/start/select script first, so keyboard input is
+polled from boot. `native-window-snapshot` writes the exact 640x480 GUI frame
+without opening a window, which is useful when checking whether the visible
+window is cropped, doubled, or black. `native-autoplay` keeps the bounded
+pre-window fast-forward path and also accepts an explicit script tail for smoke
+and control-sweep validation.
 `native-health-check` is stricter than the autoplay smoke path: it verifies the
 CPU core, mapped controls, rendered frame statistics, and per-action branch
 stability. It exits non-zero when the native renderer still has a full-scene
@@ -113,22 +113,23 @@ composition gap even if the macOS window and input path are working.
 
 Window controls:
 
-- Arrows: move.
-- `Z`: punch.
-- `X`: kick.
-- `A`: beast.
-- `S`: guard.
+- Arrows or `WASD`: move.
+- `Z`, `Space`, `J`, or `F`: confirm/punch.
+- `X`, `K`, or `H`: kick.
+- `Q`, `L`, or `B`: beast.
+- `E`, `I`, or `G`: guard.
 - `C`: coin.
-- `Enter`: start.
+- `Enter` or `P`: start.
 - `Esc`: quit.
 
 For automated smoke tests, pass an optional frame limit:
 
 ```sh
-cargo run -- native-play assets/roms 500000 fit 1800
-cargo run -- native-autoplay assets/roms 500000 fit 1800
-cargo run -- native-manual assets/roms 500000 2 700
-cargo run -- native-play-snapshot assets/roms 500000 tmp/native-validation/smoke --complete-script --fast-forward-frames 2400
+cargo run -- native-play 120000 fit 1800
+cargo run -- native-autoplay 120000 fit 1800
+cargo run -- native-manual 120000 2 700
+cargo run -- native-window-snapshot 40505333 tmp/native-validation/manual-window.png
+cargo run -- native-play-snapshot 120000 tmp/native-validation/smoke --complete-script --fast-forward-frames 2400
 ```
 
 `native-play-snapshot` exits non-zero unless the final rendered window frame
@@ -200,9 +201,9 @@ cargo run -- native-step assets/roms/bldyror2.zip 16
 cargo run -- native-step assets/roms/bldyror2.zip 1000000
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
-cargo run -- native-input-check assets/roms 500000
-cargo run -- native-health-check assets/roms 500000
-cargo run -- native-play assets/roms 500000 fit
+cargo run -- native-input-check 120000
+cargo run -- native-health-check 120000
+cargo run -- native-play 120000 fit
 cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
 ```
 

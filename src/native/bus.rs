@@ -29,15 +29,15 @@ const BR2_DRAW_SYNC_FLAG_VIRTUAL: u32 = 0x803a_2210;
 const BR2_DRAW_SYNC_FLAG_PHYSICAL: u32 = 0x003a_2210;
 const BR2_PRIMITIVE_RAM_START: u32 = 0x0038_0000;
 const BR2_PRIMITIVE_RAM_END: u32 = 0x003c_0000;
-const PRIMITIVE_RAM_RECENT_LIMIT: usize = 24;
+const PRIMITIVE_RAM_RECENT_LIMIT: usize = 64;
 const GPU_LINKED_LIST_RECENT_COMMAND_LIMIT: usize = 32;
 const GPU_LINKED_LIST_NODE_SAMPLE_LIMIT: usize = 16;
 const GPU_LINKED_LIST_NONEMPTY_NODE_SAMPLE_LIMIT: usize = 32;
 const PRIMITIVE_PACKET_SCAN_SAMPLE_LIMIT: usize = 24;
 const PRIMITIVE_PACKET_MAX_WORDS: u32 = 64;
 const DMA_ACTIVITY_RECENT_LIMIT: usize = 64;
-const BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW: u64 = 1;
-const BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT: usize = 512;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW: u64 = 4;
+const BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT: usize = 96;
 const BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT: u32 = 32;
 const BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_LINKED_NODES: u32 = 512;
 const BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS: u32 = 8;
@@ -455,6 +455,15 @@ struct PrimitiveReplayCandidate {
     priority: u8,
 }
 
+fn sort_primitive_replay_candidates(candidates: &mut [PrimitiveReplayCandidate]) {
+    candidates.sort_unstable_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.vblank.cmp(&left.vblank))
+            .then_with(|| right.address.cmp(&left.address))
+    });
+}
+
 #[derive(Clone, Debug)]
 struct GpuLinkedListDmaRunSummary {
     call: u64,
@@ -699,13 +708,16 @@ impl PrimitiveRamWriteStats {
         self.header_write_vblank_by_address.get(&address).copied()
     }
 
-    fn recent_header_addresses_written_since(&self, min_vblank: u64) -> Vec<(u64, u32)> {
-        self.recent_header_like_writes
+    fn tracked_header_addresses_written_since(&self, min_vblank: u64) -> Vec<(u64, u32)> {
+        let mut headers = self
+            .header_write_vblank_by_address
             .iter()
-            .filter_map(|sample| {
-                (sample.vblank >= min_vblank).then_some((sample.vblank, sample.address))
-            })
-            .collect()
+            .filter_map(|(address, vblank)| (*vblank >= min_vblank).then_some((*vblank, *address)))
+            .collect::<Vec<_>>();
+        headers.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
+        });
+        headers
     }
 
     fn json(&self) -> String {
@@ -1020,6 +1032,9 @@ pub struct Bus {
     access_trace_limit: usize,
     access_trace_watch_only: bool,
     access_trace_watch_ranges: Vec<BusTraceWatchRange>,
+    access_trace_watch_access_hit: Cell<bool>,
+    access_trace_watch_data_hit: Cell<bool>,
+    access_trace_watch_write_hit: Cell<bool>,
     trace_pc: Cell<Option<u32>>,
     trace_cycles: Cell<u64>,
     access_trace: RefCell<Vec<BusAccessTraceEvent>>,
@@ -1074,6 +1089,9 @@ impl Bus {
             access_trace_limit: 0,
             access_trace_watch_only: false,
             access_trace_watch_ranges: Vec::new(),
+            access_trace_watch_access_hit: Cell::new(false),
+            access_trace_watch_data_hit: Cell::new(false),
+            access_trace_watch_write_hit: Cell::new(false),
             trace_pc: Cell::new(None),
             trace_cycles: Cell::new(0),
             access_trace: RefCell::new(Vec::new()),
@@ -1800,6 +1818,9 @@ impl Bus {
     pub fn set_access_trace_limit(&mut self, limit: usize) {
         self.access_trace_limit = limit;
         self.access_trace.get_mut().clear();
+        self.access_trace_watch_access_hit.set(false);
+        self.access_trace_watch_data_hit.set(false);
+        self.access_trace_watch_write_hit.set(false);
     }
 
     pub fn set_access_trace_watch_ranges(&mut self, ranges: Vec<(u32, u32)>) {
@@ -1808,11 +1829,17 @@ impl Bus {
             .filter_map(|(address, len)| BusTraceWatchRange::new(address, len))
             .collect();
         self.access_trace.get_mut().clear();
+        self.access_trace_watch_access_hit.set(false);
+        self.access_trace_watch_data_hit.set(false);
+        self.access_trace_watch_write_hit.set(false);
     }
 
     pub fn set_access_trace_watch_only(&mut self, watch_only: bool) {
         self.access_trace_watch_only = watch_only;
         self.access_trace.get_mut().clear();
+        self.access_trace_watch_access_hit.set(false);
+        self.access_trace_watch_data_hit.set(false);
+        self.access_trace_watch_write_hit.set(false);
     }
 
     pub fn set_trace_context(&self, pc: u32, cycles: u64) {
@@ -1833,6 +1860,25 @@ impl Bus {
             .join(",")
     }
 
+    pub fn access_trace_watch_write_hit(&self) -> bool {
+        self.access_trace_watch_write_hit.get()
+    }
+
+    pub fn access_trace_watch_access_hit(&self) -> bool {
+        self.access_trace_watch_access_hit.get()
+    }
+
+    pub fn access_trace_watch_data_hit(&self) -> bool {
+        self.access_trace_watch_data_hit.get()
+    }
+
+    pub fn executable_pc_mapped(&self, pc: u32) -> bool {
+        ram_offset(pc, self.ram.len(), 4).is_some()
+            || scratchpad_offset(pc, self.scratchpad.len(), 4).is_some()
+            || rom_offset(pc, self.rom.len(), 4).is_some()
+            || banked_rom_offset(pc, self.banked_roms.len(), 4, self.zn_board.rom_bank).is_some()
+    }
+
     fn record_access_trace(
         &self,
         operation: &'static str,
@@ -1846,6 +1892,15 @@ impl Bus {
         }
         if self.access_trace_watch_only && !self.watch_matches(address, width as usize) {
             return;
+        }
+        if self.watch_matches(address, width as usize) {
+            self.access_trace_watch_access_hit.set(true);
+            if self.trace_pc.get() != Some(address) {
+                self.access_trace_watch_data_hit.set(true);
+            }
+            if operation == "write" {
+                self.access_trace_watch_write_hit.set(true);
+            }
         }
 
         let mut events = self.access_trace.borrow_mut();
@@ -1873,6 +1928,13 @@ impl Bus {
         value: u32,
     ) {
         if self.watch_matches(address, width) {
+            self.access_trace_watch_access_hit.set(true);
+            if self.trace_pc.get() != Some(address) {
+                self.access_trace_watch_data_hit.set(true);
+            }
+            if operation == "write" {
+                self.access_trace_watch_write_hit.set(true);
+            }
             self.record_access_trace(operation, region, address, width as u8, value);
         }
     }
@@ -2103,8 +2165,13 @@ impl Bus {
         let words = dma_word_count(channel.bcr).min(self.ram.len() as u32 / 4);
         let mut address = channel.madr & 0x00ff_fffc;
         let step = dma_address_step(control);
+        let mdec_video_disabled = std::env::var_os("BR2_NATIVE_DISABLE_MDEC_VIDEO").is_some();
         for _ in 0..words {
-            let word = self.io.mdec.read_dma_output();
+            let word = if mdec_video_disabled {
+                self.io.mdec.read_disabled_dma_output()
+            } else {
+                self.io.mdec.read_dma_output()
+            };
             self.write_dma_u32(address, word);
             address = address.wrapping_add(step);
         }
@@ -2204,7 +2271,7 @@ impl Bus {
             .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
         let recent_header_count = self
             .primitive_ram_writes
-            .recent_header_addresses_written_since(min_vblank)
+            .tracked_header_addresses_written_since(min_vblank)
             .len();
 
         if std::env::var_os("BR2_NATIVE_DISABLE_UNLINKED_PRIMITIVE_REPLAY").is_some() {
@@ -2313,7 +2380,7 @@ impl Bus {
         min_vblank: u64,
     ) -> u32 {
         self.primitive_ram_writes
-            .recent_header_addresses_written_since(min_vblank)
+            .tracked_header_addresses_written_since(min_vblank)
             .into_iter()
             .filter(|(_, address)| {
                 let Some(sample) = self.primitive_packet_candidate_sample(*address, linked_nodes)
@@ -2389,11 +2456,11 @@ impl Bus {
         let min_vblank = self
             .vblank_count
             .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
-        let mut candidates = Vec::new();
+        let mut candidates = HashMap::new();
         let mut seen = HashSet::new();
         for (vblank, address) in self
             .primitive_ram_writes
-            .recent_header_addresses_written_since(min_vblank)
+            .tracked_header_addresses_written_since(min_vblank)
         {
             if seen.contains(&address) {
                 continue;
@@ -2421,19 +2488,17 @@ impl Bus {
                 (false, false, false, true) => 4,
                 _ => continue,
             };
-            candidates.push(PrimitiveReplayCandidate {
+            candidates.insert(
                 address,
-                vblank,
-                priority,
-            });
+                PrimitiveReplayCandidate {
+                    address,
+                    vblank,
+                    priority,
+                },
+            );
             seen.insert(address);
         }
-        candidates.sort_unstable_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| right.vblank.cmp(&left.vblank))
-                .then_with(|| left.address.cmp(&right.address))
-        });
+        let candidates = self.unlinked_primitive_replay_order(&candidates, linked_nodes);
 
         let mut replayed_packets = 0usize;
         let mut replayed_words = 0usize;
@@ -2463,6 +2528,68 @@ impl Bus {
             replayed_packets = replayed_packets.saturating_add(1);
         }
         (replayed_packets, replayed_words)
+    }
+
+    fn unlinked_primitive_replay_order(
+        &self,
+        candidates: &HashMap<u32, PrimitiveReplayCandidate>,
+        linked_nodes: &HashSet<u32>,
+    ) -> Vec<PrimitiveReplayCandidate> {
+        let mut pointed_to = HashSet::new();
+        for address in candidates.keys() {
+            let Some(sample) = self.primitive_packet_candidate_sample(*address, linked_nodes)
+            else {
+                continue;
+            };
+            if gpu_linked_list_terminator(sample.next) {
+                continue;
+            }
+            let next = sample.next & 0x00ff_fffc;
+            if candidates.contains_key(&next) {
+                pointed_to.insert(next);
+            }
+        }
+
+        let mut heads = candidates
+            .values()
+            .filter(|candidate| !pointed_to.contains(&candidate.address))
+            .copied()
+            .collect::<Vec<_>>();
+        sort_primitive_replay_candidates(&mut heads);
+
+        let mut ordered = Vec::with_capacity(candidates.len());
+        let mut visited = HashSet::new();
+        for head in heads {
+            let mut address = head.address;
+            while let Some(candidate) = candidates.get(&address).copied() {
+                if !visited.insert(address) {
+                    break;
+                }
+                ordered.push(candidate);
+
+                let Some(sample) = self.primitive_packet_candidate_sample(address, linked_nodes)
+                else {
+                    break;
+                };
+                if gpu_linked_list_terminator(sample.next) {
+                    break;
+                }
+                let next = sample.next & 0x00ff_fffc;
+                if !candidates.contains_key(&next) {
+                    break;
+                }
+                address = next;
+            }
+        }
+
+        let mut orphans = candidates
+            .values()
+            .filter(|candidate| !visited.contains(&candidate.address))
+            .copied()
+            .collect::<Vec<_>>();
+        sort_primitive_replay_candidates(&mut orphans);
+        ordered.extend(orphans);
+        ordered
     }
 
     fn process_gpu_block_dma(&mut self, start_address: u32, bcr: u32, control: u32) {
@@ -3546,7 +3673,8 @@ mod tests {
         BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS,
         BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS, Bus, DMA_GPU_COMPLETION_DELAY_CYCLES,
         DMA_MDEC_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT, GPU_LINKED_LIST_NODE_LIMIT,
-        NativeInputActivity, draw_primitive_count, gpu_linked_list_command_ranges,
+        NativeInputActivity, PRIMITIVE_RAM_RECENT_LIMIT, draw_primitive_count,
+        gpu_linked_list_command_ranges,
     };
     use crate::action::ActionButtons;
     use crate::native::io::{
@@ -3629,7 +3757,7 @@ mod tests {
     }
 
     #[test]
-    fn board_coin_register_counts_insert_edges() {
+    fn board_coin_register_keeps_game_write_and_counts_insert_edges() {
         let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
 
         assert_eq!(bus.read_u8(0x1fa2_0000), 0);
@@ -3640,20 +3768,17 @@ mod tests {
         });
         assert_eq!(bus.read_u8(0x1fa2_0000), 1);
 
-        bus.set_input(ActionButtons {
-            coin: true,
-            ..ActionButtons::default()
-        });
-        assert_eq!(bus.read_u8(0x1fa2_0000), 1);
+        bus.write_u8(0x1fa2_0000, 0x22);
+        assert_eq!(bus.read_u8(0x1fa2_0000), 0x22);
 
         bus.set_input(ActionButtons::default());
-        assert_eq!(bus.read_u8(0x1fa2_0000), 1);
+        assert_eq!(bus.read_u8(0x1fa2_0000), 0x22);
 
         bus.set_input(ActionButtons {
             coin: true,
             ..ActionButtons::default()
         });
-        assert_eq!(bus.read_u8(0x1fa2_0000), 2);
+        assert_eq!(bus.read_u8(0x1fa2_0000), 0x23);
     }
 
     #[test]
@@ -4142,6 +4267,45 @@ mod tests {
     }
 
     #[test]
+    fn gpu_unlinked_replay_tracks_headers_beyond_recent_ring_without_default_replay() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.vblank_count = 20;
+        bus.write_u32(0x003a_1000, 0x01ff_ffff);
+        bus.write_u32(0x003a_1004, 0xe100_0400);
+
+        let packet_count = PRIMITIVE_RAM_RECENT_LIMIT + 8;
+        for index in 0..packet_count {
+            let base = 0x0038_4000 + (index as u32) * 0x20;
+            let next = if index == 0 {
+                0x00ff_ffff
+            } else {
+                (base - 0x20) & 0x00ff_ffff
+            };
+            bus.write_u32(base, 0x0500_0000 | next);
+            bus.write_u32(base + 4, 0x2800_ff00);
+            bus.write_u32(base + 8, 0x0050_0050);
+            bus.write_u32(base + 12, 0x0050_0058);
+            bus.write_u32(base + 16, 0x0058_0050);
+            bus.write_u32(base + 20, 0x0058_0058);
+        }
+
+        bus.write_u32(DMA_GPU_MADR, 0x003a_1000);
+        bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
+
+        assert!(bus.unlinked_primitive_replay.last_candidate_headers >= packet_count);
+        assert_eq!(bus.unlinked_primitive_replay.last_packets, 0);
+        assert_eq!(bus.io.gpu.commands_seen, 1);
+
+        let linked_nodes = [0x003a_1000]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let (packets, words) = bus.replay_recent_unlinked_primitive_packets(&linked_nodes);
+
+        assert_eq!(packets, packet_count);
+        assert!(words > packets);
+    }
+
+    #[test]
     fn gpu_vblank_skips_recent_unlinked_textured_primitives_by_default() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.write_u32(0x003a_1000, 0x01ff_ffff);
@@ -4174,6 +4338,30 @@ mod tests {
         let sync_json = bus.native_sync_json();
         assert!(sync_json.contains("\"conditional_replays\":0"));
         assert!(sync_json.contains("\"last_reason\":\"disabled_by_default\""));
+    }
+
+    #[test]
+    fn gpu_unlinked_replay_follows_candidate_next_links_from_head_to_tail() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let tail = 0x0038_1000;
+        let head = 0x0038_1020;
+        let linked_nodes = std::collections::HashSet::new();
+
+        bus.write_u32(tail, 0x03ff_ffff);
+        bus.write_u32(tail + 4, 0x6000_ff00);
+        bus.write_u32(tail + 8, 0x0064_0064);
+        bus.write_u32(tail + 12, 0x0001_0001);
+        bus.write_u32(head, 0x0338_1000);
+        bus.write_u32(head + 4, 0x6000_00ff);
+        bus.write_u32(head + 8, 0x0064_0064);
+        bus.write_u32(head + 12, 0x0001_0001);
+
+        let (packets, words) = bus.replay_recent_unlinked_primitive_packets(&linked_nodes);
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        let pixel = frame[100 * width + 100];
+
+        assert_eq!((packets, words), (2, 6));
+        assert_eq!(pixel, 0x0000_ff00);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use crate::native::bus::Bus;
 const CP0_STATUS: usize = 12;
 const CP0_CAUSE: usize = 13;
 const CP0_EPC: usize = 14;
+const CP0_BADVADDR: usize = 8;
 
 const STATUS_IE: u32 = 1 << 0;
 const STATUS_INTERRUPT_MASK: u32 = 0xff << 8;
@@ -35,6 +36,12 @@ const BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_START: u32 = 0x0000_0c80;
 const BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_END: u32 = 0x0000_0cac;
 const BIOS_IRQ_DISPATCH_LOOP_HLE_START: u32 = 0x0000_1b7c;
 const BIOS_IRQ_DISPATCH_LOOP_HLE_END: u32 = 0x0000_1bf0;
+const BR2_LOW_BIOS_IRQ_VECTOR_HLE_START: u32 = 0x0000_0080;
+const BR2_LOW_BIOS_IRQ_VECTOR_HLE_END: u32 = 0x0000_00c0;
+const BR2_LOW_BIOS_IRQ_HANDLER_HLE_START: u32 = 0x0000_0580;
+const BR2_LOW_BIOS_IRQ_HANDLER_HLE_END: u32 = 0x0000_0600;
+const BR2_RUNTIME_RAM_PC_START: u32 = 0x8000_0000;
+const BR2_RUNTIME_RAM_PC_END: u32 = 0x8040_0000;
 const BIOS_IRQ_DISPATCH_LOOP_SIGNATURE: [(u32, u32); 8] = [
     (0x0000_1b7c, 0x8e19_0004),
     (0x0000_1b80, 0x0000_0000),
@@ -257,6 +264,18 @@ const BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT: u32 = 0x8035_6f30;
 const BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION: u64 = 20;
 const BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS: u32 = 512;
 const BR2_POST_VS_TABLE_ACCUM_MAX_SKIP_ITERATIONS: u32 = 8_000_000;
+const BR2_POST_VS_CODE_PATCH_NOOP_START: u32 = 0x002c_c100;
+const BR2_POST_VS_CODE_PATCH_NOOP_END: u32 = 0x002c_c220;
+const BR2_POST_VS_PROTECTED_CODE_NOOP_RANGES: [(u32, u32); 2] = [
+    (
+        BIOS_EXCEPTION_VECTOR_PHYSICAL,
+        BIOS_EXCEPTION_VECTOR_PHYSICAL + 0x20,
+    ),
+    (
+        BR2_POST_VS_CODE_PATCH_NOOP_START,
+        BR2_POST_VS_CODE_PATCH_NOOP_END,
+    ),
+];
 const BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS: [u32; 15] = [
     0x8c42_0004, // lw v0, 4(v0)
     0x0005_1880, // sll v1, a1, 2
@@ -639,7 +658,7 @@ impl Cpu {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{},\"r8\":{},\"r9\":{},\"r10\":{},\"r11\":{},\"r16\":{},\"r29\":{},\"r31\":{},\"gte_command_counts\":[{}]}}",
+            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"badvaddr\":{},\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{},\"r8\":{},\"r9\":{},\"r10\":{},\"r11\":{},\"r16\":{},\"r29\":{},\"r31\":{},\"gte_command_counts\":[{}]}}",
             self.pc,
             self.next_pc,
             self.cycles,
@@ -647,6 +666,7 @@ impl Cpu {
             self.cp0[CP0_STATUS],
             self.cp0[CP0_CAUSE],
             self.cp0[CP0_EPC],
+            self.cp0[CP0_BADVADDR],
             self.regs[2],
             self.regs[3],
             self.regs[4],
@@ -1338,19 +1358,25 @@ impl Cpu {
             };
 
         let count_address = self.regs[6].wrapping_add(table_meta_offset);
-        let remaining = br2_signed_loop_remaining(start_index, limit)?;
-        if remaining < BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS {
+        if count_address & 0x03 != 0 {
             return None;
         }
-
+        let remaining = br2_signed_loop_remaining(start_index, limit)?;
         let table_base = bus.read_u32(count_address.wrapping_add(4));
         let first_target = table_base.wrapping_add(start_index.wrapping_shl(2));
 
-        let target_is_ram = br2_ram_word_range(first_target, remaining, bus.ram_len());
+        let target_is_unaligned_ram_noop = first_target & 0x03 != 0
+            && br2_ram_unaligned_word_range(first_target, 1, bus.ram_len());
+        let target_is_protected_noop = br2_post_vs_code_patch_noop_range(first_target, remaining);
         let target_is_expansion_noop = br2_expansion_noop_address(first_target);
-        let can_skip_noop_expansion_across_vblank = target_is_expansion_noop && !target_is_ram;
+        let target_is_noop =
+            target_is_expansion_noop || target_is_protected_noop || target_is_unaligned_ram_noop;
+        if remaining < BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS && !target_is_noop {
+            return None;
+        }
+        let can_skip_noop_across_vblank = target_is_noop;
         let mut max_iterations = remaining.min(BR2_POST_VS_TABLE_ACCUM_MAX_SKIP_ITERATIONS);
-        if can_skip_noop_expansion_across_vblank {
+        if can_skip_noop_across_vblank {
             max_iterations = remaining;
         } else if self.vblank_irq_can_preempt(bus) {
             let cycles_until_vblank = bus.cycles_until_next_vblank();
@@ -1361,13 +1387,15 @@ impl Cpu {
                 ((cycles_until_vblank - 1) / BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION) as u32;
             max_iterations = max_iterations.min(irq_limited_iterations);
         }
-        if max_iterations < BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS {
+        if max_iterations < BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS && !target_is_noop {
             return None;
         }
 
         let skipped_iterations;
         let ram_iterations = max_iterations;
-        if br2_ram_word_range(first_target, ram_iterations, bus.ram_len()) {
+        if target_is_noop {
+            skipped_iterations = max_iterations;
+        } else if br2_ram_word_range(first_target, ram_iterations, bus.ram_len()) {
             skipped_iterations = ram_iterations;
             for index in 0..skipped_iterations {
                 let target = first_target.wrapping_add(index.wrapping_shl(2));
@@ -1375,10 +1403,7 @@ impl Cpu {
                 bus.write_u32(target, value);
             }
         } else {
-            if !target_is_expansion_noop {
-                return None;
-            }
-            skipped_iterations = max_iterations;
+            return None;
         }
 
         let final_index = start_index.wrapping_add(skipped_iterations);
@@ -1883,6 +1908,14 @@ impl Cpu {
             }
             0x21 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if address & 0x01 != 0 {
+                    return self.raise_address_exception(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        Exception::AddressLoad,
+                        address,
+                    );
+                }
                 self.schedule_load(
                     rt(instruction),
                     (bus.read_u16(address) as i16) as i32 as u32,
@@ -1899,6 +1932,22 @@ impl Cpu {
             }
             0x23 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if address & 0x03 != 0 {
+                    if self.try_hle_br2_post_vs_unaligned_inner_load(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        address,
+                        bus,
+                    ) {
+                        return StepOutcome::Continue;
+                    }
+                    return self.raise_address_exception(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        Exception::AddressLoad,
+                        address,
+                    );
+                }
                 self.schedule_load(rt(instruction), bus.read_u32(address));
                 StepOutcome::Continue
             }
@@ -1909,6 +1958,14 @@ impl Cpu {
             }
             0x25 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if address & 0x01 != 0 {
+                    return self.raise_address_exception(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        Exception::AddressLoad,
+                        address,
+                    );
+                }
                 self.schedule_load(rt(instruction), bus.read_u16(address) as u32);
                 StepOutcome::Continue
             }
@@ -1927,6 +1984,14 @@ impl Cpu {
             }
             0x29 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if address & 0x01 != 0 {
+                    return self.raise_address_exception(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        Exception::AddressStore,
+                        address,
+                    );
+                }
                 bus.write_u16(address, self.regs[rt(instruction)] as u16);
                 StepOutcome::Continue
             }
@@ -1937,6 +2002,14 @@ impl Cpu {
             }
             0x2b => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if address & 0x03 != 0 {
+                    return self.raise_address_exception(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        Exception::AddressStore,
+                        address,
+                    );
+                }
                 bus.write_u32(address, self.regs[rt(instruction)]);
                 StepOutcome::Continue
             }
@@ -1945,18 +2018,93 @@ impl Cpu {
                 store_word_right(bus, address, self.regs[rt(instruction)]);
                 StepOutcome::Continue
             }
+            0x2f => {
+                // PS1 software may emit MIPS cache-management opcodes on later code paths.
+                // The R3000A-compatible native harness does not model CPU cache effects, so
+                // treating CACHE as a no-op preserves execution without mutating memory.
+                StepOutcome::Continue
+            }
             0x32 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if address & 0x03 != 0 {
+                    return self.raise_address_exception(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        Exception::AddressLoad,
+                        address,
+                    );
+                }
                 self.gte_data_write(rt(instruction), bus.read_u32(address));
                 StepOutcome::Continue
             }
             0x3a => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if address & 0x03 != 0 {
+                    return self.raise_address_exception(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        Exception::AddressStore,
+                        address,
+                    );
+                }
                 bus.write_u32(address, self.gte_data_read(rt(instruction)));
                 StepOutcome::Continue
             }
             _ => StepOutcome::Unsupported(instruction),
         }
+    }
+
+    fn try_hle_br2_post_vs_unaligned_inner_load(
+        &mut self,
+        current_pc: u32,
+        delay_slot_branch_pc: Option<u32>,
+        address: u32,
+        bus: &mut Bus,
+    ) -> bool {
+        if current_pc != BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x0c
+            || delay_slot_branch_pc.is_some()
+            || address != self.regs[3]
+            || !br2_post_vs_unaligned_inner_load_noop_address(address, bus.ram_len())
+        {
+            return false;
+        }
+
+        for (index, expected) in BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let address = BR2_POST_VS_TABLE_ACCUM_LOOP_START.wrapping_add((index as u32) * 4);
+            if bus.read_u32(address) != expected {
+                return false;
+            }
+        }
+
+        let table_meta_offset = bus.read_u32(self.regs[4].wrapping_add(0x7c));
+        let count_address = self.regs[6].wrapping_add(table_meta_offset);
+        if count_address & 0x03 != 0 {
+            return false;
+        }
+        let limit = bus.read_u32(count_address);
+        let Some(remaining) = br2_signed_loop_remaining(self.regs[5], limit) else {
+            return false;
+        };
+
+        self.regs[2] = count_address;
+        self.regs[3] = table_meta_offset;
+        self.regs[5] = limit;
+        self.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT;
+        self.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4;
+        self.cycles = self.cycles.saturating_add(
+            u64::from(remaining)
+                .saturating_mul(BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION)
+                .saturating_sub(2),
+        );
+        self.pending_load = None;
+        self.load_commit_register = None;
+        self.load_commit_value = None;
+        self.load_commit_cancelled = false;
+        true
     }
 
     fn execute_special(
@@ -2730,13 +2878,15 @@ impl Cpu {
         let post_vs_c80_return = (BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_START
             ..=BIOS_EXCEPTION_C80_IRQ_HANDLER_HLE_END)
             .contains(&self.pc)
-            && self.cp0[CP0_EPC] == BR2_POST_VS_TABLE_ACCUM_LOOP_START
+            && br2_post_vs_table_accum_loop_pc(self.cp0[CP0_EPC])
             && bios_exception_c80_handler_has_kernel_prefix(bus);
         let draw_sync_dispatch_return =
             (BIOS_IRQ_DISPATCH_LOOP_HLE_START..=BIOS_IRQ_DISPATCH_LOOP_HLE_END).contains(&self.pc)
                 && self.cp0[CP0_EPC] == BR2_DRAW_SYNC_WAIT_LOOP_EXIT
                 && bios_irq_dispatch_loop_has_signature(bus);
-        if !post_vs_c80_return && !draw_sync_dispatch_return {
+        let low_bios_irq_return =
+            br2_low_bios_irq_handler_pc(self.pc) && br2_runtime_ram_pc(self.cp0[CP0_EPC]);
+        if !post_vs_c80_return && !draw_sync_dispatch_return && !low_bios_irq_return {
             return false;
         }
         if draw_sync_dispatch_return && !self.restore_bios_exception_context(bus) {
@@ -2819,6 +2969,17 @@ impl Cpu {
         StepOutcome::Continue
     }
 
+    fn raise_address_exception(
+        &mut self,
+        current_pc: u32,
+        delay_slot_branch_pc: Option<u32>,
+        exception: Exception,
+        bad_vaddr: u32,
+    ) -> StepOutcome {
+        self.cp0[CP0_BADVADDR] = bad_vaddr;
+        self.raise_exception(current_pc, delay_slot_branch_pc, exception)
+    }
+
     fn set_reg(&mut self, register: usize, value: u32) {
         if register == 0 {
             return;
@@ -2858,6 +3019,8 @@ impl Cpu {
 #[derive(Clone, Copy, Debug)]
 enum Exception {
     Interrupt = 0,
+    AddressLoad = 4,
+    AddressStore = 5,
     Syscall = 8,
     Breakpoint = 9,
     Overflow = 12,
@@ -2899,6 +3062,15 @@ fn bios_irq_dispatch_loop_has_signature(bus: &Bus) -> bool {
         .all(|(address, expected)| bus.read_ram_u32_physical(address) == Some(expected))
 }
 
+fn br2_low_bios_irq_handler_pc(pc: u32) -> bool {
+    (BR2_LOW_BIOS_IRQ_VECTOR_HLE_START..=BR2_LOW_BIOS_IRQ_VECTOR_HLE_END).contains(&pc)
+        || (BR2_LOW_BIOS_IRQ_HANDLER_HLE_START..=BR2_LOW_BIOS_IRQ_HANDLER_HLE_END).contains(&pc)
+}
+
+fn br2_runtime_ram_pc(pc: u32) -> bool {
+    (BR2_RUNTIME_RAM_PC_START..BR2_RUNTIME_RAM_PC_END).contains(&pc)
+}
+
 fn bios_exception_context_base_physical(bus: &Bus) -> Option<u32> {
     let context_pointer_address =
         bus.read_ram_u32_physical(BIOS_EXCEPTION_CONTEXT_POINTER_PHYSICAL)?;
@@ -2914,8 +3086,7 @@ fn psx_physical_address(address: u32) -> u32 {
 }
 
 fn rfe_status(status: u32) -> u32 {
-    let mode_bits = status & 0x3f;
-    (status & !0x0f) | ((mode_bits >> 2) & 0x0f)
+    (status & !0x3f) | ((status & 0x3c) >> 2)
 }
 
 fn rs(instruction: u32) -> usize {
@@ -2976,12 +3147,25 @@ fn br2_signed_loop_remaining(start_index: u32, limit: u32) -> Option<u32> {
     (start_index < limit).then_some((i64::from(limit) - i64::from(start_index)) as u32)
 }
 
+fn br2_post_vs_table_accum_loop_pc(pc: u32) -> bool {
+    let loop_end = BR2_POST_VS_TABLE_ACCUM_LOOP_START
+        + (BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS.len() as u32) * 4;
+    (BR2_POST_VS_TABLE_ACCUM_LOOP_START..loop_end).contains(&pc)
+}
+
 fn br2_expansion_noop_address(address: u32) -> bool {
     let start = address & 0x1fff_ffff;
     (0x0080_0000..0x1f80_0000).contains(&start)
 }
 
 fn br2_ram_word_range(address: u32, words: u32, ram_len: usize) -> bool {
+    if address & 0x03 != 0 {
+        return false;
+    }
+    br2_ram_unaligned_word_range(address, words, ram_len)
+}
+
+fn br2_ram_unaligned_word_range(address: u32, words: u32, ram_len: usize) -> bool {
     if words == 0 || ram_len == 0 {
         return false;
     }
@@ -2995,6 +3179,34 @@ fn br2_ram_word_range(address: u32, words: u32, ram_len: usize) -> bool {
     let start = address & 0x1fff_ffff;
     let end = address.wrapping_add(last_byte_offset) & 0x1fff_ffff;
     start <= end && (end as usize) < ram_len
+}
+
+fn br2_post_vs_code_patch_noop_range(address: u32, words: u32) -> bool {
+    let Some(last_byte_offset) = words
+        .checked_sub(1)
+        .and_then(|last_word| last_word.checked_mul(4))
+        .and_then(|last_word_offset| last_word_offset.checked_add(3))
+    else {
+        return false;
+    };
+    let start = u64::from(address & 0x1fff_ffff);
+    let end = start + u64::from(last_byte_offset);
+    BR2_POST_VS_PROTECTED_CODE_NOOP_RANGES
+        .iter()
+        .any(|&(protected_start, protected_end)| {
+            start < u64::from(protected_end) && end >= u64::from(protected_start)
+        })
+}
+
+fn br2_post_vs_unaligned_inner_load_noop_address(address: u32, ram_len: usize) -> bool {
+    if address & 0x03 == 0 {
+        return false;
+    }
+    let physical = address & 0x1fff_ffff;
+    br2_ram_unaligned_word_range(address, 1, ram_len)
+        || br2_post_vs_code_patch_noop_range(address, 1)
+        || br2_expansion_noop_address(address)
+        || ((ram_len as u32)..0x0080_0000).contains(&physical)
 }
 
 fn packed_gte_matrix(registers: &[u32; 32], base: usize) -> [[i16; 3]; 3] {
@@ -3263,16 +3475,18 @@ mod tests {
         BR2_IRQ_POLL_TIMEOUT_LOOP_INSTRUCTIONS, BR2_IRQ_POLL_TIMEOUT_LOOP_START,
         BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT,
         BR2_POST_VS_TABLE_ACCUM_LOOP_INSTRUCTIONS, BR2_POST_VS_TABLE_ACCUM_LOOP_START,
-        BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT, BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS,
+        BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT, BR2_POST_VS_TABLE_ACCUM_MAX_SKIP_ITERATIONS,
+        BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS,
         BR2_REVERSE_MISMATCH_SCAN_CYCLES_PER_ITERATION,
         BR2_REVERSE_MISMATCH_SCAN_LOOP_INSTRUCTIONS, BR2_REVERSE_MISMATCH_SCAN_LOOP_START,
         BR2_REVERSE_POINTER_SCAN_CYCLES_PER_ITERATION, BR2_REVERSE_POINTER_SCAN_LOOP_EXIT,
         BR2_REVERSE_POINTER_SCAN_LOOP_INSTRUCTIONS, BR2_REVERSE_POINTER_SCAN_LOOP_START,
         BR2_REVERSE_POINTER_SCAN_MAX_SKIP_ITERATIONS, BR2_SMALL_BYTE_COPY_CYCLES_PER_BYTE,
         BR2_SMALL_BYTE_COPY_LOOP_EXIT, BR2_SMALL_BYTE_COPY_LOOP_INSTRUCTIONS,
-        BR2_SMALL_BYTE_COPY_LOOP_START, CAUSE_BD, CAUSE_IP2, CP0_CAUSE, CP0_EPC, CP0_STATUS, Cpu,
-        EXCEPTION_VECTOR, GTE_FLAG_DIVIDE_OVERFLOW, GTE_FLAG_ERROR, GTE_FLAG_SX2_SATURATED,
-        GTE_FLAG_SY2_SATURATED, GTE_FRACTIONAL_BITS, StepOutcome, gte_leading_zero_count, gte_sxy,
+        BR2_SMALL_BYTE_COPY_LOOP_START, CAUSE_BD, CAUSE_IP2, CP0_BADVADDR, CP0_CAUSE, CP0_EPC,
+        CP0_STATUS, Cpu, EXCEPTION_VECTOR, GTE_FLAG_DIVIDE_OVERFLOW, GTE_FLAG_ERROR,
+        GTE_FLAG_SX2_SATURATED, GTE_FLAG_SY2_SATURATED, GTE_FRACTIONAL_BITS, StepOutcome,
+        gte_leading_zero_count, gte_sxy, rfe_status,
     };
     use crate::native::bus::Bus;
     use crate::native::io::{DMA_INTERRUPT, DMA_SPU_CHCR};
@@ -4061,6 +4275,40 @@ mod tests {
     }
 
     #[test]
+    fn fast_forwards_br2_post_vs_unaligned_noop_expansion_without_writes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x99f6_d44e;
+        let start_index = 0u32;
+        let limit = 5_000u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(limit) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+    }
+
+    #[test]
     fn fast_forwards_br2_reverse_mismatch_scan_loop_in_place() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_reverse_mismatch_scan_loop(&mut bus);
@@ -4393,6 +4641,280 @@ mod tests {
     }
 
     #[test]
+    fn fast_forwards_br2_post_vs_code_patch_table_without_writes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_2000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x802c_c100;
+        let start_index = 0u32;
+        let limit = BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        bus.write_u32(table_base, 0x27bd_ffe0);
+        bus.write_u32(table_base + 4, 0x3c04_1f80);
+        bus.write_u32(table_base + 8, 0x8c85_0000);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(limit) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+        assert_eq!(bus.read_u32(table_base), 0x27bd_ffe0);
+        assert_eq!(bus.read_u32(table_base + 4), 0x3c04_1f80);
+        assert_eq!(bus.read_u32(table_base + 8), 0x8c85_0000);
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_exception_vector_table_without_writes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x8000_0080;
+        let start_index = 0u32;
+        let limit = BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        bus.write_u32(table_base, 0x3c1a_0000);
+        bus.write_u32(table_base + 4, 0x275a_0c80);
+        bus.write_u32(table_base + 8, 0x0340_0008);
+        bus.write_u32(table_base + 12, 0x0000_0000);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(limit) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+        assert_eq!(bus.read_u32(table_base), 0x3c1a_0000);
+        assert_eq!(bus.read_u32(table_base + 4), 0x275a_0c80);
+        assert_eq!(bus.read_u32(table_base + 8), 0x0340_0008);
+        assert_eq!(bus.read_u32(table_base + 12), 0x0000_0000);
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_code_patch_chunk_when_remaining_exceeds_ram() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_2000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x802c_c100;
+        let start_index = 0u32;
+        let limit = BR2_POST_VS_TABLE_ACCUM_MAX_SKIP_ITERATIONS + 1;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        bus.write_u32(table_base, 0x27bd_ffe0);
+        bus.write_u32(table_base + 4, 0x3c04_1f80);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(limit) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+        assert_eq!(bus.read_u32(table_base), 0x27bd_ffe0);
+        assert_eq!(bus.read_u32(table_base + 4), 0x3c04_1f80);
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_unaligned_ram_table_without_writes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_2000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x802c_c13f;
+        let start_index = 0u32;
+        let limit = BR2_POST_VS_TABLE_ACCUM_MIN_SKIP_ITERATIONS;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        for offset in 0..8 {
+            bus.write_u8(table_base + offset, 0xa0 + offset as u8);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(limit) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+        for offset in 0..8 {
+            assert_eq!(bus.read_u8(table_base + offset), 0xa0 + offset as u8);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_short_br2_post_vs_unaligned_ram_tail_without_writes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let table_base = 0x802c_c13b;
+        let start_index = 1u32;
+        let limit = 3u32;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        bus.write_u32(count_address + 4, table_base);
+        for offset in 0..16 {
+            bus.write_u8(table_base + offset, 0xc0 + offset as u8);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START;
+        cpu.next_pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 4;
+        cpu.regs[2] = count_address;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START);
+        assert_eq!(
+            report.cycles_elapsed,
+            u64::from(limit - start_index) * BR2_POST_VS_TABLE_ACCUM_CYCLES_PER_ITERATION
+        );
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[5], limit);
+        for offset in 0..16 {
+            assert_eq!(bus.read_u8(table_base + offset), 0xc0 + offset as u8);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_inner_unaligned_load_without_exception_or_writes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let target = 0x8002_ff77;
+        let start_index = 42u32;
+        let limit = start_index + 3;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+        for offset in 0..16 {
+            bus.write_u8(target + offset, 0xd0 + offset as u8);
+        }
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x0c;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[3] = target;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x0c);
+        assert_eq!(report.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], count_address);
+        assert_eq!(cpu.regs[3], table_meta_offset);
+        assert_eq!(cpu.regs[5], limit);
+        for offset in 0..16 {
+            assert_eq!(bus.read_u8(target + offset), 0xd0 + offset as u8);
+        }
+    }
+
+    #[test]
+    fn fast_forwards_br2_post_vs_inner_unmapped_low_memory_load_without_exception() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_table_accum_loop(&mut bus);
+        let owner = 0x8001_0000;
+        let table_meta_offset = 0x0002_0338;
+        let count_address = 0x0002_0348;
+        let target = 0x0044_dd12;
+        let start_index = 1024u32;
+        let limit = start_index + 5;
+        bus.write_u32(owner + 0x7c, table_meta_offset);
+        bus.write_u32(count_address, limit);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x0c;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[3] = target;
+        cpu.regs[4] = owner;
+        cpu.regs[5] = start_index;
+        cpu.regs[6] = 0x10;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x0c);
+        assert_eq!(report.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_EXIT + 4);
+        assert_eq!(cpu.regs[2], count_address);
+        assert_eq!(cpu.regs[3], table_meta_offset);
+        assert_eq!(cpu.regs[5], limit);
+    }
+
+    #[test]
     fn takes_pending_interrupt_before_br2_post_vs_fast_forward() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_post_vs_table_accum_loop(&mut bus);
@@ -4519,6 +5041,32 @@ mod tests {
     }
 
     #[test]
+    fn hle_returns_from_br2_post_vs_bios_irq_handler_for_loop_inner_epc() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_bios_c80_kernel_handler_prefix(&mut bus);
+        bus.io.irq.status = 1;
+        bus.io.irq.mask = 9;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_0c94;
+        cpu.next_pc = 0x0000_0c98;
+        cpu.cp0[CP0_STATUS] = 0x4000_0404;
+        cpu.cp0[CP0_CAUSE] = CAUSE_IP2;
+        cpu.cp0[CP0_EPC] = BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x28;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_0c94);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x28);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_TABLE_ACCUM_LOOP_START + 0x2c);
+        assert_eq!(cpu.cp0[CP0_STATUS], 0x4000_0401);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(bus.io.irq.status & 9, 0);
+    }
+
+    #[test]
     fn hle_returns_from_br2_draw_sync_bios_irq_dispatch_loop() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_bios_irq_dispatch_loop_signature(&mut bus);
@@ -4555,6 +5103,37 @@ mod tests {
         assert_eq!(cpu.lo, 0x3333_0000);
         assert_eq!(cpu.hi, 0x4444_0000);
         assert_eq!(bus.io.irq.status & 9, 0);
+    }
+
+    #[test]
+    fn hle_returns_from_br2_low_bios_irq_handler() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.io.irq.status = 1;
+        bus.io.irq.mask = 1;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_05cc;
+        cpu.next_pc = 0x0000_05d0;
+        cpu.cp0[CP0_STATUS] = 0x4000_0410;
+        cpu.cp0[CP0_CAUSE] = CAUSE_IP2;
+        cpu.cp0[CP0_EPC] = 0x8030_8374;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_05cc);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, 0x8030_8374);
+        assert_eq!(cpu.next_pc, 0x8030_8378);
+        assert_eq!(cpu.cp0[CP0_STATUS], 0x4000_0404);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(bus.io.irq.status & 1, 0);
+    }
+
+    #[test]
+    fn rfe_status_pops_all_interrupt_mode_bits() {
+        assert_eq!(rfe_status(0x4000_0410), 0x4000_0404);
+        assert_eq!(rfe_status(0x4000_0404), 0x4000_0401);
     }
 
     #[test]
@@ -4797,7 +5376,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first.1,
-            "{\"pc\":2147483776,\"next_pc\":2147483780,\"cycles\":4,\"halted\":true,\"status\":0,\"cause\":36,\"epc\":532676620,\"r2\":42,\"r3\":0,\"r4\":7,\"r5\":0,\"r6\":0,\"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r16\":0,\"r29\":0,\"r31\":0,\"gte_command_counts\":[]}"
+            "{\"pc\":2147483776,\"next_pc\":2147483780,\"cycles\":4,\"halted\":true,\"status\":0,\"cause\":36,\"epc\":532676620,\"badvaddr\":0,\"r2\":42,\"r3\":0,\"r4\":7,\"r5\":0,\"r6\":0,\"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r16\":0,\"r29\":0,\"r31\":0,\"gte_command_counts\":[]}"
         );
     }
 
@@ -4849,6 +5428,24 @@ mod tests {
         cpu.step(&mut bus);
         cpu.step(&mut bus);
         assert_eq!(cpu.regs[9], 0xef);
+    }
+
+    #[test]
+    fn executes_cache_opcode_as_noop() {
+        let rom = program(&[
+            0xbc03_803b,                // cache 3, -0x7fc5(zero)
+            i_type(0x09, 0, 2, 0x002a), // addiu v0, zero, 42
+        ]);
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+
+        let cache = cpu.step_report(&mut bus);
+        let next = cpu.step_report(&mut bus);
+
+        assert_eq!(cache.outcome, StepOutcome::Continue);
+        assert_eq!(cache.instruction, Some(0xbc03_803b));
+        assert_eq!(cpu.regs[2], 42);
+        assert_eq!(next.outcome, StepOutcome::Continue);
     }
 
     #[test]
@@ -5365,6 +5962,51 @@ mod tests {
         }
 
         assert_eq!(cpu.regs[9], 0x1122_3344);
+    }
+
+    #[test]
+    fn traps_unaligned_word_load_with_bad_vaddr() {
+        let rom = program(&[
+            i_type(0x23, 0, 8, 1),    // lw t0, 1(zero)
+            r_type(0, 0, 0, 0, 0x0d), // break
+        ]);
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+
+        assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+
+        assert_eq!(cpu.regs[8], 0);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 1);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(cpu.cp0[CP0_EPC], 0x1fc0_0000);
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+    }
+
+    #[test]
+    fn traps_unaligned_word_store_without_mutating_memory() {
+        let rom = program(&[
+            i_type(0x0f, 0, 8, 0x1122), // lui t0, 0x1122
+            i_type(0x0d, 8, 8, 0x3344), // ori t0, t0, 0x3344
+            i_type(0x2b, 0, 8, 1),      // sw t0, 1(zero)
+            r_type(0, 0, 0, 0, 0x0d),   // break
+        ]);
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        for offset in 0..8 {
+            bus.write_u8(offset, 0xa0 + offset as u8);
+        }
+        let mut cpu = Cpu::default();
+
+        assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+        assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+        assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 1);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 5 << 2);
+        assert_eq!(cpu.cp0[CP0_EPC], 0x1fc0_0008);
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+        for offset in 0..8 {
+            assert_eq!(bus.read_u8(offset), 0xa0 + offset as u8);
+        }
     }
 
     #[test]

@@ -23,6 +23,50 @@ const NATIVE_PLAY_HANDOFF_CHECK_STRIDE_FRAMES: u64 = 6;
 const NATIVE_PLAY_GUI_INPUT_SLICE_INSTRUCTIONS: u64 = 5_000;
 const NATIVE_PLAY_INPUT_LATCH_POLLS: u8 = 45;
 const NATIVE_VBLANK_TRACE_MAX_INSTRUCTIONS: u64 = 100_000;
+const NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG: &str = "500000";
+
+fn default_native_rom_source() -> PathBuf {
+    if let Some(path) = NativeRomSet::latest_cached_runtime_rom_dir() {
+        return path;
+    }
+
+    let combined_zip = PathBuf::from("assets/BloodRoar2-combined.zip");
+    if combined_zip.is_file() {
+        return combined_zip;
+    }
+
+    PathBuf::from("assets/roms")
+}
+
+fn next_native_rom_source_or_default<I>(args: &mut std::iter::Peekable<I>) -> PathBuf
+where
+    I: Iterator<Item = String>,
+{
+    if args
+        .peek()
+        .is_some_and(|value| native_arg_looks_like_rom_source(value))
+    {
+        return PathBuf::from(args.next().expect("peeked native ROM argument"));
+    }
+
+    default_native_rom_source()
+}
+
+fn native_arg_looks_like_rom_source(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('-') {
+        return false;
+    }
+
+    let path = Path::new(value);
+    let lower = value.to_ascii_lowercase();
+    path.exists()
+        || value.contains('/')
+        || lower.ends_with(".zip")
+        || lower.ends_with(".bin")
+        || lower.ends_with(".cue")
+        || lower.ends_with(".iso")
+        || lower.ends_with(".chd")
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -35,7 +79,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let mut args = env::args().skip(1);
+    let mut args = env::args().skip(1).peekable();
     let command = args.next().unwrap_or_else(|| "help".to_string());
 
     match command.as_str() {
@@ -88,10 +132,7 @@ fn run() -> Result<(), String> {
         }
         "serve-native" => {
             let address = args.next().unwrap_or_else(|| "127.0.0.1:8765".to_string());
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .unwrap_or_else(|| "10000".to_string())
@@ -175,28 +216,19 @@ fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())
         }
         "native-inspect" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let romset = NativeRomSet::scan(rom).map_err(|error| error.to_string())?;
             println!("{}", romset.json());
             Ok(())
         }
         "native-rom-summary" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let romset = NativeRomSet::scan(rom).map_err(|error| error.to_string())?;
             println!("{}", romset.compatibility_report().summary_json());
             Ok(())
         }
         "native-cache-prepare" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let scan =
                 NativeRomSet::scan_cached_with_report(rom).map_err(|error| error.to_string())?;
             println!(
@@ -207,20 +239,14 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-cache-path" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let scan =
                 NativeRomSet::scan_cached_with_report(rom).map_err(|error| error.to_string())?;
             println!("{}", scan.cache.resolved_path.display());
             Ok(())
         }
         "native-step" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let count = args
                 .next()
                 .unwrap_or_else(|| "1".to_string())
@@ -233,10 +259,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-screenshot" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let count = args
                 .next()
                 .unwrap_or_else(|| "32000000".to_string())
@@ -258,10 +281,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-display-screenshot" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let count = args
                 .next()
                 .unwrap_or_else(|| "32000000".to_string())
@@ -283,10 +303,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-vram-screenshot" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let count = args
                 .next()
                 .unwrap_or_else(|| "32000000".to_string())
@@ -308,10 +325,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-screen-dump" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let count = args
                 .next()
                 .unwrap_or_else(|| "32000000".to_string())
@@ -348,14 +362,38 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
-        "native-play-snapshot" => {
-            let rom = args
+        "native-window-snapshot" => {
+            let rom = next_native_rom_source_or_default(&mut args);
+            let count = args
+                .next()
+                .unwrap_or_else(|| "32000000".to_string())
+                .parse::<u64>()
+                .map_err(|_| "instruction count must be a non-negative integer".to_string())?;
+            let output = args
                 .next()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+                .unwrap_or_else(|| PathBuf::from("native-window.png"));
+            let mut emulator =
+                NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
+            emulator.step_instructions(count);
+            let raw_frame = emulator.display_frame();
+            let window_frame = native_play_window_frame(&raw_frame);
+            write_native_display_frame_png(&window_frame, &output)?;
+            println!(
+                "{{\"output\":\"{}\",\"instruction_count\":{},\"raw_frame\":{},\"window_frame\":{},\"state\":{}}}",
+                escape_json(&output.display().to_string()),
+                count,
+                NativeFrameStats::from_frame(&raw_frame).json(),
+                NativeFrameStats::from_frame(&window_frame).json(),
+                emulator.compact_probe_json()
+            );
+            Ok(())
+        }
+        "native-play-snapshot" => {
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .unwrap_or_else(|| "500000".to_string())
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let output_prefix = args
@@ -363,12 +401,20 @@ fn run() -> Result<(), String> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("native-play-snapshot"));
             let mut complete_script = false;
+            let mut match_script = false;
+            let mut require_gameplay_scene = false;
             let mut fast_forward_max_frames = NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES;
             let mut tail_values = Vec::new();
             let mut tail_args = args.peekable();
             while let Some(value) = tail_args.next() {
                 match value.as_str() {
                     "--complete-script" => complete_script = true,
+                    "--match-script" => {
+                        match_script = true;
+                        complete_script = true;
+                        require_gameplay_scene = true;
+                    }
+                    "--require-gameplay-scene" => require_gameplay_scene = true,
                     "--fast-forward-frames" => {
                         let raw_frames = tail_args.next().ok_or_else(|| {
                             "--fast-forward-frames requires a positive integer".to_string()
@@ -395,18 +441,17 @@ fn run() -> Result<(), String> {
                 instructions_per_frame.max(1),
                 &output_prefix,
                 complete_script,
+                match_script,
+                require_gameplay_scene,
                 fast_forward_max_frames,
                 tail_segments,
             )
         }
         "native-play" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .unwrap_or_else(|| "500000".to_string())
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let scale = parse_native_window_scale(args.next())?;
@@ -423,19 +468,16 @@ fn run() -> Result<(), String> {
                 instructions_per_frame.max(1),
                 scale,
                 max_frames,
-                default_native_play_script(),
-                true,
-                true,
+                Vec::new(),
+                false,
+                false,
             )
         }
         "native-manual" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .unwrap_or_else(|| "500000".to_string())
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let scale = parse_native_window_scale(args.next())?;
@@ -458,13 +500,10 @@ fn run() -> Result<(), String> {
             )
         }
         "native-autoplay" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .unwrap_or_else(|| "500000".to_string())
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let scale = parse_native_window_scale(args.next())?;
@@ -480,13 +519,10 @@ fn run() -> Result<(), String> {
             )
         }
         "native-input-check" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .unwrap_or_else(|| "500000".to_string())
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let mut emulator =
@@ -637,13 +673,10 @@ fn run() -> Result<(), String> {
             }
         }
         "native-health-check" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .unwrap_or_else(|| "500000".to_string())
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let branch_frames = args
@@ -672,10 +705,7 @@ fn run() -> Result<(), String> {
             )
         }
         "native-scripted-step" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -711,10 +741,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-dump" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -765,10 +792,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-candidates" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -803,10 +827,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-summary" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -835,10 +856,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-probe" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -893,10 +911,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-frame-probe" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -975,10 +990,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-compact-probe" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1057,10 +1069,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-live-probe" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1089,10 +1098,7 @@ fn run() -> Result<(), String> {
             )
         }
         "native-scripted-trace" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]"
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1159,10 +1165,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-vblank-trace" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]"
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1295,10 +1298,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-timeline" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1376,10 +1376,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-branch" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1481,10 +1478,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-branch-summary" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1562,10 +1556,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-draw-snapshot" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>"
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let count = args
                 .next()
                 .ok_or_else(|| {
@@ -1613,10 +1604,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-scripted-draw-snapshot" => {
-            let rom = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>..."
-                    .to_string()
-            })?;
+            let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
                 .ok_or_else(|| {
@@ -1669,10 +1657,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-trace" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let count = args
                 .next()
                 .unwrap_or_else(|| "1000000".to_string())
@@ -1696,10 +1681,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "native-env-step" => {
-            let rom = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/roms/bldyror2.zip"));
+            let rom = next_native_rom_source_or_default(&mut args);
             let action_index = args
                 .next()
                 .unwrap_or_else(|| "0".to_string())
@@ -1774,6 +1756,12 @@ fn run_native_play(
     if autoplay_enabled && fast_forward_script {
         let fast_forward_instructions_per_frame =
             native_fast_forward_instructions_per_frame(instructions_per_frame);
+        eprintln!(
+            "native-play fast-forward starting: segments={} instructions_per_frame={} max_frames={}",
+            script_segments.len(),
+            fast_forward_instructions_per_frame,
+            NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES
+        );
         let script_progress = if stop_script_at_first_playable {
             run_native_script_observed_until_playable_with_limit(
                 &mut emulator,
@@ -1996,11 +1984,18 @@ fn run_native_play_snapshot(
     instructions_per_frame: u64,
     output_prefix: &Path,
     complete_script: bool,
+    match_script: bool,
+    require_gameplay_scene: bool,
     fast_forward_max_frames: u64,
     tail_segments: Vec<NativeScriptSegment>,
 ) -> Result<(), String> {
     let mut emulator = NativeEmulator::from_rom_zip(rom).map_err(|error| error.to_string())?;
-    let handoff_segments = default_native_play_script();
+    let handoff_segments = if match_script {
+        native_match_entry_script()
+    } else {
+        default_native_play_script()
+    };
+    let script_name = if match_script { "match" } else { "handoff" };
     let fast_forward_instructions_per_frame =
         native_fast_forward_instructions_per_frame(instructions_per_frame);
     let progress = run_native_script_observed_until_playable_with_limit(
@@ -2025,11 +2020,14 @@ fn run_native_play_snapshot(
     let boot_frame_stats = NativeFrameStats::from_frame(&boot_window_frame);
     let handoff_frame_gameplay_scene = boot_frame_stats.has_gameplay_scene();
     let handoff_frame_handoff_scene = boot_frame_stats.has_handoff_scene();
-    let handoff_playable = boot_summary.observed_native_playable_candidate
-        && boot_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
-        && boot_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
-        && (handoff_frame_gameplay_scene || handoff_frame_handoff_scene);
+    let handoff_frame_full_size = boot_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
+        && boot_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT;
+    let handoff_frame_scene_accepted = handoff_frame_gameplay_scene || handoff_frame_handoff_scene;
+    let handoff_render_verified = handoff_frame_full_size && handoff_frame_scene_accepted;
+    let handoff_playable =
+        boot_summary.observed_native_playable_candidate && handoff_render_verified;
 
+    let has_tail_segments = !tail_segments.is_empty();
     let mut effective_tail_segments = if complete_script {
         remaining_native_script_segments(
             &handoff_segments,
@@ -2069,21 +2067,49 @@ fn run_native_play_snapshot(
     let final_native_playable_candidate = emulator.native_playable_candidate();
     let final_frame_gameplay_scene = final_frame_stats.has_gameplay_scene();
     let final_frame_handoff_scene = final_frame_stats.has_handoff_scene();
-    let final_playable = final_native_playable_candidate
-        && final_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
+    let final_render_verified = final_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
         && final_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
-        && (final_frame_gameplay_scene || final_frame_handoff_scene);
+        && if require_gameplay_scene {
+            final_frame_gameplay_scene
+        } else {
+            final_frame_gameplay_scene || final_frame_handoff_scene
+        };
+    let final_playable = final_native_playable_candidate && final_render_verified;
+    let required_playable = if complete_script || has_tail_segments || match_script {
+        final_playable
+    } else {
+        handoff_playable
+    };
+    let required_stage = if require_gameplay_scene {
+        "gameplay_scene"
+    } else if complete_script || has_tail_segments || match_script {
+        "final"
+    } else {
+        "handoff"
+    };
+    let final_frame_full_size = final_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
+        && final_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT;
+    let final_frame_scene_accepted = if require_gameplay_scene {
+        final_frame_gameplay_scene
+    } else {
+        final_frame_gameplay_scene || final_frame_handoff_scene
+    };
 
     println!(
-        "{{\"output_prefix\":\"{}\",\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"complete_script\":{},\"handoff_playable\":{},\"final_playable\":{},\"playable\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"executed_steps\":{},\"state\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"executed_steps\":{},\"state\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         instructions_per_frame,
         fast_forward_instructions_per_frame,
         fast_forward_max_frames,
+        script_name,
         complete_script,
+        match_script,
+        require_gameplay_scene,
+        required_stage,
         handoff_playable,
         final_playable,
-        handoff_playable,
+        final_render_verified,
+        required_playable,
         boot_summary.json(),
         escape_json(&boot_actual_display_output.display().to_string()),
         escape_json(&boot_raw_actual_display_output.display().to_string()),
@@ -2092,6 +2118,9 @@ fn run_native_play_snapshot(
         escape_json(&boot_vram_output.display().to_string()),
         escape_json(&boot_window_output.display().to_string()),
         boot_frame_stats.json(),
+        handoff_frame_full_size,
+        handoff_frame_scene_accepted,
+        handoff_render_verified,
         handoff_frame_gameplay_scene,
         handoff_frame_handoff_scene,
         handoff_playable,
@@ -2104,6 +2133,9 @@ fn run_native_play_snapshot(
         escape_json(&vram_output.display().to_string()),
         escape_json(&window_output.display().to_string()),
         final_frame_stats.json(),
+        final_frame_full_size,
+        final_frame_scene_accepted,
+        final_render_verified,
         final_frame_gameplay_scene,
         final_frame_handoff_scene,
         final_native_playable_candidate,
@@ -2112,10 +2144,14 @@ fn run_native_play_snapshot(
         emulator.probe_json()
     );
 
-    if handoff_playable {
+    if required_playable {
         Ok(())
     } else if !boot_summary.observed_native_playable_candidate {
         Err("native play snapshot failed: playable frame was not observed".into())
+    } else if require_gameplay_scene && !final_frame_gameplay_scene {
+        Err("native play snapshot failed: final frame did not meet gameplay scene criteria".into())
+    } else if !final_render_verified && (complete_script || has_tail_segments || match_script) {
+        Err("native play snapshot failed: final frame did not meet render criteria".into())
     } else {
         Err(
             "native play snapshot failed: handoff frame did not meet gameplay render criteria"
@@ -2565,15 +2601,13 @@ fn run_native_health_check(
         || branch_full_scene_count > 0;
     let native_play_handoff_full_scene =
         checkpoint_full_scene || checkpoint_native_playable && checkpoint_stats.has_handoff_scene();
-    let full_scene_rendering = native_play_handoff_full_scene
-        || control_sweep_full_scene
-        || branch_full_scene_count > 0
-        || match_entry_full_scene;
+    let match_entry_rendering_complete = match_entry_full_scene && !match_entry_known_rendering_gap;
+    let full_scene_rendering = native_play_handoff_full_scene && match_entry_rendering_complete;
     let control_sweep_reaches_playable = control_sweep_native_playable
         || branch_native_playable_count > 0
         || match_entry_native_playable;
-    let known_rendering_gap =
-        rendering_present && (!full_scene_rendering || !control_sweep_reaches_playable);
+    let known_rendering_gap = match_entry_known_rendering_gap
+        || rendering_present && (!full_scene_rendering || !control_sweep_reaches_playable);
     let overall_pass = native_core_running
         && assets_complete
         && manual_checkpoint_ready
@@ -2582,7 +2616,8 @@ fn run_native_health_check(
         && all_branch_actions_read
         && control_sweep_reaches_playable
         && rendering_present
-        && full_scene_rendering;
+        && full_scene_rendering
+        && match_entry_rendering_complete;
     let overall_status = if overall_pass {
         "pass"
     } else if native_core_running || rendering_present || play_controls_active {
@@ -2592,7 +2627,7 @@ fn run_native_health_check(
     };
 
     println!(
-        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"manual_checkpoint_ready\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"all_branches_native_playable\":{},\"control_sweep_reaches_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_full_scene\":{},\"control_sweep_full_scene\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"native_play_handoff_full_scene\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"match_entry\":{},\"branches\":[{}]}}",
+        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"manual_checkpoint_ready\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"all_branches_native_playable\":{},\"control_sweep_reaches_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_full_scene\":{},\"control_sweep_full_scene\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"match_entry_rendering_complete\":{},\"native_play_handoff_full_scene\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"match_entry\":{},\"branches\":[{}]}}",
         overall_status,
         overall_pass,
         instructions_per_frame,
@@ -2614,6 +2649,7 @@ fn run_native_health_check(
         control_sweep_full_scene,
         match_entry_full_scene,
         match_entry_known_rendering_gap,
+        match_entry_rendering_complete,
         native_play_handoff_full_scene,
         full_scene_rendering,
         known_rendering_gap,
@@ -2684,6 +2720,7 @@ fn optional_u64_json(value: Option<u64>) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeScriptRunSummary {
     total_frames: u64,
+    frame_attempts: u64,
     missed_vblank_frames: u64,
     observed_native_playable_candidate: bool,
     first_native_playable_frame: Option<u64>,
@@ -2701,8 +2738,9 @@ struct NativeScriptProgress {
 impl NativeScriptRunSummary {
     fn json(self) -> String {
         format!(
-            "{{\"total_frames\":{},\"missed_vblank_frames\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"stop_reason\":\"{}\"}}",
+            "{{\"total_frames\":{},\"frame_attempts\":{},\"missed_vblank_frames\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"stop_reason\":\"{}\"}}",
             self.total_frames,
+            self.frame_attempts,
             self.missed_vblank_frames,
             self.observed_native_playable_candidate,
             optional_u64_json(self.first_native_playable_frame),
@@ -2831,8 +2869,16 @@ impl NativeFrameStats {
             && self.horizontal_color_changes.saturating_mul(30) >= self.total_pixels
     }
 
+    fn has_low_palette_noise(self) -> bool {
+        self.total_pixels > 0
+            && self.unique_colors <= 96
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(45)
+    }
+
     fn has_handoff_scene(self) -> bool {
         if !self.has_scene_detail()
+            || self.has_low_palette_noise()
             || self.warm_pixels.saturating_mul(100) > self.total_pixels.saturating_mul(72)
             || self.dominant_color_bucket_pixels.saturating_mul(100)
                 > self.total_pixels.saturating_mul(80)
@@ -2848,6 +2894,7 @@ impl NativeFrameStats {
 
     fn has_gameplay_scene(self) -> bool {
         if !self.has_scene_detail()
+            || self.has_low_palette_noise()
             || self.warm_pixels.saturating_mul(100) > self.total_pixels.saturating_mul(72)
             || self.has_bottom_caption_band()
             || (self.black_pixels.saturating_mul(100) > self.total_pixels.saturating_mul(40)
@@ -2892,7 +2939,7 @@ impl NativeFrameStats {
 
     fn json(self) -> String {
         format!(
-            "{{\"width\":{},\"height\":{},\"total_pixels\":{},\"nonzero_pixels\":{},\"black_pixels\":{},\"warm_pixels\":{},\"unique_colors\":{},\"dominant_color_bucket_pixels\":{},\"horizontal_color_changes\":{},\"occupied_rows\":{},\"occupied_row_span\":{},\"bottom_caption_pixels\":{},\"bottom_dark_pixels\":{},\"bottom_caption_band\":{},\"intro_caption_band\":{},\"visible_content\":{},\"scene_detail\":{},\"handoff_scene\":{},\"gameplay_scene\":{}}}",
+            "{{\"width\":{},\"height\":{},\"total_pixels\":{},\"nonzero_pixels\":{},\"black_pixels\":{},\"warm_pixels\":{},\"unique_colors\":{},\"dominant_color_bucket_pixels\":{},\"horizontal_color_changes\":{},\"low_palette_noise\":{},\"occupied_rows\":{},\"occupied_row_span\":{},\"bottom_caption_pixels\":{},\"bottom_dark_pixels\":{},\"bottom_caption_band\":{},\"intro_caption_band\":{},\"visible_content\":{},\"scene_detail\":{},\"handoff_scene\":{},\"gameplay_scene\":{}}}",
             self.width,
             self.height,
             self.total_pixels,
@@ -2902,6 +2949,7 @@ impl NativeFrameStats {
             self.unique_colors,
             self.dominant_color_bucket_pixels,
             self.horizontal_color_changes,
+            self.has_low_palette_noise(),
             self.occupied_rows,
             self.occupied_row_span,
             self.bottom_caption_pixels,
@@ -3152,7 +3200,7 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip] [instruction_count]\n  native-screenshot [rom_zip] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip] [instruction_count] [output.png]\n  native-screen-dump [rom_zip] [instruction_count] [output_prefix]\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--fast-forward-frames n] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and reports cache_hit/materialized/resolved_path; native-cache-path prints the reusable ROM directory for repeated runs. native-play fast-forwards to the first stable character-select handoff, opens a 640x480 uncropped window, and always sends manual key presses to the emulator; arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I guard, C coin, Enter/P start, Esc quit. native-autoplay keeps the full scripted path for diagnostics. native-play-snapshot writes the same bounded fast-forwarded frame without opening a window and reports stop_reason in JSON. native-manual preserves fully manual boot input. max_frames is optional and intended for smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--fast-forward-frames n] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip_or_dir] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play opens a manual 640x480 uncropped window; arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I guard, C coin, Enter/P start, Esc quit. native-window-snapshot writes the exact 640x480 GUI frame without opening a window. native-autoplay keeps the bounded pre-window fast-forward path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON. native-manual is retained as an alias for fully manual boot input. max_frames is optional and intended for smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
 }
 
@@ -3183,23 +3231,39 @@ fn native_manual_entry_script() -> Vec<NativeScriptSegment> {
     vec![
         NativeScriptSegment {
             action: Action::Noop,
-            frames: 300,
+            frames: 180,
+        },
+        NativeScriptSegment {
+            action: Action::Punch,
+            frames: 120,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 60,
         },
         NativeScriptSegment {
             action: Action::Coin,
-            frames: 30,
+            frames: 90,
         },
         NativeScriptSegment {
             action: Action::Noop,
-            frames: 120,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::CoinStart,
+            frames: 240,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 60,
         },
         NativeScriptSegment {
             action: Action::Start,
-            frames: 300,
+            frames: 240,
         },
         NativeScriptSegment {
             action: Action::Noop,
-            frames: 120,
+            frames: 60,
         },
     ]
 }
@@ -3208,7 +3272,7 @@ fn native_select_entry_script() -> Vec<NativeScriptSegment> {
     let mut segments = native_manual_entry_script();
     segments.push(NativeScriptSegment {
         action: Action::Punch,
-        frames: 3,
+        frames: 120,
     });
     segments
 }
@@ -3563,6 +3627,7 @@ fn run_native_script_observed_with_stop(
 ) -> NativeScriptProgress {
     let instructions_per_frame = instructions_per_frame.max(1);
     let mut total_frames = 0u64;
+    let mut frame_attempts = 0u64;
     let mut missed_vblank_frames = 0u64;
     let mut observed_native_playable_candidate = false;
     let mut first_native_playable_frame = None;
@@ -3576,10 +3641,24 @@ fn run_native_script_observed_with_stop(
         segment_index = index;
         segment_frame = 0;
         emulator.set_input(segment.action.buttons());
-        for _ in 0..segment.frames {
+        while segment_frame < segment.frames {
             let vblank_advanced = step_until_next_vblank_checked(emulator, instructions_per_frame);
+            frame_attempts = frame_attempts.saturating_add(1);
             if !vblank_advanced {
                 missed_vblank_frames = missed_vblank_frames.saturating_add(1);
+                if max_frames.is_some_and(|max_frames| {
+                    frame_attempts >= max_frames.saturating_mul(8).max(max_frames)
+                }) {
+                    stop_reason = "max_frame_attempts";
+                    stopped = true;
+                    break 'script;
+                }
+                if emulator.is_terminal() {
+                    stop_reason = "terminal";
+                    stopped = true;
+                    break 'script;
+                }
+                continue;
             }
 
             total_frames += 1;
@@ -3634,8 +3713,20 @@ fn run_native_script_observed_with_stop(
         emulator.set_input(ActionButtons::default());
         loop {
             let vblank_advanced = step_until_next_vblank_checked(emulator, instructions_per_frame);
+            frame_attempts = frame_attempts.saturating_add(1);
             if !vblank_advanced {
                 missed_vblank_frames = missed_vblank_frames.saturating_add(1);
+                if max_frames.is_some_and(|max_frames| {
+                    frame_attempts >= max_frames.saturating_mul(8).max(max_frames)
+                }) {
+                    stop_reason = "max_frame_attempts";
+                    break;
+                }
+                if emulator.is_terminal() {
+                    stop_reason = "terminal";
+                    break;
+                }
+                continue;
             }
 
             total_frames += 1;
@@ -3676,6 +3767,7 @@ fn run_native_script_observed_with_stop(
     NativeScriptProgress {
         summary: NativeScriptRunSummary {
             total_frames,
+            frame_attempts,
             missed_vblank_frames,
             observed_native_playable_candidate,
             first_native_playable_frame,
@@ -3728,6 +3820,24 @@ fn parse_native_trace_options(values: Vec<String>) -> Result<NativeTraceConfig, 
                     .next()
                     .ok_or_else(|| "--stop-below-pc requires an address".to_string())?;
                 options.stop_below_pc = Some(parse_trace_u32(&raw, "--stop-below-pc")?);
+            }
+            "--stop-above-pc" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--stop-above-pc requires an address".to_string())?;
+                options.stop_above_pc = Some(parse_trace_u32(&raw, "--stop-above-pc")?);
+            }
+            "--stop-unmapped-pc" => {
+                options.stop_unmapped_pc = true;
+            }
+            "--stop-watch-access" => {
+                options.stop_watch_access = true;
+            }
+            "--stop-watch-data" => {
+                options.stop_watch_data = true;
+            }
+            "--stop-watch-write" => {
+                options.stop_watch_write = true;
             }
             "--stop-pc-skip" => {
                 let raw = args
@@ -3855,12 +3965,20 @@ fn asset_check(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn native_fast_forward_instructions_per_frame(_requested: u64) -> u64 {
-    NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
+fn native_fast_forward_instructions_per_frame(requested: u64) -> u64 {
+    if requested == 0 {
+        NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
+    } else {
+        requested.max(NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME)
+    }
 }
 
 fn native_play_gui_instructions_per_frame(requested: u64) -> u64 {
-    requested.max(NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME)
+    if requested == 0 {
+        NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME
+    } else {
+        requested.max(NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME)
+    }
 }
 
 fn escape_json(value: &str) -> String {
@@ -3878,8 +3996,9 @@ mod tests {
         native_match_entry_script, native_play_effective_buttons,
         native_play_gui_handoff_frame_ready, native_play_gui_instructions_per_frame,
         native_play_window_frame, native_script_completed, native_select_entry_script,
-        next_scripted_action, parse_action_token, parse_native_autoplay_tail,
-        parse_native_script_segments, parse_native_window_scale, remaining_native_script_segments,
+        next_native_rom_source_or_default, next_scripted_action, parse_action_token,
+        parse_native_autoplay_tail, parse_native_script_segments, parse_native_window_scale,
+        remaining_native_script_segments,
     };
     use bloodyroar2_gym::{Action, ActionButtons, NativeDisplayFrame};
     use minifb::Scale;
@@ -3911,6 +4030,22 @@ mod tests {
         assert!(parse_native_script_segments(vec!["coin".to_string()]).is_err());
         assert!(parse_native_script_segments(vec!["coin:0".to_string()]).is_err());
         assert!(parse_action_token("999").is_err());
+    }
+
+    #[test]
+    fn optional_native_rom_source_leaves_numeric_first_args_for_command_parsers() {
+        let mut args = vec![
+            "500000".to_string(),
+            "tmp/native-validation/smoke".to_string(),
+            "coin:20".to_string(),
+        ]
+        .into_iter()
+        .peekable();
+
+        let _rom = next_native_rom_source_or_default(&mut args);
+
+        assert_eq!(args.next().as_deref(), Some("500000"));
+        assert_eq!(args.next().as_deref(), Some("tmp/native-validation/smoke"));
     }
 
     #[test]
@@ -3952,7 +4087,7 @@ mod tests {
     }
 
     #[test]
-    fn native_fast_forward_uses_fixed_fast_script_budget() {
+    fn native_fast_forward_uses_stable_vblank_instruction_budget() {
         assert_eq!(
             native_fast_forward_instructions_per_frame(0),
             super::NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
@@ -3962,13 +4097,11 @@ mod tests {
             super::NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
         );
         assert_eq!(
-            native_fast_forward_instructions_per_frame(500_000),
+            native_fast_forward_instructions_per_frame(120_000),
             super::NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
         );
-        assert_eq!(
-            native_fast_forward_instructions_per_frame(600_000),
-            super::NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
-        );
+        assert_eq!(native_fast_forward_instructions_per_frame(500_000), 500_000);
+        assert_eq!(native_fast_forward_instructions_per_frame(600_000), 600_000);
     }
 
     #[test]
@@ -3977,10 +4110,9 @@ mod tests {
             native_play_gui_instructions_per_frame(0),
             super::NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME
         );
-        assert_eq!(
-            native_play_gui_instructions_per_frame(120_000),
-            super::NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME
-        );
+        assert_eq!(native_play_gui_instructions_per_frame(1), 500_000);
+        assert_eq!(native_play_gui_instructions_per_frame(10_000), 500_000);
+        assert_eq!(native_play_gui_instructions_per_frame(120_000), 500_000);
         assert_eq!(native_play_gui_instructions_per_frame(600_000), 600_000);
     }
 
@@ -4004,10 +4136,15 @@ mod tests {
                 .iter()
                 .filter(|segment| segment.action == Action::Punch)
                 .count(),
-            1
+            2
         );
         assert_eq!(segments.last().expect("last segment").action, Action::Punch);
-        assert_eq!(segments.last().expect("last segment").frames, 3);
+        assert_eq!(segments.last().expect("last segment").frames, 120);
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.action == Action::CoinStart)
+        );
         assert!(!segments.iter().any(|segment| matches!(
             segment.action,
             Action::Up
@@ -4020,16 +4157,23 @@ mod tests {
         )));
         assert_eq!(
             segments.iter().map(|segment| segment.frames).sum::<u64>(),
-            873
+            1230
         );
         assert!(segments.windows(2).any(|window| {
             window[0].action == Action::Start
                 && window[1]
                     == NativeScriptSegment {
                         action: Action::Noop,
-                        frames: 120,
+                        frames: 60,
                     }
         }));
+        assert_eq!(
+            segments.last().copied(),
+            Some(NativeScriptSegment {
+                action: Action::Punch,
+                frames: 120,
+            })
+        );
     }
 
     #[test]
@@ -4415,6 +4559,35 @@ mod tests {
 
         assert!(stats.has_scene_detail(), "{stats:?}");
         assert!(!stats.has_gameplay_scene(), "{stats:?}");
+    }
+
+    #[test]
+    fn native_frame_stats_rejects_low_palette_high_frequency_corruption() {
+        let width = 640;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let index = ((x + y * 5) % 96) as u32;
+                let red = 16 + (index.wrapping_mul(29) % 224);
+                let green = 16 + (index.wrapping_mul(47) % 224);
+                let blue = 16 + (index.wrapping_mul(61) % 224);
+                pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        let frame = NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        };
+
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(stats.has_low_palette_noise(), "{stats:?}");
+        assert!(!stats.has_handoff_scene(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+        assert!(!native_play_gui_handoff_frame_ready(&frame), "{stats:?}");
     }
 
     #[test]
