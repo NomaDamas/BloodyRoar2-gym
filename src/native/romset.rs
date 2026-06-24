@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_ulong, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::time::UNIX_EPOCH;
 
 use crate::backend::BackendError;
 use crate::native::bus::NativeBoardAssets;
@@ -13,6 +15,7 @@ const CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD: u16 = 0x0001;
 const ZIP_STORED_METHOD: u16 = 0;
 const ZIP_DEFLATED_METHOD: u16 = 8;
+const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v3";
 const BLOODY_ROAR_2_GAME_ID: &str = "bldyror2";
 const CAT702_ET01_CRC32: u32 = 0xa7dd_922e;
 const CAT702_ET03_CRC32: u32 = 0x779b_0bfd;
@@ -721,6 +724,26 @@ impl NativeRomSet {
         Self::inspect(path)
     }
 
+    pub fn scan_cached(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
+        let path = path.into();
+        let metadata = fs::metadata(&path).map_err(|error| {
+            BackendError::new(format!("failed to inspect {}: {error}", path.display()))
+        })?;
+
+        if metadata.is_dir() {
+            return Self::scan_dir(path);
+        }
+
+        let cache = NativeRomCache::for_source(&path, &metadata);
+        if let Some(romset) = Self::try_scan_cached_romset(&cache) {
+            return Ok(romset);
+        }
+
+        let source = Self::inspect(&path)?;
+        materialize_cached_romset(&source, &cache)?;
+        Self::scan_dir(cache.rom_dir)
+    }
+
     pub fn inspect(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
         let bytes = fs::read(&path).map_err(|error| {
@@ -791,6 +814,15 @@ impl NativeRomSet {
             archive_bytes: None,
             entry_bytes_cache: RefCell::new(BTreeMap::new()),
         })
+    }
+
+    fn try_scan_cached_romset(cache: &NativeRomCache) -> Option<Self> {
+        if !cache.ready_file.is_file() || !cache.rom_dir.is_dir() {
+            return None;
+        }
+
+        let romset = Self::scan_dir(cache.rom_dir.clone()).ok()?;
+        (!romset.entry_metadata.is_empty()).then_some(romset)
     }
 
     pub fn load_boot_rom(&self) -> Result<Vec<u8>, BackendError> {
@@ -1107,6 +1139,192 @@ fn duplicate_assets(entries: &[NativeRomEntry]) -> Vec<NativeRomDuplicateAsset> 
             })
         })
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct NativeRomCache {
+    base_dir: PathBuf,
+    rom_dir: PathBuf,
+    ready_file: PathBuf,
+    source_path: PathBuf,
+    source_len: u64,
+    source_modified_ns: u128,
+}
+
+impl NativeRomCache {
+    fn for_source(path: &Path, metadata: &fs::Metadata) -> Self {
+        let source_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let source_len = metadata.len();
+        let source_modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let source_identity = format!(
+            "{}:{source_len}:{source_modified_ns}",
+            source_path.display()
+        );
+        let identity_crc32 = crc32(source_identity.as_bytes());
+        let cache_key = format!(
+            "{NATIVE_ROM_CACHE_VERSION}-{identity_crc32:08x}-{source_len:016x}-{source_modified_ns:032x}"
+        );
+        let base_dir = PathBuf::from("target")
+            .join("native-rom-cache")
+            .join(cache_key);
+        let rom_dir = base_dir.join("roms");
+        let ready_file = base_dir.join("READY");
+
+        Self {
+            base_dir,
+            rom_dir,
+            ready_file,
+            source_path,
+            source_len,
+            source_modified_ns,
+        }
+    }
+
+    fn temp_dir(&self) -> PathBuf {
+        let mut name = self
+            .base_dir
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| NATIVE_ROM_CACHE_VERSION.to_string());
+        name.push_str(&format!(".tmp-{}", process::id()));
+        self.base_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("target/native-rom-cache"))
+            .join(name)
+    }
+
+    fn ready_contents(&self, written_assets: &[String]) -> String {
+        format!(
+            "version={NATIVE_ROM_CACHE_VERSION}\nsource={}\nsource_len={}\nsource_modified_ns={}\nasset_count={}\nassets={}\n",
+            self.source_path.display(),
+            self.source_len,
+            self.source_modified_ns,
+            written_assets.len(),
+            written_assets.join(",")
+        )
+    }
+}
+
+fn materialize_cached_romset(
+    source: &NativeRomSet,
+    cache: &NativeRomCache,
+) -> Result<(), BackendError> {
+    if let Some(parent) = cache.base_dir.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            BackendError::new(format!(
+                "failed to create native ROM cache root {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let temp_dir = cache.temp_dir();
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir).map_err(|error| {
+            BackendError::new(format!(
+                "failed to clear stale native ROM cache temp dir {}: {error}",
+                temp_dir.display()
+            ))
+        })?;
+    }
+
+    let temp_rom_dir = temp_dir.join("roms");
+    fs::create_dir_all(&temp_rom_dir).map_err(|error| {
+        BackendError::new(format!(
+            "failed to create native ROM cache dir {}: {error}",
+            temp_rom_dir.display()
+        ))
+    })?;
+
+    let mut written_assets = Vec::new();
+    for manifest_entry in BLOODY_ROAR_2_MANIFEST.all_assets() {
+        if source.find_entry(manifest_entry.name).is_none() {
+            continue;
+        }
+
+        let bytes = source.load_manifest_asset(manifest_entry.name)?;
+        write_cached_rom_asset(
+            &temp_rom_dir,
+            &mut written_assets,
+            manifest_entry.name,
+            &bytes,
+        )?;
+    }
+
+    let board_assets = source.load_board_assets();
+    if let Some(bytes) = board_assets.cat702_1 {
+        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et01.ic652", &bytes)?;
+    }
+    if let Some(bytes) = board_assets.cat702_2 {
+        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et03", &bytes)?;
+    }
+    if let Some(bytes) = board_assets.at28c16 {
+        let name = if crc32(&bytes) == AT28C16_WORLD_CRC32 {
+            "at28c16_world"
+        } else {
+            "bldyror2.cfg"
+        };
+        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, name, &bytes)?;
+    }
+
+    if written_assets.is_empty() {
+        return Err(BackendError::new(format!(
+            "no Bloody Roar 2 manifest assets were found in {}",
+            source.path.display()
+        )));
+    }
+
+    fs::write(
+        temp_dir.join("READY"),
+        cache.ready_contents(&written_assets),
+    )
+    .map_err(|error| {
+        BackendError::new(format!(
+            "failed to write native ROM cache marker under {}: {error}",
+            temp_dir.display()
+        ))
+    })?;
+
+    if cache.base_dir.exists() {
+        fs::remove_dir_all(&cache.base_dir).map_err(|error| {
+            BackendError::new(format!(
+                "failed to replace native ROM cache dir {}: {error}",
+                cache.base_dir.display()
+            ))
+        })?;
+    }
+    fs::rename(&temp_dir, &cache.base_dir).map_err(|error| {
+        BackendError::new(format!(
+            "failed to activate native ROM cache {}: {error}",
+            cache.base_dir.display()
+        ))
+    })
+}
+
+fn write_cached_rom_asset(
+    cache_rom_dir: &Path,
+    written_assets: &mut Vec<String>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), BackendError> {
+    if written_assets.iter().any(|asset| asset == name) {
+        return Ok(());
+    }
+
+    let output = cache_rom_dir.join(name);
+    fs::write(&output, bytes).map_err(|error| {
+        BackendError::new(format!(
+            "failed to write cached native ROM asset {}: {error}",
+            output.display()
+        ))
+    })?;
+    written_assets.push(name.to_string());
+    Ok(())
 }
 
 fn collect_files_sorted(path: &Path) -> Result<Vec<PathBuf>, BackendError> {
@@ -2073,6 +2291,68 @@ mod tests {
             .expect("load nested flash0 entry");
         assert_eq!(bytes, vec![0x11, 0x22, 0x33, 0x44]);
         let _ = fs::remove_file(zip_path);
+    }
+
+    #[test]
+    fn scan_cached_materializes_nested_zip_assets_once_under_target_cache() {
+        let inner_zip = fixture_stored_zip(&[("flash0.021", &[0x11, 0x22, 0x33, 0x44])]);
+        let outer_zip = fixture_stored_zip(&[("BloodRoar2/roms/bldyror2.zip", &inner_zip)]);
+        let zip_path = temp_zip_path("runtime-cache");
+        fs::write(&zip_path, outer_zip).expect("write runtime cache ZIP fixture");
+
+        let romset = NativeRomSet::scan_cached(&zip_path).expect("scan cached ZIP fixture");
+        let cache_base = romset
+            .path
+            .parent()
+            .expect("cache rom dir parent")
+            .to_path_buf();
+        assert!(romset.path.ends_with("roms"));
+        assert!(
+            romset
+                .path
+                .to_string_lossy()
+                .contains("target/native-rom-cache")
+        );
+        assert_eq!(
+            fs::read(romset.path.join("flash0.021")).expect("read cached flash0"),
+            vec![0x11, 0x22, 0x33, 0x44]
+        );
+        assert!(!romset.entries.iter().any(|entry| entry == "READY"));
+
+        let second = NativeRomSet::scan_cached(&zip_path).expect("reuse cached ZIP fixture");
+        assert_eq!(second.path, romset.path);
+
+        let _ = fs::remove_file(zip_path);
+        let _ = fs::remove_dir_all(cache_base);
+    }
+
+    #[test]
+    fn scan_cached_preserves_board_asset_fallbacks_from_source_neighbors() {
+        let source_dir = temp_scan_dir("runtime-cache-board-assets");
+        let zip_path = source_dir.join("game.zip");
+        fs::write(
+            &zip_path,
+            fixture_stored_zip(&[("flash0.021", &[0x11, 0x22, 0x33, 0x44])]),
+        )
+        .expect("write runtime cache ZIP fixture");
+        fs::write(source_dir.join("bldyror2.cfg"), vec![0x5a; 2048])
+            .expect("write board asset fallback fixture");
+
+        let romset = NativeRomSet::scan_cached(&zip_path)
+            .expect("scan cached ZIP fixture with board fallback");
+        let cache_base = romset
+            .path
+            .parent()
+            .expect("cache rom dir parent")
+            .to_path_buf();
+
+        assert_eq!(
+            fs::read(romset.path.join("bldyror2.cfg")).expect("read cached EEPROM fallback"),
+            vec![0x5a; 2048]
+        );
+
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(cache_base);
     }
 
     #[test]

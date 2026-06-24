@@ -214,9 +214,17 @@ but the native renderer or branch stability is not yet complete.
 Open the native macOS play window:
 
 ```sh
+cargo run --release -- native-cache-prepare assets/BloodRoar2-combined.zip
+cargo run --release -- native-play assets/BloodRoar2-combined.zip 500000 fit
 cargo run --release -- native-autoplay assets/roms 500000 fit
 cargo run --release -- native-play assets/roms 500000 fit
 ```
+
+When a ZIP is passed directly, the native runtime does not shell out to
+`unzip` on every launch. It materializes the recognized ROM assets once into
+ignored `target/native-rom-cache/<source-fingerprint>/roms`, and all subsequent
+native emulator starts reuse that cache until the source archive changes or
+`target` is removed.
 
 `native-play` and `native-autoplay` bounded-fast-forward the built-in
 match-entry script first, continue any remaining scripted input in the visible

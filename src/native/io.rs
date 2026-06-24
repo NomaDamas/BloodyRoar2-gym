@@ -7,7 +7,7 @@ use crate::native::framebuffer::{
     ClipRect, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH, FrameBufferBounds, FrameBufferStats,
     FrameBufferWindow, NativeFrameBuffer, PSX_VRAM_HEIGHT, PixelWriteOptions, Point,
     TextureCoordinate, TextureDrawOptions, TextureWindow, TexturedDrawStats, TexturedPoint,
-    VRAM_HEIGHT, VRAM_WIDTH, bytes_base64,
+    VRAM_HEIGHT, VRAM_WIDTH, bytes_base64, png_from_rgb888_pixels,
 };
 
 pub const IO_REGION_START: u32 = 0x1f80_1000;
@@ -1384,28 +1384,28 @@ impl Gpu {
                 .framebuffer
                 .psx_display_png_base64(window.x, window.y, width, height);
         }
-        if let Some(png) = self.presented_frame_png.as_deref() {
-            if self.should_prefer_presented_frame() {
-                return bytes_base64(png);
-            }
+        if self.should_prefer_presented_frame()
+            && let Some(png) = self.presented_frame_png()
+        {
+            return bytes_base64(&png);
         }
-        if self.should_prefer_best_observation() {
-            if let Some(png) = self.best_observation_png.as_deref() {
-                return bytes_base64(png);
-            }
+        if self.should_prefer_best_observation()
+            && let Some(png) = self.best_observation_png()
+        {
+            return bytes_base64(&png);
         }
         if let Some(presented) = self.presented_frame_window {
             if !self.display_window_is_texture_atlas(presented)
-                && let Some(png) = self.presented_frame_png.as_deref()
+                && let Some(png) = self.presented_frame_png()
             {
-                return bytes_base64(png);
+                return bytes_base64(&png);
             }
         }
         if let Some(best) = self.best_observation_window {
             if !self.display_window_is_texture_atlas(best)
-                && let Some(png) = self.best_observation_png.as_deref()
+                && let Some(png) = self.best_observation_png()
             {
-                return bytes_base64(png);
+                return bytes_base64(&png);
             }
         }
         let (width, height) = self.display_dimensions();
@@ -1440,28 +1440,28 @@ impl Gpu {
                 .framebuffer
                 .psx_display_png(window.x, window.y, width, height);
         }
-        if let Some(png) = &self.presented_frame_png {
-            if self.should_prefer_presented_frame() {
-                return png.clone();
-            }
+        if self.should_prefer_presented_frame()
+            && let Some(png) = self.presented_frame_png()
+        {
+            return png;
         }
-        if self.should_prefer_best_observation() {
-            if let Some(png) = &self.best_observation_png {
-                return png.clone();
-            }
+        if self.should_prefer_best_observation()
+            && let Some(png) = self.best_observation_png()
+        {
+            return png;
         }
         if let Some(presented) = self.presented_frame_window {
             if !self.display_window_is_texture_atlas(presented)
-                && let Some(png) = &self.presented_frame_png
+                && let Some(png) = self.presented_frame_png()
             {
-                return png.clone();
+                return png;
             }
         }
         if let Some(best) = self.best_observation_window {
             if !self.display_window_is_texture_atlas(best)
-                && let Some(png) = &self.best_observation_png
+                && let Some(png) = self.best_observation_png()
             {
-                return png.clone();
+                return png;
             }
         }
         let (width, height) = self.display_dimensions();
@@ -1496,21 +1496,21 @@ impl Gpu {
                 .framebuffer
                 .psx_display_png(window.x, window.y, width, height);
         }
-        if let Some(png) = &self.presented_frame_png {
-            if self.should_prefer_presented_frame() {
-                return png.clone();
-            }
+        if self.should_prefer_presented_frame()
+            && let Some(png) = self.presented_frame_png()
+        {
+            return png;
         }
-        if self.should_prefer_best_observation() {
-            if let Some(png) = &self.best_observation_png {
-                return png.clone();
-            }
+        if self.should_prefer_best_observation()
+            && let Some(png) = self.best_observation_png()
+        {
+            return png;
         }
         if let Some(presented) = self.presented_frame_window {
             if !self.display_window_is_texture_atlas(presented)
-                && let Some(png) = &self.presented_frame_png
+                && let Some(png) = self.presented_frame_png()
             {
-                return png.clone();
+                return png;
             }
         }
         let (start_x, start_y) = display_area_start_xy(self.display_area_start);
@@ -1773,9 +1773,9 @@ impl Gpu {
 
     fn display_output_png(&self, output: DisplayOutputWindow) -> Vec<u8> {
         if output.cached
-            && let Some(png) = &self.field_composed_display_png
+            && let Some(png) = self.field_composed_display_png()
         {
-            return png.clone();
+            return png;
         }
         self.framebuffer.psx_display_png(
             output.window.x,
@@ -1797,6 +1797,50 @@ impl Gpu {
             output.width,
             output.height,
         )
+    }
+
+    fn best_observation_png(&self) -> Option<Vec<u8>> {
+        self.cached_display_png(
+            self.best_observation_png.as_ref(),
+            self.best_observation_rgb.as_ref(),
+            self.best_observation_width,
+            self.best_observation_height,
+        )
+    }
+
+    fn presented_frame_png(&self) -> Option<Vec<u8>> {
+        self.cached_display_png(
+            self.presented_frame_png.as_ref(),
+            self.presented_frame_rgb.as_ref(),
+            self.presented_frame_width,
+            self.presented_frame_height,
+        )
+    }
+
+    fn field_composed_display_png(&self) -> Option<Vec<u8>> {
+        self.cached_display_png(
+            self.field_composed_display_png.as_ref(),
+            self.field_composed_display_rgb.as_ref(),
+            self.field_composed_display_width,
+            self.field_composed_display_height,
+        )
+    }
+
+    fn cached_display_png(
+        &self,
+        cached_png: Option<&Vec<u8>>,
+        cached_rgb: Option<&Vec<u32>>,
+        width: usize,
+        height: usize,
+    ) -> Option<Vec<u8>> {
+        if let Some(rgb) = cached_rgb {
+            let expected_len = width.checked_mul(height)?;
+            if width > 0 && height > 0 && rgb.len() == expected_len {
+                return Some(png_from_rgb888_pixels(width, height, rgb));
+            }
+        }
+
+        cached_png.cloned()
     }
 
     fn recent_display_area_history_has_field_pair(
@@ -2013,13 +2057,13 @@ impl Gpu {
 
     fn resolved_display_png(&self, resolved: DisplayResolve) -> Vec<u8> {
         if resolved.source == "best_observation" {
-            if let Some(png) = &self.best_observation_png {
-                return png.clone();
+            if let Some(png) = self.best_observation_png() {
+                return png;
             }
         }
         if resolved.source == "presented_frame" {
-            if let Some(png) = &self.presented_frame_png {
-                return png.clone();
+            if let Some(png) = self.presented_frame_png() {
+                return png;
             }
         }
         let (width, height) = self.display_dimensions();
@@ -3914,11 +3958,7 @@ impl Gpu {
             return;
         }
 
-        self.best_observation_png =
-            Some(
-                self.framebuffer
-                    .png(candidate.x, candidate.y, width, height),
-            );
+        self.best_observation_png = None;
         self.best_observation_rgb =
             Some(
                 self.framebuffer
@@ -4098,11 +4138,7 @@ impl Gpu {
             return;
         }
 
-        self.presented_frame_png =
-            Some(
-                self.framebuffer
-                    .psx_display_png(start_x, start_y, display_width, display_height),
-            );
+        self.presented_frame_png = None;
         self.presented_frame_rgb = Some(self.framebuffer.psx_display_rgb_window(
             start_x,
             start_y,
@@ -4139,12 +4175,7 @@ impl Gpu {
             return;
         }
 
-        self.field_composed_display_png = Some(self.framebuffer.psx_display_png(
-            output.window.x,
-            output.window.y,
-            output.width,
-            output.height,
-        ));
+        self.field_composed_display_png = None;
         self.field_composed_display_rgb = Some(self.framebuffer.psx_display_rgb_window(
             output.window.x,
             output.window.y,

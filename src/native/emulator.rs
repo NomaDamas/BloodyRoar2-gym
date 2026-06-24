@@ -28,7 +28,7 @@ pub struct NativeEmulator {
 
 impl NativeEmulator {
     pub fn from_rom_zip(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
-        let romset = NativeRomSet::scan(path.into())?;
+        let romset = NativeRomSet::scan_cached(path.into())?;
         let rom_compatibility = romset.compatibility_report();
         let boot_rom = romset.load_boot_rom()?;
         let banked_roms = romset.load_banked_roms()?;
