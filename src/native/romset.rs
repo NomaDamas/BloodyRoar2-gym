@@ -16,7 +16,7 @@ const CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD: u16 = 0x0001;
 const ZIP_STORED_METHOD: u16 = 0;
 const ZIP_DEFLATED_METHOD: u16 = 8;
-const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v6";
+const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v10";
 const NATIVE_ROM_CACHE_ENV: &str = "BLOODYROAR2_NATIVE_ROM_CACHE_DIR";
 const DEFAULT_NATIVE_ROM_CACHE_ROOT: &str = ".runtime-cache/native-rom-cache";
 const NATIVE_ROM_CACHE_LATEST_FILE: &str = "LATEST_ROM_DIR";
@@ -37,7 +37,10 @@ const BLOODY_ROAR_2_MANIFEST: NativeRomManifest = NativeRomManifest {
     bios_assets: &SONY_ZN_BIOS_MANIFEST_ASSETS,
     game_assets: &BLOODY_ROAR_2_GAME_MANIFEST_ASSETS,
 };
-const ROM_NAME_ALIASES: [(&str, &str); 1] = [("coh-1002e.353", "m27c402cz-54.ic353")];
+const ROM_NAME_ALIASES: [(&str, &str); 2] = [
+    ("coh-1002e.353", "m27c402cz-54.ic353"),
+    ("bldyror2.cfg", "at28c16_world"),
+];
 const SONY_ZN_BIOS_MANIFEST_ASSETS: [NativeRomManifestEntry; 3] = [
     NativeRomManifestEntry {
         name: "m27c402cz-54.ic353",
@@ -556,6 +559,10 @@ impl NativeRomCompatibilityReport {
             .any(|duplicate| is_required_asset_name(&duplicate.normalized_name))
     }
 
+    pub fn has_known_variant(&self, variant: &str) -> bool {
+        self.known_variants().contains(&variant)
+    }
+
     pub fn summary_json(&self) -> String {
         let mismatched_assets = self
             .mismatched_assets
@@ -639,16 +646,23 @@ impl NativeRomCompatibilityReport {
     }
 
     fn known_variants(&self) -> Vec<&'static str> {
+        let mut variants = Vec::new();
         let has_zinc_jp_flash = self.mismatched_assets.iter().any(|mismatch| {
             mismatch.name.eq_ignore_ascii_case("flash1.024")
                 && mismatch.actual_crc32 == ZINC_JP_FLASH1_CRC32
         });
+        let has_zinc_cfg_eeprom = self.mismatched_assets.iter().any(|mismatch| {
+            mismatch.name.eq_ignore_ascii_case("at28c16_world") && mismatch.actual_size == 2048
+        });
 
         if has_zinc_jp_flash {
-            vec!["zinc_jp_bundle_flash_variant"]
-        } else {
-            Vec::new()
+            variants.push("zinc_jp_bundle_flash_variant");
         }
+        if has_zinc_cfg_eeprom {
+            variants.push("zinc_cfg_eeprom_variant");
+        }
+
+        variants
     }
 }
 
@@ -660,9 +674,37 @@ fn native_runtime_required_asset_missing(asset: &str) -> bool {
 }
 
 fn native_runtime_allowed_mismatch(mismatch: &NativeRomAssetMismatch) -> bool {
-    mismatch.name.eq_ignore_ascii_case("flash1.024")
-        && mismatch.actual_size == mismatch.expected_size
-        && mismatch.actual_crc32 == ZINC_JP_FLASH1_CRC32
+    if mismatch.name.eq_ignore_ascii_case("flash1.024") {
+        return mismatch.actual_size == mismatch.expected_size
+            && mismatch.actual_crc32 == ZINC_JP_FLASH1_CRC32;
+    }
+
+    mismatch.name.eq_ignore_ascii_case("at28c16_world") && mismatch.actual_size == 2048
+}
+
+fn env_flag_is_false(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn env_flag_is_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn legacy_zinc_input_compat(env_value: Option<&str>, at28c16_from_zinc_cfg: bool) -> bool {
+    match env_value {
+        Some(value) if env_flag_is_false(value) => false,
+        Some(value) if env_flag_is_true(value) => true,
+        Some(_) | None => {
+            let _ = at28c16_from_zinc_cfg;
+            false
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -791,6 +833,20 @@ impl NativeRomSet {
     pub fn scan_cached_with_report(
         path: impl Into<PathBuf>,
     ) -> Result<NativeRomCachedScan, BackendError> {
+        Self::scan_cached_with_report_in_cache_root_opt(path, None)
+    }
+
+    pub fn scan_cached_with_report_in_cache_root(
+        path: impl Into<PathBuf>,
+        cache_root: impl Into<PathBuf>,
+    ) -> Result<NativeRomCachedScan, BackendError> {
+        Self::scan_cached_with_report_in_cache_root_opt(path, Some(cache_root.into()))
+    }
+
+    fn scan_cached_with_report_in_cache_root_opt(
+        path: impl Into<PathBuf>,
+        cache_root: Option<PathBuf>,
+    ) -> Result<NativeRomCachedScan, BackendError> {
         let path = path.into();
         let metadata = fs::metadata(&path).map_err(|error| {
             BackendError::new(format!("failed to inspect {}: {error}", path.display()))
@@ -802,7 +858,7 @@ impl NativeRomSet {
             return Ok(NativeRomCachedScan { romset, cache });
         }
 
-        let cache = NativeRomCache::for_source(&path, &metadata);
+        let cache = NativeRomCache::for_source(&path, &metadata, cache_root);
         if let Some(romset) = Self::try_scan_cached_romset(&cache) {
             record_latest_cached_rom_dir(&cache)?;
             let cache = NativeRomCacheReport::cached(path, &cache, true);
@@ -927,11 +983,32 @@ impl NativeRomSet {
     }
 
     pub fn load_board_assets(&self) -> NativeBoardAssets {
+        let legacy_zinc_input_compat_env = env::var("BLOODYROAR2_NATIVE_LEGACY_ZINC_INPUT").ok();
+        let canonical_at28c16 = self.load_exact_canonical_asset("at28c16_world", 2048);
+        let (at28c16, at28c16_from_zinc_cfg) = match canonical_at28c16 {
+            Some(bytes) => (Some(bytes), false),
+            None => {
+                let zinc_cfg = self.load_zinc_cfg_eeprom_asset();
+                let from_zinc_cfg = zinc_cfg.is_some();
+                (zinc_cfg, from_zinc_cfg)
+            }
+        };
         let mut assets = NativeBoardAssets {
             cat702_1: self.load_exact_8_asset("et01.ic652"),
             cat702_2: self.load_exact_8_asset("et03"),
-            at28c16: self.load_exact_asset("at28c16_world", 2048),
+            at28c16,
+            at28c16_blank_default: false,
+            legacy_zinc_input_compat: legacy_zinc_input_compat(
+                legacy_zinc_input_compat_env.as_deref(),
+                at28c16_from_zinc_cfg,
+            ),
         };
+
+        if assets.cat702_1.is_some() && assets.cat702_2.is_some() && assets.at28c16.is_some() {
+            return assets;
+        }
+
+        self.load_embedded_cat702_assets(&mut assets);
 
         if assets.cat702_1.is_some() && assets.cat702_2.is_some() && assets.at28c16.is_some() {
             return assets;
@@ -958,6 +1035,33 @@ impl NativeRomSet {
         }
 
         assets
+    }
+
+    fn load_embedded_cat702_assets(&self, assets: &mut NativeBoardAssets) {
+        if assets.cat702_1.is_some() && assets.cat702_2.is_some() {
+            return;
+        }
+
+        for entry in self
+            .entry_metadata
+            .iter()
+            .filter(|entry| embedded_cat702_source_candidate(&entry.name, entry.uncompressed_size))
+        {
+            let Ok(bytes) = self.load_entry_bytes(entry) else {
+                continue;
+            };
+
+            if assets.cat702_1.is_none() {
+                assets.cat702_1 = find_crc32_window_8(&bytes, CAT702_ET01_CRC32);
+            }
+            if assets.cat702_2.is_none() {
+                assets.cat702_2 = find_crc32_window_8(&bytes, CAT702_ET03_CRC32);
+            }
+
+            if assets.cat702_1.is_some() && assets.cat702_2.is_some() {
+                break;
+            }
+        }
     }
 
     pub fn load_manifest_region(&self, region: &str) -> Result<Vec<u8>, BackendError> {
@@ -1194,9 +1298,24 @@ impl NativeRomSet {
         exact_8_bytes(&bytes)
     }
 
-    fn load_exact_asset(&self, manifest_name: &str, expected_len: usize) -> Option<Vec<u8>> {
-        let bytes = self.load_manifest_asset(manifest_name).ok()?;
+    fn load_exact_canonical_asset(
+        &self,
+        manifest_name: &str,
+        expected_len: usize,
+    ) -> Option<Vec<u8>> {
+        let entry = self.entry_metadata.iter().find(|entry| {
+            normalized_file_name(&entry.name) == normalized_file_name(manifest_name)
+        })?;
+        let bytes = self.load_entry_bytes(entry).ok()?;
         (bytes.len() == expected_len).then_some(bytes)
+    }
+
+    fn load_zinc_cfg_eeprom_asset(&self) -> Option<Vec<u8>> {
+        let entry = self.entry_metadata.iter().find(|entry| {
+            entry.uncompressed_size == 2048 && is_explicit_zinc_bldyror2_cfg_entry(&entry.name)
+        })?;
+        let bytes = self.load_entry_bytes(entry).ok()?;
+        (bytes.len() == 2048).then_some(bytes)
     }
 
     pub fn duplicate_assets(&self) -> Vec<NativeRomDuplicateAsset> {
@@ -1244,7 +1363,7 @@ struct NativeRomCache {
 }
 
 impl NativeRomCache {
-    fn for_source(path: &Path, metadata: &fs::Metadata) -> Self {
+    fn for_source(path: &Path, metadata: &fs::Metadata, cache_root: Option<PathBuf>) -> Self {
         let source_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let source_len = metadata.len();
         let source_modified_ns = metadata
@@ -1261,7 +1380,9 @@ impl NativeRomCache {
         let cache_key = format!(
             "{NATIVE_ROM_CACHE_VERSION}-{identity_crc32:08x}-{source_len:016x}-{source_modified_ns:032x}"
         );
-        let base_dir = native_rom_cache_root().join(cache_key);
+        let base_dir = cache_root
+            .unwrap_or_else(native_rom_cache_root)
+            .join(cache_key);
         let rom_dir = base_dir.join("roms");
         let ready_file = base_dir.join("READY");
 
@@ -1301,10 +1422,37 @@ impl NativeRomCache {
 }
 
 fn native_rom_cache_root() -> PathBuf {
-    env::var_os(NATIVE_ROM_CACHE_ENV)
+    let configured = env::var_os(NATIVE_ROM_CACHE_ENV)
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_NATIVE_ROM_CACHE_ROOT))
+        .map(PathBuf::from);
+    #[cfg(test)]
+    let using_default = configured.is_none();
+    let root = configured.unwrap_or_else(|| PathBuf::from(DEFAULT_NATIVE_ROM_CACHE_ROOT));
+
+    #[cfg(test)]
+    {
+        if using_default {
+            return root.join(native_rom_cache_test_component());
+        }
+    }
+
+    root
+}
+
+#[cfg(test)]
+fn native_rom_cache_test_component() -> String {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("unnamed");
+    let mut component = format!("test-{}-", process::id());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            component.push(ch);
+        } else {
+            component.push('_');
+        }
+    }
+    component.truncate(180);
+    component
 }
 
 fn record_latest_cached_rom_dir(cache: &NativeRomCache) -> Result<(), BackendError> {
@@ -1367,7 +1515,7 @@ fn materialize_cached_romset(
         .iter()
         .filter(|entry| !entry.name.ends_with('/') && !is_zip_entry_name(&entry.name))
     {
-        if manifest_entry_for_asset_name(&entry.name).is_some() {
+        if !should_preserve_expanded_runtime_cache_asset(&entry.name) {
             continue;
         }
         let Ok(bytes) = source.load_entry_bytes(entry) else {
@@ -1380,11 +1528,14 @@ fn materialize_cached_romset(
     }
 
     for manifest_entry in BLOODY_ROAR_2_MANIFEST.all_assets() {
-        if source.find_entry(manifest_entry.name).is_none() {
+        let Some(entry) = source.find_entry(manifest_entry.name) else {
+            continue;
+        };
+        if should_skip_runtime_cache_manifest_alias(manifest_entry, entry) {
             continue;
         }
 
-        let bytes = source.load_manifest_asset(manifest_entry.name)?;
+        let bytes = source.load_entry_bytes(entry)?;
         write_cached_rom_asset(
             &temp_rom_dir,
             &mut written_assets,
@@ -1394,21 +1545,19 @@ fn materialize_cached_romset(
     }
 
     let board_assets = source.load_board_assets();
-    if let Some(bytes) = board_assets.cat702_1 {
-        if !written_assets
+    if let Some(bytes) = board_assets.cat702_1
+        && !written_assets
             .iter()
             .any(|asset| asset_names_match(asset, "et01.ic652"))
-        {
-            write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et01.ic652", &bytes)?;
-        }
+    {
+        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et01.ic652", &bytes)?;
     }
-    if let Some(bytes) = board_assets.cat702_2 {
-        if !written_assets
+    if let Some(bytes) = board_assets.cat702_2
+        && !written_assets
             .iter()
             .any(|asset| asset_names_match(asset, "et03"))
-        {
-            write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et03", &bytes)?;
-        }
+    {
+        write_cached_rom_asset(&temp_rom_dir, &mut written_assets, "et03", &bytes)?;
     }
     if let Some(bytes) = board_assets.at28c16 {
         let name = if crc32(&bytes) == AT28C16_WORLD_CRC32 {
@@ -1503,6 +1652,23 @@ fn cached_expanded_entry_name(name: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+fn should_preserve_expanded_runtime_cache_asset(name: &str) -> bool {
+    is_explicit_zinc_bldyror2_cfg_entry(name)
+}
+
+fn is_explicit_zinc_bldyror2_cfg_entry(name: &str) -> bool {
+    let normalized = normalized_asset_name(name);
+    normalized == "cfg/bldyror2.cfg" || normalized.ends_with("/cfg/bldyror2.cfg")
+}
+
+fn should_skip_runtime_cache_manifest_alias(
+    manifest_entry: &NativeRomManifestEntry,
+    entry: &NativeRomEntry,
+) -> bool {
+    manifest_entry.name.eq_ignore_ascii_case("at28c16_world")
+        && normalized_file_name(&entry.name) != normalized_file_name(manifest_entry.name)
+}
+
 fn collect_files_sorted(path: &Path) -> Result<Vec<PathBuf>, BackendError> {
     let mut files = Vec::new();
     collect_files(path, &mut files)?;
@@ -1547,6 +1713,8 @@ fn board_asset_candidates(path: &Path) -> Vec<PathBuf> {
         push_candidate(&mut candidates, root.join("at28c16_asia"));
         push_candidate(&mut candidates, root.join("bldyror2.cfg"));
         push_candidate(&mut candidates, root.join("ZiNc.exe"));
+        push_candidate(&mut candidates, root.join("BloodRoar2/ZiNc.exe"));
+        push_candidate(&mut candidates, root.join("BloodRoar2/cfg/bldyror2.cfg"));
         push_candidate(&mut candidates, root.join("cfg/bldyror2.cfg"));
         push_candidate(&mut candidates, root.join("extracted/BloodRoar2/ZiNc.exe"));
         push_candidate(
@@ -1556,6 +1724,17 @@ fn board_asset_candidates(path: &Path) -> Vec<PathBuf> {
     }
 
     candidates
+}
+
+fn embedded_cat702_source_candidate(name: &str, uncompressed_size: u64) -> bool {
+    if !(8..=8 * 1024 * 1024).contains(&uncompressed_size) {
+        return false;
+    }
+
+    matches!(
+        normalized_file_name(name).as_str(),
+        "zinc.exe" | "zenith.exe" | "pr1data.8k"
+    )
 }
 
 fn board_asset_roots(path: &Path) -> Vec<PathBuf> {
@@ -1604,7 +1783,7 @@ fn at28c16_fallback_bytes(path: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
-            name.eq_ignore_ascii_case("bldyror2.cfg")
+            name.eq_ignore_ascii_case("bldyror2.cfg") && is_known_region_eeprom
                 || name.eq_ignore_ascii_case("at28c16_world")
                 || name.eq_ignore_ascii_case("at28c16_usa")
                 || name.eq_ignore_ascii_case("at28c16_japan")
@@ -2270,7 +2449,7 @@ fn read_nested_zip_entry_from_bytes(
     archive_entry: &str,
     inner_entry: &str,
 ) -> Result<Vec<u8>, BackendError> {
-    let outer_entries = parse_zip_entries(&outer_archive)?;
+    let outer_entries = parse_zip_entries(outer_archive)?;
     let outer_entry = outer_entries
         .iter()
         .find(|entry| asset_names_match(&entry.name, archive_entry))
@@ -2535,7 +2714,47 @@ mod tests {
     }
 
     #[test]
-    fn scan_cached_preserves_expanded_unknown_assets_from_nested_zip() {
+    fn scan_cached_with_report_uses_explicit_cache_root() {
+        let inner_zip = fixture_stored_zip(&[("flash0.021", &[0xaa, 0xbb, 0xcc, 0xdd])]);
+        let outer_zip = fixture_stored_zip(&[("BloodRoar2/roms/bldyror2.zip", &inner_zip)]);
+        let zip_path = temp_zip_path("explicit-runtime-cache");
+        let cache_root = std::env::temp_dir().join(format!(
+            "bloodyroar2-native-explicit-cache-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ));
+        fs::write(&zip_path, outer_zip).expect("write explicit cache ZIP fixture");
+
+        let first = NativeRomSet::scan_cached_with_report_in_cache_root(&zip_path, &cache_root)
+            .expect("scan cached ZIP fixture with explicit root");
+
+        assert!(first.cache.used_cache);
+        assert!(first.cache.materialized);
+        assert_eq!(
+            first.cache.cache_root.as_deref(),
+            Some(cache_root.as_path())
+        );
+        assert!(first.cache.resolved_path.starts_with(&cache_root));
+        assert_eq!(
+            fs::read(first.cache.resolved_path.join("flash0.021"))
+                .expect("read explicit cached manifest flash0"),
+            vec![0xaa, 0xbb, 0xcc, 0xdd]
+        );
+
+        let second = NativeRomSet::scan_cached_with_report_in_cache_root(&zip_path, &cache_root)
+            .expect("reuse explicit cached ZIP fixture");
+        assert!(second.cache.cache_hit);
+        assert!(!second.cache.materialized);
+        assert_eq!(second.cache.resolved_path, first.cache.resolved_path);
+
+        let _ = fs::remove_file(zip_path);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn scan_cached_skips_expanded_unknown_assets_from_nested_zip() {
         let inner_zip = fixture_stored_zip(&[
             ("flash0.021", &[0x11, 0x22, 0x33, 0x44]),
             ("unknown-extra.bin", &[0xaa, 0xbb, 0xcc]),
@@ -2554,19 +2773,20 @@ mod tests {
 
         let expanded_unknown = "BloodRoar2/roms/bldyror2.zip.contents/unknown-extra.bin";
         assert!(
-            romset.entries.iter().any(|entry| entry == expanded_unknown),
+            !romset.entries.iter().any(|entry| entry == expanded_unknown),
             "{:?}",
             romset.entries
         );
-        assert_eq!(
-            fs::read(romset.path.join(expanded_unknown)).expect("read expanded unknown asset"),
-            vec![0xaa, 0xbb, 0xcc]
+        assert!(
+            !romset.path.join(expanded_unknown).exists(),
+            "runtime cache should not materialize unused nested ZIP assets"
         );
         assert!(
-            romset
+            !romset
                 .compatibility_report()
                 .unknown_assets
-                .contains(&expanded_unknown.to_string())
+                .contains(&expanded_unknown.to_string()),
+            "runtime cache report should not be polluted by skipped unknown assets"
         );
 
         let _ = fs::remove_file(zip_path);
@@ -2574,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_cached_preserves_board_asset_fallbacks_from_source_neighbors() {
+    fn scan_cached_ignores_arbitrary_board_asset_fallbacks_from_source_neighbors() {
         let source_dir = temp_scan_dir("runtime-cache-board-assets");
         let zip_path = source_dir.join("game.zip");
         fs::write(
@@ -2593,13 +2813,148 @@ mod tests {
             .expect("cache rom dir parent")
             .to_path_buf();
 
-        assert_eq!(
-            fs::read(romset.path.join("bldyror2.cfg")).expect("read cached EEPROM fallback"),
-            vec![0x5a; 2048]
-        );
+        assert!(!romset.path.join("bldyror2.cfg").exists());
+        assert!(!romset.path.join("at28c16_world").exists());
 
         let _ = fs::remove_dir_all(source_dir);
         let _ = fs::remove_dir_all(cache_base);
+    }
+
+    #[test]
+    fn scan_cached_loads_explicit_zinc_cfg_alias_without_promoting_root_eeprom() {
+        let zip_path = temp_zip_path("runtime-cache-zinc-cfg-alias");
+        let zinc_cfg = vec![0x5a; 2048];
+        fs::write(
+            &zip_path,
+            fixture_stored_zip(&[
+                ("flash0.021", &[0x11, 0x22, 0x33, 0x44]),
+                ("BloodRoar2/cfg/bldyror2.cfg", &zinc_cfg),
+            ]),
+        )
+        .expect("write runtime cache ZIP fixture");
+
+        let romset =
+            NativeRomSet::scan_cached(&zip_path).expect("scan cached ZIP fixture with ZiNc cfg");
+        let cache_base = romset
+            .path
+            .parent()
+            .expect("cache rom dir parent")
+            .to_path_buf();
+
+        assert!(romset.path.join("BloodRoar2/cfg/bldyror2.cfg").exists());
+        assert!(!romset.path.join("bldyror2.cfg").exists());
+        assert!(!romset.path.join("at28c16_world").exists());
+        let assets = romset.load_board_assets();
+        assert_eq!(assets.at28c16, Some(zinc_cfg));
+        assert!(
+            !assets.legacy_zinc_input_compat,
+            "ZiNc cfg EEPROM fallback must not enable non-MAME input mirroring by default"
+        );
+        let report = romset.compatibility_report();
+        assert!(
+            !report
+                .missing_required_assets
+                .contains(&"at28c16_world".to_string())
+        );
+        assert_eq!(report.known_variants(), vec!["zinc_cfg_eeprom_variant"]);
+
+        let _ = fs::remove_file(zip_path);
+        let _ = fs::remove_dir_all(cache_base);
+    }
+
+    #[test]
+    fn scan_cached_materializes_cat702_from_embedded_zinc_exe() {
+        let zip_path = temp_zip_path("runtime-cache-zinc-cat702");
+        let et01 = [0x02, 0x08, 0x18, 0x1c, 0xfd, 0xc1, 0x40, 0x80];
+        let et03 = [0xc0, 0x08, 0xfa, 0xe2, 0xe1, 0xfd, 0x7c, 0x80];
+        let mut zinc_exe = vec![0x90; 64];
+        zinc_exe.extend_from_slice(&et01);
+        zinc_exe.extend_from_slice(&[0; 8]);
+        zinc_exe.extend_from_slice(&et03);
+        fs::write(
+            &zip_path,
+            fixture_stored_zip(&[
+                ("flash0.021", &[0x11, 0x22, 0x33, 0x44]),
+                ("BloodRoar2/ZiNc.exe", &zinc_exe),
+            ]),
+        )
+        .expect("write runtime cache ZIP fixture with embedded CAT702 data");
+
+        let romset =
+            NativeRomSet::scan_cached(&zip_path).expect("scan cached ZIP fixture with ZiNc.exe");
+        let cache_base = romset
+            .path
+            .parent()
+            .expect("cache rom dir parent")
+            .to_path_buf();
+        let assets = romset.load_board_assets();
+
+        assert_eq!(assets.cat702_1, Some(et01));
+        assert_eq!(assets.cat702_2, Some(et03));
+        assert_eq!(
+            fs::read(romset.path.join("et01.ic652")).expect("read cached et01"),
+            et01
+        );
+        assert_eq!(
+            fs::read(romset.path.join("et03")).expect("read cached et03"),
+            et03
+        );
+
+        let _ = fs::remove_file(zip_path);
+        let _ = fs::remove_dir_all(cache_base);
+    }
+
+    #[test]
+    fn board_assets_do_not_load_arbitrary_zinc_cfg_as_eeprom() {
+        let source_dir = temp_scan_dir("runtime-board-assets-ignore-zinc-cfg");
+        fs::write(source_dir.join("bldyror2.cfg"), vec![0x5a; 2048])
+            .expect("write ZiNc cfg fixture");
+
+        let romset = NativeRomSet::scan(&source_dir).expect("scan cfg fixture");
+        let assets = romset.load_board_assets();
+
+        assert_eq!(assets.at28c16, None);
+
+        let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[test]
+    fn board_assets_load_explicit_zinc_cfg_path_as_eeprom() {
+        let source_dir = temp_scan_dir("runtime-board-assets-load-zinc-cfg");
+        let cfg_dir = source_dir.join("BloodRoar2/cfg");
+        fs::create_dir_all(&cfg_dir).expect("create ZiNc cfg fixture dir");
+        let zinc_cfg = vec![0x5a; 2048];
+        fs::write(cfg_dir.join("bldyror2.cfg"), &zinc_cfg).expect("write ZiNc cfg fixture");
+
+        let romset = NativeRomSet::scan(&source_dir).expect("scan cfg fixture");
+        let assets = romset.load_board_assets();
+
+        assert_eq!(assets.at28c16, Some(zinc_cfg));
+        assert!(!assets.legacy_zinc_input_compat);
+
+        let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[test]
+    fn legacy_zinc_input_env_false_overrides_zinc_cfg_auto_compat() {
+        assert!(!legacy_zinc_input_compat(Some("0"), true));
+        assert!(!legacy_zinc_input_compat(Some("false"), true));
+        assert!(!legacy_zinc_input_compat(Some("off"), true));
+    }
+
+    #[test]
+    fn legacy_zinc_input_env_true_forces_canonical_eeprom_compat() {
+        assert!(legacy_zinc_input_compat(Some("1"), false));
+        assert!(legacy_zinc_input_compat(Some("true"), false));
+        assert!(legacy_zinc_input_compat(Some("on"), false));
+    }
+
+    #[test]
+    fn legacy_zinc_input_defaults_to_mame_mapping_even_with_zinc_cfg_eeprom() {
+        assert!(!legacy_zinc_input_compat(None, true));
+        assert!(!legacy_zinc_input_compat(None, false));
+        assert!(!legacy_zinc_input_compat(Some("invalid"), true));
+        assert!(!legacy_zinc_input_compat(Some("invalid"), false));
     }
 
     #[test]
@@ -3131,6 +3486,65 @@ mod tests {
             report
                 .summary_json()
                 .contains("\"native_runtime_usable\":true")
+        );
+    }
+
+    #[test]
+    fn native_runtime_accepts_zinc_cfg_as_at28c16_alias() {
+        let mut entries = Vec::new();
+        let mut entry_metadata = Vec::new();
+
+        for expectation in BLOODY_ROAR_2_REQUIRED_ASSETS {
+            if matches!(
+                expectation.name,
+                "et01.ic652" | "78081g503.ic655" | "at28c16_world" | "et03"
+            ) {
+                continue;
+            }
+            let crc32 = if expectation.name == "flash1.024" {
+                ZINC_JP_FLASH1_CRC32
+            } else {
+                expectation.expected_crc32.unwrap_or(0)
+            };
+            entries.push(expectation.name.to_string());
+            entry_metadata.push(NativeRomEntry {
+                name: expectation.name.to_string(),
+                uncompressed_size: expectation.expected_size,
+                compressed_size: expectation.expected_size,
+                crc32,
+                compression_method: 0,
+                local_header_offset: None,
+            });
+        }
+        entries.push("BloodRoar2/cfg/bldyror2.cfg".to_string());
+        entry_metadata.push(NativeRomEntry {
+            name: "BloodRoar2/cfg/bldyror2.cfg".to_string(),
+            uncompressed_size: 2048,
+            compressed_size: 2048,
+            crc32: 0x4c5f_ea47,
+            compression_method: 0,
+            local_header_offset: None,
+        });
+
+        let romset = NativeRomSet {
+            path: PathBuf::from("fixture.zip"),
+            entries,
+            entry_metadata,
+            archive_bytes: None,
+            entry_bytes_cache: RefCell::new(BTreeMap::new()),
+        };
+
+        let report = romset.bloody_roar_2_compatibility();
+
+        assert!(
+            !report
+                .missing_required_assets
+                .contains(&"at28c16_world".to_string())
+        );
+        assert!(report.native_runtime_usable());
+        assert_eq!(
+            report.known_variants(),
+            vec!["zinc_jp_bundle_flash_variant", "zinc_cfg_eeprom_variant"]
         );
     }
 

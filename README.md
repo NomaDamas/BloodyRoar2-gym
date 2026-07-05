@@ -99,17 +99,26 @@ keeps repeat runs off the source ZIP unless you intentionally rebuild the cache.
 Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
 outside the repo.
 
-`native-play` uses the cached ROM directory and opens a manual macOS window. It
-does not run the default coin/start/select script first, so keyboard input is
-polled from boot. `native-window-snapshot` writes the exact 640x480 GUI frame
-without opening a window, which is useful when checking whether the visible
-window is cropped, doubled, or black. `native-autoplay` keeps the bounded
-pre-window fast-forward path and also accepts an explicit script tail for smoke
-and control-sweep validation.
+`native-play` and `native-manual` use the cached ROM directory and open a macOS
+keyboard window. `native-play` skips the warning-wait segment, then layers the
+built-in coin/start/select match-entry script while manual keys remain active.
+Use `native-manual` for a cold-boot window with no entry script. Use
+`native-autoplay` when you intentionally want the bounded pre-window
+fast-forward and custom entry-assist diagnostics.
+`native-window-snapshot` writes the exact 640x480 GUI frame without opening a
+window, which is useful when checking whether the visible window is cropped,
+doubled, or black. `native-autoplay` also accepts an explicit script tail for
+smoke and control-sweep validation.
 `native-health-check` is stricter than the autoplay smoke path: it verifies the
 CPU core, mapped controls, rendered frame statistics, and per-action branch
 stability. It exits non-zero when the native renderer still has a full-scene
 composition gap even if the macOS window and input path are working.
+
+Bloody Roar 2 uses the MAME `znt2p` input map by default. When a ZiNc bundle
+contains `cfg/bldyror2.cfg`, the native loader also uses it as an EEPROM
+fallback, but keeps the MAME input map. Set
+`BLOODYROAR2_NATIVE_LEGACY_ZINC_INPUT=1` only when explicitly testing legacy
+ZiNc input mirroring for diagnostics.
 
 Window controls:
 
@@ -119,17 +128,18 @@ Window controls:
 - `Q`, `L`, or `B`: beast.
 - `E`, `I`, or `G`: guard.
 - `C`: coin.
+- `V`: service credit.
 - `Enter` or `P`: start.
 - `Esc`: quit.
 
 For automated smoke tests, pass an optional frame limit:
 
 ```sh
-cargo run -- native-play 120000 fit 1800
-cargo run -- native-autoplay 120000 fit 1800
+cargo run -- native-play 120000 fit 1000
+cargo run -- native-autoplay 120000 fit 1000
 cargo run -- native-manual 120000 2 700
 cargo run -- native-window-snapshot 40505333 tmp/native-validation/manual-window.png
-cargo run -- native-play-snapshot 120000 tmp/native-validation/smoke --complete-script --fast-forward-frames 2400
+cargo run -- native-play-snapshot assets/BloodRoar2-combined.zip 120000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
 ```
 
 `native-play-snapshot` exits non-zero unless the final rendered window frame
@@ -218,7 +228,8 @@ command before claiming emulator parity.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend.
 `native-scripted-step` applies a sequence of Gym actions to the native core and
-writes a PNG observation for repeatable boot/input debugging. `native-input-check`
+writes the same 640x480 GUI frame that `native-play` presents, with raw/window
+frame stats in JSON for repeatable boot/input debugging. `native-input-check`
 verifies that the game reads mapped coin/start/fighter controls,
 `native-health-check` fails on remaining full-scene rendering or branch-stability
 gaps, and `native-play` opens the native macOS framebuffer window.

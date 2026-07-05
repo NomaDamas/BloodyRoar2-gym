@@ -16,7 +16,8 @@ pub use native::{
     NativeGpuDisplayCandidate, NativeInputActivity, NativePlatformInfo, NativeRomAssetExpectation,
     NativeRomAssetMatch, NativeRomAssetMismatch, NativeRomCacheReport, NativeRomCachedScan,
     NativeRomCompatibilityReport, NativeRomDuplicateAsset, NativeRomEntry, NativeRomSet,
-    NativeTraceConfig, native_platform_json, png_from_rgb888_pixels, preferred_platform_info,
+    NativeTraceConfig, native_platform_json, native_window_frame_from_display,
+    png_from_rgb888_pixels, preferred_platform_info,
 };
 pub use protocol::{action_space_json, api_index_json, observation_space_json};
 pub use zinc::{ZincConfig, ZincRuntime};

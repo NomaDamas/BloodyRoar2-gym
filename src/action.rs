@@ -18,6 +18,7 @@ pub enum Action {
     BeastKick,
     Start,
     Coin,
+    Service,
     CoinStart,
 }
 
@@ -25,6 +26,7 @@ pub enum Action {
 pub struct ActionButtons {
     pub start: bool,
     pub coin: bool,
+    pub service: bool,
     pub up: bool,
     pub down: bool,
     pub left: bool,
@@ -35,7 +37,7 @@ pub struct ActionButtons {
     pub guard: bool,
 }
 
-pub const ACTION_SPACE: [Action; 19] = [
+pub const ACTION_SPACE: [Action; 20] = [
     Action::Noop,
     Action::Up,
     Action::Down,
@@ -54,6 +56,7 @@ pub const ACTION_SPACE: [Action; 19] = [
     Action::BeastKick,
     Action::Start,
     Action::Coin,
+    Action::Service,
     Action::CoinStart,
 ];
 
@@ -103,6 +106,7 @@ impl Action {
             Action::BeastKick => "beast+kick",
             Action::Start => "start",
             Action::Coin => "coin",
+            Action::Service => "service",
             Action::CoinStart => "coin+start",
         }
     }
@@ -185,6 +189,10 @@ impl Action {
                 coin: true,
                 ..ActionButtons::default()
             },
+            Action::Service => ActionButtons {
+                service: true,
+                ..ActionButtons::default()
+            },
             Action::CoinStart => ActionButtons {
                 coin: true,
                 start: true,
@@ -197,9 +205,10 @@ impl Action {
 impl ActionButtons {
     pub fn json(self) -> String {
         format!(
-            "{{\"start\":{},\"coin\":{},\"up\":{},\"down\":{},\"left\":{},\"right\":{},\"punch\":{},\"kick\":{},\"beast\":{},\"guard\":{}}}",
+            "{{\"start\":{},\"coin\":{},\"service\":{},\"up\":{},\"down\":{},\"left\":{},\"right\":{},\"punch\":{},\"kick\":{},\"beast\":{},\"guard\":{}}}",
             self.start,
             self.coin,
+            self.service,
             self.up,
             self.down,
             self.left,
@@ -230,6 +239,7 @@ mod tests {
         assert_eq!(Action::from_name("no-op"), Some(Action::Noop));
         assert_eq!(Action::from_name("coin+start"), Some(Action::CoinStart));
         assert_eq!(Action::from_name("coin_start"), Some(Action::CoinStart));
+        assert_eq!(Action::from_name("service"), Some(Action::Service));
         assert_eq!(Action::from_name("BEAST-KICK"), Some(Action::BeastKick));
         assert_eq!(Action::from_name("invalid"), None);
     }

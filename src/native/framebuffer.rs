@@ -1,5 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::sync::OnceLock;
+
 pub const VRAM_WIDTH: usize = 1024;
 pub const VRAM_HEIGHT: usize = 1024;
 pub const PSX_VRAM_HEIGHT: usize = 512;
@@ -11,6 +13,17 @@ pub struct NativeFrameBuffer {
     pixels: Vec<u32>,
     raw_pixels: Vec<u16>,
     clip: Option<ClipRect>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TextureCandidateImage {
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub raw_width: usize,
+    pub raw_height: usize,
+    pub decoded_png: Vec<u8>,
+    pub raw_png: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -409,6 +422,59 @@ impl NativeFrameBuffer {
         }
     }
 
+    pub fn draw_shaded_triangle_with_options(
+        &mut self,
+        a: Point,
+        b: Point,
+        c: Point,
+        colors: [u32; 3],
+        options: PixelWriteOptions,
+    ) {
+        let (clip_left, clip_top, clip_right, clip_bottom) = self.clip_bounds();
+        if clip_left >= clip_right || clip_top >= clip_bottom {
+            return;
+        }
+
+        let min_x = a.x.min(b.x).min(c.x).clamp(clip_left, clip_right - 1);
+        let max_x = a.x.max(b.x).max(c.x).clamp(clip_left, clip_right - 1);
+        let min_y = a.y.min(b.y).min(c.y).clamp(clip_top, clip_bottom - 1);
+        let max_y = a.y.max(b.y).max(c.y).clamp(clip_top, clip_bottom - 1);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        let area = edge(a, b, c);
+        if area == 0 {
+            return;
+        }
+
+        let denom = area.unsigned_abs() as i64;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let point = Point { x, y };
+                let mut w0 = edge(b, c, point);
+                let mut w1 = edge(c, a, point);
+                let mut w2 = edge(a, b, point);
+                let inside = if area > 0 {
+                    w0 >= 0 && w1 >= 0 && w2 >= 0
+                } else {
+                    w0 <= 0 && w1 <= 0 && w2 <= 0
+                };
+                if !inside {
+                    continue;
+                }
+                if area < 0 {
+                    w0 = -w0;
+                    w1 = -w1;
+                    w2 = -w2;
+                }
+
+                let color = interpolate_psx_rgb(colors, w0, w1, w2, denom);
+                self.set_pixel_with_options(x, y, psx_rgb_to_rgb888(color), options);
+            }
+        }
+    }
+
     pub fn draw_textured_triangle(
         &mut self,
         a: TexturedPoint,
@@ -454,7 +520,9 @@ impl NativeFrameBuffer {
             return stats;
         }
 
-        let source = self.clone();
+        let dest_bounds = (min_x, min_y, max_x, max_y);
+        let source_snapshot = self.textured_draw_requires_snapshot(dest_bounds, texture_page, clut);
+        let source_raw = source_snapshot.as_deref();
         let denom = area.unsigned_abs() as i64;
         for y in min_y..=max_y {
             for x in min_x..=max_x {
@@ -480,8 +548,118 @@ impl NativeFrameBuffer {
                 let u = ((a.u as i64 * w0 + b.u as i64 * w1 + c.u as i64 * w2) / denom) as u8;
                 let v = ((a.v as i64 * w0 + b.v as i64 * w1 + c.v as i64 * w2) / denom) as u8;
                 let (u, v) = texture_window.apply(u, v);
-                if let Some(color) = source.sample_texture(texture_page, clut, u, v) {
-                    let color = options.apply_color(color);
+                let sample = self.sample_texture(
+                    source_raw,
+                    texture_page,
+                    clut,
+                    u,
+                    v,
+                    options.allow_palette_fallback,
+                );
+                stats.record_sample(sample);
+                if sample.color != 0 {
+                    let color = options.apply_color(sample.color);
+                    stats.record_color(color);
+                    stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
+                    if self.set_textured_pixel(x, y, color, options) {
+                        stats.written_pixels = stats.written_pixels.saturating_add(1);
+                    } else {
+                        stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
+                    }
+                } else {
+                    stats.transparent_pixels = stats.transparent_pixels.saturating_add(1);
+                }
+            }
+        }
+        stats
+    }
+
+    pub fn draw_shaded_textured_triangle(
+        &mut self,
+        a: TexturedPoint,
+        b: TexturedPoint,
+        c: TexturedPoint,
+        colors: [u32; 3],
+        texture_page: u16,
+        clut: u16,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> TexturedDrawStats {
+        let mut stats = TexturedDrawStats::default();
+        let (clip_left, clip_top, clip_right, clip_bottom) = self.clip_bounds();
+        if clip_left >= clip_right || clip_top >= clip_bottom {
+            return stats;
+        }
+
+        let min_x = a
+            .point
+            .x
+            .min(b.point.x)
+            .min(c.point.x)
+            .clamp(clip_left, clip_right - 1);
+        let max_x = a
+            .point
+            .x
+            .max(b.point.x)
+            .max(c.point.x)
+            .clamp(clip_left, clip_right - 1);
+        let min_y = a
+            .point
+            .y
+            .min(b.point.y)
+            .min(c.point.y)
+            .clamp(clip_top, clip_bottom - 1);
+        let max_y = a
+            .point
+            .y
+            .max(b.point.y)
+            .max(c.point.y)
+            .clamp(clip_top, clip_bottom - 1);
+        let area = edge(a.point, b.point, c.point);
+        if area == 0 {
+            return stats;
+        }
+
+        let dest_bounds = (min_x, min_y, max_x, max_y);
+        let source_snapshot = self.textured_draw_requires_snapshot(dest_bounds, texture_page, clut);
+        let source_raw = source_snapshot.as_deref();
+        let denom = area.unsigned_abs() as i64;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let point = Point { x, y };
+                let mut w0 = edge(b.point, c.point, point);
+                let mut w1 = edge(c.point, a.point, point);
+                let mut w2 = edge(a.point, b.point, point);
+                let inside = if area > 0 {
+                    w0 >= 0 && w1 >= 0 && w2 >= 0
+                } else {
+                    w0 <= 0 && w1 <= 0 && w2 <= 0
+                };
+                if !inside {
+                    continue;
+                }
+
+                stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
+                if area < 0 {
+                    w0 = -w0;
+                    w1 = -w1;
+                    w2 = -w2;
+                }
+                let u = ((a.u as i64 * w0 + b.u as i64 * w1 + c.u as i64 * w2) / denom) as u8;
+                let v = ((a.v as i64 * w0 + b.v as i64 * w1 + c.v as i64 * w2) / denom) as u8;
+                let (u, v) = texture_window.apply(u, v);
+                let sample = self.sample_texture(
+                    source_raw,
+                    texture_page,
+                    clut,
+                    u,
+                    v,
+                    options.allow_palette_fallback,
+                );
+                stats.record_sample(sample);
+                if sample.color != 0 {
+                    let primitive_color = interpolate_psx_rgb(colors, w0, w1, w2, denom);
+                    let color = options.apply_color_with_primitive(sample.color, primitive_color);
                     stats.record_color(color);
                     stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
                     if self.set_textured_pixel(x, y, color, options) {
@@ -513,7 +691,14 @@ impl NativeFrameBuffer {
             return stats;
         }
 
-        let source = self.clone();
+        let dest_bounds = (
+            dest.x,
+            dest.y,
+            dest.x.saturating_add(width).saturating_sub(1),
+            dest.y.saturating_add(height).saturating_sub(1),
+        );
+        let source_snapshot = self.textured_draw_requires_snapshot(dest_bounds, texture_page, clut);
+        let source_raw = source_snapshot.as_deref();
         for row in 0..height {
             for col in 0..width {
                 stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
@@ -528,8 +713,17 @@ impl NativeFrameBuffer {
                     uv.v.wrapping_add(row as u8)
                 };
                 let (u, v) = texture_window.apply(u, v);
-                if let Some(color) = source.sample_texture(texture_page, clut, u, v) {
-                    let color = options.apply_color(color);
+                let sample = self.sample_texture(
+                    source_raw,
+                    texture_page,
+                    clut,
+                    u,
+                    v,
+                    options.allow_palette_fallback,
+                );
+                stats.record_sample(sample);
+                if sample.color != 0 {
+                    let color = options.apply_color(sample.color);
                     stats.record_color(color);
                     stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
                     if self.set_textured_pixel(dest.x + col, dest.y + row, color, options) {
@@ -563,35 +757,128 @@ impl NativeFrameBuffer {
             })
     }
 
-    fn sample_texture(&self, texture_page: u16, clut: u16, u: u8, v: u8) -> Option<u16> {
-        let color = self.sample_texture_raw(texture_page, clut, u, v);
-        (color != 0).then_some(color)
+    fn sample_texture(
+        &self,
+        source_raw: Option<&[u16]>,
+        texture_page: u16,
+        clut: u16,
+        u: u8,
+        v: u8,
+        allow_palette_fallback: bool,
+    ) -> TextureSample {
+        self.sample_texture_sample_from(
+            source_raw.unwrap_or(&self.raw_pixels),
+            texture_page,
+            clut,
+            u,
+            v,
+            allow_palette_fallback,
+        )
     }
 
     fn sample_texture_raw(&self, texture_page: u16, clut: u16, u: u8, v: u8) -> u16 {
-        let page_x = ((texture_page & 0x0f) as i32) * 64;
-        let page_y = texture_page_y(texture_page) as i32;
-        let mode = (texture_page >> 7) & 0x03;
+        self.sample_texture_sample_from(&self.raw_pixels, texture_page, clut, u, v, true)
+            .color
+    }
+
+    fn sample_texture_sample_from(
+        &self,
+        raw_pixels: &[u16],
+        texture_page: u16,
+        clut: u16,
+        u: u8,
+        v: u8,
+        allow_palette_fallback: bool,
+    ) -> TextureSample {
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        self.sample_texture_sample_from_origin(
+            raw_pixels,
+            texture_page,
+            clut,
+            u,
+            v,
+            page_x,
+            page_y,
+            texture_page_raw_width(texture_page),
+            allow_palette_fallback,
+        )
+    }
+
+    fn sample_texture_sample_from_origin(
+        &self,
+        raw_pixels: &[u16],
+        texture_page: u16,
+        clut: u16,
+        u: u8,
+        v: u8,
+        origin_x: i32,
+        origin_y: i32,
+        raw_width: usize,
+        allow_palette_fallback: bool,
+    ) -> TextureSample {
+        let mode = texture_page_color_mode(texture_page);
+        let raw_width = raw_width.max(1) as i32;
         let u = u as i32;
         let v = v as i32;
+        let raw_x = |offset: i32| origin_x + offset.rem_euclid(raw_width);
 
         match mode {
             0 => {
-                let packed = self.raw_pixel(page_x + u / 4, page_y + v);
+                let packed = raw_pixel_from(raw_pixels, raw_x(u / 4), origin_y + v);
                 let index = ((packed >> ((u & 3) * 4)) & 0x0f) as i32;
-                self.raw_pixel(((clut & 0x3f) as i32) * 16 + index, clut_y(clut) as i32)
+                indexed_palette_sample_from(
+                    raw_pixels,
+                    texture_page,
+                    clut,
+                    index,
+                    16,
+                    allow_palette_fallback,
+                )
             }
             1 => {
-                let packed = self.raw_pixel(page_x + u / 2, page_y + v);
-                let index = if u & 1 == 0 {
-                    packed & 0x00ff
-                } else {
+                let packed = raw_pixel_from(raw_pixels, raw_x(u / 2), origin_y + v);
+                let use_high_byte = (u & 1 == 0) == native_swap_8bpp_texture_bytes();
+                let index = if use_high_byte {
                     packed >> 8
+                } else {
+                    packed & 0x00ff
                 } as i32;
-                self.raw_pixel(((clut & 0x3f) as i32) * 16 + index, clut_y(clut) as i32)
+                indexed_palette_sample_from(
+                    raw_pixels,
+                    texture_page,
+                    clut,
+                    index,
+                    256,
+                    allow_palette_fallback,
+                )
             }
-            _ => self.raw_pixel(page_x + u, page_y + v),
+            _ => {
+                let color = raw_pixel_from(raw_pixels, raw_x(u), origin_y + v);
+                TextureSample {
+                    color,
+                    texture_nonzero: color != 0,
+                    zero_texel: color == 0,
+                    clut_nonzero: color != 0,
+                    ..TextureSample::default()
+                }
+            }
         }
+    }
+
+    fn textured_draw_requires_snapshot(
+        &self,
+        dest_bounds: (i32, i32, i32, i32),
+        texture_page: u16,
+        clut: u16,
+    ) -> Option<Vec<u16>> {
+        let texture_bounds = texture_page_raw_bounds(texture_page);
+        let palette_bounds = texture_palette_raw_bounds(texture_page, clut);
+        if bounds_overlap(dest_bounds, texture_bounds)
+            || palette_bounds.is_some_and(|bounds| bounds_overlap(dest_bounds, bounds))
+        {
+            return Some(self.raw_pixels.clone());
+        }
+        None
     }
 
     pub fn decoded_texture_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
@@ -606,22 +893,443 @@ impl NativeFrameBuffer {
         png_from_rgb888_pixels(width, height, &pixels)
     }
 
+    fn decoded_texture_png_from_origin(
+        &self,
+        texture_page: u16,
+        clut: u16,
+        origin_x: i32,
+        origin_y: i32,
+        raw_width: usize,
+    ) -> Vec<u8> {
+        let (width, height) = texture_page_dimensions(texture_page);
+        let mut pixels = Vec::with_capacity(width.saturating_mul(height));
+        for y in 0..height {
+            for x in 0..width {
+                let color = self
+                    .sample_texture_sample_from_origin(
+                        &self.raw_pixels,
+                        texture_page,
+                        clut,
+                        x as u8,
+                        y as u8,
+                        origin_x,
+                        origin_y,
+                        raw_width,
+                        true,
+                    )
+                    .color;
+                pixels.push(rgb555_to_rgb888(color));
+            }
+        }
+        png_from_rgb888_pixels(width, height, &pixels)
+    }
+
+    pub fn raw_texture_page_png(&self, texture_page: u16) -> Vec<u8> {
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let width = texture_page_raw_width(texture_page);
+        let height = 256usize;
+        let mut pixels = Vec::with_capacity(width.saturating_mul(height));
+        for y in 0..height {
+            for x in 0..width {
+                let color = raw_pixel_from(&self.raw_pixels, page_x + x as i32, page_y + y as i32);
+                pixels.push(rgb555_to_rgb888(color));
+            }
+        }
+        png_from_rgb888_pixels(width, height, &pixels)
+    }
+
+    fn raw_texture_page_png_from_origin(
+        &self,
+        origin_x: i32,
+        origin_y: i32,
+        raw_width: usize,
+    ) -> Vec<u8> {
+        let width = raw_width.max(1);
+        let height = 256usize;
+        let mut pixels = Vec::with_capacity(width.saturating_mul(height));
+        for y in 0..height {
+            for x in 0..width {
+                let color =
+                    raw_pixel_from(&self.raw_pixels, origin_x + x as i32, origin_y + y as i32);
+                pixels.push(rgb555_to_rgb888(color));
+            }
+        }
+        png_from_rgb888_pixels(width, height, &pixels)
+    }
+
+    pub fn texture_candidate_images(
+        &self,
+        texture_page: u16,
+        clut: u16,
+    ) -> Vec<TextureCandidateImage> {
+        let mut raw_widths = vec![texture_page_raw_width(texture_page)];
+        if texture_page_color_mode(texture_page) == 1
+            && texture_page_uses_zn_extended_origin(texture_page)
+        {
+            push_unique_usize(&mut raw_widths, 64);
+            push_unique_usize(&mut raw_widths, 128);
+        }
+
+        let mut images = Vec::new();
+        for candidate in texture_origin_candidates(texture_page) {
+            for raw_width in raw_widths.iter().copied() {
+                let label = format!("{}-raw{}", candidate.label, raw_width);
+                images.push(TextureCandidateImage {
+                    label,
+                    x: candidate.x,
+                    y: candidate.y,
+                    raw_width,
+                    raw_height: 256,
+                    decoded_png: self.decoded_texture_png_from_origin(
+                        texture_page,
+                        clut,
+                        candidate.x,
+                        candidate.y,
+                        raw_width,
+                    ),
+                    raw_png: self.raw_texture_page_png_from_origin(
+                        candidate.x,
+                        candidate.y,
+                        raw_width,
+                    ),
+                });
+            }
+        }
+        images
+    }
+
     pub fn texture_palette_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
         let palette_entries = texture_palette_entries(texture_page);
         if palette_entries == 0 {
             return png_from_rgb888_pixels(1, 1, &[0]);
         }
 
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = clut_y(clut) as i32;
+        self.palette_region_png(clut_x, clut_y, palette_entries, false)
+    }
+
+    pub fn resolved_texture_palette_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
+        let palette_entries = texture_palette_entries(texture_page);
+        if palette_entries == 0 {
+            return png_from_rgb888_pixels(1, 1, &[0]);
+        }
+
+        let requested_nonzero_entries =
+            palette_row_nonzero_entries(&self.raw_pixels, clut, palette_entries);
+        let requested_stats = palette_row_stats(&self.raw_pixels, clut, palette_entries);
+        if palette_entries == 16
+            && let Some(candidate) =
+                fallback_zn_4bpp_palette_candidate(&self.raw_pixels, texture_page, clut)
+            && should_use_zn_4bpp_palette_sample(
+                texture_page,
+                clut,
+                true,
+                requested_stats.nonzero_entries,
+                requested_stats.unique_entries,
+                candidate.nonzero_entries,
+                candidate.unique_entries,
+            )
+        {
+            return self.palette_region_png(candidate.x, candidate.y, palette_entries, false);
+        }
+
+        if requested_nonzero_entries == 0
+            && palette_entries == 256
+            && let Some(candidate) =
+                fallback_tiled_256_palette_candidate(&self.raw_pixels, texture_page, clut)
+        {
+            return self.palette_region_png(candidate.x, candidate.y, palette_entries, true);
+        }
+
+        self.texture_palette_png(texture_page, clut)
+    }
+
+    pub fn texture_diagnostics_json(&self, texture_page: u16, clut: u16) -> String {
+        let mode = texture_page_color_mode(texture_page);
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let (decoded_width, decoded_height) = texture_page_dimensions(texture_page);
+        let raw_width = texture_page_raw_width(texture_page);
+        let entries = texture_palette_entries(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = clut_y(clut) as i32;
+
+        let texture_candidates = texture_origin_candidates(texture_page);
+
+        let texture_candidates_json = texture_candidates
+            .iter()
+            .map(|candidate| self.texture_origin_diagnostics_json(texture_page, *candidate))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut palette_candidates = Vec::new();
+        push_unique_origin(&mut palette_candidates, "requested", clut_x, clut_y);
+        push_unique_origin(
+            &mut palette_candidates,
+            "requested_y16_base",
+            clut_x,
+            clut_y & !0x0f,
+        );
+        push_unique_origin(
+            &mut palette_candidates,
+            "requested_y32_base",
+            clut_x,
+            clut_y & !0x1f,
+        );
+        push_unique_origin(
+            &mut palette_candidates,
+            "requested_prev_row",
+            clut_x,
+            clut_y.saturating_sub(16),
+        );
+        push_unique_origin(
+            &mut palette_candidates,
+            "requested_next_row",
+            clut_x,
+            clut_y.saturating_add(16),
+        );
+        push_unique_origin(&mut palette_candidates, "left_alias", clut_x - 16, clut_y);
+        push_unique_origin(&mut palette_candidates, "right_alias", clut_x + 16, clut_y);
+
+        if entries == 256 {
+            for x in [384, 400, 416, 432, 448, 464, 480, 496] {
+                push_unique_origin(
+                    &mut palette_candidates,
+                    "tiled_256_y32_base",
+                    x,
+                    clut_y & !0x1f,
+                );
+                push_unique_origin(
+                    &mut palette_candidates,
+                    "tiled_256_y16_base",
+                    x,
+                    clut_y & !0x0f,
+                );
+            }
+            if let Some(candidate) =
+                fallback_tiled_256_palette_candidate(&self.raw_pixels, texture_page, clut)
+            {
+                push_unique_origin(
+                    &mut palette_candidates,
+                    "resolved_tiled_256",
+                    candidate.x,
+                    candidate.y,
+                );
+            }
+        }
+
+        let palette_candidates_json = palette_candidates
+            .iter()
+            .map(|candidate| self.palette_origin_diagnostics_json(*candidate, entries))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "{{\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"mode\":{},\"decoded_width\":{},\"decoded_height\":{},\"raw_width\":{},\"raw_height\":256,\"resolved_origin\":{{\"x\":{},\"y\":{}}},\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"clut_origin\":{{\"x\":{},\"y\":{}}},\"palette_entries\":{},\"texture_candidates\":[{}],\"palette_candidates\":[{}]}}",
+            texture_page,
+            texture_page,
+            mode,
+            decoded_width,
+            decoded_height,
+            raw_width,
+            page_x,
+            page_y,
+            clut,
+            clut,
+            clut_x,
+            clut_y,
+            entries,
+            texture_candidates_json,
+            palette_candidates_json
+        )
+    }
+
+    fn texture_origin_diagnostics_json(
+        &self,
+        texture_page: u16,
+        candidate: OriginCandidate,
+    ) -> String {
+        let mode = texture_page_color_mode(texture_page);
+        let raw_width = texture_page_raw_width(texture_page);
+        let raw_height = 256;
+        let mut nonzero_words = 0usize;
+        let mut zero_words = 0usize;
+        let mut outside_words = 0usize;
+        let mut first_nonzero = None;
+        let mut last_nonzero = None;
+        let mut checksum = 2_166_136_261u32;
+        let mut index_hist = [0usize; 256];
+        let mut index_nonzero_samples = 0usize;
+        let mut low_byte_nonzero_samples = 0usize;
+        let mut high_byte_nonzero_samples = 0usize;
+
+        for y in 0..raw_height {
+            for x in 0..raw_width {
+                let raw_x = candidate.x + x as i32;
+                let raw_y = candidate.y + y as i32;
+                if raw_x < 0
+                    || raw_y < 0
+                    || raw_x >= VRAM_WIDTH as i32
+                    || raw_y >= VRAM_HEIGHT as i32
+                {
+                    outside_words = outside_words.saturating_add(1);
+                    continue;
+                }
+
+                let word = self.raw_pixel(raw_x, raw_y);
+                checksum ^= u32::from(word);
+                checksum = checksum.wrapping_mul(16_777_619);
+                if word == 0 {
+                    zero_words = zero_words.saturating_add(1);
+                } else {
+                    nonzero_words = nonzero_words.saturating_add(1);
+                    first_nonzero.get_or_insert((raw_x, raw_y, word));
+                    last_nonzero = Some((raw_x, raw_y, word));
+                }
+
+                match mode {
+                    0 => {
+                        for shift in [0, 4, 8, 12] {
+                            let index = ((word >> shift) & 0x0f) as usize;
+                            index_hist[index] = index_hist[index].saturating_add(1);
+                            if index != 0 {
+                                index_nonzero_samples = index_nonzero_samples.saturating_add(1);
+                            }
+                        }
+                    }
+                    1 => {
+                        let low = (word & 0x00ff) as usize;
+                        let high = (word >> 8) as usize;
+                        index_hist[low] = index_hist[low].saturating_add(1);
+                        index_hist[high] = index_hist[high].saturating_add(1);
+                        if low != 0 {
+                            index_nonzero_samples = index_nonzero_samples.saturating_add(1);
+                            low_byte_nonzero_samples = low_byte_nonzero_samples.saturating_add(1);
+                        }
+                        if high != 0 {
+                            index_nonzero_samples = index_nonzero_samples.saturating_add(1);
+                            high_byte_nonzero_samples = high_byte_nonzero_samples.saturating_add(1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let index_hist_json = match mode {
+            0 => format_index_hist_json(&index_hist[..16], false),
+            1 => format_index_hist_json(&index_hist, true),
+            _ => "[]".to_string(),
+        };
+        let unique_index_count = index_hist.iter().filter(|count| **count != 0).count();
+
+        format!(
+            "{{\"label\":\"{}\",\"x\":{},\"y\":{},\"raw_width\":{},\"raw_height\":{},\"nonzero_words\":{},\"zero_words\":{},\"outside_words\":{},\"first_nonzero\":{},\"last_nonzero\":{},\"checksum\":{},\"checksum_hex\":\"0x{:08x}\",\"unique_index_count\":{},\"index_nonzero_samples\":{},\"low_byte_nonzero_samples\":{},\"high_byte_nonzero_samples\":{},\"index_hist\":{}}}",
+            candidate.label,
+            candidate.x,
+            candidate.y,
+            raw_width,
+            raw_height,
+            nonzero_words,
+            zero_words,
+            outside_words,
+            optional_raw_sample_json(first_nonzero),
+            optional_raw_sample_json(last_nonzero),
+            checksum,
+            checksum,
+            unique_index_count,
+            index_nonzero_samples,
+            low_byte_nonzero_samples,
+            high_byte_nonzero_samples,
+            index_hist_json
+        )
+    }
+
+    fn palette_origin_diagnostics_json(
+        &self,
+        candidate: OriginCandidate,
+        entries: usize,
+    ) -> String {
+        let scan_entries = entries.clamp(0, 256);
+        let mut nonzero_entries = 0usize;
+        let mut zero_entries = 0usize;
+        let mut outside_entries = 0usize;
+        let mut unique_colors = Vec::<u16>::new();
+        let mut checksum = 2_166_136_261u32;
+        let tiled = scan_entries == 256 && candidate.label.contains("tiled");
+
+        for index in 0..scan_entries {
+            let (x, y) = if tiled {
+                (
+                    candidate.x + (index & 0x0f) as i32,
+                    candidate.y + (index / 16) as i32,
+                )
+            } else {
+                (candidate.x + index as i32, candidate.y)
+            };
+
+            if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
+                outside_entries = outside_entries.saturating_add(1);
+                continue;
+            }
+
+            let color = self.raw_pixel(x, y);
+            checksum ^= u32::from(color);
+            checksum = checksum.wrapping_mul(16_777_619);
+            if color == 0 {
+                zero_entries = zero_entries.saturating_add(1);
+            } else {
+                nonzero_entries = nonzero_entries.saturating_add(1);
+            }
+            if unique_colors.len() < 32 && !unique_colors.contains(&color) {
+                unique_colors.push(color);
+            }
+        }
+
+        let unique_json = unique_colors
+            .iter()
+            .map(|color| format!("\"0x{color:04x}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "{{\"label\":\"{}\",\"x\":{},\"y\":{},\"entries\":{},\"tiled\":{},\"nonzero_entries\":{},\"zero_entries\":{},\"outside_entries\":{},\"unique_color_count_capped\":{},\"unique_colors\":[{}],\"checksum\":{},\"checksum_hex\":\"0x{:08x}\"}}",
+            candidate.label,
+            candidate.x,
+            candidate.y,
+            scan_entries,
+            tiled,
+            nonzero_entries,
+            zero_entries,
+            outside_entries,
+            unique_colors.len(),
+            unique_json,
+            checksum,
+            checksum
+        )
+    }
+
+    fn palette_region_png(
+        &self,
+        origin_x: i32,
+        origin_y: i32,
+        palette_entries: usize,
+        tiled_256: bool,
+    ) -> Vec<u8> {
         let columns = palette_entries.min(16);
         let rows = palette_entries.div_ceil(columns);
         let cell_size = 8usize;
         let width = columns * cell_size;
         let height = rows * cell_size;
-        let clut_x = ((clut & 0x3f) as i32) * 16;
-        let clut_y = clut_y(clut) as i32;
         let mut pixels = vec![0; width.saturating_mul(height)];
         for index in 0..palette_entries {
-            let color = rgb555_to_rgb888(self.raw_pixel(clut_x + index as i32, clut_y));
+            let color = if tiled_256 && palette_entries == 256 {
+                let col = (index & 0x0f) as i32;
+                let row = (index / 16) as i32;
+                rgb555_to_rgb888(self.raw_pixel(origin_x + col, origin_y + row))
+            } else {
+                rgb555_to_rgb888(self.raw_pixel(origin_x + index as i32, origin_y))
+            };
             let cell_x = (index % columns) * cell_size;
             let cell_y = (index / columns) * cell_size;
             for y in 0..cell_size {
@@ -699,10 +1407,27 @@ impl NativeFrameBuffer {
         width: usize,
         height: usize,
     ) -> Vec<u8> {
+        self.psx_display_png_with_depth(start_x, start_y, width, height, false)
+    }
+
+    pub fn psx_display_png_with_depth(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+        rgb24: bool,
+    ) -> Vec<u8> {
         png_rgb(
             width.max(1),
             height.max(1),
-            &self.psx_display_rgb_rows(start_x, start_y, width.max(1), height.max(1)),
+            &self.psx_display_rgb_rows_with_depth(
+                start_x,
+                start_y,
+                width.max(1),
+                height.max(1),
+                rgb24,
+            ),
         )
     }
 
@@ -714,6 +1439,17 @@ impl NativeFrameBuffer {
         height: usize,
     ) -> String {
         base64_encode(&self.psx_display_png(start_x, start_y, width, height))
+    }
+
+    pub fn psx_display_png_base64_with_depth(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+        rgb24: bool,
+    ) -> String {
+        base64_encode(&self.psx_display_png_with_depth(start_x, start_y, width, height, rgb24))
     }
 
     pub fn rgb_window(
@@ -748,17 +1484,57 @@ impl NativeFrameBuffer {
         width: usize,
         height: usize,
     ) -> Vec<u32> {
+        self.psx_display_rgb_window_with_depth(start_x, start_y, width, height, false)
+    }
+
+    pub fn psx_display_rgb_window_with_depth(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+        rgb24: bool,
+    ) -> Vec<u32> {
         let width = width.max(1);
         let height = height.max(1);
         let mut pixels = Vec::with_capacity(width * height);
         for y in 0..height {
-            let source_y = (start_y + y) % PSX_VRAM_HEIGHT;
             for x in 0..width {
-                let source_x = (start_x + x) % VRAM_WIDTH;
-                pixels.push(self.pixels[source_y * VRAM_WIDTH + source_x]);
+                pixels.push(self.psx_display_pixel(start_x, start_y, x, y, rgb24));
             }
         }
         pixels
+    }
+
+    pub fn psx_display_pixel(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        x: usize,
+        y: usize,
+        rgb24: bool,
+    ) -> u32 {
+        let source_y = (start_y + y) % PSX_VRAM_HEIGHT;
+        if !rgb24 {
+            let source_x = (start_x + x) % VRAM_WIDTH;
+            return self.pixels[source_y * VRAM_WIDTH + source_x];
+        }
+
+        let byte_offset = x.saturating_mul(3);
+        let r = self.psx_display_byte(start_x, source_y, byte_offset);
+        let g = self.psx_display_byte(start_x, source_y, byte_offset + 1);
+        let b = self.psx_display_byte(start_x, source_y, byte_offset + 2);
+        (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+    }
+
+    fn psx_display_byte(&self, start_x: usize, source_y: usize, byte_offset: usize) -> u8 {
+        let word_x = (start_x + byte_offset / 2) % VRAM_WIDTH;
+        let raw = self.raw_pixels[source_y * VRAM_WIDTH + word_x];
+        if byte_offset & 1 == 0 {
+            (raw & 0x00ff) as u8
+        } else {
+            (raw >> 8) as u8
+        }
     }
 
     pub fn display_stats(
@@ -831,6 +1607,17 @@ impl NativeFrameBuffer {
         width: usize,
         height: usize,
     ) -> FrameBufferStats {
+        self.psx_display_stats_with_depth(start_x, start_y, width, height, false)
+    }
+
+    pub fn psx_display_stats_with_depth(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+        rgb24: bool,
+    ) -> FrameBufferStats {
         let width = width.max(1);
         let height = height.max(1);
         let pixel_count = (width as u64).saturating_mul(height as u64);
@@ -842,11 +1629,9 @@ impl NativeFrameBuffer {
         let mut checksum = 0x811c_9dc5_u32;
         let mut previous_row_luma = vec![0_u8; width];
         for y in 0..height {
-            let source_y = (start_y + y) % PSX_VRAM_HEIGHT;
             let mut previous_luma = 0_u8;
             for x in 0..width {
-                let source_x = (start_x + x) % VRAM_WIDTH;
-                let rgb = self.pixels[source_y * VRAM_WIDTH + source_x];
+                let rgb = self.psx_display_pixel(start_x, start_y, x, y, rgb24);
                 if rgb != 0 {
                     nonzero_pixels += 1;
                 }
@@ -1046,20 +1831,19 @@ impl NativeFrameBuffer {
         rows
     }
 
-    fn psx_display_rgb_rows(
+    fn psx_display_rgb_rows_with_depth(
         &self,
         start_x: usize,
         start_y: usize,
         width: usize,
         height: usize,
+        rgb24: bool,
     ) -> Vec<u8> {
         let mut rows = Vec::with_capacity(height * (1 + width * 3));
         for y in 0..height {
             rows.push(0);
-            let source_y = (start_y + y) % PSX_VRAM_HEIGHT;
             for x in 0..width {
-                let source_x = (start_x + x) % VRAM_WIDTH;
-                let rgb = self.pixels[source_y * VRAM_WIDTH + source_x];
+                let rgb = self.psx_display_pixel(start_x, start_y, x, y, rgb24);
                 rows.push(((rgb >> 16) & 0xff) as u8);
                 rows.push(((rgb >> 8) & 0xff) as u8);
                 rows.push((rgb & 0xff) as u8);
@@ -1170,6 +1954,12 @@ pub struct TexturedDrawStats {
     pub written_pixels: u64,
     pub clipped_pixels: u64,
     pub transparent_pixels: u64,
+    pub texture_nonzero_samples: u64,
+    pub zero_texel_samples: u64,
+    pub clut_nonzero_samples: u64,
+    pub clut_blank_samples: u64,
+    pub palette_fallback_samples: u64,
+    pub nonzero_texel_transparent_samples: u64,
     pub first_color: u16,
     pub last_color: u16,
     pub color_hash: u32,
@@ -1177,6 +1967,52 @@ pub struct TexturedDrawStats {
 }
 
 impl TexturedDrawStats {
+    pub fn json(self) -> String {
+        format!(
+            "{{\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"texture_nonzero_samples\":{},\"zero_texel_samples\":{},\"clut_nonzero_samples\":{},\"clut_blank_samples\":{},\"palette_fallback_samples\":{},\"nonzero_texel_transparent_samples\":{},\"first_color\":{},\"first_color_hex\":\"0x{:04x}\",\"last_color\":{},\"last_color_hex\":\"0x{:04x}\",\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
+            self.sampled_pixels,
+            self.drawn_pixels,
+            self.written_pixels,
+            self.clipped_pixels,
+            self.transparent_pixels,
+            self.texture_nonzero_samples,
+            self.zero_texel_samples,
+            self.clut_nonzero_samples,
+            self.clut_blank_samples,
+            self.palette_fallback_samples,
+            self.nonzero_texel_transparent_samples,
+            self.first_color,
+            self.first_color,
+            self.last_color,
+            self.last_color,
+            self.color_hash,
+            self.color_hash,
+            self.color_changes
+        )
+    }
+
+    fn record_sample(&mut self, sample: TextureSample) {
+        if sample.texture_nonzero {
+            self.texture_nonzero_samples = self.texture_nonzero_samples.saturating_add(1);
+        }
+        if sample.zero_texel {
+            self.zero_texel_samples = self.zero_texel_samples.saturating_add(1);
+        }
+        if sample.clut_nonzero {
+            self.clut_nonzero_samples = self.clut_nonzero_samples.saturating_add(1);
+        }
+        if sample.clut_blank {
+            self.clut_blank_samples = self.clut_blank_samples.saturating_add(1);
+        }
+        if sample.palette_fallback {
+            self.palette_fallback_samples = self.palette_fallback_samples.saturating_add(1);
+        }
+        if sample.texture_nonzero && sample.color == 0 {
+            self.nonzero_texel_transparent_samples =
+                self.nonzero_texel_transparent_samples.saturating_add(1);
+        }
+    }
+
     fn record_color(&mut self, color: u16) {
         if self.drawn_pixels == 0 {
             self.first_color = color;
@@ -1187,6 +2023,16 @@ impl TexturedDrawStats {
         self.color_hash ^= u32::from(color);
         self.color_hash = self.color_hash.wrapping_mul(16_777_619);
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TextureSample {
+    color: u16,
+    texture_nonzero: bool,
+    zero_texel: bool,
+    clut_nonzero: bool,
+    clut_blank: bool,
+    palette_fallback: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1205,6 +2051,7 @@ pub struct TextureDrawOptions {
     pub check_mask_bit: bool,
     pub texture_flip_x: bool,
     pub texture_flip_y: bool,
+    pub allow_palette_fallback: bool,
 }
 
 impl TextureDrawOptions {
@@ -1218,14 +2065,19 @@ impl TextureDrawOptions {
             check_mask_bit: false,
             texture_flip_x: false,
             texture_flip_y: false,
+            allow_palette_fallback: true,
         }
     }
 
     fn apply_color(self, color: u16) -> u16 {
+        self.apply_color_with_primitive(color, self.primitive_color)
+    }
+
+    fn apply_color_with_primitive(self, color: u16, primitive_color: u32) -> u16 {
         if self.raw_texture {
             return color;
         }
-        modulate_rgb555(color, self.primitive_color)
+        modulate_rgb555(color, primitive_color)
     }
 }
 
@@ -1245,6 +2097,13 @@ impl TextureWindow {
             offset_x: (((value >> 10) & 0x1f) as u8) << 3,
             offset_y: (((value >> 15) & 0x1f) as u8) << 3,
         }
+    }
+
+    pub fn json(self) -> String {
+        format!(
+            "{{\"mask_x\":{},\"mask_y\":{},\"offset_x\":{},\"offset_y\":{}}}",
+            self.mask_x, self.mask_y, self.offset_x, self.offset_y
+        )
     }
 
     fn apply(self, u: u8, v: u8) -> (u8, u8) {
@@ -1396,8 +2255,911 @@ fn modulate_rgb555(color: u16, primitive_color: u32) -> u16 {
     (color & 0x8000) | r | (g << 5) | (b << 10)
 }
 
+fn interpolate_psx_rgb(colors: [u32; 3], w0: i64, w1: i64, w2: i64, denom: i64) -> u32 {
+    let denom = denom.max(1);
+    let channel = |shift: u32| -> u32 {
+        (((i64::from((colors[0] >> shift) & 0xff) * w0)
+            + (i64::from((colors[1] >> shift) & 0xff) * w1)
+            + (i64::from((colors[2] >> shift) & 0xff) * w2))
+            / denom)
+            .clamp(0, 0xff) as u32
+    };
+    channel(0) | (channel(8) << 8) | (channel(16) << 16)
+}
+
+fn psx_rgb_to_rgb888(value: u32) -> u32 {
+    let r = value & 0xff;
+    let g = (value >> 8) & 0xff;
+    let b = (value >> 16) & 0xff;
+    (r << 16) | (g << 8) | b
+}
+
 fn clut_y(clut: u16) -> u16 {
     (clut >> 6) & 0x03ff
+}
+
+pub fn texture_page_origin_for_diagnostics(texture_page: u16) -> (i32, i32) {
+    texture_page_origin(texture_page)
+}
+
+pub fn texture_page_color_mode_for_diagnostics(texture_page: u16) -> u16 {
+    texture_page_color_mode(texture_page)
+}
+
+pub fn clut_origin_for_diagnostics(clut: u16) -> (i32, i32) {
+    (((clut & 0x3f) as i32) * 16, clut_y(clut) as i32)
+}
+
+fn raw_pixel_from(raw_pixels: &[u16], x: i32, y: i32) -> u16 {
+    if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
+        return 0;
+    }
+
+    raw_pixels
+        .get(y as usize * VRAM_WIDTH + x as usize)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OriginCandidate {
+    label: &'static str,
+    x: i32,
+    y: i32,
+}
+
+fn texture_origin_candidates(texture_page: u16) -> Vec<OriginCandidate> {
+    let (page_x, page_y) = texture_page_origin(texture_page);
+    let standard_x = ((texture_page & 0x0f) as i32) * 64;
+    let standard_y = texture_page_y(texture_page) as i32;
+    let extended_x = (((texture_page >> 10) & 0x0f) as i32) * 64;
+    let extended_low3_x = (((texture_page >> 10) & 0x07) as i32) * 64;
+    let extended_y = (((texture_page >> 9) & 0x01) as i32) * 256;
+
+    let mut candidates = Vec::new();
+    push_unique_origin(&mut candidates, "resolved", page_x, page_y);
+    push_unique_origin(&mut candidates, "resolved_minus_64", page_x - 64, page_y);
+    push_unique_origin(&mut candidates, "resolved_plus_64", page_x + 64, page_y);
+    push_unique_origin(&mut candidates, "psx_standard", standard_x, standard_y);
+    push_unique_origin(&mut candidates, "standard_y0", standard_x, 0);
+    push_unique_origin(&mut candidates, "standard_y256", standard_x, 256);
+    push_unique_origin(&mut candidates, "zn_extended_bits", extended_x, extended_y);
+    push_unique_origin(
+        &mut candidates,
+        "zn_extended_low3_bits",
+        extended_low3_x,
+        extended_y,
+    );
+    push_unique_origin(&mut candidates, "resolved_y0", page_x, 0);
+    push_unique_origin(&mut candidates, "resolved_y256", page_x, 256);
+    candidates
+}
+
+fn push_unique_origin(candidates: &mut Vec<OriginCandidate>, label: &'static str, x: i32, y: i32) {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.x == x && candidate.y == y)
+    {
+        return;
+    }
+    candidates.push(OriginCandidate { label, x, y });
+}
+
+fn optional_raw_sample_json(sample: Option<(i32, i32, u16)>) -> String {
+    sample.map_or_else(
+        || "null".to_string(),
+        |(x, y, value)| {
+            format!(
+                "{{\"x\":{},\"y\":{},\"value\":{},\"value_hex\":\"0x{:04x}\"}}",
+                x, y, value, value
+            )
+        },
+    )
+}
+
+fn format_index_hist_json(hist: &[usize], sparse: bool) -> String {
+    format!(
+        "[{}]",
+        hist.iter()
+            .enumerate()
+            .filter(|(_, count)| !sparse || **count != 0)
+            .map(|(index, count)| format!("{{\"index\":{},\"count\":{}}}", index, count))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn palette_raw_pixel_from(raw_pixels: &[u16], clut: u16, index: i32) -> u16 {
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    raw_pixel_from(raw_pixels, clut_x + index, clut_y(clut) as i32)
+}
+
+fn indexed_palette_sample_from(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    index: i32,
+    entries: usize,
+    allow_palette_fallback: bool,
+) -> TextureSample {
+    let color = palette_raw_pixel_from(raw_pixels, clut, index);
+    let mut sample = TextureSample {
+        color,
+        texture_nonzero: index != 0,
+        zero_texel: index == 0,
+        clut_nonzero: color != 0,
+        ..TextureSample::default()
+    };
+    if index == 0 {
+        if native_palette_index_zero_transparent(texture_page, color) {
+            sample.color = 0;
+            sample.clut_nonzero = false;
+        }
+        return sample;
+    }
+
+    let requested_stats = palette_row_stats(raw_pixels, clut, entries);
+    sample.clut_blank = requested_stats.nonzero_entries == 0;
+    if entries == 16
+        && let Some(fallback) =
+            fallback_zn_4bpp_palette_sample(raw_pixels, texture_page, clut, index)
+        && should_use_zn_4bpp_palette_sample(
+            texture_page,
+            clut,
+            allow_palette_fallback,
+            requested_stats.nonzero_entries,
+            requested_stats.unique_entries,
+            fallback.nonzero_entries,
+            fallback.unique_entries,
+        )
+    {
+        sample.color = fallback.color;
+        sample.palette_fallback = true;
+        sample.clut_nonzero = fallback.color != 0;
+        return sample;
+    }
+
+    if allow_palette_fallback && entries == 256 && native_force_y16_base_256_palette() {
+        let color = palette_y16_base_raw_pixel_from(raw_pixels, clut, index);
+        sample.color = color;
+        sample.palette_fallback = true;
+        sample.clut_nonzero = color != 0;
+        return sample;
+    }
+
+    if entries == 256
+        && let Some(fallback) =
+            fallback_tiled_256_palette_sample(raw_pixels, texture_page, clut, index)
+        && should_use_tiled_256_palette_sample(
+            texture_page,
+            clut,
+            allow_palette_fallback,
+            requested_stats.nonzero_entries,
+            fallback.nonzero_entries,
+            color,
+        )
+    {
+        sample.color = fallback.color;
+        sample.palette_fallback = true;
+        sample.clut_nonzero = fallback.color != 0;
+        return sample;
+    }
+
+    if color != 0 {
+        return sample;
+    }
+
+    if !sample.clut_blank {
+        return sample;
+    }
+
+    if !allow_palette_fallback {
+        return sample;
+    }
+
+    if let Some(fallback) =
+        fallback_palette_raw_pixel_from(raw_pixels, texture_page, clut, index, entries)
+    {
+        sample.color = fallback;
+        sample.palette_fallback = true;
+    }
+    sample
+}
+
+fn palette_row_nonzero_entries(raw_pixels: &[u16], clut: u16, entries: usize) -> usize {
+    palette_row_stats(raw_pixels, clut, entries).nonzero_entries
+}
+
+fn palette_row_stats(raw_pixels: &[u16], clut: u16, entries: usize) -> PaletteRegionStats {
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    let clut_y = clut_y(clut) as i32;
+    palette_region_stats(raw_pixels, clut_x, clut_y, entries).unwrap_or_default()
+}
+
+fn palette_y16_base_raw_pixel_from(raw_pixels: &[u16], clut: u16, index: i32) -> u16 {
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    let clut_y = (clut_y(clut) as i32) & !0x0f;
+    raw_pixel_from(raw_pixels, clut_x + index, clut_y)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PaletteRegionStats {
+    nonzero_entries: usize,
+    unique_entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinearPaletteSample {
+    color: u16,
+    nonzero_entries: usize,
+    unique_entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinearPaletteCandidate {
+    x: i32,
+    y: i32,
+    nonzero_entries: usize,
+    unique_entries: usize,
+}
+
+fn palette_region_stats(
+    raw_pixels: &[u16],
+    x: i32,
+    y: i32,
+    entries: usize,
+) -> Option<PaletteRegionStats> {
+    if x < 0 || y < 0 || x + entries as i32 > VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
+        return None;
+    }
+
+    let mut unique = [0_u16; 256];
+    let mut unique_entries = 0usize;
+    let mut nonzero_entries = 0usize;
+    for offset in 0..entries {
+        let color = raw_pixel_from(raw_pixels, x + offset as i32, y);
+        if color != 0 {
+            nonzero_entries = nonzero_entries.saturating_add(1);
+        }
+        if !unique[..unique_entries].contains(&color) {
+            unique[unique_entries] = color;
+            unique_entries = unique_entries.saturating_add(1);
+        }
+    }
+
+    Some(PaletteRegionStats {
+        nonzero_entries,
+        unique_entries,
+    })
+}
+
+fn fallback_zn_4bpp_palette_sample(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    index: i32,
+) -> Option<LinearPaletteSample> {
+    let candidate = fallback_zn_4bpp_palette_candidate(raw_pixels, texture_page, clut)?;
+
+    Some(LinearPaletteSample {
+        color: raw_pixel_from(raw_pixels, candidate.x + index, candidate.y),
+        nonzero_entries: candidate.nonzero_entries,
+        unique_entries: candidate.unique_entries,
+    })
+}
+
+fn fallback_zn_4bpp_palette_candidate(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+) -> Option<LinearPaletteCandidate> {
+    if texture_page_color_mode(texture_page) != 0
+        || (texture_page & 0x0200 == 0 && texture_page & 0x2000 == 0)
+    {
+        return None;
+    }
+
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    let clut_y = clut_y(clut) as i32;
+    if clut_y < 480 {
+        return None;
+    }
+
+    for y in [
+        clut_y & !0x0f,
+        clut_y & !0x1f,
+        clut_y.saturating_sub(16),
+        clut_y.saturating_add(16),
+    ] {
+        if y == clut_y {
+            continue;
+        }
+        let Some(stats) = palette_region_stats(raw_pixels, clut_x, y, 16) else {
+            continue;
+        };
+        if stats.nonzero_entries < 12 || stats.unique_entries < 8 {
+            continue;
+        }
+        return Some(LinearPaletteCandidate {
+            x: clut_x,
+            y,
+            nonzero_entries: stats.nonzero_entries,
+            unique_entries: stats.unique_entries,
+        });
+    }
+
+    None
+}
+
+fn should_use_zn_4bpp_palette_sample(
+    texture_page: u16,
+    clut: u16,
+    allow_palette_fallback: bool,
+    requested_nonzero_entries: usize,
+    requested_unique_entries: usize,
+    fallback_nonzero_entries: usize,
+    fallback_unique_entries: usize,
+) -> bool {
+    if !allow_palette_fallback || texture_page_color_mode(texture_page) != 0 {
+        return false;
+    }
+
+    let clut_y = clut_y(clut) as i32;
+    if clut_y < 480 || (texture_page & 0x0200 == 0 && texture_page & 0x2000 == 0) {
+        return false;
+    }
+
+    // ZN title/character pages sometimes point 4bpp sprites at a sparse row
+    // inside a 16-row CLUT upload block. Do not override valid 15/16-color
+    // rows; only recover visibly sparse rows like 0x7c80 used by BR2 portraits.
+    (requested_nonzero_entries <= 8 || requested_unique_entries <= 6)
+        && fallback_nonzero_entries >= 12
+        && fallback_unique_entries >= 8
+}
+
+fn fallback_palette_raw_pixel_from(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    index: i32,
+    entries: usize,
+) -> Option<u16> {
+    if entries == 256 {
+        return fallback_tiled_256_palette_raw_pixel_from(raw_pixels, texture_page, clut, index);
+    }
+
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    let clut_y = clut_y(clut) as i32;
+    let offsets = fallback_palette_alias_offsets(entries);
+
+    offsets.iter().find_map(|(dx, dy)| {
+        let x = clut_x + dx;
+        let y = clut_y + dy;
+        if x < 0 || y < 0 || x + entries as i32 > VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
+            return None;
+        }
+        let nonzero_entries = (0..entries as i32)
+            .filter(|offset| raw_pixel_from(raw_pixels, x + offset, y) != 0)
+            .count();
+        if nonzero_entries < fallback_palette_min_nonzero_entries(entries) {
+            return None;
+        }
+        let color = raw_pixel_from(raw_pixels, x + index, y);
+        (color != 0).then_some(color)
+    })
+}
+
+fn fallback_tiled_256_palette_raw_pixel_from(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    index: i32,
+) -> Option<u16> {
+    fallback_tiled_256_palette_sample(raw_pixels, texture_page, clut, index).and_then(|sample| {
+        if sample.color != 0 {
+            Some(sample.color)
+        } else {
+            None
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TiledPaletteSample {
+    color: u16,
+    nonzero_entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TiledPaletteCandidate {
+    x: i32,
+    y: i32,
+    nonzero_entries: usize,
+}
+
+const TILED_256_PALETTE_SWITCH_NONZERO_MARGIN: usize = 96;
+
+fn fallback_tiled_256_palette_sample(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    index: i32,
+) -> Option<TiledPaletteSample> {
+    let row = index / 16;
+    let col = index & 0x0f;
+    let candidate = fallback_tiled_256_palette_candidate(raw_pixels, texture_page, clut)?;
+
+    Some(TiledPaletteSample {
+        color: raw_pixel_from(raw_pixels, candidate.x + col, candidate.y + row),
+        nonzero_entries: candidate.nonzero_entries,
+    })
+}
+
+fn fallback_tiled_256_palette_candidate(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+) -> Option<TiledPaletteCandidate> {
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    let clut_y = clut_y(clut) as i32;
+    let override_x = native_clut_tile_x_override();
+    let preferred_x = override_x.unwrap_or_else(|| preferred_tiled_256_palette_x(texture_page));
+    let preferred_actual_x = if (384..512).contains(&clut_x) {
+        preferred_x
+    } else {
+        clut_x + preferred_x
+    };
+    let lock_preferred_x =
+        override_x.is_none() && locks_preferred_tiled_256_palette_x(texture_page);
+    let x_candidates = tiled_256_palette_x_candidates(clut_x, preferred_x, override_x);
+    let y_candidates = [
+        clut_y & !0x1f,
+        clut_y & !0x0f,
+        clut_y.saturating_sub(16) & !0x0f,
+    ];
+
+    let mut best = None;
+    let mut best_preferred_x = None;
+    for y in y_candidates {
+        for x in x_candidates.iter().copied() {
+            if x < 0 || y < 0 || x + 16 > VRAM_WIDTH as i32 || y + 16 > VRAM_HEIGHT as i32 {
+                continue;
+            }
+            let nonzero_entries = (0..16)
+                .flat_map(|tile_y| (0..16).map(move |tile_x| (tile_x, tile_y)))
+                .filter(|(tile_x, tile_y)| raw_pixel_from(raw_pixels, x + tile_x, y + tile_y) != 0)
+                .count();
+            if nonzero_entries < 64 {
+                continue;
+            }
+
+            let candidate = TiledPaletteCandidate {
+                x,
+                y,
+                nonzero_entries,
+            };
+            best = prefer_tiled_256_palette_candidate(best, candidate);
+            if x == preferred_actual_x {
+                best_preferred_x = if lock_preferred_x {
+                    prefer_locked_tiled_256_palette_candidate(best_preferred_x, candidate)
+                } else {
+                    prefer_tiled_256_palette_candidate(best_preferred_x, candidate)
+                };
+            }
+        }
+    }
+    if lock_preferred_x && best_preferred_x.is_some() {
+        return best_preferred_x;
+    }
+    best
+}
+
+fn tiled_256_palette_x_candidates(
+    clut_x: i32,
+    preferred_x: i32,
+    override_x: Option<i32>,
+) -> Vec<i32> {
+    if let Some(override_x) = override_x {
+        return vec![clut_x + override_x];
+    }
+
+    let mut candidates = Vec::with_capacity(12);
+
+    if (384..512).contains(&clut_x) {
+        // Some ZN commands already point CLUT x into the tiled palette bank.
+        // Treat the bank coordinates as absolute; adding 384 again selects
+        // unrelated texture art around x=800 and produces striped playfields.
+        for x in [
+            clut_x,
+            preferred_x,
+            clut_x - 16,
+            clut_x + 16,
+            384,
+            400,
+            416,
+            432,
+            448,
+            464,
+            480,
+            496,
+        ] {
+            push_unique_i32(&mut candidates, x);
+        }
+    } else {
+        for dx in [preferred_x, 0, 384, 400, 416, 432, 448, 464, 480, 496] {
+            push_unique_i32(&mut candidates, clut_x + dx);
+        }
+    }
+
+    candidates
+}
+
+fn push_unique_i32(values: &mut Vec<i32>, value: i32) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn push_unique_usize(values: &mut Vec<usize>, value: usize) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn prefer_locked_tiled_256_palette_candidate(
+    best: Option<TiledPaletteCandidate>,
+    candidate: TiledPaletteCandidate,
+) -> Option<TiledPaletteCandidate> {
+    let Some(best) = best else {
+        return Some(candidate);
+    };
+
+    // ZN title/intro pages upload 256-color palettes as explicit 16x16 tiles.
+    // When the requested CLUT row lands inside a 32-row block, the block base is
+    // the stable tile origin; the next 16-row band often contains unrelated art
+    // with more nonzero pixels and used to win by density alone.
+    if candidate.y < best.y {
+        return Some(candidate);
+    }
+
+    if candidate.y == best.y
+        && candidate.nonzero_entries
+            >= best
+                .nonzero_entries
+                .saturating_add(TILED_256_PALETTE_SWITCH_NONZERO_MARGIN)
+    {
+        return Some(candidate);
+    }
+
+    Some(best)
+}
+
+fn prefer_tiled_256_palette_candidate(
+    best: Option<TiledPaletteCandidate>,
+    candidate: TiledPaletteCandidate,
+) -> Option<TiledPaletteCandidate> {
+    let Some(best) = best else {
+        return Some(candidate);
+    };
+
+    if candidate.nonzero_entries
+        >= best
+            .nonzero_entries
+            .saturating_add(TILED_256_PALETTE_SWITCH_NONZERO_MARGIN)
+    {
+        Some(candidate)
+    } else {
+        Some(best)
+    }
+}
+
+fn should_prefer_tiled_256_palette(
+    requested_nonzero_entries: usize,
+    tiled_nonzero_entries: usize,
+    requested_color: u16,
+) -> bool {
+    if tiled_nonzero_entries < 64 {
+        return false;
+    }
+    if requested_nonzero_entries == 0 {
+        return true;
+    }
+
+    let sparse_requested = requested_nonzero_entries <= 32;
+    let much_richer_tile =
+        tiled_nonzero_entries >= requested_nonzero_entries.saturating_mul(2).max(64);
+
+    (requested_color == 0 || sparse_requested) && much_richer_tile
+}
+
+fn should_use_tiled_256_palette_sample(
+    texture_page: u16,
+    clut: u16,
+    allow_palette_fallback: bool,
+    requested_nonzero_entries: usize,
+    tiled_nonzero_entries: usize,
+    requested_color: u16,
+) -> bool {
+    if native_force_tiled_256_palette() {
+        return true;
+    }
+
+    if should_force_zn_tiled_256_palette(
+        texture_page,
+        clut,
+        requested_nonzero_entries,
+        tiled_nonzero_entries,
+        requested_color,
+    ) {
+        return true;
+    }
+
+    if !allow_palette_fallback {
+        return false;
+    }
+
+    if should_prefer_tiled_256_palette(
+        requested_nonzero_entries,
+        tiled_nonzero_entries,
+        requested_color,
+    ) {
+        return true;
+    }
+
+    false
+}
+
+fn should_force_zn_tiled_256_palette(
+    texture_page: u16,
+    clut: u16,
+    requested_nonzero_entries: usize,
+    tiled_nonzero_entries: usize,
+    requested_color: u16,
+) -> bool {
+    let texture_mode = (texture_page >> 7) & 0x03;
+    if texture_mode != 1 {
+        return false;
+    }
+
+    if texture_page & 0x0200 == 0 && texture_page & 0x2000 == 0 {
+        return false;
+    }
+
+    let clut_y = clut_y(clut);
+    if !(480..512).contains(&clut_y) {
+        return false;
+    }
+
+    if texture_page & 0x2000 != 0
+        && texture_page_uses_zn_extended_origin(texture_page)
+        && requested_color == 0
+        && requested_nonzero_entries <= 32
+    {
+        return tiled_nonzero_entries >= 128;
+    }
+
+    if requested_nonzero_entries < 128 {
+        return false;
+    }
+
+    tiled_nonzero_entries >= 128
+        && tiled_nonzero_entries >= requested_nonzero_entries.saturating_add(48)
+}
+
+fn preferred_tiled_256_palette_x(texture_page: u16) -> i32 {
+    let texture_mode = (texture_page >> 7) & 0x03;
+    if texture_mode == 1 && texture_page & 0x0200 != 0 && texture_page & 0x0010 != 0 {
+        let low_bank_page = ((texture_page & 0x000e) as i32 - 8).max(0) / 2;
+        return 384 + low_bank_page * 16;
+    }
+    384
+}
+
+fn locks_preferred_tiled_256_palette_x(texture_page: u16) -> bool {
+    let texture_mode = (texture_page >> 7) & 0x03;
+    texture_mode == 1 && texture_page & 0x0200 != 0 && texture_page & 0x0010 != 0
+}
+
+fn native_clut_tile_x_override() -> Option<i32> {
+    static OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_CLUT_TILE_X")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+    })
+}
+
+fn native_force_tiled_256_palette() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_FORCE_TILED_256_PALETTE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_force_y16_base_256_palette() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_FORCE_Y16_BASE_256_PALETTE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn fallback_palette_alias_offsets(entries: usize) -> &'static [(i32, i32)] {
+    match entries {
+        16 => &[
+            (0, -16),
+            (16, 0),
+            (-16, 0),
+            (0, 16),
+            (16, -16),
+            (-16, -16),
+            (16, 16),
+            (-16, 16),
+        ],
+        256 => &[],
+        _ => &[],
+    }
+}
+
+fn fallback_palette_min_nonzero_entries(entries: usize) -> usize {
+    match entries {
+        16 => entries.saturating_sub(1),
+        256 => 16,
+        _ => usize::MAX,
+    }
+}
+
+fn texture_page_raw_bounds(texture_page: u16) -> (i32, i32, i32, i32) {
+    let (page_x, page_y) = texture_page_origin(texture_page);
+    let raw_width = texture_page_raw_width(texture_page) as i32;
+    (page_x, page_y, page_x + raw_width - 1, page_y + 256 - 1)
+}
+
+fn texture_page_raw_width(texture_page: u16) -> usize {
+    match texture_page_color_mode(texture_page) {
+        0 => 64,
+        1 => 128,
+        _ => 256,
+    }
+}
+
+fn texture_palette_raw_bounds(texture_page: u16, clut: u16) -> Option<(i32, i32, i32, i32)> {
+    let entries = texture_palette_entries(texture_page);
+    if entries == 0 {
+        return None;
+    }
+    let left = ((clut & 0x3f) as i32) * 16;
+    let top = clut_y(clut) as i32;
+    Some((left, top, left + entries as i32 - 1, top))
+}
+
+fn texture_page_origin(texture_page: u16) -> (i32, i32) {
+    if texture_page_uses_zn_extended_origin(texture_page) {
+        let page_x_bits = if native_mask_extended_texture_x_high_bit() {
+            (texture_page >> 10) & 0x07
+        } else {
+            (texture_page >> 10) & 0x0f
+        };
+        let page_x = (page_x_bits as i32) * 64;
+        let page_y = if native_force_extended_texture_y0_alias() {
+            0
+        } else {
+            (((texture_page >> 9) & 0x01) as i32) * 256
+        };
+        return (page_x, page_y);
+    }
+
+    if texture_page_uses_zn_low_bank_y0_alias(texture_page) {
+        return (
+            low_bank_y0_alias_page_x(texture_page, native_low_bank_y0_alias_preserves_odd_x()),
+            0,
+        );
+    }
+
+    if texture_page_uses_zn_4bpp_title_y0_alias(texture_page) {
+        return (((texture_page & 0x0f) as i32) * 64, 0);
+    }
+
+    if native_force_4bpp_y0_alias() {
+        let texture_mode = (texture_page >> 7) & 0x03;
+        if texture_mode == 0 && texture_page & 0x0010 != 0 && texture_page & 0x0800 == 0 {
+            return (((texture_page & 0x0f) as i32) * 64, 0);
+        }
+    }
+
+    (
+        ((texture_page & 0x0f) as i32) * 64,
+        texture_page_y(texture_page) as i32,
+    )
+}
+
+fn low_bank_y0_alias_page_x(texture_page: u16, preserve_odd_x: bool) -> i32 {
+    let page_bits = if preserve_odd_x {
+        texture_page & 0x0f
+    } else {
+        texture_page & 0x0e
+    };
+    page_bits as i32 * 64
+}
+
+fn texture_page_uses_zn_extended_origin(texture_page: u16) -> bool {
+    texture_page & 0x2000 != 0 && texture_page & 0x0e00 != 0
+}
+
+fn texture_page_uses_zn_low_bank_y0_alias(texture_page: u16) -> bool {
+    if native_disable_low_bank_y0_alias() {
+        return false;
+    }
+
+    let texture_mode = (texture_page >> 7) & 0x03;
+    texture_mode == 1
+        && texture_page & 0x0200 != 0
+        && texture_page & 0x0010 != 0
+        && texture_page & 0x0800 == 0
+}
+
+fn texture_page_uses_zn_4bpp_title_y0_alias(texture_page: u16) -> bool {
+    if native_disable_4bpp_title_y0_alias() {
+        return false;
+    }
+
+    let texture_mode = (texture_page >> 7) & 0x03;
+    texture_mode == 0 && matches!(texture_page, 0x0039 | 0x003f)
+}
+
+fn native_disable_low_bank_y0_alias() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_DISABLE_LOW_BANK_Y0_ALIAS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_disable_4bpp_title_y0_alias() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_DISABLE_4BPP_TITLE_Y0_ALIAS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_force_4bpp_y0_alias() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_FORCE_4BPP_Y0_ALIAS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_mask_extended_texture_x_high_bit() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_MASK_EXTENDED_TEXTURE_X_HIGH_BIT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_low_bank_y0_alias_preserves_odd_x() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_LOW_BANK_Y0_ALIAS_PRESERVE_ODD_X").map_or(true, |value| {
+            value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
+
+fn bounds_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    let (a_left, a_top, a_right, a_bottom) = a;
+    let (b_left, b_top, b_right, b_bottom) = b;
+    a_left <= a_right
+        && a_top <= a_bottom
+        && b_left <= b_right
+        && b_top <= b_bottom
+        && a_left <= b_right
+        && b_left <= a_right
+        && a_top <= b_bottom
+        && b_top <= a_bottom
 }
 
 fn texture_page_y(texture_page: u16) -> u16 {
@@ -1409,11 +3171,71 @@ fn texture_page_dimensions(_texture_page: u16) -> (usize, usize) {
 }
 
 fn texture_palette_entries(texture_page: u16) -> usize {
-    match (texture_page >> 7) & 0x03 {
+    match texture_page_color_mode(texture_page) {
         0 => 16,
         1 => 256,
         _ => 0,
     }
+}
+
+fn texture_page_color_mode(texture_page: u16) -> u16 {
+    let mode = (texture_page >> 7) & 0x03;
+    if native_force_texture_raw15() && mode == 1 {
+        return 2;
+    }
+    mode
+}
+
+fn native_force_texture_raw15() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_FORCE_TEXTURE_RAW15")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_swap_8bpp_texture_bytes() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_SWAP_8BPP_TEXTURE_BYTES")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_force_extended_texture_y0_alias() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_FORCE_EXTENDED_TEXTURE_Y0_ALIAS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_palette_index_zero_transparent(texture_page: u16, color: u16) -> bool {
+    if native_disable_palette_index_zero_transparent() {
+        return false;
+    }
+    if native_force_palette_index_zero_transparent() {
+        return true;
+    }
+
+    let texture_mode = (texture_page >> 7) & 0x03;
+    color == 0 && texture_mode <= 1 && (texture_page & 0x0200 != 0 || texture_page & 0x2000 != 0)
+}
+
+fn native_force_palette_index_zero_transparent() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_FORCE_PALETTE_INDEX_ZERO_TRANSPARENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_disable_palette_index_zero_transparent() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_DISABLE_PALETTE_INDEX_ZERO_TRANSPARENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 fn modulate_channel(value_5bit: u16, primitive_8bit: u32) -> u16 {
@@ -1477,7 +3299,9 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::{
         NativeFrameBuffer, PSX_VRAM_HEIGHT, Point, TextureCoordinate, TextureDrawOptions,
-        TextureWindow, VRAM_HEIGHT, VRAM_WIDTH,
+        TextureWindow, VRAM_HEIGHT, VRAM_WIDTH, fallback_tiled_256_palette_candidate,
+        low_bank_y0_alias_page_x, preferred_tiled_256_palette_x, texture_page_origin,
+        tiled_256_palette_x_candidates,
     };
 
     #[test]
@@ -1514,6 +3338,8 @@ mod tests {
 
         assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
         assert_eq!(framebuffer.pixel(9, 8), 0x0000_ff00);
+        assert_eq!(framebuffer.raw_pixel(8, 8), 0x001f);
+        assert_eq!(framebuffer.raw_pixel(9, 8), 0x03e0);
     }
 
     #[test]
@@ -1585,6 +3411,992 @@ mod tests {
         );
 
         assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_zn_low_bank_y0_alias_for_title_pages() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+
+        assert_eq!((page_x, page_y), (576, 0));
+
+        framebuffer.set_raw_pixel(page_x, 256, 0x0002);
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0001);
+        framebuffer.set_raw_pixel(1, 0, 0x001f);
+        framebuffer.set_raw_pixel(2, 0, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            0,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_zn_4bpp_title_y0_alias_for_runtime_title_pages() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x003f;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+
+        assert_eq!((page_x, page_y), (960, 0));
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        framebuffer.set_raw_pixel(page_x, 256, 0x0002);
+        framebuffer.set_raw_pixel(1, 0, 0x001f);
+        framebuffer.set_raw_pixel(2, 0, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            0,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_standard_4bpp_y_page_outside_title_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x001f;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+
+        assert_eq!((page_x, page_y), (960, 256));
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0002);
+        framebuffer.set_raw_pixel(1, 0, 0x001f);
+        framebuffer.set_raw_pixel(2, 0, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            0,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_low_bank_y0_alias_preserves_runtime_title_odd_page_x_by_default() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+
+        assert_eq!((page_x, page_y), (576, 0));
+
+        framebuffer.set_raw_pixel(512, 0, 0x0002);
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0001);
+        framebuffer.set_raw_pixel(1, 0, 0x001f);
+        framebuffer.set_raw_pixel(2, 0, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            0,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_standard_low_page_y_without_zn_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0099;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+
+        assert_eq!((page_x, page_y), (576, 256));
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0002);
+        framebuffer.set_raw_pixel(1, 0, 0x001f);
+        framebuffer.set_raw_pixel(2, 0, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            0,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_low_bank_y0_alias_can_preserve_odd_page_x_for_diagnostics() {
+        let texture_page = 0x0299;
+
+        assert_eq!(low_bank_y0_alias_page_x(texture_page, false), 512);
+        assert_eq!(low_bank_y0_alias_page_x(texture_page, true), 576);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_zn_high_texture_page_origin() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x2e80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+
+        assert_eq!((page_x, page_y), (704, 256));
+
+        framebuffer.set_raw_pixel(64, PSX_VRAM_HEIGHT as i32, 0x0202);
+        framebuffer.set_raw_pixel(page_x + 64, page_y, 0x0201);
+        framebuffer.set_raw_pixel(1, 0, 0x001f);
+        framebuffer.set_raw_pixel(2, 0, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (2, 1),
+            texture_page,
+            0,
+            TextureCoordinate { u: 128, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+        assert_eq!(framebuffer.pixel(9, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_zn_extended_8bpp_candidate_widths_split_adjacent_uploads() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x2e80;
+        let clut = 0;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+
+        assert_eq!((page_x, page_y), (704, 256));
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0201);
+        framebuffer.set_raw_pixel(page_x + 64, page_y, 0x0403);
+        framebuffer.set_raw_pixel(1, 0, 0x001f);
+        framebuffer.set_raw_pixel(2, 0, 0x03e0);
+        framebuffer.set_raw_pixel(3, 0, 0x7c00);
+        framebuffer.set_raw_pixel(4, 0, 0x03ff);
+
+        let native_width = framebuffer
+            .sample_texture_sample_from_origin(
+                &framebuffer.raw_pixels,
+                texture_page,
+                clut,
+                128,
+                0,
+                page_x,
+                page_y,
+                128,
+                true,
+            )
+            .color;
+        let wrapped_width = framebuffer
+            .sample_texture_sample_from_origin(
+                &framebuffer.raw_pixels,
+                texture_page,
+                clut,
+                128,
+                0,
+                page_x,
+                page_y,
+                64,
+                true,
+            )
+            .color;
+        let candidate_images = framebuffer.texture_candidate_images(texture_page, clut);
+
+        assert_eq!(native_width, 0x7c00);
+        assert_eq!(wrapped_width, 0x001f);
+        assert!(
+            candidate_images
+                .iter()
+                .any(|candidate| candidate.label == "resolved-raw64")
+        );
+        assert!(
+            candidate_images
+                .iter()
+                .any(|candidate| candidate.label == "resolved_plus_64-raw128")
+        );
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_zn_tiled_clut_for_textured_polygons() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x2e80;
+        let clut = 0x795a;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let tiled_y = clut_y & !0x1f;
+        let index = 0x2a;
+
+        assert_eq!((page_x, page_y), (704, 256));
+        assert_eq!((clut_x, tiled_y), (416, 480));
+
+        framebuffer.set_raw_pixel(page_x, page_y, index as u16);
+        framebuffer.set_raw_pixel(clut_x + index, clut_y, 0x001f);
+        for palette_index in 1..180 {
+            let col = palette_index & 0x0f;
+            let row = palette_index / 16;
+            framebuffer.set_raw_pixel(clut_x + col, tiled_y + row, 0x03e0);
+        }
+        framebuffer.set_raw_pixel(clut_x + (index & 0x0f), tiled_y + (index / 16), 0x03e0);
+
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_honors_disabled_zn_tiled_clut_fallback() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x2e80;
+        let clut = 0x795a;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let tiled_y = clut_y & !0x1f;
+        let index = 0x2a;
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.allow_palette_fallback = false;
+
+        assert_eq!((page_x, page_y), (704, 256));
+        assert_eq!((clut_x, clut_y, tiled_y), (416, 485, 480));
+
+        framebuffer.set_raw_pixel(page_x, page_y, index as u16);
+        framebuffer.set_raw_pixel(clut_x + index, clut_y, 0x001f);
+        for palette_index in 1..245 {
+            let col = palette_index & 0x0f;
+            let row = palette_index / 16;
+            framebuffer.set_raw_pixel(clut_x + col, tiled_y + row, 0x03e0);
+        }
+        framebuffer.set_raw_pixel(clut_x + (index & 0x0f), tiled_y + (index / 16), 0x03e0);
+
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_forces_blank_high_zn_256_clut_tile_for_polygons() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x2e80;
+        let clut = 0x795a;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let tiled_y = clut_y & !0x1f;
+        let index = 0x2a;
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.allow_palette_fallback = false;
+
+        assert_eq!((page_x, page_y), (704, 256));
+        assert_eq!((clut_x, clut_y, tiled_y), (416, 485, 480));
+
+        framebuffer.set_raw_pixel(page_x, page_y, index as u16);
+        for palette_index in 1..160 {
+            let col = palette_index & 0x0f;
+            let row = palette_index / 16;
+            framebuffer.set_raw_pixel(clut_x + col, tiled_y + row, 0x03e0);
+        }
+        framebuffer.set_raw_pixel(clut_x + (index & 0x0f), tiled_y + (index / 16), 0x03e0);
+
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_rejects_far_zn_high_clut_tile_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x2e80;
+        let clut = 0x795a;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let tiled_y = clut_y & !0x1f;
+        let index = 0x2a;
+
+        assert_eq!((page_x, page_y), (704, 256));
+        assert_eq!((clut_x, clut_y, tiled_y), (416, 485, 480));
+        assert!(
+            !tiled_256_palette_x_candidates(
+                clut_x,
+                preferred_tiled_256_palette_x(texture_page),
+                None,
+            )
+            .contains(&800)
+        );
+
+        framebuffer.set_raw_pixel(page_x, page_y, index as u16);
+
+        for palette_index in 1..196 {
+            let col = palette_index & 0x0f;
+            let row = palette_index / 16;
+            framebuffer.set_raw_pixel(clut_x + col, tiled_y + row, 0x03e0);
+        }
+        for palette_index in 1..246 {
+            let col = palette_index & 0x0f;
+            let row = palette_index / 16;
+            framebuffer.set_raw_pixel(clut_x + 16 + col, tiled_y + row, 0x001f);
+        }
+        for palette_index in 1..256 {
+            let col = palette_index & 0x0f;
+            let row = palette_index / 16;
+            framebuffer.set_raw_pixel(800 + col, tiled_y + row, 0x7c00);
+        }
+        framebuffer.set_raw_pixel(clut_x + (index & 0x0f), tiled_y + (index / 16), 0x03e0);
+        framebuffer.set_raw_pixel(clut_x + 16 + (index & 0x0f), tiled_y + (index / 16), 0x001f);
+        framebuffer.set_raw_pixel(800 + (index & 0x0f), tiled_y + (index / 16), 0x7c00);
+
+        let candidate =
+            fallback_tiled_256_palette_candidate(&framebuffer.raw_pixels, texture_page, clut)
+                .expect("expected nearby fallback palette candidate");
+
+        assert_ne!((candidate.x, candidate.y), (800, tiled_y));
+        assert!(candidate.x < 512);
+
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_ne!(framebuffer.pixel(8, 8), 0x0000_00ff);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_recovers_blank_zn_clut_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x000d;
+        let clut = 0x7c17;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y - 16, 0x001f);
+        for index in 2..16 {
+            framebuffer.set_raw_pixel(clut_x + index, clut_y - 16, 0x03e0);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_can_disable_blank_clut_alias_fallback() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x000d;
+        let clut = 0x7c17;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.allow_palette_fallback = false;
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y - 16, 0x001f);
+        for index in 2..16 {
+            framebuffer.set_raw_pixel(clut_x + index, clut_y - 16, 0x03e0);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_prefers_requested_clut_when_present() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x000d;
+        let clut = 0x7c17;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x03e0);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y - 16, 0x001f);
+        for index in 2..16 {
+            framebuffer.set_raw_pixel(clut_x + index, clut_y - 16, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_recovers_sparse_zn_4bpp_clut_base_row() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020a;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let base_y = clut_y & !0x0f;
+
+        assert_eq!((page_x, page_y), (640, 0));
+        assert_eq!((clut_x, clut_y, base_y), (0, 498, 496));
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0001);
+        for index in 1..=7 {
+            framebuffer.set_raw_pixel(clut_x + index, clut_y, 0x1000);
+        }
+        for index in 1..=14 {
+            framebuffer.set_raw_pixel(clut_x + index, base_y, 0x0400 + index as u16);
+        }
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 1, base_y, 0x03e0);
+
+        let requested_png = framebuffer.texture_palette_png(texture_page, clut);
+        let resolved_png = framebuffer.resolved_texture_palette_png(texture_page, clut);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_ne!(requested_png, resolved_png);
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_draws_nonzero_zn_4bpp_clut_zero_color() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020a;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0000);
+        framebuffer.set_raw_pixel(clut_x, clut_y, 0x001f);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_dense_zn_4bpp_requested_clut() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020a;
+        let clut = 0x7b1f;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let base_y = clut_y & !0x0f;
+
+        assert_eq!((page_x, page_y), (640, 0));
+        assert_eq!((clut_x, clut_y, base_y), (496, 492, 480));
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0001);
+        for index in 1..=15 {
+            framebuffer.set_raw_pixel(clut_x + index, clut_y, 0x0400 + index as u16);
+            framebuffer.set_raw_pixel(clut_x + index, base_y, 0x0800 + index as u16);
+        }
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 1, base_y, 0x03e0);
+
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_recovers_blank_zn_256_clut_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let alias_y = clut_y & !0x0f;
+
+        assert_eq!((page_x, page_y), (576, 0));
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            framebuffer.set_raw_pixel(alias_x + (index & 0x0f), alias_y + (index / 16), 0x03e0);
+        }
+        framebuffer.set_raw_pixel(alias_x + 0x0a, alias_y + 0x02, 0x001f);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_resolved_palette_png_uses_blank_zn_256_clut_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let alias_y = clut_y & !0x0f;
+
+        for index in 1..256 {
+            framebuffer.set_raw_pixel(alias_x + (index & 0x0f), alias_y + (index / 16), 0x03e0);
+        }
+
+        let candidate =
+            fallback_tiled_256_palette_candidate(&framebuffer.raw_pixels, texture_page, clut)
+                .expect("expected fallback palette candidate");
+        let requested_png = framebuffer.texture_palette_png(texture_page, clut);
+        let resolved_png = framebuffer.resolved_texture_palette_png(texture_page, clut);
+
+        assert_eq!((candidate.x, candidate.y), (alias_x, alias_y));
+        assert_ne!(requested_png, resolved_png);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_prefers_zn_256_clut_32row_block_base() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let alias_y_32 = clut_y & !0x1f;
+        let alias_y_16 = clut_y & !0x0f;
+
+        assert_eq!((page_x, page_y), (576, 0));
+        assert_ne!(alias_y_32, alias_y_16);
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(alias_x + col, alias_y_32 + row, 0x03e0);
+            framebuffer.set_raw_pixel(alias_x + col, alias_y_16 + row, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_prefers_tiled_256_clut_x_for_zn_page_pair() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x029b;
+        let clut = 0x7cc0;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_y = clut_y & !0x1f;
+
+        assert_eq!((page_x, page_y), (704, 0));
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(384 + col, alias_y + row, 0x03e0);
+            framebuffer.set_raw_pixel(400 + col, alias_y + row, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_preferred_zn_256_clut_when_neighbor_is_only_modestly_denser()
+     {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let preferred_x = preferred_tiled_256_palette_x(texture_page);
+        let neighbor_x = preferred_x + 48;
+        let alias_y = clut_y & !0x1f;
+
+        assert_eq!((page_x, page_y), (576, 0));
+        assert_eq!(preferred_x, 384);
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..196 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(preferred_x + col, alias_y + row, 0x001f);
+        }
+        for index in 1..246 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(neighbor_x + col, alias_y + row, 0x03e0);
+        }
+
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_locks_preferred_zn_256_clut_x_over_dense_neighbor() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let preferred_x = preferred_tiled_256_palette_x(texture_page);
+        let neighbor_x = preferred_x + 48;
+        let alias_y = clut_y & !0x1f;
+
+        assert_eq!((page_x, page_y), (576, 0));
+        assert_eq!(preferred_x, 384);
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..96 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(preferred_x + col, alias_y + row, 0x001f);
+        }
+        for index in 1..256 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(neighbor_x + col, alias_y + row, 0x03e0);
+        }
+
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_zero_from_valid_zn_256_clut_32row_tile() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let alias_y_32 = clut_y & !0x1f;
+        let alias_y_16 = clut_y & !0x0f;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            let color = if index == 0x2a { 0 } else { 0x03e0 };
+            framebuffer.set_raw_pixel(alias_x + col, alias_y_32 + row, color);
+            framebuffer.set_raw_pixel(alias_x + col, alias_y_16 + row, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_valid_zn_256_clut_32row_tile_over_dense_neighbor() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let sparse_alias_y = clut_y & !0x1f;
+        let dense_alias_y = clut_y & !0x0f;
+
+        assert_eq!((page_x, page_y), (576, 0));
+        assert_ne!(sparse_alias_y, dense_alias_y);
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..80 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(alias_x + col, sparse_alias_y + row, 0x03e0);
+        }
+        framebuffer.set_raw_pixel(alias_x + 0x0a, sparse_alias_y + 0x02, 0x03e0);
+        for index in 1..256 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(alias_x + col, dense_alias_y + row, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_rejects_zn_256_linear_row_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..128 {
+            framebuffer.set_raw_pixel(alias_x + index, clut_y, 0x03e0);
+        }
+        framebuffer.set_raw_pixel(alias_x + 0x2a, clut_y, 0x001f);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_can_disable_blank_zn_256_clut_alias_fallback() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.allow_palette_fallback = false;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..128 {
+            framebuffer.set_raw_pixel(alias_x + index, clut_y, 0x03e0);
+        }
+        framebuffer.set_raw_pixel(alias_x + 0x2a, clut_y, 0x001f);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_prefers_requested_zn_256_clut_when_present() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        framebuffer.set_raw_pixel(clut_x + 0x2a, clut_y, 0x03e0);
+        for index in 1..128 {
+            framebuffer.set_raw_pixel(alias_x + index, clut_y, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_overrides_sparse_requested_zn_256_clut() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let alias_y = clut_y & !0x1f;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        framebuffer.set_raw_pixel(clut_x + 0x2a, clut_y, 0x03e0);
+        for index in 1..256 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(alias_x + col, alias_y + row, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_dense_requested_zn_256_clut() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7c80;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let alias_y = clut_y & !0x1f;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            framebuffer.set_raw_pixel(clut_x + index, clut_y, 0x03e0);
+            let col = index & 0x0f;
+            let row = index / 16;
+            framebuffer.set_raw_pixel(alias_x + col, alias_y + row, 0x001f);
+        }
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
     }
 
     #[test]

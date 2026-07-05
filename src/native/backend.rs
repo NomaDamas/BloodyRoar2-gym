@@ -4,6 +4,9 @@ use crate::action::ActionButtons;
 use crate::backend::{Backend, BackendError, Observation};
 use crate::native::emulator::NativeEmulator;
 
+const NATIVE_BACKEND_VBLANK_CAPTURE_INTERVAL: u64 = 6_000;
+const NATIVE_BACKEND_UNLINKED_PRIMITIVE_REPLAY_INTERVAL: u64 = 5;
+
 #[derive(Clone, Debug)]
 pub struct NativeBackend {
     emulator: NativeEmulator,
@@ -18,7 +21,8 @@ impl NativeBackend {
         instructions_per_frame: u64,
     ) -> Result<Self, BackendError> {
         let rom_path = rom_path.into();
-        let emulator = NativeEmulator::from_rom_zip(rom_path.clone())?;
+        let mut emulator = NativeEmulator::from_rom_zip(rom_path.clone())?;
+        configure_native_backend_emulator(&mut emulator);
         Ok(Self {
             emulator,
             rom_path,
@@ -35,7 +39,7 @@ impl NativeBackend {
             beast_meter: self.emulator.progress_signal(),
             round_time: (99.0 - (self.frame as f32 / 60.0)).max(0.0),
             terminal: self.emulator.is_terminal(),
-            screenshot_b64: Some(self.emulator.screenshot_png_base64()),
+            screenshot_b64: Some(self.emulator.display_window_png_base64()),
         }
     }
 }
@@ -43,6 +47,7 @@ impl NativeBackend {
 impl Backend for NativeBackend {
     fn reset(&mut self) -> Result<Observation, BackendError> {
         self.emulator = NativeEmulator::from_rom_zip(self.rom_path.clone())?;
+        configure_native_backend_emulator(&mut self.emulator);
         self.frame = 0;
         Ok(self.observe())
     }
@@ -59,4 +64,12 @@ impl Backend for NativeBackend {
         }
         Ok(self.observe())
     }
+}
+
+fn configure_native_backend_emulator(emulator: &mut NativeEmulator) {
+    emulator.apply_auto_coin_input_mapping();
+    emulator.set_vblank_presentation_capture_interval(Some(NATIVE_BACKEND_VBLANK_CAPTURE_INTERVAL));
+    emulator.set_unlinked_primitive_replay_interval(Some(
+        NATIVE_BACKEND_UNLINKED_PRIMITIVE_REPLAY_INTERVAL,
+    ));
 }

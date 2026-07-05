@@ -145,7 +145,8 @@ Exercise one native backend environment step from the CLI:
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 ```
 
-Run a deterministic input script and write the selected PNG observation:
+Run a deterministic input script and write the same 640x480 GUI frame that
+`native-play` presents:
 
 ```sh
 cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
@@ -154,6 +155,11 @@ cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-scrip
 Each script segment is `<action:frames>` where `action` is either an action
 index from `cargo run -- action-space` or an action name such as `coin`,
 `start`, or `coin+start`.
+
+The JSON includes both `raw_frame` and `window_frame` statistics. Use
+`window_frame` and the written PNG when checking the macOS GUI crop/deinterlace
+path; use `native-scripted-dump` when raw display, observation, and VRAM images
+are all needed for GPU debugging.
 
 Serve the native backend over the Gym-style HTTP API:
 
@@ -228,30 +234,39 @@ native emulator starts reuse that cache until the source archive changes or
 that cache is removed. Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to
 store the runtime cache outside the repository.
 
-`native-play` and `native-autoplay` bounded-fast-forward the built-in
-match-entry script first, continue any remaining scripted input in the visible
-window, then return control to the keyboard. The bounded phase uses a full
-vblank-sized instruction budget so it does not mistake partial warning,
-transition, or stale frames for progress. Use `native-manual` when you want
-manual input from boot.
+`native-play` skips the warning-wait segment, opens the native macOS keyboard
+window, then layers the built-in coin/start/select match-entry script while
+manual keys remain active. `native-manual` opens a cold-boot keyboard window
+with no entry script. Use `native-autoplay` when you need bounded pre-window
+fast-forward, entry-assist, or scripted smoke diagnostics. `native-autoplay`
+bounded-fast-forwards the built-in match-entry script first, continues any
+remaining scripted input in the visible window, then returns control to the
+keyboard. The bounded phase uses a full vblank-sized instruction budget so it
+does not mistake partial warning, transition, or stale frames for progress.
+
+Input defaults to the MAME `znt2p` map for Bloody Roar 2. A ZiNc
+`cfg/bldyror2.cfg` file is treated as an EEPROM fallback, but native input
+stays on the MAME map. Set `BLOODYROAR2_NATIVE_LEGACY_ZINC_INPUT=1` only when
+explicitly testing legacy ZiNc input mirroring for diagnostics.
 
 Controls:
 
-- Arrows: move.
-- `Z`: punch.
-- `X`: kick.
-- `A`: beast.
-- `S`: guard.
+- Arrows or `WASD`: move.
+- `Z`, `Space`, `J`, or `F`: punch/confirm.
+- `X`, `K`, or `H`: kick.
+- `Q`, `L`, or `B`: beast.
+- `E`, `I`, or `G`: guard.
 - `C`: coin.
-- `Enter`: start.
+- `V`: service credit.
+- `Enter` or `P`: start.
 - `Esc`: quit.
 
 For non-interactive smoke validation, pass a frame limit:
 
 ```sh
-cargo run --release -- native-autoplay assets/roms 500000 fit 1800
-cargo run --release -- native-play assets/roms 500000 fit 1800
-cargo run --release -- native-play-snapshot assets/roms 500000 tmp/native-validation/smoke --complete-script --fast-forward-frames 2400
+cargo run --release -- native-autoplay assets/roms 500000 fit 1000
+cargo run --release -- native-play assets/roms 500000 fit 1000
+cargo run --release -- native-play-snapshot assets/roms 500000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
 ```
 
 `native-play-snapshot` is intentionally stricter than the quick GUI path: it

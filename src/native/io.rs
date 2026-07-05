@@ -7,8 +7,10 @@ use crate::action::ActionButtons;
 use crate::native::framebuffer::{
     ClipRect, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH, FrameBufferBounds, FrameBufferStats,
     FrameBufferWindow, NativeFrameBuffer, PSX_VRAM_HEIGHT, PixelWriteOptions, Point,
-    TextureCoordinate, TextureDrawOptions, TextureWindow, TexturedDrawStats, TexturedPoint,
-    VRAM_HEIGHT, VRAM_WIDTH, bytes_base64, png_from_rgb888_pixels,
+    TextureCandidateImage, TextureCoordinate, TextureDrawOptions, TextureWindow, TexturedDrawStats,
+    TexturedPoint, VRAM_HEIGHT, VRAM_WIDTH, bytes_base64, clut_origin_for_diagnostics,
+    png_from_rgb888_pixels, texture_page_color_mode_for_diagnostics,
+    texture_page_origin_for_diagnostics,
 };
 
 pub const IO_REGION_START: u32 = 0x1f80_1000;
@@ -88,6 +90,7 @@ const DMA_CHANNEL_COUNT: usize = 7;
 const DMA_INTERRUPT_IRQ_ENABLE_MASK: u32 = 0x007f_0000;
 const DMA_INTERRUPT_FLAG_MASK: u32 = 0x7f00_0000;
 const SIO_STATUS_IRQ_REQUEST: u16 = 1 << 9;
+const SIO_SECURITY_TRANSFER_TRACE_LIMIT: usize = 64;
 const GP0_RECENT_COMMAND_LIMIT: usize = 16;
 const GP0_RECENT_COMMAND_WORD_LIMIT: usize = 12;
 const GP1_RECENT_COMMAND_LIMIT: usize = 16;
@@ -105,9 +108,25 @@ const GP0_BEST_OBSERVATION_DRAW_INTERVAL: u64 = 128;
 const STALE_PRESENTATION_CAPTURE_GRACE: u64 = 8;
 const DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS: u64 = 16;
 const DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS: u64 = 512;
+const DISPLAY_RESOLVE_MIN_3D_TRIANGLE_COMMANDS: u64 = 128;
 const DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS: u64 = 64;
 const DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS: u64 = 8_192;
+const DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_TRIANGLE_COMMANDS: u64 = 8;
+const DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_WRITTEN_PIXELS: u64 =
+    DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64;
+const DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_COLOR_CHANGES: u64 = 262_144;
+const DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_PRESENTATION_CAPTURES: u64 = 120;
 const DISPLAY_SCENE_MAX_CHANNEL_DOMINANCE: u64 = 2;
+const DISPLAY_SCENE_MIN_COLOR_BUCKETS: u16 = 24;
+const NATIVE_REPLAY_STAGED_MIN_DISPLAY_WIDTH: usize = 256;
+const DISPLAY_SOURCE_GP1_DISPLAY_AREA: &str = "gp1_display_area";
+const DISPLAY_SOURCE_CLEAR_WIDTH_DISPLAY_AREA: &str = "gp1_display_area_clear_width";
+const DISPLAY_SOURCE_ACTIVE_FIELD: &str = "gp1_display_area_active_field";
+const DISPLAY_SOURCE_PRESENTED_FIELD: &str = "gp1_display_area_presented_field";
+const DISPLAY_SOURCE_SAFE_FIELD: &str = "gp1_display_area_safe_field";
+const DISPLAY_SOURCE_HIGH_VERTICAL_FULL: &str = "gp1_display_area_high_vertical_full";
+const DISPLAY_SOURCE_HIGH_VERTICAL_DEINTERLACED: &str =
+    "gp1_display_area_high_vertical_deinterlaced";
 const VRAM_X_MASK: u32 = 0x03ff;
 const VRAM_Y_MASK: u32 = 0x03ff;
 
@@ -664,7 +683,7 @@ impl Io {
         let screenshot_window = self.gpu.screenshot_window();
         let (display_width, display_height) = self.gpu.display_dimensions();
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"gpu_gp0_pending_words\":{},\"gpu_gp0_pending_head\":{},\"gpu_gp0_expected_words\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_vram_nonzero_bounds\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_invalid_fill_rect_commands\":{},\"gpu_invalid_image_upload_commands\":{},\"gpu_invalid_vram_copy_commands\":{},\"gpu_gp0_command_counts\":[{}],\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_focus_draw_commands\":[{}],\"gpu_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{}}}",
+            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"gpu_gp0_pending_words\":{},\"gpu_gp0_pending_head\":{},\"gpu_gp0_expected_words\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_vram_nonzero_bounds\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_invalid_fill_rect_commands\":{},\"gpu_invalid_image_upload_commands\":{},\"gpu_invalid_vram_copy_commands\":{},\"gpu_gp0_command_counts\":[{}],\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_focus_draw_commands\":[{}],\"gpu_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{}}}",
             self.irq.status,
             self.irq.mask,
             self.dma.control,
@@ -708,6 +727,7 @@ impl Io {
             self.gpu.textured_draw_stats.written_pixels,
             self.gpu.textured_draw_stats.clipped_pixels,
             self.gpu.textured_draw_stats.transparent_pixels,
+            self.gpu.textured_draw_stats.json(),
             self.gpu.image_upload_commands,
             self.gpu.vram_copy_commands,
             self.gpu.invalid_fill_rect_commands,
@@ -738,7 +758,7 @@ impl Io {
         let screenshot_window = self.gpu.screenshot_window();
         let (display_width, display_height) = self.gpu.display_dimensions();
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"gpu_gp0_pending_words\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_vram_nonzero_bounds\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_invalid_fill_rect_commands\":{},\"gpu_invalid_image_upload_commands\":{},\"gpu_invalid_vram_copy_commands\":{},\"gpu_gp0_command_counts\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_focus_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{}}}",
+            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"gpu_gp0_pending_words\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_vram_nonzero_bounds\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_invalid_fill_rect_commands\":{},\"gpu_invalid_image_upload_commands\":{},\"gpu_invalid_vram_copy_commands\":{},\"gpu_gp0_command_counts\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_focus_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{}}}",
             self.irq.status,
             self.irq.mask,
             self.dma.control,
@@ -780,6 +800,7 @@ impl Io {
             self.gpu.textured_draw_stats.written_pixels,
             self.gpu.textured_draw_stats.clipped_pixels,
             self.gpu.textured_draw_stats.transparent_pixels,
+            self.gpu.textured_draw_stats.json(),
             self.gpu.image_upload_commands,
             self.gpu.vram_copy_commands,
             self.gpu.invalid_fill_rect_commands,
@@ -807,7 +828,7 @@ impl Io {
         let screenshot_window = self.gpu.screenshot_window();
         let (display_width, display_height) = self.gpu.display_dimensions();
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{}}}",
+            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{},\"controller\":{}}}",
             self.irq.status,
             self.irq.mask,
             self.gpu.commands_seen,
@@ -848,6 +869,7 @@ impl Io {
             self.gpu.textured_draw_stats.written_pixels,
             self.gpu.textured_draw_stats.clipped_pixels,
             self.gpu.textured_draw_stats.transparent_pixels,
+            self.gpu.textured_draw_stats.json(),
             self.gpu.image_upload_commands,
             self.gpu.vram_copy_commands,
             self.gpu.largest_draw_command_compact_json(),
@@ -860,13 +882,14 @@ impl Io {
             self.timers.0[2].counter,
             self.controller.status,
             self.controller.p1_state,
-            self.controller.zn_mcu_diagnostic_json()
+            self.controller.zn_mcu_diagnostic_json(),
+            self.controller.diagnostic_json()
         )
     }
 
     pub fn runtime_compact_probe_json(&self) -> String {
         format!(
-            "{{\"irq_status\":{},\"irq_status_hex\":\"0x{:04x}\",\"irq_mask\":{},\"irq_mask_hex\":\"0x{:04x}\",\"dma_interrupt\":{},\"dma_interrupt_hex\":\"0x{:08x}\",\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"playability\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"sio_status_hex\":\"0x{:04x}\",\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"zn_mcu\":{}}}",
+            "{{\"irq_status\":{},\"irq_status_hex\":\"0x{:04x}\",\"irq_mask\":{},\"irq_mask_hex\":\"0x{:04x}\",\"dma_interrupt\":{},\"dma_interrupt_hex\":\"0x{:08x}\",\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_top_left_hex\":\"0x{:08x}\",\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_area_bottom_right_hex\":\"0x{:08x}\",\"gpu_drawing_offset\":{},\"gpu_drawing_offset_hex\":\"0x{:08x}\",\"gpu_texture_page\":{},\"gpu_texture_page_hex\":\"0x{:04x}\",\"gpu_texture_window\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_textured_stats\":{},\"gpu_recent_transfer_commands\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"playability\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"sio_status_hex\":\"0x{:04x}\",\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"zn_mcu\":{},\"controller\":{}}}",
             self.irq.status,
             self.irq.status,
             self.irq.mask,
@@ -875,6 +898,24 @@ impl Io {
             self.dma.interrupt,
             self.gpu.commands_seen,
             self.gpu.draw_sequence,
+            self.gpu.drawing_area_top_left,
+            self.gpu.drawing_area_top_left,
+            self.gpu.drawing_area_bottom_right,
+            self.gpu.drawing_area_bottom_right,
+            self.gpu.drawing_offset,
+            self.gpu.drawing_offset,
+            self.gpu.texture_page,
+            self.gpu.texture_page,
+            self.gpu.texture_window.json(),
+            self.gpu.display_area_start,
+            self.gpu.display_area_history_json(),
+            self.gpu.recent_gp1_commands_json(),
+            self.gpu.textured_draw_stats.json(),
+            self.gpu.recent_transfer_commands_json(),
+            self.gpu.largest_draw_command_compact_json(),
+            self.gpu.top_draw_commands_compact_json(8),
+            self.gpu.recent_draw_commands_compact_json(32),
+            self.gpu.overlap_draw_commands_compact_json(16),
             self.gpu.native_playability_compact_json(),
             self.timers.0[0].counter,
             self.timers.0[1].counter,
@@ -883,7 +924,8 @@ impl Io {
             self.controller.status,
             self.controller.p1_state,
             self.controller.p1_state,
-            self.controller.zn_mcu_diagnostic_json()
+            self.controller.zn_mcu_diagnostic_json(),
+            self.controller.diagnostic_json()
         )
     }
 
@@ -897,6 +939,36 @@ impl Io {
 
     pub fn native_playable_candidate(&self) -> bool {
         self.gpu.native_playable_candidate()
+    }
+
+    pub fn native_rendered_scene_candidate(&self) -> bool {
+        self.gpu.native_rendered_scene_candidate()
+    }
+
+    pub fn native_sparse_scene_replay_gate(&self) -> bool {
+        self.gpu.native_sparse_scene_replay_gate()
+    }
+
+    pub fn native_replay_validation_candidate(&self) -> bool {
+        self.gpu.native_replay_validation_candidate()
+    }
+
+    pub fn native_replay_validation_incremental_candidate(&self, before: &Gpu) -> bool {
+        self.gpu
+            .native_replay_validation_incremental_candidate(before)
+    }
+
+    pub fn native_replay_lightweight_validation_candidate(&self, before: &Gpu) -> bool {
+        self.gpu
+            .native_replay_lightweight_validation_candidate(before)
+    }
+
+    pub fn display_candidate_summary_json(&self) -> String {
+        self.gpu.display_candidate_summary_json()
+    }
+
+    pub fn display_candidate_compact_summary_json(&self, limit: usize) -> String {
+        self.gpu.display_candidate_compact_summary_json(limit)
     }
 
     pub fn display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
@@ -1194,6 +1266,7 @@ pub struct Gpu {
     pub horizontal_range: u32,
     pub vertical_range: u32,
     status_reads: Cell<u32>,
+    field_parity: Cell<bool>,
     framebuffer: NativeFrameBuffer,
     gp0_fifo: Vec<u32>,
     gp0_fifo_sources: Vec<Option<GpuCommandSource>>,
@@ -1261,6 +1334,7 @@ impl Default for Gpu {
             horizontal_range: 0,
             vertical_range: 0,
             status_reads: Cell::new(0),
+            field_parity: Cell::new(false),
             framebuffer: NativeFrameBuffer::default(),
             gp0_fifo: Vec::new(),
             gp0_fifo_sources: Vec::new(),
@@ -1324,11 +1398,15 @@ impl Gpu {
     pub fn read_status(&self) -> u32 {
         let reads = self.status_reads.get().wrapping_add(1);
         self.status_reads.set(reads);
-        if reads & 1 == 0 {
-            self.status & !0x8000_0000
-        } else {
+        if self.field_parity.get() {
             self.status | 0x8000_0000
+        } else {
+            self.status & !0x8000_0000
         }
+    }
+
+    pub fn advance_vblank_field(&self) {
+        self.field_parity.set(!self.field_parity.get());
     }
 
     pub fn write_gp0(&mut self, value: u32) {
@@ -1337,6 +1415,10 @@ impl Gpu {
 
     pub fn write_gp0_with_source(&mut self, value: u32, source: GpuCommandSource) {
         self.write_gp0_from(value, Some(source));
+    }
+
+    pub fn write_gp1_with_source(&mut self, value: u32, source: GpuCommandSource) {
+        self.write_gp1_from(value, Some(source));
     }
 
     fn write_gp0_from(&mut self, value: u32, source: Option<GpuCommandSource>) {
@@ -1348,8 +1430,12 @@ impl Gpu {
     }
 
     pub fn write_gp1(&mut self, value: u32) {
+        self.write_gp1_from(value, None);
+    }
+
+    fn write_gp1_from(&mut self, value: u32, source: Option<GpuCommandSource>) {
         let command = value >> 24;
-        self.push_recent_gp1_command(value);
+        self.push_recent_gp1_command(value, source.as_ref());
         match command {
             0x00 => {
                 let draw_capture_range = self.draw_capture_range;
@@ -1374,13 +1460,21 @@ impl Gpu {
             }
             0x05 => {
                 self.display_area_start = value & 0x00ff_ffff;
-                self.push_display_area_trace(value);
+                self.push_display_area_trace(value, source.as_ref());
                 self.capture_presented_frame_after_display_area_change();
             }
             0x06 => self.horizontal_range = value & 0x00ff_ffff,
             0x07 => self.vertical_range = value & 0x00ff_ffff,
             0x08 => {
+                let previous_dimensions = self.display_dimensions();
+                let previous_interlace = self.high_vertical_interlace_enabled();
                 self.status = (self.status & !0x007f_0000) | ((value & 0x3f) << 17);
+                if previous_dimensions != self.display_dimensions()
+                    || previous_interlace != self.high_vertical_interlace_enabled()
+                {
+                    self.invalidate_field_composed_display_cache();
+                    self.display_area_history.clear();
+                }
             }
             _ => {}
         }
@@ -1389,26 +1483,34 @@ impl Gpu {
 
     pub fn screenshot_png_base64(&self) -> String {
         let output = self.current_display_output_window();
-        if self.should_use_field_composed_output(output) {
+        let resolved = self.display_resolve();
+        if self.should_use_display_output(output, resolved) {
             return bytes_base64(&self.display_output_png(output));
         }
-        let resolved = self.display_resolve();
         if resolved.promoted && self.should_present_resolved_display(resolved) {
             return bytes_base64(&self.resolved_display_png(resolved));
         }
         if self.should_show_current_display_over_stale_candidates() {
             let window = self.current_display_window();
             let (width, height) = self.display_dimensions();
-            return self
-                .framebuffer
-                .psx_display_png_base64(window.x, window.y, width, height);
+            return self.framebuffer.psx_display_png_base64_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
         }
         if self.should_prefer_current_display() {
             let window = self.current_display_window();
             let (width, height) = self.display_dimensions();
-            return self
-                .framebuffer
-                .psx_display_png_base64(window.x, window.y, width, height);
+            return self.framebuffer.psx_display_png_base64_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
         }
         if self.should_prefer_presented_frame()
             && let Some(png) = self.presented_frame_png()
@@ -1428,7 +1530,7 @@ impl Gpu {
             }
         }
         if let Some(best) = self.best_observation_window {
-            if !self.display_window_is_texture_atlas(best)
+            if self.best_observation_is_safe_display_candidate(best)
                 && let Some(png) = self.best_observation_png()
             {
                 return bytes_base64(&png);
@@ -1439,32 +1541,45 @@ impl Gpu {
         if self.display_window_is_texture_atlas_with_dimensions(window, width, height) {
             window = self.current_display_window();
         }
-        self.framebuffer
-            .psx_display_png_base64(window.x, window.y, width, height)
+        self.framebuffer.psx_display_png_base64_with_depth(
+            window.x,
+            window.y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        )
     }
 
     pub fn screenshot_png(&self) -> Vec<u8> {
         let output = self.current_display_output_window();
-        if self.should_use_field_composed_output(output) {
+        let resolved = self.display_resolve();
+        if self.should_use_display_output(output, resolved) {
             return self.display_output_png(output);
         }
-        let resolved = self.display_resolve();
         if resolved.promoted && self.should_present_resolved_display(resolved) {
             return self.resolved_display_png(resolved);
         }
         if self.should_show_current_display_over_stale_candidates() {
             let window = self.current_display_window();
             let (width, height) = self.display_dimensions();
-            return self
-                .framebuffer
-                .psx_display_png(window.x, window.y, width, height);
+            return self.framebuffer.psx_display_png_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
         }
         if self.should_prefer_current_display() {
             let window = self.current_display_window();
             let (width, height) = self.display_dimensions();
-            return self
-                .framebuffer
-                .psx_display_png(window.x, window.y, width, height);
+            return self.framebuffer.psx_display_png_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
         }
         if self.should_prefer_presented_frame()
             && let Some(png) = self.presented_frame_png()
@@ -1484,7 +1599,7 @@ impl Gpu {
             }
         }
         if let Some(best) = self.best_observation_window {
-            if !self.display_window_is_texture_atlas(best)
+            if self.best_observation_is_safe_display_candidate(best)
                 && let Some(png) = self.best_observation_png()
             {
                 return png;
@@ -1495,28 +1610,66 @@ impl Gpu {
         if self.display_window_is_texture_atlas_with_dimensions(window, width, height) {
             window = self.current_display_window();
         }
-        self.framebuffer
-            .psx_display_png(window.x, window.y, width, height)
+        self.framebuffer.psx_display_png_with_depth(
+            window.x,
+            window.y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        )
     }
 
     pub fn display_png(&self) -> Vec<u8> {
+        let output = self.current_display_output_window();
         let resolved = self.display_resolve();
+        let visibility_resolved = self.display_resolve_for_visibility_with_strict(resolved);
+        if let Some(gui_output) = self.cached_gui_field_composed_output_for_handoff(output) {
+            return self.display_output_png(gui_output);
+        }
+        if let Some(gui_output) =
+            self.high_vertical_gui_deinterlaced_output_for_active_field(output, resolved)
+        {
+            return self.display_output_png(gui_output);
+        }
+        if self.should_use_visibility_resolved_over_display_output(output, visibility_resolved) {
+            return self.resolved_display_png(visibility_resolved);
+        }
+        if self.should_use_display_output(output, resolved) {
+            return self.display_output_png(output);
+        }
         if resolved.promoted && self.should_present_resolved_display(resolved) {
             return self.resolved_display_png(resolved);
+        }
+        if visibility_resolved.promoted
+            && visibility_resolved != resolved
+            && self.should_present_visibility_resolved_display(visibility_resolved)
+        {
+            return self.resolved_display_png(visibility_resolved);
+        }
+        if let Some(gui_output) = self.current_gui_display_output_window() {
+            return self.display_output_png(gui_output);
         }
         if self.should_show_current_display_over_stale_candidates() {
             let window = self.current_display_window();
             let (width, height) = self.display_dimensions();
-            return self
-                .framebuffer
-                .psx_display_png(window.x, window.y, width, height);
+            return self.framebuffer.psx_display_png_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
         }
         if self.should_prefer_current_display() {
             let window = self.current_display_window();
             let (width, height) = self.display_dimensions();
-            return self
-                .framebuffer
-                .psx_display_png(window.x, window.y, width, height);
+            return self.framebuffer.psx_display_png_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
         }
         if self.should_prefer_presented_frame()
             && let Some(png) = self.presented_frame_png()
@@ -1537,8 +1690,13 @@ impl Gpu {
         }
         let (start_x, start_y) = display_area_start_xy(self.display_area_start);
         let (width, height) = self.display_dimensions();
-        self.framebuffer
-            .psx_display_png(start_x, start_y, width, height)
+        self.framebuffer.psx_display_png_with_depth(
+            start_x,
+            start_y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        )
     }
 
     pub fn display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
@@ -1546,18 +1704,62 @@ impl Gpu {
     }
 
     pub fn stable_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
+        let output = self.current_display_output_window();
         let resolved = self.display_resolve();
+        let visibility_resolved = self.display_resolve_for_visibility_with_strict(resolved);
+        if let Some(gui_output) = self.cached_gui_field_composed_output_for_handoff(output) {
+            return (
+                gui_output.width,
+                gui_output.height,
+                self.display_output_rgb(gui_output),
+            );
+        }
+        if let Some(gui_output) =
+            self.high_vertical_gui_deinterlaced_output_for_active_field(output, resolved)
+        {
+            return (
+                gui_output.width,
+                gui_output.height,
+                self.display_output_rgb(gui_output),
+            );
+        }
+        if self.should_use_visibility_resolved_over_display_output(output, visibility_resolved) {
+            let (width, height) = self.display_dimensions();
+            return self.resolved_display_rgb_frame(visibility_resolved, width, height);
+        }
+        if self.should_use_display_output(output, resolved) {
+            return (output.width, output.height, self.display_output_rgb(output));
+        }
+
         let (width, height) = self.display_dimensions();
         if resolved.promoted && self.should_present_resolved_display(resolved) {
             return self.resolved_display_rgb_frame(resolved, width, height);
+        }
+        if visibility_resolved.promoted
+            && visibility_resolved != resolved
+            && self.should_present_visibility_resolved_display(visibility_resolved)
+        {
+            return self.resolved_display_rgb_frame(visibility_resolved, width, height);
+        }
+        if let Some(gui_output) = self.current_gui_display_output_window() {
+            return (
+                gui_output.width,
+                gui_output.height,
+                self.display_output_rgb(gui_output),
+            );
         }
         if self.should_show_current_display_over_stale_candidates() {
             let window = self.current_display_window();
             return (
                 width,
                 height,
-                self.framebuffer
-                    .psx_display_rgb_window(window.x, window.y, width, height),
+                self.framebuffer.psx_display_rgb_window_with_depth(
+                    window.x,
+                    window.y,
+                    width,
+                    height,
+                    self.display_24bit_enabled(),
+                ),
             );
         }
         if self.should_prefer_current_display() {
@@ -1565,12 +1767,18 @@ impl Gpu {
             return (
                 width,
                 height,
-                self.framebuffer
-                    .psx_display_rgb_window(window.x, window.y, width, height),
+                self.framebuffer.psx_display_rgb_window_with_depth(
+                    window.x,
+                    window.y,
+                    width,
+                    height,
+                    self.display_24bit_enabled(),
+                ),
             );
         }
         if let Some(presented) = self.presented_frame_window
             && self.should_prefer_presented_frame()
+            && self.presented_frame_is_safe_display_candidate(presented)
         {
             return self.cached_display_rgb_frame_or_capture(
                 self.presented_frame_rgb.as_deref(),
@@ -1596,7 +1804,7 @@ impl Gpu {
             );
         }
         if let Some(presented) = self.presented_frame_window {
-            if !self.display_window_is_texture_atlas(presented) {
+            if self.presented_frame_is_safe_display_candidate(presented) {
                 return self.cached_display_rgb_frame_or_capture(
                     self.presented_frame_rgb.as_deref(),
                     self.presented_frame_width,
@@ -1609,7 +1817,7 @@ impl Gpu {
             }
         }
         if let Some(best) = self.best_observation_window {
-            if !self.display_window_is_texture_atlas(best) {
+            if self.best_observation_is_safe_display_candidate(best) {
                 return self.cached_display_rgb_frame_or_capture(
                     self.best_observation_rgb.as_deref(),
                     self.best_observation_width,
@@ -1625,73 +1833,355 @@ impl Gpu {
         (
             width,
             height,
-            self.framebuffer
-                .psx_display_rgb_window(start_x, start_y, width, height),
+            self.framebuffer.psx_display_rgb_window_with_depth(
+                start_x,
+                start_y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
         )
     }
 
     fn current_display_window(&self) -> FrameBufferWindow {
-        let (start_x, start_y) = display_area_start_xy(self.display_area_start);
         let (width, height) = self.display_dimensions();
+        self.current_display_window_with_dimensions(width, height)
+    }
+
+    fn current_display_window_with_dimensions(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> FrameBufferWindow {
+        let (start_x, start_y) = display_area_start_xy(self.display_area_start);
         FrameBufferWindow {
             x: start_x,
             y: start_y,
-            stats: self
-                .framebuffer
-                .psx_display_stats(start_x, start_y, width, height),
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                start_x,
+                start_y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
         }
     }
 
     fn current_display_output_window(&self) -> DisplayOutputWindow {
-        let (width, height) = self.display_dimensions();
+        let (register_width, height) = self.display_dimensions();
+        let clear_width_hint = self.display_clear_width_hint(register_width, height);
+        if clear_width_hint.is_some()
+            && let Some(output) =
+                self.high_vertical_register_width_output_window(register_width, height)
+        {
+            return output;
+        }
+        let width = clear_width_hint.unwrap_or(register_width);
+        if let Some(output) = self.recent_low_height_field_pair_output_window(width, height) {
+            if let Some(safe_field) = self.safe_field_output_from_field_composed_output(output) {
+                return safe_field;
+            }
+            if self.should_use_field_composed_output(output) {
+                return output;
+            }
+        }
         if let Some(field_height) = self.interlaced_field_pair_height(height) {
             if let Some(output) = self.interlaced_field_pair_output_window(width, field_height) {
+                if let Some(safe_field) = self.safe_field_output_from_field_composed_output(output)
+                {
+                    return safe_field;
+                }
                 if self.should_use_field_composed_output(output) {
                     return output;
                 }
-                if self.high_vertical_interlace_enabled()
-                    && let Some(cached) =
-                        self.cached_interlaced_field_pair_output_window(width, field_height)
+                if let Some(cached) =
+                    self.cached_interlaced_field_pair_output_window(width, field_height)
                     && self.should_use_cached_field_composed_output(cached)
                 {
                     return cached;
                 }
-            } else if self.high_vertical_interlace_enabled()
-                && let Some(output) =
-                    self.cached_interlaced_field_pair_output_window(width, field_height)
+            } else if let Some(output) =
+                self.cached_interlaced_field_pair_output_window(width, field_height)
                 && self.should_use_cached_field_composed_output(output)
             {
                 return output;
             }
 
-            if self.high_vertical_interlace_enabled() {
-                if let Some(output) = self.cached_field_composed_display_output_window()
-                    && self.should_use_cached_field_composed_output(output)
-                {
-                    return output;
-                }
+            if let Some(output) = self.cached_field_composed_display_output_window()
+                && self.cached_field_composed_output_matches_active_field_pair(output, field_height)
+                && self.should_use_cached_field_composed_output(output)
+            {
+                return output;
             }
+        }
+        if let Some(full) = self.full_output_from_high_vertical_current_display(width, height) {
+            return full;
+        }
+        if let Some(active_field) =
+            self.visible_single_field_output_from_high_vertical_current_display(width, height)
+        {
+            return active_field;
+        }
+        if let Some(safe_field) =
+            self.safe_field_output_from_high_vertical_current_display(width, height)
+        {
+            return safe_field;
+        }
+        if let Some(presented_field) =
+            self.presented_field_output_from_high_vertical_current_display(width, height)
+        {
+            return presented_field;
+        }
+        if let Some(active_field) =
+            self.active_field_output_from_high_vertical_current_display(width, height)
+        {
+            return active_field;
         }
 
         DisplayOutputWindow {
-            source: "gp1_display_area",
+            source: if width == register_width {
+                DISPLAY_SOURCE_GP1_DISPLAY_AREA
+            } else {
+                DISPLAY_SOURCE_CLEAR_WIDTH_DISPLAY_AREA
+            },
             field_composed: false,
             cached: false,
             width,
             height,
-            window: self.current_display_window(),
+            window: self.current_display_window_with_dimensions(width, height),
         }
+    }
+
+    fn high_vertical_register_width_output_window(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<DisplayOutputWindow> {
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        if let Some(full) = self.full_output_from_high_vertical_current_display(width, height) {
+            return Some(full);
+        }
+        if let Some(active_field) =
+            self.visible_single_field_output_from_high_vertical_current_display(width, height)
+        {
+            return Some(active_field);
+        }
+        if let Some(safe_field) =
+            self.safe_field_output_from_high_vertical_current_display(width, height)
+        {
+            return Some(safe_field);
+        }
+        if let Some(presented_field) =
+            self.presented_field_output_from_high_vertical_current_display(width, height)
+        {
+            return Some(presented_field);
+        }
+        self.active_field_output_from_high_vertical_current_display(width, height)
+    }
+
+    fn display_clear_width_hint(&self, register_width: usize, height: usize) -> Option<usize> {
+        if register_width <= DEFAULT_DISPLAY_WIDTH || height < DEFAULT_DISPLAY_HEIGHT {
+            return None;
+        }
+
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        let display_x = display_x as i32;
+        let display_y = display_y as i32;
+        let minimum_height = if self.high_vertical_interlace_enabled() {
+            (height as i32).saturating_mul(9) / 10
+        } else {
+            (height as i32).saturating_mul(4) / 5
+        };
+
+        self.recent_draw_commands
+            .iter()
+            .chain(self.top_draw_commands.iter())
+            .chain(self.largest_draw_command.iter())
+            .filter_map(|trace| {
+                if !matches!(trace.kind, "fill_rect_unclipped" | "fill_rect") {
+                    return None;
+                }
+                if trace.bounds.left != display_x || trace.bounds.top != display_y {
+                    return None;
+                }
+                let clear_width = trace.bounds.right.saturating_sub(trace.bounds.left) + 1;
+                let clear_height = trace.bounds.bottom.saturating_sub(trace.bounds.top) + 1;
+                if clear_height < minimum_height {
+                    return None;
+                }
+                let clear_width = usize::try_from(clear_width).ok()?;
+                let clear_height = usize::try_from(clear_height).ok()?;
+                if clear_width >= register_width
+                    || clear_width < DEFAULT_DISPLAY_WIDTH
+                    || clear_height < DEFAULT_DISPLAY_HEIGHT
+                    || !matches!(clear_width, 320 | 384)
+                {
+                    return None;
+                }
+                Some(clear_width)
+            })
+            .max()
+    }
+
+    fn current_gui_display_output_window(&self) -> Option<DisplayOutputWindow> {
+        if self.best_observation_window.is_some_and(|best| {
+            self.best_observation_is_safe_display_candidate(best)
+                && !self.display_window_is_texture_atlas(best)
+                && is_detailed_observation(best.stats)
+        }) {
+            return None;
+        }
+
+        let (width, height) = self.display_dimensions();
+        if let Some(output) = self.recent_low_height_field_pair_output_window(width, height)
+            && self.should_use_gui_field_composed_output(output)
+        {
+            return Some(output);
+        }
+        if let Some(field_height) = self.interlaced_field_pair_height(height) {
+            if let Some(output) = self.interlaced_field_pair_output_window(width, field_height)
+                && self.should_use_gui_field_composed_output(output)
+            {
+                return Some(output);
+            }
+        }
+
+        if let Some(output) = self.cached_field_composed_display_output_window()
+            && self.should_use_cached_gui_field_composed_output(
+                output,
+                width,
+                height,
+                self.current_display_output_window(),
+            )
+        {
+            return Some(output);
+        }
+
+        None
+    }
+
+    fn cached_gui_field_composed_output_for_handoff(
+        &self,
+        current_output: DisplayOutputWindow,
+    ) -> Option<DisplayOutputWindow> {
+        let (width, height) = self.display_dimensions();
+        let output = self.cached_field_composed_display_output_window()?;
+        self.should_use_cached_gui_field_composed_output(output, width, height, current_output)
+            .then_some(output)
+    }
+
+    fn should_use_cached_gui_field_composed_output(
+        &self,
+        output: DisplayOutputWindow,
+        width: usize,
+        height: usize,
+        current_output: DisplayOutputWindow,
+    ) -> bool {
+        let matches_current_register = output.width == width && output.height == height;
+        let matches_low_height_register =
+            output.width == width && output.height == height.saturating_mul(2);
+        let matches_active_field = output.width == current_output.width
+            && current_output.height.saturating_mul(2) == output.height;
+
+        output.cached
+            && output.field_composed
+            && (matches_current_register || matches_low_height_register || matches_active_field)
+            && height >= DEFAULT_DISPLAY_HEIGHT
+            && output.height <= PSX_VRAM_HEIGHT
+            && screen_observation_worth_saving(output.window.stats)
+            && !self.field_composed_output_has_texture_atlas_half(output)
+            && (self.display_output_is_unusable_for_cached_gui_handoff(current_output)
+                || self.current_display_is_unusable_for_cached_field_handoff(
+                    self.current_display_window(),
+                ))
+    }
+
+    fn display_output_is_unusable_for_cached_gui_handoff(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        if output.width == 0 || output.height == 0 {
+            return true;
+        }
+        if self.display_window_is_texture_atlas_with_dimensions(
+            output.window,
+            output.width,
+            output.height,
+        ) {
+            return true;
+        }
+        if !screen_observation_worth_saving(output.window.stats)
+            || is_sparse_display(output.window.stats)
+        {
+            return true;
+        }
+
+        let color_stats =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        color_stats.has_intro_caption_band() || color_stats.has_caption_text_band()
+    }
+
+    fn high_vertical_gui_deinterlaced_output_for_active_field(
+        &self,
+        output: DisplayOutputWindow,
+        _resolved: DisplayResolve,
+    ) -> Option<DisplayOutputWindow> {
+        if output.source != DISPLAY_SOURCE_ACTIVE_FIELD || output.field_composed || output.cached {
+            return None;
+        }
+
+        let (width, height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        let current = self.current_display_window();
+        if output.window.x != current.x
+            || output.width != width
+            || output.height.saturating_mul(2) != height
+            || output.window.y == current.y
+            || current.y.saturating_add(height) > PSX_VRAM_HEIGHT
+            || !screen_observation_worth_saving(current.stats)
+            || current.stats.nonzero_pixels < output.window.stats.nonzero_pixels
+        {
+            return None;
+        }
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_DEINTERLACED,
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: output.window,
+        };
+        // This path feeds only the GUI/native-play frame, not the playability
+        // classifier.  When the game presents a high-vertical single field,
+        // line-double the visible field instead of exposing a cropped 240-line
+        // buffer or a half-blank framebuffer to the user.
+        Some(full)
     }
 
     fn current_raw_display_output_window(&self) -> DisplayOutputWindow {
         let (width, height) = self.display_dimensions();
+        if let Some(output) = self.recent_low_height_field_pair_output_window(width, height) {
+            return output;
+        }
         if let Some(field_height) = self.interlaced_field_pair_height(height) {
             if let Some(output) = self.interlaced_field_pair_output_window(width, field_height) {
                 return output;
             }
-            if self.high_vertical_interlace_enabled()
-                && let Some(output) =
-                    self.cached_interlaced_field_pair_output_window(width, field_height)
+            if let Some(output) =
+                self.cached_interlaced_field_pair_output_window(width, field_height)
             {
                 return output;
             }
@@ -1734,14 +2224,19 @@ impl Gpu {
 
         let base_y = current_y.min(other_y);
         let output_height = field_height * 2;
-        let top_stats = self
-            .framebuffer
-            .psx_display_stats(current_x, base_y, width, field_height);
-        let bottom_stats = self.framebuffer.psx_display_stats(
+        let top_stats = self.framebuffer.psx_display_stats_with_depth(
+            current_x,
+            base_y,
+            width,
+            field_height,
+            self.display_24bit_enabled(),
+        );
+        let bottom_stats = self.framebuffer.psx_display_stats_with_depth(
             current_x,
             base_y + field_height,
             width,
             field_height,
+            self.display_24bit_enabled(),
         );
         if !screen_observation_worth_saving(top_stats)
             || !screen_observation_worth_saving(bottom_stats)
@@ -1758,22 +2253,302 @@ impl Gpu {
             window: FrameBufferWindow {
                 x: current_x,
                 y: base_y,
-                stats: self
-                    .framebuffer
-                    .psx_display_stats(current_x, base_y, width, output_height),
+                stats: self.framebuffer.psx_display_stats_with_depth(
+                    current_x,
+                    base_y,
+                    width,
+                    output_height,
+                    self.display_24bit_enabled(),
+                ),
             },
         })
+    }
+
+    fn recent_low_height_field_pair_output_window(
+        &self,
+        width: usize,
+        display_height: usize,
+    ) -> Option<DisplayOutputWindow> {
+        if display_height < DEFAULT_DISPLAY_HEIGHT
+            || display_height.saturating_mul(2) > PSX_VRAM_HEIGHT
+        {
+            return None;
+        }
+
+        let (current_x, current_y) = display_area_start_xy(self.display_area_start);
+        let other_y = if current_y >= display_height {
+            current_y - display_height
+        } else {
+            current_y.checked_add(display_height)?
+        };
+        let base_y = current_y.min(other_y);
+        let paired_y = current_y.max(other_y);
+        let output_height = display_height.checked_mul(2)?;
+        if paired_y >= PSX_VRAM_HEIGHT || base_y.saturating_add(output_height) > PSX_VRAM_HEIGHT {
+            return None;
+        }
+        if !self.recent_display_area_history_contains(current_x, base_y)
+            || !self.recent_display_area_history_contains(current_x, paired_y)
+        {
+            return None;
+        }
+
+        let stats = self.framebuffer.psx_display_stats_with_depth(
+            current_x,
+            base_y,
+            width,
+            output_height,
+            self.display_24bit_enabled(),
+        );
+        if !screen_observation_worth_saving(stats) {
+            return None;
+        }
+
+        Some(DisplayOutputWindow {
+            source: "gp1_display_area_fields",
+            field_composed: true,
+            cached: false,
+            width,
+            height: output_height,
+            window: FrameBufferWindow {
+                x: current_x,
+                y: base_y,
+                stats,
+            },
+        })
+    }
+
+    fn low_height_field_pair_probe_json(&self) -> String {
+        let (width, display_height) = self.display_dimensions();
+        let (current_x, current_y) = display_area_start_xy(self.display_area_start);
+        let other_y = if current_y >= display_height {
+            current_y.saturating_sub(display_height)
+        } else {
+            current_y.saturating_add(display_height)
+        };
+        let base_y = current_y.min(other_y);
+        let paired_y = current_y.max(other_y);
+        let output_height = display_height.saturating_mul(2);
+        let height_gate = display_height >= DEFAULT_DISPLAY_HEIGHT
+            && output_height <= PSX_VRAM_HEIGHT
+            && base_y.saturating_add(output_height) <= PSX_VRAM_HEIGHT;
+        let contains_base = self.recent_display_area_history_contains(current_x, base_y);
+        let contains_paired = self.recent_display_area_history_contains(current_x, paired_y);
+        let candidate = self.recent_low_height_field_pair_output_window(width, display_height);
+        let candidate_stats = candidate
+            .map(|output| framebuffer_window_json(output.window))
+            .unwrap_or_else(|| "null".to_string());
+        let candidate_usable =
+            candidate.is_some_and(|output| self.should_use_field_composed_output(output));
+
+        format!(
+            "{{\"width\":{},\"display_height\":{},\"high_vertical_interlace\":{},\"current_x\":{},\"current_y\":{},\"other_y\":{},\"base_y\":{},\"paired_y\":{},\"height_gate\":{},\"contains_base\":{},\"contains_paired\":{},\"candidate_present\":{},\"candidate_usable\":{},\"candidate\":{}}}",
+            width,
+            display_height,
+            self.high_vertical_interlace_enabled(),
+            current_x,
+            current_y,
+            other_y,
+            base_y,
+            paired_y,
+            height_gate,
+            contains_base,
+            contains_paired,
+            candidate.is_some(),
+            candidate_usable,
+            candidate_stats
+        )
+    }
+
+    fn high_vertical_full_output_gate_json(&self) -> String {
+        let (width, height) = self.display_dimensions();
+        let high_vertical_interlace = self.high_vertical_interlace_enabled();
+        let height_even = height.is_multiple_of(2);
+        let candidate_present =
+            high_vertical_interlace && height >= DEFAULT_DISPLAY_HEIGHT * 2 && height_even;
+        if !candidate_present {
+            return format!(
+                "{{\"candidate_present\":false,\"width\":{},\"height\":{},\"high_vertical_interlace\":{},\"height_even\":{},\"minimum_height\":{},\"reason\":\"candidate_not_present\"}}",
+                width,
+                height,
+                high_vertical_interlace,
+                height_even,
+                DEFAULT_DISPLAY_HEIGHT * 2
+            );
+        }
+
+        let output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+        let worth_saving = screen_observation_worth_saving(output.window.stats);
+        let saturated_logo_transition =
+            self.display_window_has_saturated_logo_transition(output.window, width, height, true);
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        let origin_matches = output.window.x == display_x && output.window.y == display_y;
+        let color_stats = self.display_window_color_stats(output.window, width, height, true);
+        let color_diversity = color_stats.has_scene_color_diversity();
+        let low_bucket_scene_range_signal = color_stats.has_low_bucket_scene_range_signal();
+        let low_bucket_playfield_brightness = color_stats.has_low_bucket_playfield_brightness();
+        let strong_native_3d_textured_playfield =
+            self.has_strong_native_3d_textured_playfield_activity();
+        let has_color_signal = color_diversity
+            || (low_bucket_scene_range_signal
+                && low_bucket_playfield_brightness
+                && strong_native_3d_textured_playfield);
+
+        let halves = self.field_composed_output_half_windows(output);
+        let (top_json, bottom_json, field_height, full_score, top_score, bottom_score) =
+            if let Some((top, bottom, field_height)) = halves {
+                (
+                    framebuffer_window_json(top),
+                    framebuffer_window_json(bottom),
+                    field_height,
+                    screen_observation_score(output.window.stats),
+                    screen_observation_score(top.stats),
+                    screen_observation_score(bottom.stats),
+                )
+            } else {
+                (
+                    "null".to_string(),
+                    "null".to_string(),
+                    0,
+                    screen_observation_score(output.window.stats),
+                    0,
+                    0,
+                )
+            };
+        let both_halves_visible = halves.is_some_and(|(top, bottom, _)| {
+            screen_observation_worth_saving(top.stats)
+                && screen_observation_worth_saving(bottom.stats)
+        });
+        let full_has_more_information = halves.is_some_and(|(top, bottom, _)| {
+            let best_half_score = top_score.max(bottom_score);
+            full_score > best_half_score.saturating_add(best_half_score / 3)
+                || output.window.stats.detail_edges
+                    > top
+                        .stats
+                        .detail_edges
+                        .max(bottom.stats.detail_edges)
+                        .saturating_mul(2)
+                        .max(4096)
+        });
+        let field_intro_caption = self.field_composed_output_is_intro_video_caption(output);
+        let full_frame_scene = has_native_full_scene_detail(output.window.stats)
+            && has_native_gameplay_display_profile(output.window.stats)
+            && !field_intro_caption
+            && both_halves_visible
+            && full_has_more_information;
+        let single_field_scene = halves.is_some_and(|(top, bottom, _)| {
+            self.high_vertical_full_output_has_live_single_field_scene(output, top, bottom)
+        });
+        let (top_glyph, bottom_glyph) = halves
+            .map(|(top, bottom, field_height)| {
+                (
+                    self.display_window_has_glyph_texture_grid(top, width, field_height)
+                        || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                            top,
+                            width,
+                            field_height,
+                        ),
+                    self.display_window_has_glyph_texture_grid(bottom, width, field_height)
+                        || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                            bottom,
+                            width,
+                            field_height,
+                        ),
+                )
+            })
+            .unwrap_or((false, false));
+        let live_draw_overlap = self.display_candidate_has_live_draw_overlap(output.window);
+        let scene_upload_overlap = self.display_candidate_has_scene_upload_overlap(output.window);
+        let allowed = self.should_use_high_vertical_full_output(output);
+        let reason = if allowed {
+            "allowed"
+        } else if !worth_saving {
+            "not_worth_saving"
+        } else if saturated_logo_transition {
+            "saturated_logo_transition"
+        } else if !origin_matches {
+            "origin_mismatch"
+        } else if !has_color_signal {
+            "low_color_signal"
+        } else if halves.is_none() {
+            "missing_halves"
+        } else if !full_frame_scene && single_field_scene {
+            "single_field_scene_prefers_active_field"
+        } else if !full_frame_scene {
+            "no_full_or_single_field_scene"
+        } else if top_glyph || bottom_glyph {
+            "glyph_texture_grid"
+        } else if !live_draw_overlap {
+            "missing_live_draw_overlap"
+        } else if scene_upload_overlap {
+            "scene_upload_overlap"
+        } else {
+            "unknown_rejection"
+        };
+
+        format!(
+            "{{\"candidate_present\":true,\"allowed\":{},\"reason\":\"{}\",\"width\":{},\"height\":{},\"window\":{},\"worth_saving\":{},\"saturated_logo_transition\":{},\"origin_matches\":{},\"color\":{},\"color_diversity\":{},\"low_bucket_scene_range_signal\":{},\"low_bucket_playfield_brightness\":{},\"strong_native_3d_textured_playfield\":{},\"has_color_signal\":{},\"halves_present\":{},\"field_height\":{},\"top\":{},\"bottom\":{},\"full_score\":{},\"top_score\":{},\"bottom_score\":{},\"both_halves_visible\":{},\"full_has_more_information\":{},\"field_intro_caption\":{},\"full_frame_scene\":{},\"single_field_scene\":{},\"top_glyph\":{},\"bottom_glyph\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{}}}",
+            allowed,
+            reason,
+            width,
+            height,
+            framebuffer_window_json(output.window),
+            worth_saving,
+            saturated_logo_transition,
+            origin_matches,
+            color_stats.json(),
+            color_diversity,
+            low_bucket_scene_range_signal,
+            low_bucket_playfield_brightness,
+            strong_native_3d_textured_playfield,
+            has_color_signal,
+            halves.is_some(),
+            field_height,
+            top_json,
+            bottom_json,
+            full_score,
+            top_score,
+            bottom_score,
+            both_halves_visible,
+            full_has_more_information,
+            field_intro_caption,
+            full_frame_scene,
+            single_field_scene,
+            top_glyph,
+            bottom_glyph,
+            live_draw_overlap,
+            scene_upload_overlap
+        )
+    }
+
+    fn high_vertical_full_output_has_saturated_logo_transition(&self) -> bool {
+        let (width, height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return false;
+        }
+
+        let window = self.current_display_window_with_dimensions(width, height);
+        self.display_window_has_saturated_logo_transition(window, width, height, true)
     }
 
     fn interlaced_field_pair_height(&self, display_height: usize) -> Option<usize> {
         if self.high_vertical_interlace_enabled() {
             let field_height = display_height.checked_div(2)?;
-            if field_height < DEFAULT_DISPLAY_HEIGHT
-                || field_height.saturating_mul(2) != display_height
+            if field_height >= DEFAULT_DISPLAY_HEIGHT
+                && field_height.saturating_mul(2) == display_height
             {
-                return None;
+                return Some(field_height);
             }
-            return Some(field_height);
         }
 
         self.low_height_display_area_field_pair_height(display_height)
@@ -1797,7 +2572,11 @@ impl Gpu {
     }
 
     fn high_vertical_interlace_enabled(&self) -> bool {
-        self.status & (1 << 19) != 0 && self.status & (1 << 22) != 0
+        high_vertical_resolution_status(self.status)
+    }
+
+    fn display_24bit_enabled(&self) -> bool {
+        self.status & (1 << 21) != 0
     }
 
     fn cached_interlaced_field_pair_output_window(
@@ -1836,17 +2615,40 @@ impl Gpu {
         })
     }
 
+    fn cached_field_composed_output_matches_active_field_pair(
+        &self,
+        output: DisplayOutputWindow,
+        field_height: usize,
+    ) -> bool {
+        if !output.cached
+            || output.height != field_height.saturating_mul(2)
+            || output.window.y.saturating_add(field_height) >= PSX_VRAM_HEIGHT
+        {
+            return false;
+        }
+
+        self.recent_display_area_history_has_field_pair(
+            output.window.x,
+            output.window.y,
+            output.window.y.saturating_add(field_height),
+        )
+    }
+
     fn display_output_png(&self, output: DisplayOutputWindow) -> Vec<u8> {
         if output.cached
             && let Some(png) = self.field_composed_display_png()
         {
             return png;
         }
-        self.framebuffer.psx_display_png(
+        if let Some(rgb) = self.high_vertical_deinterlaced_output_rgb(output) {
+            return png_from_rgb888_pixels(output.width, output.height, &rgb);
+        }
+        self.framebuffer.psx_display_png_with_depth(
             output.window.x,
             output.window.y,
             output.width,
             output.height,
+            self.display_24bit_enabled(),
         )
     }
 
@@ -1856,12 +2658,50 @@ impl Gpu {
         {
             return rgb.clone();
         }
-        self.framebuffer.psx_display_rgb_window(
+        if let Some(rgb) = self.high_vertical_deinterlaced_output_rgb(output) {
+            return rgb;
+        }
+        self.framebuffer.psx_display_rgb_window_with_depth(
             output.window.x,
             output.window.y,
             output.width,
             output.height,
+            self.display_24bit_enabled(),
         )
+    }
+
+    fn high_vertical_deinterlaced_output_rgb(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> Option<Vec<u32>> {
+        if output.source != DISPLAY_SOURCE_HIGH_VERTICAL_DEINTERLACED
+            || !output.field_composed
+            || output.cached
+            || output.width == 0
+            || output.height < 2
+            || !output.height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        let field_height = output.height / 2;
+        let field = self.framebuffer.psx_display_rgb_window_with_depth(
+            output.window.x,
+            output.window.y,
+            output.width,
+            field_height,
+            self.display_24bit_enabled(),
+        );
+        if field.len() != output.width.saturating_mul(field_height) {
+            return None;
+        }
+
+        let mut pixels = Vec::with_capacity(output.width.saturating_mul(output.height));
+        for row in field.chunks(output.width) {
+            pixels.extend_from_slice(row);
+            pixels.extend_from_slice(row);
+        }
+        Some(pixels)
     }
 
     fn best_observation_png(&self) -> Option<Vec<u8>> {
@@ -1942,6 +2782,9 @@ impl Gpu {
         if self.display_window_is_texture_atlas(current) {
             return false;
         }
+        if self.current_display_is_sparse_intro_caption_candidate(current) {
+            return false;
+        }
         if self.should_show_current_display_over_stale_candidates_with(current) {
             return true;
         }
@@ -1949,8 +2792,11 @@ impl Gpu {
             return false;
         }
         if let Some(best) = self.best_observation_window
-            && !self.display_window_is_texture_atlas(best)
+            && self.best_observation_is_safe_display_candidate(best)
         {
+            if self.cached_observation_beats_partial_current_display(current, best) {
+                return false;
+            }
             let current_score = screen_observation_score(current.stats);
             let best_score = screen_observation_score(best.stats);
             if is_sparse_display(current.stats)
@@ -1971,6 +2817,12 @@ impl Gpu {
         }
         if let Some(presented) = self.presented_frame_window {
             if self.display_window_is_texture_atlas(presented) {
+                return false;
+            }
+            if !self.presented_frame_is_safe_display_candidate(presented) {
+                return true;
+            }
+            if self.cached_observation_beats_partial_current_display(current, presented) {
                 return false;
             }
             let current_score = screen_observation_score(current.stats);
@@ -2017,12 +2869,12 @@ impl Gpu {
             }
         }
         if let Some(presented) = self.presented_frame_window {
-            if !self.display_window_is_texture_atlas(presented) {
+            if self.presented_frame_is_safe_display_candidate(presented) {
                 return presented;
             }
         }
         if let Some(best) = self.best_observation_window {
-            if !self.display_window_is_texture_atlas(best) {
+            if self.best_observation_is_safe_display_candidate(best) {
                 return best;
             }
         }
@@ -2056,12 +2908,44 @@ impl Gpu {
         if !screen_observation_worth_saving(current.stats) {
             return false;
         }
+        if self.current_display_is_stale_periodic_video(current) {
+            return false;
+        }
+        if self.current_display_is_sparse_intro_caption_candidate(current) {
+            return false;
+        }
         if self.has_better_cached_observation_than_current(current) {
             return false;
         }
 
         let display_pixels = (self.display_dimensions().0 * self.display_dimensions().1) as u64;
         current.stats.nonzero_pixels >= display_pixels / 512
+    }
+
+    fn current_display_is_sparse_intro_caption_candidate(
+        &self,
+        current: FrameBufferWindow,
+    ) -> bool {
+        let pixel_count = current.stats.pixel_count.max(1);
+        let low_density_caption = current.stats.nonzero_pixels.saturating_mul(32) <= pixel_count;
+        if (!is_sparse_display(current.stats) && !low_density_caption)
+            || has_native_playfield_density(current.stats)
+            || self.current_display_has_scene_quality(current)
+        {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        let color_stats = self.display_window_color_stats(current, width, height, true);
+        if !color_stats.has_intro_caption_band() && !color_stats.has_caption_text_band() {
+            return false;
+        }
+
+        self.has_textured_scene_draws()
+            && self.has_playfield_draws()
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
     }
 
     fn has_better_cached_observation_than_current(&self, current: FrameBufferWindow) -> bool {
@@ -2072,10 +2956,22 @@ impl Gpu {
             None
         };
 
+        if self.presented_frame_window.is_some_and(|presented| {
+            !self.presented_frame_is_fresh()
+                && self.cached_observation_beats_partial_current_display(current, presented)
+        }) {
+            return true;
+        }
+
         presented
             .into_iter()
             .chain(self.best_observation_window)
             .filter(|candidate| !self.display_window_is_texture_atlas(*candidate))
+            .filter(|candidate| {
+                self.presented_frame_window
+                    .is_none_or(|presented| presented != *candidate)
+                    || self.presented_frame_is_safe_display_candidate(*candidate)
+            })
             .any(|candidate| {
                 if should_defer_low_detail_current(current.stats, candidate.stats) {
                     return true;
@@ -2095,27 +2991,90 @@ impl Gpu {
             })
     }
 
+    fn cached_observation_beats_partial_current_display(
+        &self,
+        current: FrameBufferWindow,
+        candidate: FrameBufferWindow,
+    ) -> bool {
+        if candidate.x == current.x
+            && candidate.y == current.y
+            && candidate.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+        if self.display_window_is_texture_atlas(candidate)
+            || !screen_observation_worth_saving(candidate.stats)
+            || !is_detailed_observation(candidate.stats)
+        {
+            return false;
+        }
+        if self.presented_frame_window.is_some_and(|presented| {
+            presented.x == candidate.x
+                && presented.y == candidate.y
+                && presented.stats.checksum == candidate.stats.checksum
+                && !self.presented_frame_is_safe_display_candidate(candidate)
+        }) {
+            return false;
+        }
+
+        let pixel_count = current.stats.pixel_count.max(1);
+        let current_is_partial = current.stats.nonzero_pixels.saturating_mul(24) <= pixel_count;
+        if !current_is_partial || has_native_playfield_density(current.stats) {
+            return false;
+        }
+        if !self.display_candidate_has_live_draw_overlap(candidate)
+            && !self.display_candidate_has_streamed_scene_presentation(candidate)
+        {
+            return false;
+        }
+
+        let current_score = screen_observation_score(current.stats);
+        let candidate_score = screen_observation_score(candidate.stats);
+        candidate.stats.nonzero_pixels > current.stats.nonzero_pixels.saturating_mul(3)
+            && candidate.stats.detail_edges > current.stats.detail_edges.saturating_mul(3).max(512)
+            && candidate_score > current_score.saturating_add(current_score / 3)
+    }
+
     pub fn actual_display_png(&self) -> Vec<u8> {
         let output = self.current_display_output_window();
-        if self.should_use_field_composed_output(output) {
+        let resolved = self.display_resolve();
+        if self.should_use_display_output(output, resolved) {
             return self.display_output_png(output);
         }
-        let resolved = self.display_resolve();
         if !resolved.promoted || !self.should_present_resolved_display(resolved) {
-            return self.display_png();
+            let (width, height) = self.display_dimensions();
+            let window = self.current_display_window();
+            return self.framebuffer.psx_display_png_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
         }
         self.resolved_display_png(resolved)
     }
 
     pub fn actual_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
         let output = self.current_display_output_window();
-        if self.should_use_field_composed_output(output) {
+        let resolved = self.display_resolve();
+        if self.should_use_display_output(output, resolved) {
             return (output.width, output.height, self.display_output_rgb(output));
         }
-        let resolved = self.display_resolve();
         let (width, height) = self.display_dimensions();
         if !resolved.promoted || !self.should_present_resolved_display(resolved) {
-            return self.display_rgb_frame();
+            let window = self.current_display_window();
+            return (
+                width,
+                height,
+                self.framebuffer.psx_display_rgb_window_with_depth(
+                    window.x,
+                    window.y,
+                    width,
+                    height,
+                    self.display_24bit_enabled(),
+                ),
+            );
         }
         self.resolved_display_rgb_frame(resolved, width, height)
     }
@@ -2133,8 +3092,13 @@ impl Gpu {
         }
         let (width, height) = self.display_dimensions();
         if resolved.source == "gp1_display_area" {
-            self.framebuffer
-                .psx_display_png(resolved.window.x, resolved.window.y, width, height)
+            self.framebuffer.psx_display_png_with_depth(
+                resolved.window.x,
+                resolved.window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            )
         } else {
             self.framebuffer
                 .png(resolved.window.x, resolved.window.y, width, height)
@@ -2162,11 +3126,12 @@ impl Gpu {
             );
         }
         if resolved.source == "gp1_display_area" {
-            self.framebuffer.psx_display_rgb_window(
+            self.framebuffer.psx_display_rgb_window_with_depth(
                 resolved.window.x,
                 resolved.window.y,
                 width,
                 height,
+                self.display_24bit_enabled(),
             )
         } else {
             self.framebuffer
@@ -2225,8 +3190,13 @@ impl Gpu {
         }
 
         if use_psx_wrap {
-            self.framebuffer
-                .psx_display_rgb_window(window.x, window.y, width, height)
+            self.framebuffer.psx_display_rgb_window_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            )
         } else {
             self.framebuffer
                 .rgb_window(window.x, window.y, width, height)
@@ -2278,15 +3248,1514 @@ impl Gpu {
         self.display_output_png(output)
     }
 
+    fn should_use_display_output(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if self.should_use_high_vertical_full_output(output) {
+            return !self.should_field_composed_output_yield_to_resolved(output, resolved);
+        }
+        if self.should_use_active_field_output(output, resolved) {
+            return true;
+        }
+        if self.should_use_presented_field_output(output) {
+            return true;
+        }
+        if self.should_use_safe_field_output(output) {
+            return !self.should_safe_field_output_yield_to_resolved(output, resolved);
+        }
+
+        self.should_use_field_composed_output(output)
+            && !self.should_field_composed_output_yield_to_resolved(output, resolved)
+    }
+
+    fn should_use_high_vertical_full_output(&self, output: DisplayOutputWindow) -> bool {
+        if output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+            || !output.field_composed
+            || output.cached
+            || output.width < DEFAULT_DISPLAY_WIDTH
+            || output.height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !screen_observation_worth_saving(output.window.stats)
+            || self.display_window_has_saturated_logo_transition(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            )
+        {
+            return false;
+        }
+
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if output.window.x != display_x || output.window.y != display_y {
+            return false;
+        }
+
+        let color_stats =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        let has_color_signal = color_stats.has_scene_color_diversity()
+            || (color_stats.has_low_bucket_scene_range_signal()
+                && color_stats.has_low_bucket_playfield_brightness()
+                && self.has_strong_native_3d_textured_playfield_activity());
+        if !has_color_signal {
+            return false;
+        }
+
+        let full_score = screen_observation_score(output.window.stats);
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(output)
+        else {
+            return false;
+        };
+        let top_score = screen_observation_score(top.stats);
+        let bottom_score = screen_observation_score(bottom.stats);
+        let best_half_score = top_score.max(bottom_score);
+        let both_halves_visible = screen_observation_worth_saving(top.stats)
+            && screen_observation_worth_saving(bottom.stats);
+        let full_has_more_information = full_score
+            > best_half_score.saturating_add(best_half_score / 3)
+            || output.window.stats.detail_edges
+                > top
+                    .stats
+                    .detail_edges
+                    .max(bottom.stats.detail_edges)
+                    .saturating_mul(2)
+                    .max(4096);
+        let full_frame_scene = has_native_full_scene_detail(output.window.stats)
+            && has_native_gameplay_display_profile(output.window.stats)
+            && !self.field_composed_output_is_intro_video_caption(output)
+            && both_halves_visible
+            && full_has_more_information;
+        if !full_frame_scene {
+            return false;
+        }
+
+        let top_glyph = self.display_window_has_glyph_texture_grid(top, output.width, field_height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                top,
+                output.width,
+                field_height,
+            );
+        let bottom_glyph =
+            self.display_window_has_glyph_texture_grid(bottom, output.width, field_height)
+                || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                    bottom,
+                    output.width,
+                    field_height,
+                );
+        if top_glyph || bottom_glyph {
+            return false;
+        }
+
+        // A high-vertical game frame can look atlas-like to the generic page
+        // heuristic, but a live draw overlap without matching texture upload
+        // overlap is display flow, not a texture page.
+        self.display_candidate_has_live_draw_overlap(output.window)
+            && !self.display_candidate_has_scene_upload_overlap(output.window)
+    }
+
+    fn high_vertical_full_output_has_live_single_field_scene(
+        &self,
+        output: DisplayOutputWindow,
+        top: FrameBufferWindow,
+        bottom: FrameBufferWindow,
+    ) -> bool {
+        self.high_vertical_full_output_has_live_single_field_scene_with_visibility(
+            output, top, bottom, true,
+        )
+    }
+
+    fn high_vertical_full_output_has_live_single_field_scene_with_visibility(
+        &self,
+        output: DisplayOutputWindow,
+        top: FrameBufferWindow,
+        bottom: FrameBufferWindow,
+        allow_visible_lookup: bool,
+    ) -> bool {
+        let has_presentation = if allow_visible_lookup {
+            self.has_visible_presentation()
+        } else {
+            self.presentation_captures > 0
+        };
+        if !self.has_playfield_draws()
+            || !self.has_native_play_3d_draw_signal()
+            || !has_presentation
+            || self.textured_draw_stats.written_pixels
+                < DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16
+            || self.textured_draw_stats.color_changes < 16_384
+        {
+            return false;
+        }
+
+        let field_height = output.height / 2;
+        let live_field = [top, bottom].into_iter().any(|field| {
+            let color = self.display_window_color_stats(field, output.width, field_height, true);
+            let full_density_scene = screen_observation_worth_saving(field.stats)
+                && has_native_full_scene_detail(field.stats)
+                && color.has_scene_color_diversity()
+                && !self.display_window_has_glyph_texture_grid(field, output.width, field_height)
+                && !self.display_window_has_glyph_texture_grid_with_psx_depth(
+                    field,
+                    output.width,
+                    field_height,
+                )
+                && !self.field_half_is_probable_texture_atlas_artifact(
+                    field,
+                    output.width,
+                    field_height,
+                );
+            full_density_scene
+                || self.high_vertical_live_single_field_scene_signal(
+                    field,
+                    output.width,
+                    field_height,
+                    color,
+                )
+        });
+        if !live_field {
+            return false;
+        }
+
+        let top_empty = !screen_observation_worth_saving(top.stats)
+            || top.stats.nonzero_pixels < top.stats.pixel_count / 16;
+        let bottom_empty = !screen_observation_worth_saving(bottom.stats)
+            || bottom.stats.nonzero_pixels < bottom.stats.pixel_count / 16;
+        top_empty || bottom_empty
+    }
+
+    #[cfg(test)]
+    fn high_vertical_full_output_has_single_visible_field(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        let Some((top, bottom, _)) = self.field_composed_output_half_windows(output) else {
+            return false;
+        };
+        let top_sparse = high_vertical_single_field_is_sparse(top.stats);
+        let bottom_sparse = high_vertical_single_field_is_sparse(bottom.stats);
+
+        top_sparse != bottom_sparse
+    }
+
+    fn should_use_safe_field_output(&self, output: DisplayOutputWindow) -> bool {
+        !output.field_composed
+            && !output.cached
+            && output.source == DISPLAY_SOURCE_SAFE_FIELD
+            && output.width > 0
+            && output.height > 0
+            && screen_observation_worth_saving(output.window.stats)
+            && self.safe_field_output_matches_display_flow(output.window)
+            && (self.safe_field_output_has_scene_signal(output)
+                || self.safe_field_output_sanitizes_high_vertical_artifact(output))
+            && !self.field_half_is_probable_texture_atlas_artifact(
+                output.window,
+                output.width,
+                output.height,
+            )
+    }
+
+    fn should_use_active_field_output(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        output.source == DISPLAY_SOURCE_ACTIVE_FIELD
+            && !output.field_composed
+            && !output.cached
+            && output.width > 0
+            && output.height > 0
+            && screen_observation_worth_saving(output.window.stats)
+            && !self.field_half_is_probable_texture_atlas_artifact(
+                output.window,
+                output.width,
+                output.height,
+            )
+            && !self.field_half_is_caption_or_font_texture_page_artifact(
+                output.window,
+                output.width,
+                output.height,
+                self.display_window_color_stats(output.window, output.width, output.height, false),
+                self.display_window_color_stats(output.window, output.width, output.height, true),
+            )
+            && (!resolved.promoted
+                || !self.should_present_resolved_display(resolved)
+                || self.display_window_is_texture_atlas(resolved.window))
+    }
+
+    fn should_use_presented_field_output(&self, output: DisplayOutputWindow) -> bool {
+        if output.source != DISPLAY_SOURCE_PRESENTED_FIELD
+            || output.field_composed
+            || output.cached
+            || output.width == 0
+            || output.height == 0
+            || !self.presented_frame_matches_field_origin(output.window)
+            || !screen_observation_worth_saving(output.window.stats)
+            || !is_detailed_observation(output.window.stats)
+        {
+            return false;
+        }
+
+        let color =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        has_native_playfield_density(output.window.stats)
+            && !self.low_palette_noise_candidate(output.window.stats, color)
+            && (color.has_scene_color_diversity() || color.has_low_bucket_scene_range_signal())
+    }
+
+    fn should_safe_field_output_yield_to_resolved(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if output.source != DISPLAY_SOURCE_SAFE_FIELD
+            || !resolved.promoted
+            || !self.should_present_resolved_display(resolved)
+            || self.display_window_is_texture_atlas(resolved.window)
+            || !screen_observation_worth_saving(resolved.window.stats)
+        {
+            return false;
+        }
+
+        let (resolved_width, resolved_height) = self.resolved_display_dimensions(resolved);
+        let resolved_color =
+            self.display_window_color_stats(resolved.window, resolved_width, resolved_height, true);
+        let resolved_has_scene_signal = resolved_color.has_scene_color_diversity()
+            || self.resolved_display_has_strong_live_playfield_signal(resolved)
+            || self.display_candidate_has_live_draw_overlap(resolved.window);
+        if !resolved_has_scene_signal {
+            return false;
+        }
+
+        let output_score = screen_observation_score(output.window.stats);
+        let resolved_score = screen_observation_score(resolved.window.stats);
+        resolved_score > output_score.saturating_add(output_score / 4)
+            || resolved.window.stats.detail_edges
+                > output.window.stats.detail_edges.saturating_mul(2).max(4096)
+    }
+
+    fn safe_field_output_has_scene_signal(&self, output: DisplayOutputWindow) -> bool {
+        if !self.safe_field_output_matches_display_flow(output.window) {
+            return false;
+        }
+
+        let color_stats =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        if color_stats.has_scene_color_diversity() {
+            return true;
+        }
+
+        self.has_strong_native_3d_textured_playfield_activity()
+            && color_stats.has_low_bucket_scene_range_signal()
+            && color_stats.has_low_bucket_playfield_brightness()
+            && !self.display_window_has_periodic_horizontal_ghosting(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            )
+    }
+
+    fn safe_field_output_sanitizes_high_vertical_artifact(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        output.source == DISPLAY_SOURCE_SAFE_FIELD
+            && self.high_vertical_interlace_enabled()
+            && output.height.saturating_mul(2) == self.display_dimensions().1
+            && self.safe_field_output_matches_display_flow(output.window)
+    }
+
+    fn should_use_unresolved_non_field_output(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if output.field_composed || output.source == DISPLAY_SOURCE_SAFE_FIELD || resolved.promoted
+        {
+            return false;
+        }
+        if self.display_window_is_texture_atlas_with_dimensions(
+            output.window,
+            output.width,
+            output.height,
+        ) {
+            return false;
+        }
+        if self.presented_frame_window.is_some_and(|presented| {
+            self.cached_observation_beats_partial_current_display(output.window, presented)
+        }) {
+            return false;
+        }
+        if self.best_observation_window.is_some_and(|best| {
+            self.cached_observation_beats_partial_current_display(output.window, best)
+        }) {
+            return false;
+        }
+
+        true
+    }
+
     fn should_use_field_composed_output(&self, output: DisplayOutputWindow) -> bool {
         output.field_composed
             && has_native_full_scene_detail(output.window.stats)
+            && !self.field_composed_output_is_intro_video_caption(output)
+            && !self.field_composed_output_has_texture_atlas_half(output)
             && (output.cached
+                || self.display_output_matches_recent_field_pair(output)
                 || !self.display_window_is_texture_atlas_with_dimensions(
                     output.window,
                     output.width,
                     output.height,
                 ))
+    }
+
+    fn should_use_gui_field_composed_output(&self, output: DisplayOutputWindow) -> bool {
+        output.field_composed
+            && !output.cached
+            && output.width > 0
+            && output.height >= DEFAULT_DISPLAY_HEIGHT * 2
+            && screen_observation_worth_saving(output.window.stats)
+            && !self.field_composed_output_has_texture_atlas_half(output)
+            && (self.display_output_matches_recent_field_pair(output)
+                || !self.display_window_is_texture_atlas_with_dimensions(
+                    output.window,
+                    output.width,
+                    output.height,
+                ))
+    }
+
+    fn safe_field_output_from_field_composed_output(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> Option<DisplayOutputWindow> {
+        if output.cached {
+            return None;
+        }
+        let (top, bottom, field_height) = self.field_composed_output_half_windows(output)?;
+        let top_is_artifact =
+            self.field_half_is_probable_texture_atlas_artifact(top, output.width, field_height);
+        let bottom_is_artifact =
+            self.field_half_is_probable_texture_atlas_artifact(bottom, output.width, field_height);
+        if top_is_artifact == bottom_is_artifact {
+            return None;
+        }
+
+        let safe = if top_is_artifact { bottom } else { top };
+        if !screen_observation_worth_saving(safe.stats)
+            || !self.safe_field_output_matches_display_flow(safe)
+            || self.field_half_is_probable_texture_atlas_artifact(safe, output.width, field_height)
+        {
+            return None;
+        }
+
+        Some(DisplayOutputWindow {
+            source: DISPLAY_SOURCE_SAFE_FIELD,
+            field_composed: false,
+            cached: false,
+            width: output.width,
+            height: field_height,
+            window: safe,
+        })
+    }
+
+    fn safe_field_output_matches_display_flow(&self, window: FrameBufferWindow) -> bool {
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        (window.x == display_x && window.y == display_y)
+            || self.recent_display_area_history_contains(window.x, window.y)
+    }
+
+    fn safe_field_output_from_high_vertical_current_display(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<DisplayOutputWindow> {
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        let current = DisplayOutputWindow {
+            source: "gp1_display_area_high_vertical_fields",
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+        self.safe_field_output_from_field_composed_output(current)
+    }
+
+    fn full_output_from_high_vertical_current_display(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<DisplayOutputWindow> {
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        let output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+
+        self.should_use_high_vertical_full_output(output)
+            .then_some(output)
+    }
+
+    fn active_field_output_from_high_vertical_current_display(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<DisplayOutputWindow> {
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        let current = self.current_display_window_with_dimensions(width, height);
+        if !self.display_window_is_texture_atlas_with_dimensions(current, width, height) {
+            return None;
+        }
+
+        let field_height = height / 2;
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if display_y.saturating_add(field_height) > PSX_VRAM_HEIGHT {
+            return None;
+        }
+
+        let active = FrameBufferWindow {
+            x: display_x,
+            y: display_y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                display_x,
+                display_y,
+                width,
+                field_height,
+                self.display_24bit_enabled(),
+            ),
+        };
+        if !screen_observation_worth_saving(active.stats)
+            || self.display_window_has_glyph_texture_grid(active, width, field_height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                active,
+                width,
+                field_height,
+            )
+            || self.field_half_is_probable_texture_atlas_artifact(active, width, field_height)
+            || self.field_half_is_caption_or_font_texture_page_artifact(
+                active,
+                width,
+                field_height,
+                self.display_window_color_stats(active, width, field_height, false),
+                self.display_window_color_stats(active, width, field_height, true),
+            )
+            || self.display_candidate_has_dominant_unpresented_texture_upload(
+                active,
+                width,
+                field_height,
+            )
+        {
+            return None;
+        }
+
+        Some(DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: active,
+        })
+    }
+
+    fn visible_single_field_output_from_high_vertical_current_display(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<DisplayOutputWindow> {
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        let full = DisplayOutputWindow {
+            source: "gp1_display_area_high_vertical_fields",
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+        let (top, bottom, field_height) = self.field_composed_output_half_windows(full)?;
+        let top_score = screen_observation_score(top.stats);
+        let bottom_score = screen_observation_score(bottom.stats);
+        let top_sparse = high_vertical_single_field_is_sparse(top.stats);
+        let bottom_sparse = high_vertical_single_field_is_sparse(bottom.stats);
+
+        let candidate = if !top_sparse
+            && (bottom_sparse || top_score > bottom_score.saturating_mul(3).max(1))
+        {
+            top
+        } else if !bottom_sparse
+            && (top_sparse || bottom_score > top_score.saturating_mul(3).max(1))
+        {
+            bottom
+        } else {
+            return None;
+        };
+
+        let (_display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if candidate.y == display_y {
+            return None;
+        }
+
+        if !screen_observation_worth_saving(candidate.stats)
+            || self.display_window_has_glyph_texture_grid(candidate, width, field_height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                candidate,
+                width,
+                field_height,
+            )
+            || self.field_half_is_probable_texture_atlas_artifact(candidate, width, field_height)
+            || self.display_candidate_has_dominant_unpresented_texture_upload(
+                candidate,
+                width,
+                field_height,
+            )
+        {
+            return None;
+        }
+
+        Some(DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: candidate,
+        })
+    }
+
+    fn presented_field_output_from_high_vertical_current_display(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<DisplayOutputWindow> {
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+            || self.presented_frame_window.is_none()
+        {
+            return None;
+        }
+
+        let full = DisplayOutputWindow {
+            source: "gp1_display_area_high_vertical_fields",
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+        let (top, bottom, field_height) = self.field_composed_output_half_windows(full)?;
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        let active = if top.x == display_x && top.y == display_y {
+            top
+        } else if bottom.x == display_x && bottom.y == display_y {
+            bottom
+        } else {
+            return None;
+        };
+
+        let candidates = [top, bottom];
+        let candidate = candidates
+            .into_iter()
+            .filter(|candidate| candidate.x != active.x || candidate.y != active.y)
+            .find(|candidate| self.presented_frame_matches_field_origin(*candidate))?;
+
+        if !self.presented_counterpart_field_is_better_than_active(
+            active,
+            candidate,
+            width,
+            field_height,
+        ) {
+            return None;
+        }
+
+        Some(DisplayOutputWindow {
+            source: DISPLAY_SOURCE_PRESENTED_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: candidate,
+        })
+    }
+
+    fn presented_frame_matches_field_origin(&self, candidate: FrameBufferWindow) -> bool {
+        self.presented_frame_window
+            .is_some_and(|presented| presented.x == candidate.x && presented.y == candidate.y)
+    }
+
+    fn presented_counterpart_field_is_better_than_active(
+        &self,
+        active: FrameBufferWindow,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !screen_observation_worth_saving(candidate.stats)
+            || !is_detailed_observation(candidate.stats)
+            || self.display_window_has_glyph_texture_grid(candidate, width, height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(candidate, width, height)
+        {
+            return false;
+        }
+
+        let candidate_color = self.display_window_color_stats(candidate, width, height, true);
+        if self.low_palette_noise_candidate(candidate.stats, candidate_color) {
+            return false;
+        }
+
+        let candidate_has_scene_signal = has_native_playfield_density(candidate.stats)
+            && (candidate_color.has_scene_color_diversity()
+                || candidate_color.has_low_bucket_scene_range_signal())
+            && candidate.stats.detail_edges >= (candidate.stats.pixel_count / 256).max(512);
+        if !candidate_has_scene_signal {
+            return false;
+        }
+
+        let active_score = screen_observation_score(active.stats);
+        let candidate_score = screen_observation_score(candidate.stats);
+        !has_native_playfield_density(active.stats)
+            || !has_native_gameplay_display_profile(active.stats)
+            || self.field_half_is_probable_texture_atlas_artifact(active, width, height)
+            || candidate_score > active_score.saturating_add(active_score / 4)
+            || candidate.stats.detail_edges > active.stats.detail_edges.saturating_mul(2).max(512)
+    }
+
+    fn field_composed_output_has_texture_atlas_half(&self, output: DisplayOutputWindow) -> bool {
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(output)
+        else {
+            return false;
+        };
+
+        self.field_half_is_probable_texture_atlas_artifact(top, output.width, field_height)
+            || self.field_half_is_probable_texture_atlas_artifact(
+                bottom,
+                output.width,
+                field_height,
+            )
+    }
+
+    fn field_composed_output_half_windows(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> Option<(FrameBufferWindow, FrameBufferWindow, usize)> {
+        if !output.field_composed || output.height == 0 {
+            return None;
+        }
+
+        let field_height = output.height.checked_div(2)?;
+        if field_height == 0
+            || field_height.saturating_mul(2) != output.height
+            || output.window.y.saturating_add(output.height) > PSX_VRAM_HEIGHT
+        {
+            return None;
+        }
+
+        let bottom_y = output.window.y.saturating_add(field_height);
+        let top = FrameBufferWindow {
+            x: output.window.x,
+            y: output.window.y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                output.window.x,
+                output.window.y,
+                output.width,
+                field_height,
+                self.display_24bit_enabled(),
+            ),
+        };
+        let bottom = FrameBufferWindow {
+            x: output.window.x,
+            y: bottom_y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                output.window.x,
+                bottom_y,
+                output.width,
+                field_height,
+                self.display_24bit_enabled(),
+            ),
+        };
+
+        Some((top, bottom, field_height))
+    }
+
+    fn field_half_is_probable_texture_atlas_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width < 256 || height < 120 {
+            return false;
+        }
+
+        if self.display_window_has_glyph_texture_grid(window, width, height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(window, width, height)
+        {
+            return true;
+        }
+
+        let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let psx_color_stats = self.display_window_color_stats(window, width, height, true);
+        let raw_caption_like =
+            raw_color_stats.has_intro_caption_band() || raw_color_stats.has_caption_text_band();
+        let psx_caption_like =
+            psx_color_stats.has_intro_caption_band() || psx_color_stats.has_caption_text_band();
+        let raw_periodic =
+            self.display_window_has_periodic_horizontal_ghosting(window, width, height, false);
+        let psx_periodic =
+            self.display_window_has_periodic_horizontal_ghosting(window, width, height, true);
+        if (raw_caption_like && raw_periodic || psx_caption_like && psx_periodic)
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.has_native_play_3d_draw_signal()
+        {
+            return true;
+        }
+
+        if self.field_half_has_periodic_backdrop_texture_fragments(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+            raw_periodic,
+            psx_periodic,
+        ) {
+            return true;
+        }
+
+        if self.field_half_is_caption_or_font_texture_page_artifact(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+        ) {
+            return true;
+        }
+
+        if self.image_upload_rects.is_empty() {
+            return false;
+        }
+
+        if self.field_half_is_dense_caption_texture_page(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+        ) {
+            return true;
+        }
+
+        let (upload_overlap, upload_overlap_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(window, width, height);
+        if upload_overlap <= 0 && upload_overlap_rects == 0 && max_upload_overlap <= 0 {
+            return false;
+        }
+
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+        let upload_overlap = upload_overlap.max(0) as u64;
+        let max_upload_overlap = max_upload_overlap.max(0) as u64;
+        let upload_touches_field = upload_overlap >= pixel_count / 16
+            || max_upload_overlap >= pixel_count / 8
+            || upload_overlap_rects >= 4;
+        if !upload_touches_field {
+            return false;
+        }
+
+        if self.field_half_has_dominant_backdrop_texture_fragments(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+            upload_overlap,
+            upload_overlap_rects,
+            max_upload_overlap,
+        ) {
+            return true;
+        }
+
+        (raw_caption_like || psx_caption_like)
+            && !has_native_gameplay_display_profile(window.stats)
+            && (raw_periodic || psx_periodic)
+    }
+
+    fn field_half_is_caption_or_font_texture_page_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+    ) -> bool {
+        self.field_half_is_caption_texture_page_artifact(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+        ) || self.field_half_is_low_color_font_texture_page_artifact(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+        )
+    }
+
+    fn field_half_is_caption_texture_page_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || width > display_width
+            || height.saturating_mul(2) != display_height
+            || !is_likely_texture_page_candidate(window.x, window.y, width, height)
+            || !self.has_native_play_3d_draw_signal()
+            || !has_native_playfield_density(window.stats)
+            || !is_detailed_observation(window.stats)
+        {
+            return false;
+        }
+
+        let caption_like = raw_color_stats.has_intro_caption_band()
+            || raw_color_stats.has_caption_text_band()
+            || psx_color_stats.has_intro_caption_band()
+            || psx_color_stats.has_caption_text_band();
+        if !caption_like
+            || raw_color_stats.has_scene_color_diversity()
+            || psx_color_stats.has_scene_color_diversity()
+        {
+            return false;
+        }
+
+        let strict_low_bucket =
+            raw_color_stats.bucket_count <= 32 || psx_color_stats.bucket_count <= 32;
+        let dominant_backdrop = self
+            .display_window_dominant_bucket_per_mille(window, width, height, false)
+            >= 500
+            || self.display_window_dominant_bucket_per_mille(window, width, height, true) >= 500;
+        let dark_lower_band = (raw_color_stats.bottom_band_samples > 0
+            && raw_color_stats.bottom_dark_samples.saturating_mul(100)
+                >= raw_color_stats.bottom_band_samples.saturating_mul(45))
+            || (psx_color_stats.bottom_band_samples > 0
+                && psx_color_stats.bottom_dark_samples.saturating_mul(100)
+                    >= psx_color_stats.bottom_band_samples.saturating_mul(45));
+
+        strict_low_bucket && dominant_backdrop && dark_lower_band
+    }
+
+    fn field_half_is_low_color_font_texture_page_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || width > display_width
+            || height.saturating_mul(2) != display_height
+            || !is_likely_texture_page_candidate(window.x, window.y, width, height)
+            || !self.has_native_play_3d_draw_signal()
+            || !has_native_playfield_density(window.stats)
+            || !is_detailed_observation(window.stats)
+            || raw_color_stats.has_scene_color_diversity()
+            || psx_color_stats.has_scene_color_diversity()
+            || raw_color_stats.has_intro_caption_band()
+            || raw_color_stats.has_caption_text_band()
+            || psx_color_stats.has_intro_caption_band()
+            || psx_color_stats.has_caption_text_band()
+        {
+            return false;
+        }
+
+        let strict_low_bucket =
+            raw_color_stats.bucket_count <= 24 || psx_color_stats.bucket_count <= 24;
+        let dominant_backdrop = self
+            .display_window_dominant_bucket_per_mille(window, width, height, false)
+            >= 750
+            || self.display_window_dominant_bucket_per_mille(window, width, height, true) >= 750;
+        let dark_lower_band = (raw_color_stats.bottom_band_samples > 0
+            && raw_color_stats.bottom_dark_samples.saturating_mul(100)
+                >= raw_color_stats.bottom_band_samples.saturating_mul(70))
+            || (psx_color_stats.bottom_band_samples > 0
+                && psx_color_stats.bottom_dark_samples.saturating_mul(100)
+                    >= psx_color_stats.bottom_band_samples.saturating_mul(70));
+        let low_playfield_brightness = !raw_color_stats.has_low_bucket_playfield_brightness()
+            && !psx_color_stats.has_low_bucket_playfield_brightness();
+        let bright_glyph_signal =
+            window.stats.bright_pixels.saturating_mul(16) >= window.stats.pixel_count.max(1);
+
+        strict_low_bucket
+            && dominant_backdrop
+            && dark_lower_band
+            && low_playfield_brightness
+            && bright_glyph_signal
+    }
+
+    fn field_half_has_dominant_backdrop_texture_fragments(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+        upload_overlap: u64,
+        upload_overlap_rects: usize,
+        max_upload_overlap: u64,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || width > display_width
+            || height.saturating_mul(2) != display_height
+            || !is_likely_texture_page_candidate(window.x, window.y, width, height)
+            || !self.has_native_play_3d_draw_signal()
+        {
+            return false;
+        }
+
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+        let upload_signal = upload_overlap >= pixel_count / 32
+            || max_upload_overlap >= pixel_count / 16
+            || upload_overlap_rects >= 2;
+        if !upload_signal
+            || !has_native_playfield_density(window.stats)
+            || !is_detailed_observation(window.stats)
+        {
+            return false;
+        }
+
+        let low_bucket_fragmented =
+            raw_color_stats.bucket_count <= 48 || psx_color_stats.bucket_count <= 48;
+        let strict_low_bucket =
+            raw_color_stats.bucket_count <= 32 || psx_color_stats.bucket_count <= 32;
+        let dominant_backdrop = self
+            .display_window_dominant_bucket_per_mille(window, width, height, false)
+            >= 250
+            || self.display_window_dominant_bucket_per_mille(window, width, height, true) >= 250;
+        let dark_lower_band = (raw_color_stats.bottom_band_samples > 0
+            && raw_color_stats.bottom_dark_samples.saturating_mul(100)
+                >= raw_color_stats.bottom_band_samples.saturating_mul(45))
+            || (psx_color_stats.bottom_band_samples > 0
+                && psx_color_stats.bottom_dark_samples.saturating_mul(100)
+                    >= psx_color_stats.bottom_band_samples.saturating_mul(45));
+
+        low_bucket_fragmented && (dominant_backdrop || (strict_low_bucket && dark_lower_band))
+    }
+
+    fn field_half_has_periodic_backdrop_texture_fragments(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+        raw_periodic: bool,
+        psx_periodic: bool,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || width > display_width
+            || height.saturating_mul(2) != display_height
+            || !is_likely_texture_page_candidate(window.x, window.y, width, height)
+            || !self.has_native_play_3d_draw_signal()
+            || !(raw_periodic && psx_periodic)
+            || !has_native_playfield_density(window.stats)
+            || !is_detailed_observation(window.stats)
+        {
+            return false;
+        }
+
+        let strict_low_bucket =
+            raw_color_stats.bucket_count <= 32 || psx_color_stats.bucket_count <= 32;
+        let dominant_backdrop = self
+            .display_window_dominant_bucket_per_mille(window, width, height, false)
+            >= 500
+            || self.display_window_dominant_bucket_per_mille(window, width, height, true) >= 500;
+        let dark_lower_band = (raw_color_stats.bottom_band_samples > 0
+            && raw_color_stats.bottom_dark_samples.saturating_mul(100)
+                >= raw_color_stats.bottom_band_samples.saturating_mul(45))
+            || (psx_color_stats.bottom_band_samples > 0
+                && psx_color_stats.bottom_dark_samples.saturating_mul(100)
+                    >= psx_color_stats.bottom_band_samples.saturating_mul(45));
+
+        strict_low_bucket && dominant_backdrop && dark_lower_band
+    }
+
+    fn field_half_texture_artifact_diagnostics_json(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> String {
+        let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let psx_color_stats = self.display_window_color_stats(window, width, height, true);
+        let raw_caption_like =
+            raw_color_stats.has_intro_caption_band() || raw_color_stats.has_caption_text_band();
+        let psx_caption_like =
+            psx_color_stats.has_intro_caption_band() || psx_color_stats.has_caption_text_band();
+        let raw_periodic =
+            self.display_window_has_periodic_horizontal_ghosting(window, width, height, false);
+        let psx_periodic =
+            self.display_window_has_periodic_horizontal_ghosting(window, width, height, true);
+        let (upload_overlap, upload_overlap_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(window, width, height);
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+        let upload_overlap_u64 = upload_overlap.max(0) as u64;
+        let max_upload_overlap_u64 = max_upload_overlap.max(0) as u64;
+        let upload_signal = upload_overlap_u64 >= pixel_count / 32
+            || max_upload_overlap_u64 >= pixel_count / 16
+            || upload_overlap_rects >= 2;
+        let upload_touches_field = upload_overlap_u64 >= pixel_count / 16
+            || max_upload_overlap_u64 >= pixel_count / 8
+            || upload_overlap_rects >= 4;
+        let (display_width, display_height) = self.display_dimensions();
+        let high_vertical_texture_page_field = self.high_vertical_interlace_enabled()
+            && width >= DEFAULT_DISPLAY_WIDTH
+            && width <= display_width
+            && height.saturating_mul(2) == display_height
+            && is_likely_texture_page_candidate(window.x, window.y, width, height)
+            && self.has_native_play_3d_draw_signal();
+        let low_bucket_fragmented =
+            raw_color_stats.bucket_count <= 48 || psx_color_stats.bucket_count <= 48;
+        let strict_low_bucket =
+            raw_color_stats.bucket_count <= 32 || psx_color_stats.bucket_count <= 32;
+        let raw_dominant_bucket =
+            self.display_window_dominant_bucket_per_mille(window, width, height, false);
+        let psx_dominant_bucket =
+            self.display_window_dominant_bucket_per_mille(window, width, height, true);
+        let dominant_backdrop = raw_dominant_bucket >= 250 || psx_dominant_bucket >= 250;
+        let dark_lower_band = (raw_color_stats.bottom_band_samples > 0
+            && raw_color_stats.bottom_dark_samples.saturating_mul(100)
+                >= raw_color_stats.bottom_band_samples.saturating_mul(45))
+            || (psx_color_stats.bottom_band_samples > 0
+                && psx_color_stats.bottom_dark_samples.saturating_mul(100)
+                    >= psx_color_stats.bottom_band_samples.saturating_mul(45));
+        let dominant_backdrop_fragments = self.field_half_has_dominant_backdrop_texture_fragments(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+            upload_overlap_u64,
+            upload_overlap_rects,
+            max_upload_overlap_u64,
+        );
+        let periodic_backdrop_fragments = self.field_half_has_periodic_backdrop_texture_fragments(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+            raw_periodic,
+            psx_periodic,
+        );
+        let caption_texture_page_artifact = self.field_half_is_caption_texture_page_artifact(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+        );
+        let font_texture_page_artifact = self.field_half_is_low_color_font_texture_page_artifact(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+        );
+        let probable_texture_atlas =
+            self.field_half_is_probable_texture_atlas_artifact(window, width, height);
+
+        format!(
+            "{{\"window\":{},\"width\":{},\"height\":{},\"high_vertical_texture_page_field\":{},\"likely_texture_page_candidate\":{},\"has_3d_draw_signal\":{},\"raw_caption_like\":{},\"psx_caption_like\":{},\"raw_periodic\":{},\"psx_periodic\":{},\"upload_overlap\":{},\"upload_overlap_rects\":{},\"max_upload_overlap\":{},\"upload_signal\":{},\"upload_touches_field\":{},\"has_playfield_density\":{},\"is_detailed\":{},\"low_bucket_fragmented\":{},\"strict_low_bucket\":{},\"raw_dominant_bucket_per_mille\":{},\"psx_dominant_bucket_per_mille\":{},\"dominant_backdrop\":{},\"dark_lower_band\":{},\"dominant_backdrop_fragments\":{},\"periodic_backdrop_fragments\":{},\"caption_texture_page_artifact\":{},\"font_texture_page_artifact\":{},\"probable_texture_atlas\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{},\"dominant_unpresented_texture_upload\":{},\"raw_color\":{},\"psx_color\":{}}}",
+            framebuffer_window_json(window),
+            width,
+            height,
+            high_vertical_texture_page_field,
+            is_likely_texture_page_candidate(window.x, window.y, width, height),
+            self.has_native_play_3d_draw_signal(),
+            raw_caption_like,
+            psx_caption_like,
+            raw_periodic,
+            psx_periodic,
+            upload_overlap,
+            upload_overlap_rects,
+            max_upload_overlap,
+            upload_signal,
+            upload_touches_field,
+            has_native_playfield_density(window.stats),
+            is_detailed_observation(window.stats),
+            low_bucket_fragmented,
+            strict_low_bucket,
+            raw_dominant_bucket,
+            psx_dominant_bucket,
+            dominant_backdrop,
+            dark_lower_band,
+            dominant_backdrop_fragments,
+            periodic_backdrop_fragments,
+            caption_texture_page_artifact,
+            font_texture_page_artifact,
+            probable_texture_atlas,
+            self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height),
+            self.display_candidate_has_scene_upload_overlap(window),
+            self.display_candidate_has_dominant_unpresented_texture_upload(window, width, height),
+            raw_color_stats.json(),
+            psx_color_stats.json()
+        )
+    }
+
+    fn field_half_is_dense_caption_texture_page(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+    ) -> bool {
+        self.field_half_has_dense_caption_texture_shape(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+            true,
+        )
+    }
+
+    fn field_half_has_dense_caption_texture_shape(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+        reject_recently_presented: bool,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !is_likely_texture_page_candidate(window.x, window.y, width, height)
+            || (reject_recently_presented
+                && self.display_candidate_was_recently_presented(window, height))
+        {
+            return false;
+        }
+
+        let caption_like = raw_color_stats.has_intro_caption_band()
+            || raw_color_stats.has_caption_text_band()
+            || psx_color_stats.has_intro_caption_band()
+            || psx_color_stats.has_caption_text_band()
+            || self.display_window_has_title_logo_overlay(window, width, height, false)
+            || self.display_window_has_title_logo_overlay(window, width, height, true);
+        if !caption_like
+            || raw_color_stats.has_scene_color_diversity()
+            || psx_color_stats.has_scene_color_diversity()
+            || has_native_gameplay_display_profile(window.stats)
+        {
+            return false;
+        }
+
+        let pixel_count = window.stats.pixel_count.max(1);
+        let dense_bright_detail = window.stats.nonzero_pixels.saturating_mul(3)
+            >= pixel_count.saturating_mul(2)
+            && window.stats.bright_pixels.saturating_mul(4) >= pixel_count
+            && window.stats.detail_edges.saturating_mul(4) >= pixel_count;
+        if !dense_bright_detail {
+            return false;
+        }
+
+        let (upload_overlap, upload_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(window, width, height);
+        let has_upload_signal = upload_overlap > 0 || upload_rects > 0 || max_upload_overlap > 0;
+
+        has_upload_signal
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.has_native_play_3d_draw_signal()
+    }
+
+    fn presented_frame_has_high_vertical_mixed_artifact(
+        &self,
+        presented: FrameBufferWindow,
+    ) -> bool {
+        let (width, height) = self.presented_frame_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return false;
+        }
+
+        let field_height = height / 2;
+        let bottom_y = presented.y.saturating_add(field_height);
+        let top = FrameBufferWindow {
+            x: presented.x,
+            y: presented.y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                presented.x,
+                presented.y,
+                width,
+                field_height,
+                self.display_24bit_enabled(),
+            ),
+        };
+        let bottom = FrameBufferWindow {
+            x: presented.x,
+            y: bottom_y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                presented.x,
+                bottom_y,
+                width,
+                field_height,
+                self.display_24bit_enabled(),
+            ),
+        };
+
+        let top_sparse = self.high_vertical_presented_half_is_sparse_artifact(top);
+        let bottom_sparse = self.high_vertical_presented_half_is_sparse_artifact(bottom);
+        if top_sparse == bottom_sparse {
+            return false;
+        }
+
+        let dense = if top_sparse { bottom } else { top };
+        self.high_vertical_presented_half_has_dense_caption_texture_shape(
+            dense,
+            width,
+            field_height,
+        ) || self.high_vertical_presented_half_has_single_field_caption_atlas(
+            dense,
+            width,
+            field_height,
+        )
+    }
+
+    fn presented_frame_has_high_vertical_single_field_scene_artifact(
+        &self,
+        presented: FrameBufferWindow,
+    ) -> bool {
+        let (width, height) = self.presented_frame_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return false;
+        }
+
+        let full = DisplayOutputWindow {
+            source: "presented_frame",
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: presented,
+        };
+        let Some((top, bottom, _)) = self.field_composed_output_half_windows(full) else {
+            return false;
+        };
+
+        self.high_vertical_full_output_has_live_single_field_scene_with_visibility(
+            full, top, bottom, false,
+        )
+    }
+
+    fn high_vertical_presented_half_has_single_field_caption_atlas(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !self.has_strong_native_3d_textured_playfield_activity()
+            || self.image_upload_commands < DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+        {
+            return false;
+        }
+
+        let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let psx_color_stats = self.display_window_color_stats(window, width, height, true);
+        let caption_like = raw_color_stats.has_intro_caption_band()
+            || raw_color_stats.has_caption_text_band()
+            || psx_color_stats.has_intro_caption_band()
+            || psx_color_stats.has_caption_text_band()
+            || self.display_window_has_atlas_caption_ghosting(
+                window,
+                width,
+                height,
+                true,
+                psx_color_stats,
+            );
+        if !caption_like {
+            return false;
+        }
+
+        let pixel_count = window.stats.pixel_count.max(1);
+        let dense_half = window.stats.nonzero_pixels.saturating_mul(4) >= pixel_count
+            && window.stats.bright_pixels >= pixel_count.saturating_div(64).max(512)
+            && window.stats.detail_edges >= detail_edge_cutoff(window.stats);
+        if !dense_half {
+            return false;
+        }
+
+        true
+    }
+
+    fn high_vertical_presented_half_is_sparse_artifact(&self, window: FrameBufferWindow) -> bool {
+        let pixel_count = window.stats.pixel_count.max(1);
+        let low_density = window.stats.nonzero_pixels.saturating_mul(64) < pixel_count
+            || (window.stats.bright_pixels.saturating_mul(128) < pixel_count
+                && average_luma(window.stats) < 16);
+        let low_detail = window.stats.detail_edges.saturating_mul(16) < pixel_count;
+
+        low_density
+            && low_detail
+            && !has_native_playfield_density(window.stats)
+            && !has_native_gameplay_display_profile(window.stats)
+    }
+
+    fn high_vertical_presented_half_has_dense_caption_texture_shape(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let psx_color_stats = self.display_window_color_stats(window, width, height, true);
+
+        if self.field_half_has_dense_caption_texture_shape(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+            false,
+        ) {
+            return true;
+        }
+
+        let caption_like = raw_color_stats.has_intro_caption_band()
+            || raw_color_stats.has_caption_text_band()
+            || psx_color_stats.has_intro_caption_band()
+            || psx_color_stats.has_caption_text_band()
+            || self.display_window_has_title_logo_overlay(window, width, height, false)
+            || self.display_window_has_title_logo_overlay(window, width, height, true);
+        if !caption_like
+            || raw_color_stats.has_scene_color_diversity()
+            || psx_color_stats.has_scene_color_diversity()
+        {
+            return false;
+        }
+
+        let pixel_count = window.stats.pixel_count.max(1);
+        let dense_bright_detail = window.stats.nonzero_pixels.saturating_mul(3)
+            >= pixel_count.saturating_mul(2)
+            && window.stats.bright_pixels.saturating_mul(4) >= pixel_count
+            && window.stats.detail_edges.saturating_mul(4) >= pixel_count;
+        if !dense_bright_detail {
+            return false;
+        }
+
+        let (upload_overlap, upload_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(window, width, height);
+        let upload_signal = upload_overlap > 0 || upload_rects > 0 || max_upload_overlap > 0;
+        let resident_texture_signal = self.has_strong_native_3d_textured_playfield_activity()
+            && self.presentation_captures > 0;
+
+        (upload_signal || resident_texture_signal)
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.has_native_play_3d_draw_signal()
+    }
+
+    fn field_composed_output_is_intro_video_caption(&self, output: DisplayOutputWindow) -> bool {
+        if !output.field_composed || output.width == 0 || output.height == 0 {
+            return false;
+        }
+
+        let color_stats =
+            self.display_window_color_stats(output.window, output.width, output.height, false);
+        (color_stats.has_intro_caption_band()
+            || (output.width <= DEFAULT_DISPLAY_WIDTH
+                && output.height >= DEFAULT_DISPLAY_HEIGHT * 2
+                && color_stats.has_caption_text_band()))
+            && !self.caption_band_playfield_ui_allowed(output.width, output.height)
+    }
+
+    fn display_output_matches_recent_field_pair(&self, output: DisplayOutputWindow) -> bool {
+        if !output.field_composed || output.height == 0 {
+            return false;
+        }
+        let Some(field_height) = output.height.checked_div(2) else {
+            return false;
+        };
+        if field_height.saturating_mul(2) != output.height
+            || output.window.y.saturating_add(field_height) >= PSX_VRAM_HEIGHT
+        {
+            return false;
+        }
+
+        self.recent_display_area_history_has_field_pair(
+            output.window.x,
+            output.window.y,
+            output.window.y.saturating_add(field_height),
+        )
+    }
+
+    fn should_field_composed_output_yield_to_resolved(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !output.field_composed || !resolved.promoted {
+            return false;
+        }
+
+        if self.display_output_has_periodic_horizontal_ghosting(output)
+            && self.resolved_display_safely_overrides_periodic_field_output(resolved)
+        {
+            return true;
+        }
+
+        self.resolved_display_safely_overrides_low_quality_field_output(output, resolved)
     }
 
     fn should_use_cached_field_composed_output(&self, output: DisplayOutputWindow) -> bool {
@@ -2298,12 +4767,7 @@ impl Gpu {
         }
 
         let current = self.current_display_window();
-        if self.display_window_is_texture_atlas(current)
-            || !screen_observation_worth_saving(current.stats)
-        {
-            return true;
-        }
-        if self.current_display_is_unusable_for_cached_field_handoff(current) {
+        if self.current_display_is_missing_for_cached_field_handoff(current) {
             return true;
         }
 
@@ -2317,6 +4781,7 @@ impl Gpu {
         if let Some(presented) = self.presented_frame_window
             && self.presented_frame_is_fresh()
             && !self.display_window_is_texture_atlas(presented)
+            && self.presented_frame_is_safe_display_candidate(presented)
             && screen_observation_worth_saving(presented.stats)
             && screen_observation_score(presented.stats)
                 >= cached_score.saturating_sub(cached_score / 8)
@@ -2331,16 +4796,24 @@ impl Gpu {
         &self,
         current: FrameBufferWindow,
     ) -> bool {
+        if self.current_display_is_missing_for_cached_field_handoff(current) {
+            return true;
+        }
+
+        let (width, height) = self.display_dimensions();
+        self.display_window_color_stats(current, width, height, true)
+            .has_intro_caption_band()
+    }
+
+    fn current_display_is_missing_for_cached_field_handoff(
+        &self,
+        current: FrameBufferWindow,
+    ) -> bool {
         let (width, height) = self.display_dimensions();
         if self.display_window_is_texture_atlas_with_dimensions(current, width, height) {
             return true;
         }
-        if !screen_observation_worth_saving(current.stats) || is_sparse_display(current.stats) {
-            return true;
-        }
-
-        self.display_window_color_stats(current, width, height, true)
-            .has_intro_caption_band()
+        !screen_observation_worth_saving(current.stats) || is_sparse_display(current.stats)
     }
 
     fn field_composed_display_is_fresh(&self) -> bool {
@@ -2351,6 +4824,37 @@ impl Gpu {
 
     pub fn capture_vblank_presented_frame(&mut self) {
         self.capture_current_presented_frame();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_live_textured_playfield_for_test(&mut self, width: usize, height: usize) {
+        self.commands_seen = self.commands_seen.max(1);
+        self.image_upload_commands = self
+            .image_upload_commands
+            .max(DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS);
+        self.textured_triangle_commands = self
+            .textured_triangle_commands
+            .max(DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS);
+        self.textured_draw_stats.written_pixels = self
+            .textured_draw_stats
+            .written_pixels
+            .max(DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS);
+        self.textured_draw_stats.color_changes = self.textured_draw_stats.color_changes.max(64);
+        self.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            },
+            self.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 0, y: 0 }],
+            None,
+        ));
     }
 
     fn display_resolve(&self) -> DisplayResolve {
@@ -2378,11 +4882,211 @@ impl Gpu {
         }
     }
 
+    fn display_resolve_for_visibility_with_strict(&self, strict: DisplayResolve) -> DisplayResolve {
+        if strict.promoted && self.should_present_resolved_display(strict) {
+            return strict;
+        }
+
+        let current = self.current_display_window();
+        if !self.should_resolve_display_from_visibility_candidates(current) {
+            return strict;
+        }
+
+        let Some((source, candidate)) = self.best_visibility_display_candidate(current) else {
+            return strict;
+        };
+
+        DisplayResolve {
+            source,
+            promoted: true,
+            window: candidate,
+        }
+    }
+
+    fn best_visibility_display_candidate(
+        &self,
+        current: FrameBufferWindow,
+    ) -> Option<(&'static str, FrameBufferWindow)> {
+        let (width, height) = self.display_dimensions();
+        let current_score = screen_observation_score(current.stats);
+
+        self.display_candidate_windows(width, height)
+            .into_iter()
+            .filter(|(_, candidate)| candidate.x != current.x || candidate.y != current.y)
+            .filter(|(_, candidate)| {
+                self.display_candidate_is_visible_gui_fallback(
+                    current,
+                    current_score,
+                    *candidate,
+                    width,
+                    height,
+                )
+            })
+            .max_by(|(_, left), (_, right)| {
+                self.visibility_display_candidate_score(current, *left)
+                    .cmp(&self.visibility_display_candidate_score(current, *right))
+            })
+    }
+
+    fn display_candidate_is_visible_gui_fallback(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !screen_observation_worth_saving(candidate.stats)
+            || !is_detailed_observation(candidate.stats)
+            || self.display_window_is_texture_atlas(candidate)
+            || self.display_window_is_texture_atlas_with_dimensions(candidate, width, height)
+            || self.display_candidate_is_cross_page_texture_atlas(candidate, width, height)
+        {
+            return false;
+        }
+
+        let reason = self.display_candidate_resolution_reason(current, current_score, candidate);
+        if reason != "title_logo_overlay" {
+            return false;
+        }
+        if !self.display_window_has_title_logo_overlay(candidate, width, height, true)
+            || self.display_window_has_saturated_logo_transition(candidate, width, height, true)
+        {
+            return false;
+        }
+
+        let has_display_flow = self.display_candidate_has_live_draw_overlap(candidate)
+            || self.display_candidate_has_scene_upload_overlap(candidate)
+            || self.display_candidate_was_recently_presented(candidate, height)
+            || self.display_candidate_has_streamed_scene_presentation(candidate);
+        if !has_display_flow {
+            return false;
+        }
+
+        let candidate_score = screen_observation_score(candidate.stats);
+        let current_is_weak = !screen_observation_worth_saving(current.stats)
+            || is_sparse_display(current.stats)
+            || self.display_window_is_texture_atlas_with_dimensions(current, width, height)
+            || candidate.stats.nonzero_pixels > current.stats.nonzero_pixels.saturating_mul(2)
+            || candidate.stats.detail_edges > current.stats.detail_edges.saturating_mul(2).max(512);
+        current_is_weak || candidate_score > current_score.saturating_add(current_score / 4)
+    }
+
+    fn visibility_display_candidate_score(
+        &self,
+        current: FrameBufferWindow,
+        candidate: FrameBufferWindow,
+    ) -> u64 {
+        let mut score = screen_observation_score(candidate.stats);
+        if self.display_candidate_has_live_draw_overlap(candidate) {
+            score = score.saturating_add(score / 4);
+        }
+        if self.display_candidate_has_scene_upload_overlap(candidate) {
+            score = score.saturating_add(score / 8);
+        }
+        if candidate.stats.nonzero_pixels > current.stats.nonzero_pixels {
+            score = score.saturating_add(
+                candidate
+                    .stats
+                    .nonzero_pixels
+                    .saturating_sub(current.stats.nonzero_pixels),
+            );
+        }
+        score
+    }
+
+    fn should_use_visibility_resolved_over_display_output(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !resolved.promoted || !self.should_present_visibility_resolved_display(resolved) {
+            return false;
+        }
+        if output.cached || output.source == DISPLAY_SOURCE_HIGH_VERTICAL_DEINTERLACED {
+            return false;
+        }
+
+        let output_color =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        let output_is_weak = output.height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(output.window.stats)
+            || !has_native_playfield_density(output.window.stats)
+            || !output_color.has_scene_color_diversity()
+            || self.display_window_is_texture_atlas_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            );
+        if !output_is_weak {
+            return false;
+        }
+
+        let (resolved_width, resolved_height) = self.resolved_display_dimensions(resolved);
+        let resolved_score = screen_observation_score(resolved.window.stats);
+        let output_score = screen_observation_score(output.window.stats);
+        let resolved_has_more_pixels =
+            resolved.window.stats.nonzero_pixels > output.window.stats.nonzero_pixels * 2;
+        let resolved_has_more_detail = resolved.window.stats.detail_edges
+            > output.window.stats.detail_edges.saturating_mul(2).max(512);
+        let resolved_has_full_frame = resolved_width >= DEFAULT_DISPLAY_WIDTH
+            && resolved_height >= DEFAULT_DISPLAY_HEIGHT
+            && output.height < DEFAULT_DISPLAY_HEIGHT;
+
+        resolved_has_full_frame
+            || resolved_score > output_score.saturating_add(output_score / 2)
+            || (resolved_has_more_pixels && resolved_has_more_detail)
+    }
+
+    fn should_present_visibility_resolved_display(&self, resolved: DisplayResolve) -> bool {
+        if self.should_present_resolved_display(resolved) {
+            return true;
+        }
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let (width, height) = self.display_dimensions();
+        self.display_candidate_is_visible_gui_fallback(
+            current,
+            current_score,
+            resolved.window,
+            width,
+            height,
+        )
+    }
+
+    fn should_resolve_display_from_visibility_candidates(
+        &self,
+        current: FrameBufferWindow,
+    ) -> bool {
+        if self.should_resolve_display_from_candidates(current) {
+            return true;
+        }
+
+        if self.image_upload_commands < DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            || !self.has_textured_scene_draws()
+            || self.textured_draw_stats.written_pixels < DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
+        {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        let current_color = self.display_window_color_stats(current, width, height, true);
+        let current_is_weak = !screen_observation_worth_saving(current.stats)
+            || is_sparse_display(current.stats)
+            || !has_native_playfield_density(current.stats)
+            || !current_color.has_scene_color_diversity()
+            || self.display_window_is_texture_atlas_with_dimensions(current, width, height);
+
+        current_is_weak && (self.has_playfield_draws() || self.has_visible_presentation())
+    }
+
     fn should_resolve_display_from_candidates(&self, current: FrameBufferWindow) -> bool {
         let current_is_texture_atlas = self.display_window_is_texture_atlas(current);
         if !current_is_texture_atlas
             && has_native_playfield_density(current.stats)
             && is_detailed_observation(current.stats)
+            && self.current_display_has_scene_quality(current)
+            && !self.current_display_is_stale_periodic_video(current)
         {
             return false;
         }
@@ -2395,6 +5099,8 @@ impl Gpu {
             return false;
         }
         if !self.has_playfield_draws()
+            && !self.has_blank_current_3d_scene_fallback_candidate(current)
+            && !self.has_blank_current_streamed_scene_fallback_candidate(current)
             && !self.has_resolvable_cached_display_candidate(current)
             && !self.has_resolvable_framebuffer_candidate(current)
         {
@@ -2413,6 +5119,21 @@ impl Gpu {
             return false;
         }
         true
+    }
+
+    fn current_display_has_scene_quality(&self, current: FrameBufferWindow) -> bool {
+        if !has_native_gameplay_display_profile(current.stats) {
+            return false;
+        }
+        let (width, height) = self.display_dimensions();
+        self.display_window_color_stats(current, width, height, true)
+            .has_scene_color_diversity()
+    }
+
+    fn current_display_is_stale_periodic_video(&self, current: FrameBufferWindow) -> bool {
+        let (width, height) = self.display_dimensions();
+        self.has_native_play_3d_draw_signal()
+            && self.display_window_has_periodic_horizontal_ghosting(current, width, height, true)
     }
 
     fn has_textured_scene_draws(&self) -> bool {
@@ -2451,29 +5172,163 @@ impl Gpu {
         let (width, height) = self.display_dimensions();
         let current_score = screen_observation_score(current.stats);
 
-        if let Some(presented) = self.presented_frame_window
+        let presented_candidate = if let Some(presented) = self.presented_frame_window
             && self.presented_frame_is_fresh()
-            && self.resolved_display_candidate_is_valid(current, current_score, presented)
+            && (self.fresh_presented_display_candidate_is_valid(presented)
+                || self.resolved_display_candidate_is_valid(current, current_score, presented))
         {
-            return Some(("presented_frame", presented));
-        }
+            Some(("presented_frame", presented))
+        } else {
+            None
+        };
 
-        if self.should_prefer_best_observation()
+        let best_observation = if self.should_prefer_best_observation()
             && let Some(best) = self.best_observation_window
             && self.resolved_display_candidate_is_valid(current, current_score, best)
         {
-            return Some(("best_observation", best));
-        }
+            Some(("best_observation", best))
+        } else {
+            None
+        };
+        let cached_candidate = best_observation.or(presented_candidate);
 
-        self.display_candidate_windows(width, height)
+        let framebuffer_candidate = self
+            .display_candidate_windows(width, height)
             .into_iter()
             .filter(|(_, candidate)| candidate.x != current.x || candidate.y != current.y)
             .filter(|(_, candidate)| {
                 self.resolved_display_candidate_is_valid(current, current_score, *candidate)
             })
             .max_by(|(_, left), (_, right)| {
-                screen_observation_score(left.stats).cmp(&screen_observation_score(right.stats))
-            })
+                self.framebuffer_candidate_selection_score(*left)
+                    .cmp(&self.framebuffer_candidate_selection_score(*right))
+            });
+
+        if let Some(framebuffer_candidate) = framebuffer_candidate {
+            if self.should_prefer_framebuffer_candidate_over_cached(
+                current,
+                cached_candidate.map(|(_, candidate)| candidate),
+                framebuffer_candidate.1,
+            ) {
+                return Some(framebuffer_candidate);
+            }
+            return cached_candidate.or(Some(framebuffer_candidate));
+        }
+
+        cached_candidate
+    }
+
+    fn should_prefer_framebuffer_candidate_over_cached(
+        &self,
+        current: FrameBufferWindow,
+        cached: Option<FrameBufferWindow>,
+        framebuffer: FrameBufferWindow,
+    ) -> bool {
+        let Some(cached) = cached else {
+            return true;
+        };
+        let current_score = screen_observation_score(current.stats);
+        let blank_current_fallback = self.display_candidate_has_blank_current_3d_scene_fallback(
+            current,
+            current_score,
+            framebuffer,
+        ) || self
+            .display_candidate_has_blank_current_streamed_scene_fallback(
+                current,
+                current_score,
+                framebuffer,
+            );
+        if self.display_window_is_texture_atlas(framebuffer) && !blank_current_fallback {
+            return false;
+        }
+        if !self.framebuffer_candidate_has_display_signal(framebuffer) && !blank_current_fallback {
+            return false;
+        }
+
+        let framebuffer_score = screen_observation_score(framebuffer.stats);
+        let cached_score = screen_observation_score(cached.stats);
+        if self.display_window_is_texture_atlas(current) {
+            return framebuffer_score > cached_score.saturating_add(cached_score / 2);
+        }
+        if self.framebuffer_candidate_is_live_counterpart_of_stale_cached(
+            current,
+            cached,
+            framebuffer,
+        ) {
+            return true;
+        }
+
+        self.cached_display_candidate_should_yield_to_framebuffer(cached, framebuffer)
+    }
+
+    fn framebuffer_candidate_selection_score(&self, candidate: FrameBufferWindow) -> u64 {
+        let score = screen_observation_score(candidate.stats);
+        let (width, height) = self.display_dimensions();
+        if self.display_candidate_is_low_height_field_counterpart(candidate, width, height)
+            && self.display_candidate_has_live_draw_overlap(candidate)
+        {
+            return score.saturating_add(score / 3);
+        }
+        score
+    }
+
+    fn framebuffer_candidate_has_display_signal(&self, framebuffer: FrameBufferWindow) -> bool {
+        has_native_full_scene_detail(framebuffer.stats)
+            && (self.display_candidate_has_live_draw_overlap(framebuffer)
+                || self.display_candidate_has_scene_upload_overlap(framebuffer)
+                || self.display_candidate_has_streamed_scene_presentation(framebuffer))
+    }
+
+    fn framebuffer_candidate_is_live_counterpart_of_stale_cached(
+        &self,
+        current: FrameBufferWindow,
+        cached: FrameBufferWindow,
+        framebuffer: FrameBufferWindow,
+    ) -> bool {
+        let (width, height) = self.display_dimensions();
+        if !self.display_candidate_is_low_height_field_counterpart(framebuffer, width, height)
+            || !self.display_candidate_has_live_draw_overlap(framebuffer)
+        {
+            return false;
+        }
+        if cached.x == current.x
+            && cached.y == current.y
+            && cached.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+
+        let framebuffer_score = screen_observation_score(framebuffer.stats);
+        let cached_score = screen_observation_score(cached.stats);
+        let score_is_comparable =
+            framebuffer_score.saturating_mul(4) >= cached_score.saturating_mul(3);
+        let cached_color = self.display_window_color_stats(cached, width, height, true);
+
+        score_is_comparable && !cached_color.has_scene_color_diversity()
+    }
+
+    fn cached_display_candidate_should_yield_to_framebuffer(
+        &self,
+        cached: FrameBufferWindow,
+        framebuffer: FrameBufferWindow,
+    ) -> bool {
+        let framebuffer_score = screen_observation_score(framebuffer.stats);
+        let cached_score = screen_observation_score(cached.stats);
+        let score_is_stronger = framebuffer_score > cached_score.saturating_add(cached_score / 2);
+        let detail_is_stronger =
+            framebuffer.stats.detail_edges > cached.stats.detail_edges.saturating_mul(2).max(512);
+        if !score_is_stronger && !detail_is_stronger {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        let cached_color = self.display_window_color_stats(cached, width, height, true);
+        let cached_is_periodic =
+            self.display_window_has_periodic_horizontal_ghosting(cached, width, height, true);
+        let cached_is_low_scene_quality = !has_native_gameplay_display_profile(cached.stats)
+            || !cached_color.has_scene_color_diversity();
+
+        cached_is_periodic || cached_is_low_scene_quality
     }
 
     fn resolved_display_candidate_is_valid(
@@ -2542,8 +5397,15 @@ impl Gpu {
             resolved_display_candidate_has_scene_signal(current, current_score, candidate);
         let rejection_reason =
             self.display_candidate_resolution_reason(current, current_score, candidate);
+        let visible_for_gui_fallback = self.display_candidate_is_visible_gui_fallback(
+            current,
+            current_score,
+            candidate,
+            self.display_dimensions().0,
+            self.display_dimensions().1,
+        );
         format!(
-            "{{\"label\":\"{}\",\"window\":{},\"score\":{},\"score_delta\":{},\"texture_atlas\":{},\"live_draw_overlap_area\":{},\"minimum_live_draw_overlap_area\":{},\"live_draw_overlap\":{},\"scene_upload_overlap_area\":{},\"minimum_scene_upload_overlap_area\":{},\"scene_upload_overlap\":{},\"scene_signal\":{},\"valid_for_display_resolve\":{},\"rejection_reason\":\"{}\"}}",
+            "{{\"label\":\"{}\",\"window\":{},\"score\":{},\"score_delta\":{},\"texture_atlas\":{},\"live_draw_overlap_area\":{},\"minimum_live_draw_overlap_area\":{},\"live_draw_overlap\":{},\"scene_upload_overlap_area\":{},\"minimum_scene_upload_overlap_area\":{},\"scene_upload_overlap\":{},\"scene_signal\":{},\"valid_for_display_resolve\":{},\"visible_for_gui_fallback\":{},\"rejection_reason\":\"{}\"}}",
             label,
             framebuffer_window_json(candidate),
             candidate_score,
@@ -2557,6 +5419,7 @@ impl Gpu {
             scene_upload_overlap,
             scene_signal,
             rejection_reason == "valid",
+            visible_for_gui_fallback,
             rejection_reason
         )
     }
@@ -2573,8 +5436,174 @@ impl Gpu {
         {
             return "current_display";
         }
-        if self.display_window_is_texture_atlas(candidate) {
+        let (width, height) = self.display_dimensions();
+        if self.display_candidate_is_cross_page_texture_atlas(candidate, width, height) {
+            return "cross_page_texture_atlas";
+        }
+        if self.display_candidate_has_texture_atlas_half_with_dimensions(candidate, width, height) {
+            return "field_texture_atlas_artifact";
+        }
+        let blank_current_scene_fallback = self.display_candidate_has_blank_current_scene_fallback(
+            current,
+            current_score,
+            candidate,
+        );
+        let blank_current_3d_scene_fallback = self
+            .display_candidate_has_blank_current_3d_scene_fallback(
+                current,
+                current_score,
+                candidate,
+            );
+        let blank_current_streamed_scene_fallback = self
+            .display_candidate_has_blank_current_streamed_scene_fallback(
+                current,
+                current_score,
+                candidate,
+            );
+        let staged_streamed_scene_recovery = self
+            .display_candidate_has_staged_streamed_scene_recovery(
+                current,
+                current_score,
+                candidate,
+                width,
+                height,
+            );
+        let caption_current_streamed_scene_recovery = self
+            .display_candidate_has_caption_current_streamed_scene_recovery(
+                current,
+                current_score,
+                candidate,
+                width,
+                height,
+            );
+        let high_confidence_live_texture_scene = self
+            .display_candidate_has_high_confidence_live_texture_scene(
+                current,
+                current_score,
+                candidate,
+            );
+        let candidate_is_texture_atlas = self.display_window_is_texture_atlas(candidate);
+        let candidate_has_live_draw_overlap =
+            self.display_candidate_has_live_draw_overlap(candidate);
+        let candidate_has_scene_upload_overlap =
+            self.display_candidate_has_scene_upload_overlap(candidate);
+        let candidate_has_display_flow = candidate_has_live_draw_overlap
+            || self.display_candidate_was_recently_presented(candidate, height)
+            || self.display_candidate_has_streamed_scene_presentation(candidate);
+        let candidate_color_stats = self.display_window_color_stats(candidate, width, height, true);
+        let candidate_has_title_logo_overlay =
+            self.display_window_has_title_logo_overlay_artifact(candidate, width, height, true);
+        let candidate_has_live_uploaded_title_logo_overlay = candidate_has_title_logo_overlay
+            && candidate_has_live_draw_overlap
+            && candidate_has_scene_upload_overlap;
+        if candidate_is_texture_atlas
+            && !candidate_has_live_uploaded_title_logo_overlay
+            && (self.display_window_has_primitive_workspace_artifact(candidate, width, height)
+                && candidate.x >= DEFAULT_DISPLAY_WIDTH
+                || (!candidate_has_display_flow
+                    && self.has_strong_streamed_scene_rect_activity()
+                    && self.display_candidate_has_scene_upload_overlap(candidate)
+                    && !blank_current_scene_fallback
+                    && !blank_current_3d_scene_fallback
+                    && !blank_current_streamed_scene_fallback
+                    && !staged_streamed_scene_recovery
+                    && !caption_current_streamed_scene_recovery
+                    && !high_confidence_live_texture_scene))
+        {
             return "texture_atlas";
+        }
+        if candidate_has_title_logo_overlay {
+            return "title_logo_overlay";
+        }
+        if self.display_window_has_atlas_caption_ghosting(
+            candidate,
+            width,
+            height,
+            true,
+            candidate_color_stats,
+        ) && !caption_current_streamed_scene_recovery
+        {
+            return "atlas_caption_ghosting";
+        }
+        if candidate_is_texture_atlas
+            && !candidate_has_display_flow
+            && !blank_current_scene_fallback
+        {
+            return "texture_atlas";
+        }
+        if self
+            .display_candidate_is_unpresented_live_texture_page(current, candidate, width, height)
+        {
+            return "unpresented_live_texture_page";
+        }
+        if candidate_is_texture_atlas && !blank_current_scene_fallback {
+            if blank_current_3d_scene_fallback
+                || blank_current_streamed_scene_fallback
+                || staged_streamed_scene_recovery
+                || caption_current_streamed_scene_recovery
+                || high_confidence_live_texture_scene
+            {
+                return "valid";
+            }
+            return "texture_atlas";
+        }
+        if self.presented_frame_window.is_some_and(|presented| {
+            presented.x == candidate.x
+                && presented.y == candidate.y
+                && presented.stats.checksum == candidate.stats.checksum
+                && presented.stats.pixel_count == candidate.stats.pixel_count
+        }) && !self.presented_frame_is_safe_display_candidate(candidate)
+        {
+            return "presented_frame_low_color_periodic_ghosting";
+        }
+        let unpresented_texture_page =
+            self.display_candidate_is_unpresented_texture_page(candidate, width, height);
+        let current_caption_lacks_scene =
+            self.current_display_is_sparse_intro_caption_candidate(current) || {
+                let current_color = self.display_window_color_stats(current, width, height, true);
+                current_color.has_intro_caption_band()
+                    && !has_native_playfield_density(current.stats)
+                    && !current_color.has_scene_color_diversity()
+            };
+        if width >= DEFAULT_DISPLAY_WIDTH
+            && current_caption_lacks_scene
+            && !self.display_candidate_has_live_draw_overlap(candidate)
+            && !self.display_candidate_was_recently_presented(candidate, height)
+            && self.display_candidate_has_scene_upload_overlap(candidate)
+            && !self.display_candidate_has_streamed_scene_presentation(candidate)
+            && !blank_current_3d_scene_fallback
+            && !blank_current_streamed_scene_fallback
+            && !staged_streamed_scene_recovery
+            && !caption_current_streamed_scene_recovery
+            && !high_confidence_live_texture_scene
+        {
+            return "caption_texture_page_not_presented";
+        }
+        let has_scene_upload_display_signal = self
+            .display_candidate_has_strong_scene_upload_overlap(candidate)
+            && resolved_display_candidate_has_scene_signal(current, current_score, candidate);
+        if has_scene_upload_display_signal
+            && (!unpresented_texture_page
+                || self.current_display_is_minimal_sparse_boot_speckle(current))
+        {
+            return "valid";
+        }
+        if unpresented_texture_page
+            && !blank_current_3d_scene_fallback
+            && !blank_current_streamed_scene_fallback
+            && !staged_streamed_scene_recovery
+            && !caption_current_streamed_scene_recovery
+            && !high_confidence_live_texture_scene
+        {
+            return "texture_page_not_presented";
+        }
+        if blank_current_3d_scene_fallback
+            || blank_current_streamed_scene_fallback
+            || staged_streamed_scene_recovery
+            || caption_current_streamed_scene_recovery
+            || high_confidence_live_texture_scene
+        {
+            return "valid";
         }
         if self.fresh_presented_display_candidate_is_valid(candidate) {
             return "valid";
@@ -2586,11 +5615,32 @@ impl Gpu {
         ) {
             return "valid";
         }
+        if self.resolved_display_candidate_has_live_field_counterpart_signal(
+            current,
+            current_score,
+            candidate,
+            width,
+            height,
+        ) {
+            return "valid";
+        }
+        if self.display_candidate_is_unverified_stale_periodic_substitute(
+            current, candidate, width, height,
+        ) {
+            return "unverified_stale_periodic_substitute";
+        }
         if !has_native_playfield_density(candidate.stats) {
             return "low_density";
         }
         if !is_detailed_observation(candidate.stats) {
             return "low_detail";
+        }
+        if self.current_display_is_stale_periodic_video(current)
+            && (self.display_candidate_has_live_draw_overlap(candidate)
+                || self.display_candidate_has_scene_upload_overlap(candidate)
+                || self.display_candidate_has_streamed_scene_presentation(candidate))
+        {
+            return "valid";
         }
 
         if self.display_window_is_texture_atlas(current) {
@@ -2617,6 +5667,592 @@ impl Gpu {
         "valid"
     }
 
+    fn current_display_is_minimal_sparse_boot_speckle(&self, current: FrameBufferWindow) -> bool {
+        let pixel_count = current.stats.pixel_count.max(1);
+        current.stats.nonzero_pixels.saturating_mul(256) <= pixel_count
+            && current.stats.bright_pixels == current.stats.nonzero_pixels
+            && current.stats.detail_edges <= 64
+            && !has_native_playfield_density(current.stats)
+            && !is_detailed_observation(current.stats)
+    }
+
+    fn display_candidate_has_blank_current_scene_fallback(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+    ) -> bool {
+        if current.stats.nonzero_pixels != 0 || !is_sparse_display(current.stats) {
+            return false;
+        }
+        if candidate.x == current.x
+            && candidate.y == current.y
+            && candidate.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+        if !has_native_gameplay_display_profile(candidate.stats)
+            || !resolved_display_candidate_has_scene_signal(current, current_score, candidate)
+            || !self.display_candidate_has_scene_upload_overlap(candidate)
+            || !self.has_playfield_draws()
+            || !self.has_textured_scene_draws()
+        {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        let color_stats = self.display_window_color_stats(candidate, width, height, true);
+        if color_stats.has_intro_caption_band() {
+            return false;
+        }
+
+        self.textured_triangle_commands >= DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64
+            && self.textured_draw_stats.color_changes >= 262_144
+            && self.presentation_captures >= 120
+    }
+
+    fn has_blank_current_3d_scene_fallback_candidate(&self, current: FrameBufferWindow) -> bool {
+        let (width, height) = self.display_dimensions();
+        let current_score = screen_observation_score(current.stats);
+        self.display_candidate_windows(width, height)
+            .into_iter()
+            .any(|(_, candidate)| {
+                self.display_candidate_has_blank_current_3d_scene_fallback(
+                    current,
+                    current_score,
+                    candidate,
+                )
+            })
+    }
+
+    fn has_blank_current_streamed_scene_fallback_candidate(
+        &self,
+        current: FrameBufferWindow,
+    ) -> bool {
+        let (width, height) = self.display_dimensions();
+        let current_score = screen_observation_score(current.stats);
+        self.display_candidate_windows(width, height)
+            .into_iter()
+            .any(|(_, candidate)| {
+                self.display_candidate_has_blank_current_streamed_scene_fallback(
+                    current,
+                    current_score,
+                    candidate,
+                )
+            })
+    }
+
+    fn display_candidate_has_blank_current_3d_scene_fallback(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+    ) -> bool {
+        if candidate.x == current.x
+            && candidate.y == current.y
+            && candidate.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+        let current_is_weak_scene = current.stats.nonzero_pixels == 0
+            || is_sparse_display(current.stats)
+            || !has_native_playfield_density(current.stats)
+            || !screen_observation_worth_saving(current.stats);
+        if !current_is_weak_scene && current_score != 0 {
+            return false;
+        }
+        if !self.has_strong_native_3d_textured_playfield_activity() {
+            return false;
+        }
+        let (width, height) = self.display_dimensions();
+        if self.display_candidate_is_cross_page_texture_atlas(candidate, width, height)
+            || self
+                .display_candidate_has_texture_atlas_half_with_dimensions(candidate, width, height)
+        {
+            return false;
+        }
+        if self.display_window_is_texture_atlas(candidate)
+            && !self.display_candidate_was_recently_presented(candidate, height)
+        {
+            return false;
+        }
+        if self.display_candidate_is_unpresented_texture_page(candidate, width, height) {
+            return false;
+        }
+        if !screen_observation_worth_saving(candidate.stats)
+            || !is_detailed_observation(candidate.stats)
+        {
+            return false;
+        }
+
+        let pixel_count = candidate.stats.pixel_count.max(1);
+        let enough_visible_scene = candidate.stats.nonzero_pixels >= pixel_count / 8
+            && candidate.stats.bright_pixels >= pixel_count.saturating_div(128).max(512)
+            && candidate.stats.detail_edges >= full_scene_detail_cutoff(candidate.stats);
+        if !enough_visible_scene {
+            return false;
+        }
+
+        let candidate_score = screen_observation_score(candidate.stats);
+        if current_score > 0
+            && candidate_score <= current_score.saturating_add(current_score / 2)
+            && candidate.stats.detail_edges <= current.stats.detail_edges.saturating_mul(4).max(512)
+        {
+            return false;
+        }
+
+        let upload_overlap = self.display_candidate_scene_upload_overlap_area(candidate);
+        let scene_overlap =
+            upload_overlap >= self.minimum_scene_upload_overlap_area().saturating_div(2);
+        let live_overlap = self.display_candidate_has_live_draw_overlap(candidate);
+        if !scene_overlap && !live_overlap {
+            return false;
+        }
+        if !live_overlap
+            && (self.presentation_captures < 120
+                || self.textured_draw_stats.color_changes < 262_144)
+        {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(candidate, width, height, true);
+        if self.display_window_has_title_logo_overlay(candidate, width, height, true)
+            || self.display_window_has_atlas_caption_ghosting(
+                candidate,
+                width,
+                height,
+                true,
+                color_stats,
+            )
+        {
+            return false;
+        }
+        if color_stats.has_intro_caption_band() && !live_overlap {
+            return false;
+        }
+        color_stats.has_scene_color_diversity()
+            || color_stats.has_low_bucket_scene_range_signal()
+            || self.textured_draw_stats.color_changes >= 262_144
+    }
+
+    fn display_candidate_has_blank_current_streamed_scene_fallback(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+    ) -> bool {
+        if candidate.x == current.x
+            && candidate.y == current.y
+            && candidate.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+
+        let current_is_weak_scene = current.stats.nonzero_pixels == 0
+            || is_sparse_display(current.stats)
+            || !has_native_playfield_density(current.stats)
+            || !screen_observation_worth_saving(current.stats)
+            || !self.current_display_has_scene_quality(current);
+        if !current_is_weak_scene && current_score != 0 {
+            return false;
+        }
+        if !self.has_strong_streamed_scene_rect_activity() {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        if self.display_window_is_texture_atlas_with_dimensions(candidate, width, height)
+            || self.display_candidate_is_cross_page_texture_atlas(candidate, width, height)
+            || self
+                .display_candidate_has_texture_atlas_half_with_dimensions(candidate, width, height)
+            || self.display_candidate_is_unpresented_texture_page(candidate, width, height)
+        {
+            return false;
+        }
+        if !screen_observation_worth_saving(candidate.stats)
+            || !has_native_full_scene_detail(candidate.stats)
+            || !resolved_display_candidate_has_scene_signal(current, current_score, candidate)
+        {
+            return false;
+        }
+
+        let pixel_count = candidate.stats.pixel_count.max(1);
+        let enough_visible_scene = candidate.stats.nonzero_pixels.saturating_mul(3) >= pixel_count
+            && candidate.stats.bright_pixels >= pixel_count.saturating_div(64).max(512)
+            && candidate.stats.detail_edges
+                >= full_scene_detail_cutoff(candidate.stats).saturating_mul(4);
+        if !enough_visible_scene {
+            return false;
+        }
+
+        let upload_overlap = self.display_candidate_scene_upload_overlap_area(candidate);
+        if upload_overlap < self.minimum_scene_upload_overlap_area().saturating_mul(4)
+            || (upload_overlap as u64).saturating_mul(5) < pixel_count.saturating_mul(2)
+        {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(candidate, width, height, true);
+        let caption_like_dense_scene = color_stats.has_intro_caption_band()
+            && (candidate.stats.nonzero_pixels.saturating_mul(2) >= pixel_count
+                || self.textured_triangle_commands
+                    >= DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS);
+        if caption_like_dense_scene {
+            return false;
+        }
+
+        color_stats.has_scene_color_diversity()
+            || color_stats.has_low_bucket_scene_range_signal()
+            || self.textured_draw_stats.color_changes >= 262_144
+    }
+
+    fn display_candidate_has_high_confidence_live_texture_scene(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+    ) -> bool {
+        if candidate.x == current.x
+            && candidate.y == current.y
+            && candidate.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        if !is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
+            || self.display_candidate_is_cross_page_texture_atlas(candidate, width, height)
+            || self
+                .display_candidate_has_texture_atlas_half_with_dimensions(candidate, width, height)
+            || self.display_candidate_is_probable_texture_upload_page(candidate, width, height)
+        {
+            return false;
+        }
+
+        let current_is_weak = is_sparse_display(current.stats)
+            || !has_native_playfield_density(current.stats)
+            || !self.current_display_has_scene_quality(current)
+            || self.current_display_is_stale_periodic_video(current);
+        if !current_is_weak {
+            return false;
+        }
+        if !self.has_strong_native_3d_textured_playfield_activity()
+            && !self.has_strong_streamed_scene_rect_activity()
+        {
+            return false;
+        }
+        let direct_scene_signal =
+            resolved_display_candidate_has_scene_signal(current, current_score, candidate);
+        let streamed_scene_signal = self
+            .display_candidate_has_strong_streamed_texture_scene_signal(
+                current,
+                current_score,
+                candidate,
+                width,
+                height,
+            );
+        if !screen_observation_worth_saving(candidate.stats)
+            || !has_native_full_scene_detail(candidate.stats)
+            || !has_native_gameplay_display_profile(candidate.stats)
+            || (!direct_scene_signal && !streamed_scene_signal)
+        {
+            return false;
+        }
+
+        let live_overlap = self.display_candidate_has_live_draw_overlap(candidate);
+        let strong_upload_overlap =
+            self.display_candidate_has_strong_scene_upload_overlap(candidate);
+        if !live_overlap && !strong_upload_overlap {
+            return false;
+        }
+        if !live_overlap
+            && !self.display_candidate_was_recently_presented(candidate, height)
+            && !self.has_strong_streamed_scene_rect_activity()
+        {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(candidate, width, height, true);
+        let streamed_caption_playfield =
+            streamed_scene_signal && color_stats.has_scene_color_diversity();
+        if self.display_window_has_title_logo_overlay(candidate, width, height, true)
+            || (color_stats.has_intro_caption_band() && !streamed_caption_playfield)
+            || self.low_palette_noise_candidate(candidate.stats, color_stats)
+            || self.display_window_has_atlas_caption_ghosting(
+                candidate,
+                width,
+                height,
+                true,
+                color_stats,
+            ) && !streamed_caption_playfield
+            || self.display_window_has_periodic_horizontal_ghosting(candidate, width, height, true)
+            || self.display_window_has_saturated_logo_transition(candidate, width, height, true)
+        {
+            return false;
+        }
+
+        self.presentation_captures > 0
+            && (color_stats.has_scene_color_diversity()
+                || color_stats.has_low_bucket_scene_range_signal())
+    }
+
+    fn display_candidate_has_strong_streamed_texture_scene_signal(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+        width: usize,
+        _height: usize,
+    ) -> bool {
+        let current_pixel_count = current.stats.pixel_count.max(1);
+        let current_has_visible_but_weak_signal = current.stats.nonzero_pixels
+            >= current_pixel_count / 64
+            && !has_native_playfield_density(current.stats)
+            && (current.stats.bright_pixels >= 512
+                || current.stats.detail_edges >= detail_edge_cutoff(current.stats));
+        if !current_has_visible_but_weak_signal || !self.has_strong_streamed_scene_rect_activity() {
+            return false;
+        }
+
+        let candidate_score = screen_observation_score(candidate.stats);
+        let candidate_pixel_count = candidate.stats.pixel_count.max(1);
+        let dense_scene = candidate.stats.nonzero_pixels.saturating_mul(5)
+            >= candidate_pixel_count.saturating_mul(3);
+        let strong_detail = candidate.stats.detail_edges
+            >= full_scene_detail_cutoff(candidate.stats).saturating_mul(8)
+            && candidate.stats.detail_edges >= current.stats.detail_edges.saturating_mul(3);
+        let strong_score = candidate_score > current_score.saturating_add(current_score / 2).max(1);
+        if !dense_scene || !strong_detail || !strong_score {
+            return false;
+        }
+
+        let upload_overlap = self.display_candidate_scene_upload_overlap_area(candidate);
+        let minimum_upload = self.minimum_scene_upload_overlap_area();
+        if upload_overlap < minimum_upload.saturating_mul(4)
+            || (upload_overlap as u64).saturating_mul(5) < candidate_pixel_count.saturating_mul(2)
+        {
+            return false;
+        }
+
+        candidate.stats.bright_pixels >= candidate_pixel_count.saturating_div(64).max(512)
+            && width >= DEFAULT_DISPLAY_WIDTH
+    }
+
+    fn display_candidate_has_staged_streamed_scene_recovery(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if candidate.x == current.x
+            && candidate.y == current.y
+            && candidate.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+
+        let current_is_weak = is_sparse_display(current.stats)
+            || !has_native_playfield_density(current.stats)
+            || !self.current_display_has_scene_quality(current)
+            || self.current_display_is_stale_periodic_video(current);
+        let current_color = self.display_window_color_stats(current, width, height, true);
+        let current_is_caption_only_scene = current_color.has_intro_caption_band()
+            && !has_native_playfield_density(current.stats)
+            && !current_color.has_scene_color_diversity();
+        if width >= DEFAULT_DISPLAY_WIDTH && current_is_caption_only_scene {
+            return false;
+        }
+        let streamed_render_activity = self.has_textured_scene_draws()
+            && self.has_playfield_draws()
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.textured_rect_commands >= DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS.saturating_mul(4)
+            && self.textured_draw_stats.color_changes >= 16_384
+            && self.presentation_captures >= 32;
+        if !current_is_weak || !streamed_render_activity {
+            return false;
+        }
+
+        let candidate_score = screen_observation_score(candidate.stats);
+        if candidate_score <= current_score.saturating_add(current_score / 2).max(1)
+            || candidate.stats.detail_edges <= current.stats.detail_edges.saturating_mul(3).max(512)
+        {
+            return false;
+        }
+
+        let display_flow = self.display_candidate_has_live_draw_overlap(candidate)
+            || self.display_candidate_has_scene_upload_overlap(candidate)
+            || self.display_candidate_has_streamed_scene_presentation(candidate)
+            || self.display_candidate_was_recently_presented(candidate, height);
+        if !display_flow
+            || width < NATIVE_REPLAY_STAGED_MIN_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(candidate.stats)
+            || !is_detailed_observation(candidate.stats)
+            || self.display_window_has_saturated_logo_transition(candidate, width, height, true)
+        {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(candidate, width, height, true);
+        if self.display_window_has_title_logo_overlay(candidate, width, height, true) {
+            return false;
+        }
+        let has_periodic_ghosting =
+            self.display_window_has_periodic_horizontal_ghosting(candidate, width, height, true);
+        if has_periodic_ghosting {
+            return false;
+        }
+
+        let candidate_pixel_count = candidate.stats.pixel_count.max(1);
+        let has_visible_density = candidate.stats.nonzero_pixels
+            >= candidate_pixel_count.saturating_div(4).max(2048)
+            && candidate.stats.bright_pixels >= candidate_pixel_count.saturating_div(256).max(256);
+        let has_detail = candidate.stats.detail_edges
+            >= detail_edge_cutoff(candidate.stats).max(candidate_pixel_count / 96);
+        let has_color_signal =
+            color_stats.bucket_count >= 16 || color_stats.has_low_bucket_scene_range_signal();
+        if !has_visible_density || !has_detail || !has_color_signal {
+            return false;
+        }
+
+        let atlas_like =
+            self.display_window_is_texture_atlas_with_dimensions(candidate, width, height);
+        if atlas_like {
+            let display_only_density =
+                candidate.stats.nonzero_pixels >= candidate_pixel_count.saturating_div(5);
+            if width < DEFAULT_DISPLAY_WIDTH
+                || height != DEFAULT_DISPLAY_HEIGHT
+                || !has_native_full_scene_detail(candidate.stats)
+                || !display_only_density
+                || !(color_stats.has_intro_caption_band()
+                    || self.display_candidate_has_live_draw_overlap_with_dimensions(
+                        candidate, width, height,
+                    )
+                    || self.display_candidate_has_scene_upload_overlap(candidate))
+            {
+                return false;
+            }
+        }
+
+        candidate.stats.nonzero_pixels >= 1024
+            && candidate.stats.bright_pixels >= 256
+            && candidate.stats.detail_edges >= detail_edge_cutoff(candidate.stats).min(512)
+            && color_stats.bucket_count >= 6
+            && !self.low_palette_noise_candidate(candidate.stats, color_stats)
+    }
+
+    fn display_candidate_has_caption_current_streamed_scene_recovery(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if candidate.x == current.x
+            && candidate.y == current.y
+            && candidate.stats.checksum == current.stats.checksum
+        {
+            return false;
+        }
+        if width > 384 || height != DEFAULT_DISPLAY_HEIGHT {
+            return false;
+        }
+        if !self.current_display_is_sparse_intro_caption_candidate(current) {
+            return false;
+        }
+        if self.display_candidate_is_cross_page_texture_atlas(candidate, width, height)
+            || self
+                .display_candidate_has_texture_atlas_half_with_dimensions(candidate, width, height)
+        {
+            return false;
+        }
+        let atlas_like = self
+            .display_window_is_texture_atlas_with_dimensions(candidate, width, height)
+            || self.display_candidate_is_probable_texture_upload_page(candidate, width, height);
+        if atlas_like
+            && !self
+                .display_candidate_has_live_draw_overlap_with_dimensions(candidate, width, height)
+            && !self.display_candidate_was_recently_presented(candidate, height)
+            && !self.display_candidate_has_streamed_scene_presentation(candidate)
+        {
+            return false;
+        }
+        if !self.has_textured_scene_draws()
+            || !self.has_playfield_draws()
+            || self.textured_rect_commands < DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 2
+            || self.textured_draw_stats.written_pixels
+                < DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16
+            || self.textured_draw_stats.color_changes < 65_536
+            || self.presentation_captures < 120
+        {
+            return false;
+        }
+        if !screen_observation_worth_saving(candidate.stats)
+            || !is_detailed_observation(candidate.stats)
+            || has_native_playfield_density(candidate.stats)
+        {
+            return false;
+        }
+
+        let pixel_count = candidate.stats.pixel_count.max(1);
+        if candidate.stats.nonzero_pixels < pixel_count / 5
+            || candidate.stats.bright_pixels < pixel_count.saturating_div(64).max(512)
+        {
+            return false;
+        }
+
+        let candidate_score = screen_observation_score(candidate.stats);
+        if candidate_score <= current_score.saturating_add(current_score / 2).max(1)
+            || candidate.stats.detail_edges <= current.stats.detail_edges.saturating_mul(4).max(512)
+        {
+            return false;
+        }
+
+        let upload_overlap = self.display_candidate_scene_upload_overlap_area(candidate);
+        if upload_overlap < self.minimum_scene_upload_overlap_area().saturating_mul(4) {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(candidate, width, height, true);
+        if self.low_palette_noise_candidate(candidate.stats, color_stats)
+            || self.display_window_has_periodic_horizontal_ghosting(candidate, width, height, true)
+            || self.display_window_has_saturated_logo_transition(candidate, width, height, true)
+        {
+            return false;
+        }
+
+        color_stats.bucket_count >= 6 || color_stats.has_low_bucket_scene_range_signal()
+    }
+
+    fn display_candidate_is_unverified_stale_periodic_substitute(
+        &self,
+        current: FrameBufferWindow,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !self.current_display_is_stale_periodic_video(current) {
+            return false;
+        }
+        if self.display_candidate_was_recently_presented(candidate, height)
+            || self.display_candidate_has_scene_upload_overlap(candidate)
+            || self.display_candidate_has_streamed_scene_presentation(candidate)
+        {
+            return false;
+        }
+
+        !self
+            .display_window_color_stats(candidate, width, height, true)
+            .has_scene_color_diversity()
+    }
+
     fn fresh_presented_display_candidate_is_valid(&self, candidate: FrameBufferWindow) -> bool {
         let Some(presented) = self.presented_frame_window else {
             return false;
@@ -2626,6 +6262,7 @@ impl Gpu {
             || presented.y != candidate.y
             || presented.stats.checksum != candidate.stats.checksum
             || presented.stats.pixel_count != candidate.stats.pixel_count
+            || !self.presented_frame_is_safe_display_candidate(candidate)
         {
             return false;
         }
@@ -2650,6 +6287,16 @@ impl Gpu {
             >= self.minimum_live_draw_overlap_area()
     }
 
+    fn display_candidate_has_live_draw_overlap_with_dimensions(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        self.display_candidate_live_draw_overlap_area_with_dimensions(candidate, width, height)
+            >= minimum_live_draw_overlap_area_for_dimensions(width, height)
+    }
+
     fn display_candidate_has_scene_upload_overlap(&self, candidate: FrameBufferWindow) -> bool {
         if !has_native_playfield_density(candidate.stats)
             || !is_detailed_observation(candidate.stats)
@@ -2660,9 +6307,310 @@ impl Gpu {
             >= self.minimum_scene_upload_overlap_area()
     }
 
+    fn display_candidate_has_strong_scene_upload_overlap(
+        &self,
+        candidate: FrameBufferWindow,
+    ) -> bool {
+        if !self.display_candidate_has_scene_upload_overlap(candidate) {
+            return false;
+        }
+
+        self.display_candidate_scene_upload_overlap_area(candidate)
+            >= self.minimum_scene_upload_overlap_area().saturating_mul(2)
+    }
+
+    fn display_candidate_has_streamed_scene_presentation(
+        &self,
+        candidate: FrameBufferWindow,
+    ) -> bool {
+        let (width, height) = self.display_dimensions();
+        let texture_page_like =
+            is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
+                || self.display_candidate_is_cross_page_texture_atlas(candidate, width, height)
+                || self.display_candidate_has_texture_atlas_half_with_dimensions(
+                    candidate, width, height,
+                )
+                || self.display_candidate_is_probable_texture_upload_page(candidate, width, height);
+        if texture_page_like
+            && !self
+                .display_candidate_has_live_draw_overlap_with_dimensions(candidate, width, height)
+            && !self.display_candidate_was_recently_presented(candidate, height)
+        {
+            return false;
+        }
+        if self.display_candidate_is_probable_texture_upload_page(candidate, width, height) {
+            return false;
+        }
+        if !has_native_gameplay_display_profile(candidate.stats)
+            || !self.display_candidate_has_scene_upload_overlap(candidate)
+            || !self.has_playfield_draws()
+            || !self.has_textured_scene_draws()
+        {
+            return false;
+        }
+
+        let pixel_count = candidate.stats.pixel_count.max(1);
+        let dense_scene =
+            candidate.stats.nonzero_pixels.saturating_mul(100) >= pixel_count.saturating_mul(55);
+        let highly_detailed =
+            candidate.stats.detail_edges >= full_scene_detail_cutoff(candidate.stats).max(4096) * 4;
+        let rich_textured_output = self.textured_draw_stats.written_pixels
+            >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS.saturating_mul(8)
+            && self.textured_draw_stats.color_changes >= 16_384;
+        let repeated_presentation = self.presentation_captures >= 32;
+
+        dense_scene && highly_detailed && rich_textured_output && repeated_presentation
+    }
+
+    fn display_candidate_is_probable_texture_upload_page(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
+            || self.display_candidate_has_live_draw_overlap(candidate)
+        {
+            return false;
+        }
+
+        let display_height = self.display_dimensions().1;
+        let field_height = self
+            .interlaced_field_pair_height(display_height)
+            .unwrap_or(display_height);
+        let recently_presented_display = self
+            .recent_display_area_history_contains(candidate.x, candidate.y)
+            || (height > field_height
+                && self.recent_display_area_history_contains(
+                    candidate.x,
+                    candidate.y.saturating_add(field_height),
+                ))
+            || (height >= field_height.saturating_mul(2)
+                && self.recent_display_area_history_has_field_pair(
+                    candidate.x,
+                    candidate.y,
+                    candidate.y.saturating_add(field_height),
+                ));
+        if recently_presented_display {
+            return false;
+        }
+
+        let (upload_overlap, upload_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(candidate, width, height);
+        if upload_overlap <= 0 {
+            return false;
+        }
+        let upload_overlap = upload_overlap as u64;
+        let max_upload_overlap = max_upload_overlap.max(0) as u64;
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+
+        let repeated_page_upload =
+            upload_rects >= 2 && upload_overlap.saturating_mul(4) >= pixel_count;
+        let large_page_upload = upload_overlap.saturating_mul(2) >= pixel_count
+            || max_upload_overlap.saturating_mul(2) >= pixel_count;
+
+        repeated_page_upload || large_page_upload
+    }
+
+    fn display_candidate_has_dominant_unpresented_texture_upload(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
+            || self.display_candidate_was_recently_presented(candidate, height)
+        {
+            return false;
+        }
+
+        let (upload_overlap, upload_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(candidate, width, height);
+        if upload_overlap <= 0 {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(candidate, width, height, true);
+        let title_recovery_scene = color_stats.has_intro_caption_band()
+            && has_native_full_scene_detail(candidate.stats)
+            && self.has_textured_scene_draws()
+            && self.has_visible_presentation();
+        if title_recovery_scene {
+            return false;
+        }
+
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+        let upload_overlap = upload_overlap as u64;
+        let max_upload_overlap = max_upload_overlap.max(0) as u64;
+        let repeated_uploads_cover_scene =
+            upload_rects >= 2 && upload_overlap.saturating_mul(4) >= pixel_count;
+        let single_upload_covers_scene = upload_overlap.saturating_mul(2) >= pixel_count
+            || max_upload_overlap.saturating_mul(2) >= pixel_count;
+
+        repeated_uploads_cover_scene || single_upload_covers_scene
+    }
+
+    fn display_candidate_is_unpresented_texture_page(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
+            && !self.display_candidate_has_live_draw_overlap(candidate)
+            && !self.display_candidate_was_recently_presented(candidate, height)
+    }
+
+    fn display_candidate_is_cross_page_texture_atlas(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || self.image_upload_rects.is_empty()
+            || is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
+            || self.display_candidate_was_recently_presented(candidate, height)
+            || self.display_candidate_is_low_height_field_counterpart(candidate, width, height)
+        {
+            return false;
+        }
+
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if candidate.x == display_x && candidate.y == display_y {
+            return false;
+        }
+
+        let Some(right) = candidate.x.checked_add(width) else {
+            return false;
+        };
+        let crosses_texture_page_boundary = [320_usize, 512, 640]
+            .into_iter()
+            .any(|boundary| candidate.x < boundary && right > boundary);
+        if !crosses_texture_page_boundary {
+            return false;
+        }
+
+        self.display_candidate_has_scene_upload_overlap(candidate)
+            && self.display_candidate_has_live_draw_overlap(candidate)
+    }
+
+    fn display_candidate_is_unpresented_live_texture_page(
+        &self,
+        current: FrameBufferWindow,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
+            || self.display_candidate_was_recently_presented(candidate, height)
+            || !self.display_candidate_has_live_draw_overlap(candidate)
+            || self.display_candidate_has_scene_upload_overlap(candidate)
+            || self.display_candidate_has_streamed_scene_presentation(candidate)
+            || self.display_window_is_texture_atlas(current)
+            || is_sparse_display(current.stats)
+        {
+            return false;
+        }
+
+        has_native_full_scene_detail(candidate.stats)
+            && self.has_strong_native_3d_textured_playfield_activity()
+    }
+
+    fn display_candidate_was_recently_presented(
+        &self,
+        candidate: FrameBufferWindow,
+        height: usize,
+    ) -> bool {
+        let display_height = self.display_dimensions().1;
+        let field_height = self
+            .interlaced_field_pair_height(display_height)
+            .unwrap_or(display_height);
+        self.recent_display_area_history_contains(candidate.x, candidate.y)
+            || (height > field_height
+                && self.recent_display_area_history_contains(
+                    candidate.x,
+                    candidate.y.saturating_add(field_height),
+                ))
+            || (height >= field_height.saturating_mul(2)
+                && self.recent_display_area_history_has_field_pair(
+                    candidate.x,
+                    candidate.y,
+                    candidate.y.saturating_add(field_height),
+                ))
+    }
+
+    fn resolved_display_candidate_has_live_field_counterpart_signal(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !self.display_candidate_is_low_height_field_counterpart(candidate, width, height)
+            || !self.display_candidate_has_live_draw_overlap(candidate)
+            || !screen_observation_worth_saving(candidate.stats)
+            || self.display_candidate_is_probable_texture_upload_page(candidate, width, height)
+        {
+            return false;
+        }
+
+        let current_is_weak = self.current_display_is_stale_periodic_video(current)
+            || !self.current_display_has_scene_quality(current)
+            || !is_detailed_observation(current.stats);
+        if !current_is_weak {
+            return false;
+        }
+
+        let candidate_score = screen_observation_score(candidate.stats);
+        let candidate_improves_current = candidate_score
+            > current_score.saturating_add(current_score / 64)
+            || candidate.stats.detail_edges > current.stats.detail_edges.saturating_add(512);
+        let candidate_is_periodic =
+            self.display_window_has_periodic_horizontal_ghosting(candidate, width, height, true);
+        if candidate_is_periodic && !candidate_improves_current {
+            return false;
+        }
+        let enough_visible_signal = candidate.stats.max_luma >= 128
+            && candidate.stats.bright_pixels >= 384
+            && candidate.stats.nonzero_pixels >= candidate.stats.pixel_count / 8
+            && candidate.stats.detail_edges >= (candidate.stats.pixel_count / 256).max(512);
+        let score_is_plausible = current_score == 0
+            || candidate_score.saturating_mul(2) >= current_score
+            || candidate.stats.detail_edges > current.stats.detail_edges.saturating_mul(2).max(512);
+
+        enough_visible_signal
+            && candidate_improves_current
+            && score_is_plausible
+            && self.has_textured_scene_draws()
+            && self.has_playfield_draws()
+    }
+
+    fn has_native_play_3d_draw_signal(&self) -> bool {
+        let triangle_command_signal = self.textured_triangle_commands
+            >= DISPLAY_RESOLVE_MIN_3D_TRIANGLE_COMMANDS
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
+            && self.textured_draw_stats.color_changes >= 16;
+        triangle_command_signal || self.has_pixel_heavy_low_triangle_playfield_activity()
+    }
+
+    fn has_pixel_heavy_low_triangle_playfield_activity(&self) -> bool {
+        self.has_playfield_draws()
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.textured_triangle_commands >= DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_TRIANGLE_COMMANDS
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_WRITTEN_PIXELS
+            && self.textured_draw_stats.color_changes
+                >= DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_COLOR_CHANGES
+            && self.presentation_captures >= DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_PRESENTATION_CAPTURES
+    }
+
     fn minimum_live_draw_overlap_area(&self) -> i64 {
         let (width, height) = self.display_dimensions();
-        ((width as i64).saturating_mul(height as i64) / 64).max(512)
+        minimum_live_draw_overlap_area_for_dimensions(width, height)
     }
 
     fn minimum_scene_upload_overlap_area(&self) -> i64 {
@@ -2672,6 +6620,15 @@ impl Gpu {
 
     fn display_candidate_live_draw_overlap_area(&self, candidate: FrameBufferWindow) -> i64 {
         let (width, height) = self.display_dimensions();
+        self.display_candidate_live_draw_overlap_area_with_dimensions(candidate, width, height)
+    }
+
+    fn display_candidate_live_draw_overlap_area_with_dimensions(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> i64 {
         let Some(right) = candidate
             .x
             .checked_add(width)
@@ -2694,7 +6651,7 @@ impl Gpu {
         };
         self.playfield_draw_traces()
             .filter(|trace| {
-                (trace.kind == "textured_quad" || trace.kind == "textured_triangle")
+                trace.is_textured_display_draw()
                     && trace.stats.written_pixels > 0
                     && trace.score() > 0
             })
@@ -2746,13 +6703,16 @@ impl Gpu {
         let Some(best) = self.best_observation_window else {
             return false;
         };
-        if self.display_window_is_texture_atlas(best) {
+        if !self.best_observation_is_safe_display_candidate(best) {
             return false;
         }
         let Some(presented) = self.presented_frame_window else {
             return true;
         };
         if self.display_window_is_texture_atlas(presented) {
+            return true;
+        }
+        if !self.presented_frame_is_safe_display_candidate(presented) {
             return true;
         }
         if self.should_prefer_presented_frame() {
@@ -2784,16 +6744,13 @@ impl Gpu {
         if self.should_show_current_display_over_stale_candidates() {
             return false;
         }
-        if !screen_observation_worth_saving(presented.stats) {
+        if !self.presented_frame_is_safe_display_candidate(presented) {
             return false;
         }
         let Some(best) = self.best_observation_window else {
             return true;
         };
-        if self.display_window_is_texture_atlas(best) {
-            return true;
-        }
-        if !screen_observation_worth_saving(best.stats) {
+        if !self.best_observation_is_safe_display_candidate(best) {
             return true;
         }
         if is_sparse_display(presented.stats)
@@ -2802,6 +6759,24 @@ impl Gpu {
             return false;
         }
         screen_observation_score(presented.stats) >= screen_observation_score(best.stats)
+    }
+
+    fn best_observation_is_safe_display_candidate(&self, best: FrameBufferWindow) -> bool {
+        if !self.best_observation_matches_current_display_dimensions() {
+            return false;
+        }
+        if !screen_observation_worth_saving(best.stats) {
+            return false;
+        }
+
+        let width = self.best_observation_width;
+        let height = self.best_observation_height;
+        if self.display_candidate_is_unpresented_texture_page(best, width, height) {
+            return false;
+        }
+        width > 0
+            && height > 0
+            && !self.display_window_is_texture_atlas_with_dimensions(best, width, height)
     }
 
     fn presented_frame_is_fresh(&self) -> bool {
@@ -2813,9 +6788,13 @@ impl Gpu {
     pub fn screenshot_window(&self) -> FrameBufferWindow {
         let (start_x, start_y) = display_area_start_xy(self.display_area_start);
         let (width, height) = self.display_dimensions();
-        let stats = self
-            .framebuffer
-            .psx_display_stats(start_x, start_y, width, height);
+        let stats = self.framebuffer.psx_display_stats_with_depth(
+            start_x,
+            start_y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        );
         let display_window = FrameBufferWindow {
             x: start_x,
             y: start_y,
@@ -2860,6 +6839,10 @@ impl Gpu {
         self.draw_captures.clear();
     }
 
+    pub fn draw_sequence(&self) -> u64 {
+        self.draw_sequence
+    }
+
     pub fn draw_captures(&self) -> &[NativeGpuDrawCapture] {
         &self.draw_captures
     }
@@ -2867,8 +6850,13 @@ impl Gpu {
     pub fn framebuffer_stats(&self) -> FrameBufferStats {
         let (start_x, start_y) = display_area_start_xy(self.display_area_start);
         let (width, height) = self.display_dimensions();
-        self.framebuffer
-            .psx_display_stats(start_x, start_y, width, height)
+        self.framebuffer.psx_display_stats_with_depth(
+            start_x,
+            start_y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        )
     }
 
     pub fn vram_stats(&self) -> FrameBufferStats {
@@ -3001,46 +6989,48 @@ impl Gpu {
                 );
             }
             0x30..=0x33 if words.len() >= 6 => {
-                self.draw_flat_triangle(
-                    words,
-                    source_ref,
-                    words[1],
-                    words[3],
-                    words[5],
-                    color(words[0]),
-                );
-            }
-            0x34..=0x37 if words.len() >= 9 => {
-                self.draw_textured_triangle(
+                self.draw_shaded_triangle(
                     words,
                     source_ref,
                     [
-                        (words[1], words[2]),
-                        (words[4], words[5]),
-                        (words[7], words[8]),
+                        (words[1], words[0]),
+                        (words[3], words[2]),
+                        (words[5], words[4]),
+                    ],
+                );
+            }
+            0x34..=0x37 if words.len() >= 9 => {
+                self.draw_shaded_textured_triangle(
+                    words,
+                    source_ref,
+                    [
+                        (words[1], words[2], words[0]),
+                        (words[4], words[5], words[3]),
+                        (words[7], words[8], words[6]),
                     ],
                 );
             }
             0x38..=0x3b if words.len() >= 8 => {
-                self.draw_flat_quad(
-                    words,
-                    words[1],
-                    words[3],
-                    words[5],
-                    words[7],
-                    color(words[0]),
-                    source_ref,
-                );
-            }
-            0x3c..=0x3f if words.len() >= 12 => {
-                self.draw_textured_quad(
+                self.draw_shaded_quad(
                     words,
                     source_ref,
                     [
-                        (words[1], words[2]),
-                        (words[4], words[5]),
-                        (words[7], words[8]),
-                        (words[10], words[11]),
+                        (words[1], words[0]),
+                        (words[3], words[2]),
+                        (words[5], words[4]),
+                        (words[7], words[6]),
+                    ],
+                );
+            }
+            0x3c..=0x3f if words.len() >= 12 => {
+                self.draw_shaded_textured_quad(
+                    words,
+                    source_ref,
+                    [
+                        (words[1], words[2], words[0]),
+                        (words[4], words[5], words[3]),
+                        (words[7], words[8], words[6]),
+                        (words[10], words[11], words[9]),
                     ],
                 );
             }
@@ -3313,6 +7303,78 @@ impl Gpu {
         ));
     }
 
+    fn draw_shaded_triangle(
+        &mut self,
+        words: &[u32],
+        source: Option<&GpuCommandSource>,
+        vertices: [(u32, u32); 3],
+    ) {
+        self.flat_triangle_commands += 1;
+        let [(a, a_color), (b, b_color), (c, c_color)] = vertices;
+        let a = self.offset_point(point(a));
+        let b = self.offset_point(point(b));
+        let c = self.offset_point(point(c));
+        self.framebuffer.draw_shaded_triangle_with_options(
+            a,
+            b,
+            c,
+            [
+                command_color(a_color),
+                command_color(b_color),
+                command_color(c_color),
+            ],
+            self.flat_draw_options(words[0]),
+        );
+        self.push_recent_draw_command(GpuDrawTrace::flat(
+            "shaded_triangle",
+            color(words[0]),
+            points_bounds(&[a, b, c]),
+            words,
+            &[a, b, c],
+            source,
+        ));
+    }
+
+    fn draw_shaded_quad(
+        &mut self,
+        words: &[u32],
+        source: Option<&GpuCommandSource>,
+        vertices: [(u32, u32); 4],
+    ) {
+        self.flat_triangle_commands += 2;
+        let [(a, a_color), (b, b_color), (c, c_color), (d, d_color)] = vertices;
+        let a = self.offset_point(point(a));
+        let b = self.offset_point(point(b));
+        let c = self.offset_point(point(c));
+        let d = self.offset_point(point(d));
+        let a_color = command_color(a_color);
+        let b_color = command_color(b_color);
+        let c_color = command_color(c_color);
+        let d_color = command_color(d_color);
+        self.framebuffer.draw_shaded_triangle_with_options(
+            a,
+            b,
+            c,
+            [a_color, b_color, c_color],
+            self.flat_draw_options(words[0]),
+        );
+        self.framebuffer.draw_shaded_triangle_with_options(
+            b,
+            c,
+            d,
+            [b_color, c_color, d_color],
+            self.flat_draw_options(words[0]),
+        );
+        self.push_recent_draw_command(GpuDrawTrace::flat(
+            "shaded_quad",
+            color(words[0]),
+            points_bounds(&[a, b, c, d]),
+            words,
+            &[a, b, c, d],
+            source,
+        ));
+    }
+
     fn draw_flat_line(
         &mut self,
         words: &[u32],
@@ -3332,6 +7394,50 @@ impl Gpu {
             points_bounds(&[a, b]),
             words,
             &[a, b],
+            source,
+        ));
+    }
+
+    fn draw_shaded_textured_triangle(
+        &mut self,
+        words: &[u32],
+        source: Option<&GpuCommandSource>,
+        vertices: [(u32, u32, u32); 3],
+    ) {
+        self.textured_triangle_commands += 1;
+        let [(a, a_uv, a_color), (b, b_uv, b_color), (c, c_uv, c_color)] = vertices;
+        let clut = clut(a_uv);
+        let texture_page = texture_page(b_uv);
+        self.texture_page = texture_page;
+        let options = self.texture_draw_options(words[0], texture_page);
+        let a = self.textured_point(a, a_uv);
+        let b = self.textured_point(b, b_uv);
+        let c = self.textured_point(c, c_uv);
+        let stats = self.framebuffer.draw_shaded_textured_triangle(
+            a,
+            b,
+            c,
+            [
+                command_color(a_color),
+                command_color(b_color),
+                command_color(c_color),
+            ],
+            texture_page,
+            clut,
+            options,
+            self.texture_window,
+        );
+        self.add_textured_draw_stats(stats);
+        self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
+            "shaded_textured_triangle",
+            texture_page,
+            clut,
+            points_bounds(&[a.point, b.point, c.point]),
+            stats,
+            words,
+            &[a, b, c],
+            self.texture_window,
+            options,
             source,
         ));
     }
@@ -3361,14 +7467,104 @@ impl Gpu {
             self.texture_window,
         );
         self.add_textured_draw_stats(stats);
-        self.push_recent_draw_command(GpuDrawTrace::textured(
+        self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
             "textured_triangle",
             texture_page,
             clut,
             points_bounds(&[a.point, b.point, c.point]),
             stats,
             words,
-            &[a.point, b.point, c.point],
+            &[a, b, c],
+            self.texture_window,
+            options,
+            source,
+        ));
+    }
+
+    fn draw_shaded_textured_quad(
+        &mut self,
+        words: &[u32],
+        source: Option<&GpuCommandSource>,
+        vertices: [(u32, u32, u32); 4],
+    ) {
+        self.textured_triangle_commands += 2;
+        let [
+            (a, a_uv, a_color),
+            (b, b_uv, b_color),
+            (c, c_uv, c_color),
+            (d, d_uv, d_color),
+        ] = vertices;
+        let clut = clut(a_uv);
+        let texture_page = texture_page(b_uv);
+        self.texture_page = texture_page;
+        let options = self.texture_draw_options(words[0], texture_page);
+        let a = self.textured_point(a, a_uv);
+        let b = self.textured_point(b, b_uv);
+        let c = self.textured_point(c, c_uv);
+        let d = self.textured_point(d, d_uv);
+        let a_color = command_color(a_color);
+        let b_color = command_color(b_color);
+        let c_color = command_color(c_color);
+        let d_color = command_color(d_color);
+        let (first, second) = if native_use_alternate_quad_split() {
+            (
+                self.framebuffer.draw_shaded_textured_triangle(
+                    a,
+                    b,
+                    d,
+                    [a_color, b_color, d_color],
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+                self.framebuffer.draw_shaded_textured_triangle(
+                    a,
+                    c,
+                    d,
+                    [a_color, c_color, d_color],
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+            )
+        } else {
+            (
+                self.framebuffer.draw_shaded_textured_triangle(
+                    a,
+                    b,
+                    c,
+                    [a_color, b_color, c_color],
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+                self.framebuffer.draw_shaded_textured_triangle(
+                    b,
+                    c,
+                    d,
+                    [b_color, c_color, d_color],
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+            )
+        };
+        self.add_textured_draw_stats(first);
+        self.add_textured_draw_stats(second);
+        self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
+            "shaded_textured_quad",
+            texture_page,
+            clut,
+            points_bounds(&[a.point, b.point, c.point, d.point]),
+            combine_textured_draw_stats(first, second),
+            words,
+            &[a, b, c, d],
+            self.texture_window,
+            options,
             source,
         ));
     }
@@ -3389,34 +7585,64 @@ impl Gpu {
         let b = self.textured_point(b, b_uv);
         let c = self.textured_point(c, c_uv);
         let d = self.textured_point(d, d_uv);
-        let first = self.framebuffer.draw_textured_triangle(
-            a,
-            b,
-            c,
-            texture_page,
-            clut,
-            options,
-            self.texture_window,
-        );
-        let second = self.framebuffer.draw_textured_triangle(
-            b,
-            c,
-            d,
-            texture_page,
-            clut,
-            options,
-            self.texture_window,
-        );
+        let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
+        let (first, second) = if should_skip_noisy_4bpp_title_draw(texture_page, clut, bounds) {
+            (TexturedDrawStats::default(), TexturedDrawStats::default())
+        } else if native_use_alternate_quad_split() {
+            (
+                self.framebuffer.draw_textured_triangle(
+                    a,
+                    b,
+                    d,
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+                self.framebuffer.draw_textured_triangle(
+                    a,
+                    c,
+                    d,
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+            )
+        } else {
+            (
+                self.framebuffer.draw_textured_triangle(
+                    a,
+                    b,
+                    c,
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+                self.framebuffer.draw_textured_triangle(
+                    b,
+                    c,
+                    d,
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+            )
+        };
         self.add_textured_draw_stats(first);
         self.add_textured_draw_stats(second);
-        self.push_recent_draw_command(GpuDrawTrace::textured(
+        self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
             "textured_quad",
             texture_page,
             clut,
-            points_bounds(&[a.point, b.point, c.point, d.point]),
+            bounds,
             combine_textured_draw_stats(first, second),
             words,
-            &[a.point, b.point, c.point, d.point],
+            &[a, b, c, d],
+            self.texture_window,
+            options,
             source,
         ));
     }
@@ -3432,24 +7658,47 @@ impl Gpu {
     ) {
         self.textured_rect_commands += 1;
         let point = self.offset_point(point(xy));
-        let stats = self.framebuffer.draw_textured_rect(
-            point,
-            (width, height),
+        let texture_uv = texture_coordinate(uv);
+        let mut options = self.texture_draw_options(words[0], self.texture_page);
+        let clut = clut(uv);
+        let bounds = rect_bounds(point, width, height);
+        if should_allow_zn_low_bank_screen_rect_palette_fallback(
+            words[0],
             self.texture_page,
-            clut(uv),
-            texture_coordinate(uv),
-            self.texture_draw_options(words[0], self.texture_page),
-            self.texture_window,
-        );
+            clut,
+            bounds,
+        ) {
+            options.allow_palette_fallback = true;
+        }
+        let stats = if should_skip_noisy_4bpp_title_draw(self.texture_page, clut, bounds) {
+            TexturedDrawStats::default()
+        } else {
+            self.framebuffer.draw_textured_rect(
+                point,
+                (width, height),
+                self.texture_page,
+                clut,
+                texture_uv,
+                options,
+                self.texture_window,
+            )
+        };
         self.add_textured_draw_stats(stats);
-        self.push_recent_draw_command(GpuDrawTrace::textured(
+        let textured_point = TexturedPoint {
+            point,
+            u: texture_uv.u,
+            v: texture_uv.v,
+        };
+        self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
             "textured_rect",
             self.texture_page,
-            clut(uv),
-            rect_bounds(point, width, height),
+            clut,
+            bounds,
             stats,
             words,
-            &[point],
+            &[textured_point],
+            self.texture_window,
+            options,
             source,
         ));
     }
@@ -3475,6 +7724,30 @@ impl Gpu {
             .textured_draw_stats
             .transparent_pixels
             .saturating_add(stats.transparent_pixels);
+        self.textured_draw_stats.texture_nonzero_samples = self
+            .textured_draw_stats
+            .texture_nonzero_samples
+            .saturating_add(stats.texture_nonzero_samples);
+        self.textured_draw_stats.zero_texel_samples = self
+            .textured_draw_stats
+            .zero_texel_samples
+            .saturating_add(stats.zero_texel_samples);
+        self.textured_draw_stats.clut_nonzero_samples = self
+            .textured_draw_stats
+            .clut_nonzero_samples
+            .saturating_add(stats.clut_nonzero_samples);
+        self.textured_draw_stats.clut_blank_samples = self
+            .textured_draw_stats
+            .clut_blank_samples
+            .saturating_add(stats.clut_blank_samples);
+        self.textured_draw_stats.palette_fallback_samples = self
+            .textured_draw_stats
+            .palette_fallback_samples
+            .saturating_add(stats.palette_fallback_samples);
+        self.textured_draw_stats.nonzero_texel_transparent_samples = self
+            .textured_draw_stats
+            .nonzero_texel_transparent_samples
+            .saturating_add(stats.nonzero_texel_transparent_samples);
         if stats.drawn_pixels != 0 {
             if self.textured_draw_stats.drawn_pixels == stats.drawn_pixels {
                 self.textured_draw_stats.first_color = stats.first_color;
@@ -3572,8 +7845,9 @@ impl Gpu {
             .join(",")
     }
 
-    fn push_recent_gp1_command(&mut self, value: u32) {
-        self.recent_gp1_commands.push(Gp1CommandTrace::new(value));
+    fn push_recent_gp1_command(&mut self, value: u32, source: Option<&GpuCommandSource>) {
+        self.recent_gp1_commands
+            .push(Gp1CommandTrace::new(value, source));
         if self.recent_gp1_commands.len() > GP1_RECENT_COMMAND_LIMIT {
             self.recent_gp1_commands.remove(0);
         }
@@ -3655,10 +7929,37 @@ impl Gpu {
             .texture_page
             .zip(trace.clut)
             .map(|(texture_page, clut)| self.framebuffer.decoded_texture_png(texture_page, clut));
+        let raw_texture_png = trace
+            .texture_page
+            .map(|texture_page| self.framebuffer.raw_texture_page_png(texture_page));
         let palette_png = trace
             .texture_page
             .zip(trace.clut)
             .map(|(texture_page, clut)| self.framebuffer.texture_palette_png(texture_page, clut));
+        let resolved_palette_png =
+            trace
+                .texture_page
+                .zip(trace.clut)
+                .map(|(texture_page, clut)| {
+                    self.framebuffer
+                        .resolved_texture_palette_png(texture_page, clut)
+                });
+        let texture_diagnostics_json =
+            trace
+                .texture_page
+                .zip(trace.clut)
+                .map(|(texture_page, clut)| {
+                    self.framebuffer
+                        .texture_diagnostics_json(texture_page, clut)
+                });
+        let texture_candidate_images = trace
+            .texture_page
+            .zip(trace.clut)
+            .map(|(texture_page, clut)| {
+                self.framebuffer
+                    .texture_candidate_images(texture_page, clut)
+            })
+            .unwrap_or_default();
         self.draw_captures.push(NativeGpuDrawCapture {
             sequence: trace.sequence,
             trace_json: trace.json(),
@@ -3666,12 +7967,16 @@ impl Gpu {
             display_y,
             display_width,
             display_height,
-            display_png: self.framebuffer.psx_display_png(
+            display_png: self.framebuffer.psx_display_png_with_depth(
                 display_x,
                 display_y,
                 display_width,
                 display_height,
+                self.display_24bit_enabled(),
             ),
+            actual_display_png: self.actual_display_png(),
+            raw_actual_display_png: self.raw_actual_display_png(),
+            gui_display_png: self.display_png(),
             bounds_x,
             bounds_y,
             bounds_width,
@@ -3680,7 +7985,11 @@ impl Gpu {
                 .framebuffer
                 .png(bounds_x, bounds_y, bounds_width, bounds_height),
             texture_png,
+            raw_texture_png,
             palette_png,
+            resolved_palette_png,
+            texture_diagnostics_json,
+            texture_candidate_images,
         });
     }
 
@@ -3736,7 +8045,7 @@ impl Gpu {
             .join(",")
     }
 
-    fn push_display_area_trace(&mut self, value: u32) {
+    fn push_display_area_trace(&mut self, value: u32, source: Option<&GpuCommandSource>) {
         let value = value & 0x00ff_ffff;
         let (x, y) = display_area_start_xy(value);
         let trace = DisplayAreaTrace {
@@ -3745,6 +8054,7 @@ impl Gpu {
             y,
             command_index: self.commands_seen,
             draw_sequence: self.draw_sequence,
+            source: source.cloned(),
         };
         if self
             .display_area_history
@@ -3838,9 +8148,13 @@ impl Gpu {
         let display = FrameBufferWindow {
             x: display_x,
             y: display_y,
-            stats: self
-                .framebuffer
-                .psx_display_stats(display_x, display_y, width, height),
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                display_x,
+                display_y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
         };
 
         let (drawing_x, drawing_y) = drawing_area_xy(self.drawing_area_top_left);
@@ -3964,6 +8278,9 @@ impl Gpu {
             let Some(window) = candidate else {
                 continue;
             };
+            if !self.search_display_candidate_is_safe(window, width, height) {
+                continue;
+            }
             if windows
                 .iter()
                 .any(|(_, existing)| existing.x == window.x && existing.y == window.y)
@@ -3974,6 +8291,24 @@ impl Gpu {
         }
 
         windows
+    }
+
+    fn search_display_candidate_is_safe(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !is_likely_texture_page_candidate(window.x, window.y, width, height) {
+            return true;
+        }
+
+        if self.display_candidate_was_recently_presented(window, height) {
+            return true;
+        }
+
+        let (upload_overlap, _, _) = self.texture_upload_overlap_summary(window, width, height);
+        upload_overlap <= 0
     }
 
     pub fn display_candidate_pngs(&self) -> Vec<NativeGpuDisplayCandidate> {
@@ -4019,6 +8354,84 @@ impl Gpu {
             .collect()
     }
 
+    fn display_candidate_summary_json(&self) -> String {
+        let (width, height) = self.display_dimensions();
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        self.display_candidate_windows(width, height)
+            .into_iter()
+            .map(|(label, window)| {
+                let rejection_reason =
+                    self.display_candidate_resolution_reason(current, current_score, window);
+                let live_draw_overlap_area = self.display_candidate_live_draw_overlap_area(window);
+                let minimum_live_draw_overlap_area = self.minimum_live_draw_overlap_area();
+                let scene_upload_overlap_area =
+                    self.display_candidate_scene_upload_overlap_area(window);
+                let minimum_scene_upload_overlap_area = self.minimum_scene_upload_overlap_area();
+                format!(
+                    "{{\"label\":\"{}\",\"window\":{},\"score\":{},\"texture_atlas\":{},\"live_draw_overlap_area\":{},\"minimum_live_draw_overlap_area\":{},\"live_draw_overlap\":{},\"scene_upload_overlap_area\":{},\"minimum_scene_upload_overlap_area\":{},\"scene_upload_overlap\":{},\"scene_signal\":{},\"valid_for_display_resolve\":{},\"rejection_reason\":\"{}\"}}",
+                    label,
+                    framebuffer_window_json(window),
+                    screen_observation_score(window.stats),
+                    self.display_window_is_texture_atlas(window),
+                    live_draw_overlap_area,
+                    minimum_live_draw_overlap_area,
+                    live_draw_overlap_area >= minimum_live_draw_overlap_area,
+                    scene_upload_overlap_area,
+                    minimum_scene_upload_overlap_area,
+                    scene_upload_overlap_area >= minimum_scene_upload_overlap_area,
+                    resolved_display_candidate_has_scene_signal(
+                        current,
+                        current_score,
+                        window,
+                    ),
+                    rejection_reason == "valid",
+                    rejection_reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn display_candidate_compact_summary_json(&self, limit: usize) -> String {
+        let (width, height) = self.display_dimensions();
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let mut candidates = self
+            .display_candidate_windows(width, height)
+            .into_iter()
+            .map(|(label, window)| {
+                let score = screen_observation_score(window.stats);
+                let rejection_reason =
+                    self.display_candidate_resolution_reason(current, current_score, window);
+                let live_draw_overlap = self.display_candidate_has_live_draw_overlap(window);
+                let scene_upload_overlap = self.display_candidate_has_scene_upload_overlap(window);
+                let scene_signal =
+                    resolved_display_candidate_has_scene_signal(current, current_score, window);
+                let json = format!(
+                    "{{\"label\":\"{}\",\"window\":{},\"score\":{},\"texture_atlas\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{},\"scene_signal\":{},\"valid_for_display_resolve\":{},\"rejection_reason\":\"{}\"}}",
+                    label,
+                    framebuffer_window_json(window),
+                    score,
+                    self.display_window_is_texture_atlas(window),
+                    live_draw_overlap,
+                    scene_upload_overlap,
+                    scene_signal,
+                    rejection_reason == "valid",
+                    rejection_reason
+                );
+                (score, json)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.0.cmp(&left.0));
+        candidates
+            .into_iter()
+            .take(limit)
+            .map(|(_, json)| json)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     fn resolved_display_json(&self) -> String {
         let resolved = self.display_resolve();
         format!(
@@ -4042,16 +8455,13 @@ impl Gpu {
 
     fn capture_best_observation(&mut self) {
         let (width, height) = self.display_dimensions();
-        let candidate = self.screenshot_window();
-        if self.display_window_is_texture_atlas_with_dimensions(candidate, width, height) {
+        let Some(candidate) = self.best_observation_capture_candidate(width, height) else {
             return;
-        }
-        if !screen_observation_worth_saving(candidate.stats) {
-            return;
-        }
+        };
 
         let best_score = self
             .best_observation_window
+            .filter(|_| self.best_observation_dimensions_match(width, height))
             .map_or(0, |window| screen_observation_score(window.stats));
         let candidate_score = screen_observation_score(candidate.stats);
         if candidate_score <= best_score {
@@ -4059,14 +8469,153 @@ impl Gpu {
         }
 
         self.best_observation_png = None;
-        self.best_observation_rgb =
-            Some(
-                self.framebuffer
-                    .rgb_window(candidate.x, candidate.y, width, height),
-            );
+        self.best_observation_rgb = Some(self.framebuffer.psx_display_rgb_window_with_depth(
+            candidate.x,
+            candidate.y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        ));
         self.best_observation_window = Some(candidate);
         self.best_observation_width = width;
         self.best_observation_height = height;
+    }
+
+    fn best_observation_capture_candidate(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<FrameBufferWindow> {
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let screenshot = self.screenshot_window();
+        let mut best = self
+            .best_observation_capture_candidate_is_safe(
+                current,
+                current_score,
+                screenshot,
+                width,
+                height,
+                true,
+            )
+            .then_some(screenshot);
+
+        if self.should_scan_best_observation_candidates(screenshot, current, width, height) {
+            for (_, candidate) in self.display_candidate_windows(width, height) {
+                if !self.best_observation_capture_candidate_is_safe(
+                    current,
+                    current_score,
+                    candidate,
+                    width,
+                    height,
+                    false,
+                ) {
+                    continue;
+                }
+                if best.is_none_or(|existing| {
+                    screen_observation_score(candidate.stats)
+                        > screen_observation_score(existing.stats)
+                }) {
+                    best = Some(candidate);
+                }
+            }
+        }
+
+        best
+    }
+
+    fn should_scan_best_observation_candidates(
+        &self,
+        screenshot: FrameBufferWindow,
+        current: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let weak_screenshot = !screen_observation_worth_saving(screenshot.stats)
+            || is_sparse_display(screenshot.stats)
+            || self.display_window_is_texture_atlas_with_dimensions(screenshot, width, height)
+            || !has_native_playfield_density(screenshot.stats)
+            || !is_detailed_observation(screenshot.stats);
+        let weak_current = !screen_observation_worth_saving(current.stats)
+            || is_sparse_display(current.stats)
+            || self.display_window_is_texture_atlas_with_dimensions(current, width, height)
+            || !self.current_display_has_scene_quality(current);
+
+        (weak_screenshot || weak_current)
+            && self.has_textured_scene_draws()
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
+    }
+
+    fn best_observation_capture_candidate_is_safe(
+        &self,
+        current: FrameBufferWindow,
+        current_score: u64,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        direct_observation: bool,
+    ) -> bool {
+        if width == 0 || height == 0 || !screen_observation_worth_saving(candidate.stats) {
+            return false;
+        }
+        if self.display_candidate_is_cross_page_texture_atlas(candidate, width, height)
+            || self
+                .display_candidate_has_texture_atlas_half_with_dimensions(candidate, width, height)
+            || self.display_window_is_texture_atlas_with_dimensions(candidate, width, height)
+            || self.best_observation_candidate_has_blocking_artifact(candidate, width, height)
+        {
+            return false;
+        }
+        if !direct_observation
+            && self.display_candidate_is_unpresented_texture_page(candidate, width, height)
+        {
+            return false;
+        }
+        direct_observation
+            || self.resolved_display_candidate_is_valid(current, current_score, candidate)
+    }
+
+    fn best_observation_candidate_has_blocking_artifact(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let psx_wrap = true;
+        let color_stats = self.display_window_color_stats(candidate, width, height, psx_wrap);
+        let caption_like = color_stats.has_intro_caption_band()
+            || self.display_window_has_atlas_caption_ghosting(
+                candidate,
+                width,
+                height,
+                psx_wrap,
+                color_stats,
+            );
+        let caption_blocks_live_scene = caption_like
+            && !self.caption_band_playfield_ui_allowed(width, height)
+            && self.has_strong_native_3d_textured_playfield_activity();
+
+        let periodic_ghosting_blocks_live_scene = self
+            .display_window_has_periodic_horizontal_ghosting(candidate, width, height, psx_wrap)
+            && (self.has_strong_native_3d_textured_playfield_activity()
+                || self.has_native_replay_render_signal());
+
+        caption_blocks_live_scene
+            || self.display_window_has_title_logo_overlay(candidate, width, height, psx_wrap)
+            || self.display_window_has_saturated_logo_transition(candidate, width, height, psx_wrap)
+            || periodic_ghosting_blocks_live_scene
+    }
+
+    fn best_observation_matches_current_display_dimensions(&self) -> bool {
+        let (width, height) = self.display_dimensions();
+        self.best_observation_dimensions_match(width, height)
+    }
+
+    fn best_observation_dimensions_match(&self, width: usize, height: usize) -> bool {
+        self.best_observation_window.is_some()
+            && self.best_observation_width == width
+            && self.best_observation_height == height
     }
 
     fn capture_best_observation_after_gp0(&mut self, command: u8) {
@@ -4114,6 +8663,20 @@ impl Gpu {
         width: usize,
         height: usize,
     ) -> bool {
+        if self.display_window_is_direct_live_display_scene(window, width, height) {
+            return false;
+        }
+
+        if self.display_window_has_primitive_workspace_artifact(window, width, height)
+            || self.display_window_has_primitive_tearing_artifact(window, width, height)
+        {
+            return true;
+        }
+
+        if self.display_candidate_has_texture_atlas_half_with_dimensions(window, width, height) {
+            return true;
+        }
+
         if self.image_upload_rects.is_empty() {
             return false;
         }
@@ -4149,6 +8712,20 @@ impl Gpu {
             && !live_draw_overlap
             && !recently_presented_field_pair
             && is_likely_texture_page_candidate(window.x, window.y, width, height);
+        let cross_page_texture_atlas =
+            self.display_candidate_is_cross_page_texture_atlas(window, width, height);
+        let heavy_unpresented_texture_page = self
+            .display_candidate_has_heavy_unpresented_texture_upload(
+                window,
+                width,
+                height,
+                upload_overlap,
+                upload_overlap_rects,
+                recently_presented_field_pair,
+            );
+        if cross_page_texture_atlas {
+            return true;
+        }
         let recently_presented_display = self
             .recent_display_area_history_contains(window.x, window.y)
             || (height > field_height
@@ -4157,7 +8734,21 @@ impl Gpu {
                     window.y.saturating_add(field_height),
                 ))
             || recently_presented_field_pair;
+        if heavy_unpresented_texture_page {
+            return true;
+        }
+        if self.display_candidate_has_streamed_scene_presentation(window) {
+            return false;
+        }
         if recently_presented_display
+            && has_native_full_scene_detail(window.stats)
+            && !mostly_full_bright
+            && !likely_streamed_texture_page
+        {
+            return false;
+        }
+        if self.display_candidate_is_low_height_field_counterpart(window, width, height)
+            && live_draw_overlap
             && has_native_full_scene_detail(window.stats)
             && !mostly_full_bright
             && !likely_streamed_texture_page
@@ -4174,6 +8765,357 @@ impl Gpu {
         }
 
         upload_overlap >= pixel_count / 8 || upload_overlap.saturating_mul(2) >= nonzero_pixels
+    }
+
+    fn display_window_is_direct_live_display_scene(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if !has_native_gameplay_display_profile(window.stats)
+            || !self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
+        {
+            return false;
+        }
+
+        let display_height = self.display_dimensions().1;
+        let field_height = self
+            .interlaced_field_pair_height(display_height)
+            .unwrap_or(display_height);
+        let recently_presented_field_pair = height >= field_height.saturating_mul(2)
+            && self.recent_display_area_history_has_field_pair(
+                window.x,
+                window.y,
+                window.y.saturating_add(field_height),
+            );
+        let recently_presented_display = self
+            .recent_display_area_history_contains(window.x, window.y)
+            || (height > field_height
+                && self.recent_display_area_history_contains(
+                    window.x,
+                    window.y.saturating_add(field_height),
+                ))
+            || recently_presented_field_pair
+            || self.display_candidate_is_low_height_field_counterpart(window, width, height)
+            || self.display_window_is_high_vertical_live_single_field_scene(window, width, height);
+        if !recently_presented_display {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(window, width, height, false);
+        color_stats.has_scene_color_diversity()
+            && !self.low_palette_noise_candidate(window.stats, color_stats)
+    }
+
+    fn display_window_is_high_vertical_live_single_field_scene(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width != display_width
+            || height == 0
+            || height.saturating_mul(2) != display_height
+            || display_height < DEFAULT_DISPLAY_HEIGHT * 2
+        {
+            return false;
+        }
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width: display_width,
+            height: display_height,
+            window: self.current_display_window_with_dimensions(display_width, display_height),
+        };
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(full)
+        else {
+            return false;
+        };
+        if field_height != height
+            || !self.high_vertical_full_output_has_live_single_field_scene(full, top, bottom)
+        {
+            return false;
+        }
+
+        let matches_top = window.x == top.x && window.y == top.y && window.stats == top.stats;
+        let matches_bottom =
+            window.x == bottom.x && window.y == bottom.y && window.stats == bottom.stats;
+        let candidate = if matches_top {
+            Some(top)
+        } else if matches_bottom {
+            Some(bottom)
+        } else {
+            None
+        };
+
+        candidate.is_some_and(|field| {
+            !self.display_candidate_has_dominant_unpresented_texture_upload(field, width, height)
+        })
+    }
+
+    fn display_window_has_primitive_workspace_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width < 384
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !self.has_strong_native_3d_textured_playfield_activity()
+        {
+            return false;
+        }
+        if !self.display_window_has_primitive_tearing_artifact(window, width, height) {
+            return false;
+        }
+
+        let x_step = (width / 128).max(2);
+        let y_step = (height / 96).max(2);
+        let cached_rgb = self.cached_rgb_for_display_color_stats(window, width, height);
+        let pixel_at = |x: usize, y: usize| -> u32 {
+            cached_rgb
+                .and_then(|rgb| rgb.get(y.saturating_mul(width).saturating_add(x)))
+                .copied()
+                .unwrap_or_else(|| self.display_window_pixel(window, x, y, false))
+                & 0x00ff_ffff
+        };
+
+        let mut top_samples = 0_u64;
+        let mut top_saturated_planes = 0_u64;
+
+        for y in (0..height).step_by(y_step) {
+            for x in (0..width).step_by(x_step) {
+                let rgb = pixel_at(x, y);
+                if y < height / 3 {
+                    top_samples = top_samples.saturating_add(1);
+                    if primitive_workspace_plane_color(rgb) {
+                        top_saturated_planes = top_saturated_planes.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        top_samples > 0
+            && top_saturated_planes.saturating_mul(100) >= top_samples.saturating_mul(35)
+    }
+
+    fn display_window_has_primitive_tearing_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !self.has_strong_native_3d_textured_playfield_activity()
+            || window.stats.detail_edges < window.stats.pixel_count / 4
+        {
+            return false;
+        }
+
+        let x_step = (width / 128).max(2);
+        let y_step = (height / 96).max(2);
+        let cached_rgb = self.cached_rgb_for_display_color_stats(window, width, height);
+        let pixel_at = |x: usize, y: usize| -> u32 {
+            cached_rgb
+                .and_then(|rgb| rgb.get(y.saturating_mul(width).saturating_add(x)))
+                .copied()
+                .unwrap_or_else(|| self.display_window_pixel(window, x, y, false))
+                & 0x00ff_ffff
+        };
+
+        let mut tear_rows = 0_u64;
+        let mut sampled_rows = 0_u64;
+        for y in (0..height).step_by(y_step) {
+            let mut row_samples = 0_u64;
+            let mut row_artifact_pixels = 0_u64;
+            let mut row_dark_pixels = 0_u64;
+            let mut row_changes = 0_u64;
+            let mut previous_bucket = None;
+
+            for x in (0..width).step_by(x_step) {
+                let rgb = pixel_at(x, y);
+                row_samples = row_samples.saturating_add(1);
+                if primitive_workspace_tear_color(rgb) {
+                    row_artifact_pixels = row_artifact_pixels.saturating_add(1);
+                }
+                if primitive_workspace_dark_tear_color(rgb) {
+                    row_dark_pixels = row_dark_pixels.saturating_add(1);
+                }
+                let bucket = primitive_workspace_color_bucket(rgb);
+                if previous_bucket.is_some_and(|previous| previous != bucket) {
+                    row_changes = row_changes.saturating_add(1);
+                }
+                previous_bucket = Some(bucket);
+            }
+
+            if row_samples > 0 {
+                sampled_rows = sampled_rows.saturating_add(1);
+                let mostly_artifact_palette =
+                    row_artifact_pixels.saturating_mul(100) >= row_samples.saturating_mul(55);
+                let has_dark_tears =
+                    row_dark_pixels.saturating_mul(100) >= row_samples.saturating_mul(15);
+                let highly_torn = row_changes.saturating_mul(100) >= row_samples.saturating_mul(25);
+                if mostly_artifact_palette && has_dark_tears && highly_torn {
+                    tear_rows = tear_rows.saturating_add(1);
+                }
+            }
+        }
+
+        sampled_rows > 0 && tear_rows.saturating_mul(100) >= sampled_rows.saturating_mul(25)
+    }
+
+    fn display_candidate_has_texture_atlas_half_with_dimensions(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width < 256
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+            || window.y.saturating_add(height) > VRAM_HEIGHT
+        {
+            return false;
+        }
+
+        let field_height = height / 2;
+        let top = FrameBufferWindow {
+            x: window.x,
+            y: window.y,
+            stats: self
+                .framebuffer
+                .display_stats(window.x, window.y, width, field_height),
+        };
+        let bottom_y = window.y.saturating_add(field_height);
+        let bottom = FrameBufferWindow {
+            x: window.x,
+            y: bottom_y,
+            stats: self
+                .framebuffer
+                .display_stats(window.x, bottom_y, width, field_height),
+        };
+
+        if self.display_window_has_glyph_texture_grid(top, width, field_height)
+            || self.display_window_has_glyph_texture_grid(bottom, width, field_height)
+        {
+            return true;
+        }
+        if self.image_upload_rects.is_empty() {
+            return false;
+        }
+
+        if self.display_candidate_has_unbalanced_unpresented_texture_half(
+            window, width, height, top, bottom,
+        ) {
+            return true;
+        }
+
+        self.field_half_is_probable_texture_atlas_artifact(top, width, field_height)
+            || self.field_half_is_probable_texture_atlas_artifact(bottom, width, field_height)
+    }
+
+    fn display_candidate_has_unbalanced_unpresented_texture_half(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        top: FrameBufferWindow,
+        bottom: FrameBufferWindow,
+    ) -> bool {
+        if !is_likely_texture_page_candidate(window.x, window.y, width, height)
+            || self.display_candidate_was_recently_presented(window, height)
+            || self.display_candidate_is_low_height_field_counterpart(window, width, height)
+            || self.display_candidate_has_scene_upload_overlap(window)
+        {
+            return false;
+        }
+
+        let field_height = height / 2;
+        let top_sparse = self.display_half_is_sparse_tail(top);
+        let bottom_sparse = self.display_half_is_sparse_tail(bottom);
+        if top_sparse == bottom_sparse {
+            return false;
+        }
+
+        let dense = if top_sparse { bottom } else { top };
+        if !has_native_playfield_density(dense.stats) || !is_detailed_observation(dense.stats) {
+            return false;
+        }
+
+        let (upload_overlap, upload_rects, _) =
+            self.texture_upload_overlap_summary(dense, width, field_height);
+        upload_overlap > 0
+            || upload_rects > 0
+            || self.display_candidate_has_live_draw_overlap(dense)
+    }
+
+    fn display_half_is_sparse_tail(&self, half: FrameBufferWindow) -> bool {
+        let pixel_count = half.stats.pixel_count.max(1);
+        half.stats.nonzero_pixels.saturating_mul(8) < pixel_count
+            || half.stats.bright_pixels.saturating_mul(64) < pixel_count
+            || average_luma(half.stats) <= 6
+    }
+
+    fn display_candidate_has_heavy_unpresented_texture_upload(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        upload_overlap: u64,
+        upload_overlap_rects: usize,
+        recently_presented_field_pair: bool,
+    ) -> bool {
+        if !is_likely_texture_page_candidate(window.x, window.y, width, height) {
+            return false;
+        }
+        if recently_presented_field_pair
+            || self.display_candidate_is_low_height_field_counterpart(window, width, height)
+            || self.recent_display_area_history_contains(window.x, window.y)
+        {
+            return false;
+        }
+
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+        let upload_dominates_window =
+            upload_overlap.saturating_mul(4) >= pixel_count.saturating_mul(3);
+        let many_uploads_cover_window =
+            upload_overlap_rects >= 4 && upload_overlap.saturating_mul(2) >= pixel_count;
+
+        upload_dominates_window || many_uploads_cover_window
+    }
+
+    fn display_candidate_is_low_height_field_counterpart(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if width != display_width
+            || height != display_height
+            || display_height < DEFAULT_DISPLAY_HEIGHT
+            || display_height.saturating_mul(2) > PSX_VRAM_HEIGHT
+        {
+            return false;
+        }
+
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if window.x != display_x {
+            return false;
+        }
+
+        let counterpart_y = if display_y >= display_height {
+            display_y - display_height
+        } else {
+            display_y.saturating_add(display_height)
+        };
+        window.y == counterpart_y && window.y.saturating_add(height) <= PSX_VRAM_HEIGHT
     }
 
     fn texture_upload_overlap_area(
@@ -4242,9 +9184,13 @@ impl Gpu {
 
         let (display_width, display_height) = self.display_dimensions();
         let (start_x, start_y) = display_area_start_xy(self.display_area_start);
-        let stats =
-            self.framebuffer
-                .psx_display_stats(start_x, start_y, display_width, display_height);
+        let stats = self.framebuffer.psx_display_stats_with_depth(
+            start_x,
+            start_y,
+            display_width,
+            display_height,
+            self.display_24bit_enabled(),
+        );
         if !screen_observation_worth_saving(stats) {
             return;
         }
@@ -4266,6 +9212,11 @@ impl Gpu {
         {
             return;
         }
+        if self.has_strong_native_3d_textured_playfield_activity()
+            && !presented_frame_has_live_scene(candidate.stats)
+        {
+            return;
+        }
         if self.presented_frame_window.is_some_and(|current| {
             current.x == candidate.x
                 && current.y == candidate.y
@@ -4276,11 +9227,12 @@ impl Gpu {
         }
 
         self.presented_frame_png = None;
-        self.presented_frame_rgb = Some(self.framebuffer.psx_display_rgb_window(
+        self.presented_frame_rgb = Some(self.framebuffer.psx_display_rgb_window_with_depth(
             start_x,
             start_y,
             display_width,
             display_height,
+            self.display_24bit_enabled(),
         ));
         self.presented_frame_window = Some(candidate);
         self.presented_frame_width = display_width;
@@ -4290,13 +9242,27 @@ impl Gpu {
 
     fn capture_current_field_composed_display(&mut self) {
         let (width, display_height) = self.display_dimensions();
+        if let Some(output) =
+            self.full_output_from_high_vertical_current_display(width, display_height)
+        {
+            self.capture_field_composed_output(output);
+            return;
+        }
+
         let Some(field_height) = self.interlaced_field_pair_height(display_height) else {
             return;
         };
         let Some(output) = self.interlaced_field_pair_output_window(width, field_height) else {
             return;
         };
+        self.capture_field_composed_output(output);
+    }
+
+    fn capture_field_composed_output(&mut self, output: DisplayOutputWindow) {
         if output.cached || !has_native_full_scene_detail(output.window.stats) {
+            return;
+        }
+        if self.field_composed_output_is_intro_video_caption(output) {
             return;
         }
         if self.display_window_is_texture_atlas_with_dimensions(
@@ -4316,16 +9282,26 @@ impl Gpu {
         }
 
         self.field_composed_display_png = None;
-        self.field_composed_display_rgb = Some(self.framebuffer.psx_display_rgb_window(
+        self.field_composed_display_rgb = Some(self.framebuffer.psx_display_rgb_window_with_depth(
             output.window.x,
             output.window.y,
             output.width,
             output.height,
+            self.display_24bit_enabled(),
         ));
         self.field_composed_display_window = Some(output.window);
         self.field_composed_display_width = output.width;
         self.field_composed_display_height = output.height;
         self.field_composed_display_capture_index = self.presentation_captures;
+    }
+
+    fn invalidate_field_composed_display_cache(&mut self) {
+        self.field_composed_display_png = None;
+        self.field_composed_display_rgb = None;
+        self.field_composed_display_window = None;
+        self.field_composed_display_width = 0;
+        self.field_composed_display_height = 0;
+        self.field_composed_display_capture_index = 0;
     }
 
     fn is_display_clear_rect(&self, x: i32, y: i32, width: i32, height: i32) -> bool {
@@ -4347,6 +9323,16 @@ impl Gpu {
 
         let overlap_area = (overlap_width as i64).saturating_mul(overlap_height as i64);
         let display_area = (display_width as i64).saturating_mul(display_height as i64);
+        if self.high_vertical_interlace_enabled() {
+            let covers_visible_field = overlap_height.saturating_mul(2) >= display_height as i32
+                && overlap_width.saturating_mul(100) >= (display_width as i32).saturating_mul(55);
+            if covers_visible_field {
+                return true;
+            }
+
+            return overlap_area.saturating_mul(100) >= display_area.saturating_mul(55);
+        }
+
         overlap_area.saturating_mul(100) >= display_area.saturating_mul(80)
     }
 
@@ -4354,9 +9340,11 @@ impl Gpu {
         let (register_width, register_height) = self.display_dimensions();
         let resolved = self.display_resolve();
         let output = self.current_display_output_window();
-        let field_composed_output_used = self.should_use_field_composed_output(output);
+        let display_output_used = self.should_use_display_output(output, resolved);
+        let field_composed_output_used = output.field_composed && display_output_used;
         let use_output =
-            field_composed_output_used || (!output.field_composed && !resolved.promoted);
+            display_output_used || self.should_use_unresolved_non_field_output(output, resolved);
+        let safe_field_fallback = display_output_used && output.source == DISPLAY_SOURCE_SAFE_FIELD;
         let actual = if use_output {
             output.window
         } else {
@@ -4415,26 +9403,52 @@ impl Gpu {
         let has_resolvable_framebuffer_candidate =
             self.has_resolvable_framebuffer_candidate(resolve_current);
         let resolved_is_live_actual = self.resolved_display_is_live_actual(resolved);
-        let has_actual_scene_density = has_native_playfield_density(live_actual.stats);
-        let has_actual_scene_detail = is_detailed_observation(live_actual.stats);
-        let has_actual_full_scene_detail = has_native_full_scene_detail(live_actual.stats);
-        let has_actual_gameplay_profile = has_native_gameplay_display_profile(live_actual.stats);
+        let caption_current_streamed_scene_recovery = !use_output
+            && self.resolved_display_has_caption_current_streamed_scene_recovery(resolved);
         let actual_color_stats =
             self.display_window_color_stats(live_actual, width, height, use_output);
+        let high_vertical_actual_live_scene =
+            use_output && self.high_vertical_active_field_live_scene(output, actual_color_stats);
+        let has_actual_scene_density = has_native_playfield_density(live_actual.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene;
+        let has_actual_scene_detail = is_detailed_observation(live_actual.stats);
+        let has_actual_full_scene_detail = has_native_full_scene_detail(live_actual.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene;
+        let has_actual_gameplay_profile = has_native_gameplay_display_profile(live_actual.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene;
         let has_actual_color_diversity = actual_color_stats.has_scene_color_diversity();
         let has_actual_intro_caption_band = actual_color_stats.has_intro_caption_band();
+        let actual_field_artifact =
+            self.field_half_texture_artifact_diagnostics_json(live_actual, width, height);
         let actual_low_palette_noise =
             self.low_palette_noise_candidate(live_actual.stats, actual_color_stats);
-        let has_actual_playfield = if use_output {
-            has_actual_gameplay_profile && !current_is_texture_atlas
+        let strong_live_field_output =
+            use_output && self.field_composed_periodic_output_is_strong_live_playfield(output);
+        let has_actual_playfield = if caption_current_streamed_scene_recovery {
+            true
+        } else if high_vertical_actual_live_scene {
+            true
+        } else if use_output {
+            has_actual_gameplay_profile && (!current_is_texture_atlas || strong_live_field_output)
         } else {
             self.has_live_actual_playfield(raw_actual, resolved)
         };
-        let has_scene_density = has_native_playfield_density(visible.stats);
-        let has_scene_detail = is_detailed_observation(visible.stats);
-        let has_full_scene_detail = has_native_full_scene_detail(visible.stats);
-        let has_scene_gameplay_profile = has_native_gameplay_display_profile(visible.stats);
         let scene_color_stats = self.display_window_color_stats(visible, width, height, use_output);
+        let high_vertical_scene_live_scene =
+            use_output && self.high_vertical_active_field_live_scene(output, scene_color_stats);
+        let has_scene_density = has_native_playfield_density(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
+        let has_scene_detail = is_detailed_observation(visible.stats);
+        let has_full_scene_detail = has_native_full_scene_detail(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
+        let has_scene_gameplay_profile = has_native_gameplay_display_profile(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
         let has_scene_color_diversity = scene_color_stats.has_scene_color_diversity();
         let has_scene_intro_caption_band = scene_color_stats.has_intro_caption_band();
         let scene_low_palette_noise =
@@ -4443,10 +9457,21 @@ impl Gpu {
         let has_textured_content = self.textured_draw_stats.written_pixels
             >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
             && self.textured_draw_stats.color_changes >= 16;
-        let caption_band_ui_allowed = self.caption_band_playfield_ui_allowed(width, height)
+        let has_3d_playfield_draws = self.has_native_play_3d_draw_signal();
+        let caption_current_streamed_caption_ui_allowed = caption_current_streamed_scene_recovery
+            && has_actual_color_diversity
+            && has_scene_color_diversity
+            && !actual_low_palette_noise
+            && !scene_low_palette_noise
             && has_actual_playfield
             && has_scene_detail
             && has_full_scene_detail;
+        let caption_band_ui_allowed = (self
+            .caption_band_playfield_ui_allowed_for_output(use_output, output, width, height)
+            && has_actual_playfield
+            && has_scene_detail
+            && has_full_scene_detail)
+            || caption_current_streamed_caption_ui_allowed;
         let narrow_field_intro_caption_band = self.narrow_field_intro_caption_band(
             use_output,
             output,
@@ -4455,12 +9480,64 @@ impl Gpu {
             actual_color_stats,
             scene_color_stats,
         );
+        let actual_display_periodic_ghosting =
+            self.field_composed_periodic_blocks_playability(output, resolved);
+        let actual_atlas_caption_ghosting = self.display_window_has_atlas_caption_ghosting(
+            live_actual,
+            width,
+            height,
+            !use_output,
+            actual_color_stats,
+        );
+        let scene_atlas_caption_ghosting = self.display_window_has_atlas_caption_ghosting(
+            visible,
+            width,
+            height,
+            !use_output,
+            scene_color_stats,
+        );
+        let high_vertical_full_logo_transition =
+            self.high_vertical_full_output_has_saturated_logo_transition();
+        let actual_display_logo_transition = high_vertical_full_logo_transition
+            || self.display_window_has_saturated_logo_transition(
+                live_actual,
+                width,
+                height,
+                use_output,
+            );
+        let scene_display_logo_transition =
+            self.display_window_has_saturated_logo_transition(visible, width, height, use_output);
+        let actual_title_logo_overlay =
+            self.display_window_has_title_logo_overlay(live_actual, width, height, use_output);
+        let scene_title_logo_overlay =
+            self.display_window_has_title_logo_overlay(visible, width, height, use_output);
+        let actual_title_logo_blocks_playability = actual_title_logo_overlay;
+        let scene_title_logo_blocks_playability = scene_title_logo_overlay;
         let actual_caption_blocks_playability = (has_actual_intro_caption_band
             && !caption_band_ui_allowed)
-            || narrow_field_intro_caption_band;
+            || narrow_field_intro_caption_band
+            || actual_atlas_caption_ghosting;
         let scene_caption_blocks_playability = (has_scene_intro_caption_band
             && !caption_band_ui_allowed)
-            || narrow_field_intro_caption_band;
+            || narrow_field_intro_caption_band
+            || scene_atlas_caption_ghosting;
+        let strong_low_color_playfield_signal = self.strong_low_color_playfield_signal(
+            use_output,
+            resolved,
+            has_actual_playfield,
+            has_actual_gameplay_profile,
+            has_scene_gameplay_profile,
+            actual_color_stats,
+            scene_color_stats,
+            actual_low_palette_noise,
+            scene_low_palette_noise,
+            actual_caption_blocks_playability,
+            scene_caption_blocks_playability,
+        );
+        let has_actual_color_playfield_signal =
+            has_actual_color_diversity || strong_low_color_playfield_signal;
+        let has_scene_color_playfield_signal =
+            has_scene_color_diversity || strong_low_color_playfield_signal;
         let has_live_presentation = self.has_visible_presentation();
         let playable_candidate = has_actual_playfield
             && has_scene_density
@@ -4469,14 +9546,21 @@ impl Gpu {
             && has_full_scene_detail
             && has_actual_gameplay_profile
             && has_scene_gameplay_profile
-            && has_actual_color_diversity
-            && has_scene_color_diversity
+            && has_actual_color_playfield_signal
+            && has_scene_color_playfield_signal
             && !actual_low_palette_noise
             && !scene_low_palette_noise
+            && !safe_field_fallback
+            && !actual_display_periodic_ghosting
+            && !actual_display_logo_transition
+            && !scene_display_logo_transition
+            && !actual_title_logo_blocks_playability
+            && !scene_title_logo_blocks_playability
             && !actual_caption_blocks_playability
             && !scene_caption_blocks_playability
             && has_playfield_draws
             && has_textured_content
+            && has_3d_playfield_draws
             && has_live_presentation;
         let classification = if playable_candidate {
             "native_playable_candidate"
@@ -4490,6 +9574,16 @@ impl Gpu {
             "hud_or_offscreen_draws_only"
         } else if narrow_field_intro_caption_band {
             "actual_display_intro_video_caption_band"
+        } else if actual_display_periodic_ghosting {
+            "actual_display_periodic_ghosting"
+        } else if actual_display_logo_transition {
+            "actual_display_logo_transition"
+        } else if safe_field_fallback {
+            "actual_display_safe_field_fallback"
+        } else if actual_title_logo_blocks_playability && !has_actual_intro_caption_band {
+            "actual_display_title_logo_overlay"
+        } else if scene_title_logo_blocks_playability && !has_scene_intro_caption_band {
+            "display_title_logo_overlay"
         } else if resolved.promoted && !resolved_is_live_actual {
             "candidate_not_live_actual"
         } else if !has_actual_scene_density {
@@ -4500,7 +9594,7 @@ impl Gpu {
             "actual_display_low_scene_complexity"
         } else if !has_actual_gameplay_profile {
             "actual_display_not_gameplay_profile"
-        } else if !has_actual_color_diversity {
+        } else if !has_actual_color_playfield_signal {
             "actual_display_low_color_diversity"
         } else if actual_low_palette_noise {
             "actual_display_low_palette_noise"
@@ -4514,24 +9608,34 @@ impl Gpu {
             "display_low_scene_complexity"
         } else if !has_scene_gameplay_profile {
             "display_not_gameplay_profile"
-        } else if !has_scene_color_diversity {
+        } else if !has_scene_color_playfield_signal {
             "display_low_color_diversity"
         } else if scene_low_palette_noise {
             "display_low_palette_noise"
+        } else if scene_display_logo_transition {
+            "display_logo_transition"
         } else if scene_caption_blocks_playability {
             "display_intro_caption_band"
+        } else if actual_title_logo_blocks_playability {
+            "actual_display_title_logo_overlay"
+        } else if scene_title_logo_blocks_playability {
+            "display_title_logo_overlay"
+        } else if !has_3d_playfield_draws {
+            "no_3d_playfield_draws"
         } else if !has_live_presentation {
             "candidate_not_presented"
         } else {
             "not_playable_candidate"
         };
+        let (reported_width, reported_height) =
+            self.playability_report_dimensions(width, height, narrow_field_intro_caption_band);
 
         format!(
-            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"display_width\":{},\"display_height\":{},\"actual_display_source\":\"{}\",\"actual_display_promoted\":{},\"actual_display_is_live\":{},\"actual_display_field_composed\":{},\"actual_display_cached\":{},\"actual_display\":{},\"raw_actual_display\":{},\"live_actual_display\":{},\"resolved_display\":{},\"visible_display\":{},\"observation\":{},\"vram\":{},\"actual_score\":{},\"live_actual_score\":{},\"visible_score\":{},\"observation_score\":{},\"current_is_texture_atlas\":{},\"best_is_texture_atlas\":{},\"presented_is_texture_atlas\":{},\"best_has_live_draw_overlap\":{},\"presented_has_live_draw_overlap\":{},\"should_resolve_from_candidates\":{},\"has_resolvable_cached_display_candidate\":{},\"has_resolvable_framebuffer_candidate\":{},\"display_resolve_gate\":{},\"display_candidate_diagnostics\":[{}],\"presented_frame_capture_index\":{},\"presented_frame_fresh\":{},\"field_composed_display_capture_index\":{},\"has_actual_scene_density\":{},\"has_actual_scene_detail\":{},\"has_actual_full_scene_detail\":{},\"has_actual_gameplay_profile\":{},\"has_actual_color_diversity\":{},\"has_actual_intro_caption_band\":{},\"actual_low_palette_noise\":{},\"has_actual_playfield\":{},\"has_scene_density\":{},\"has_scene_detail\":{},\"has_full_scene_detail\":{},\"has_scene_gameplay_profile\":{},\"has_scene_color_diversity\":{},\"has_scene_intro_caption_band\":{},\"scene_low_palette_noise\":{},\"caption_band_ui_allowed\":{},\"narrow_field_intro_caption_band\":{},\"actual_caption_blocks_playability\":{},\"scene_caption_blocks_playability\":{},\"has_playfield_draws\":{},\"has_textured_content\":{},\"has_live_presentation\":{},\"actual_color\":{},\"visible_color\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"image_upload_commands\":{},\"vram_copy_commands\":{},\"textured_triangle_commands\":{},\"textured_rect_commands\":{},\"textured_written_pixels\":{},\"textured_color_changes\":{},\"presentation_captures\":{}}}",
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"display_width\":{},\"display_height\":{},\"actual_display_source\":\"{}\",\"actual_display_promoted\":{},\"actual_display_is_live\":{},\"actual_display_field_composed\":{},\"actual_display_cached\":{},\"actual_display\":{},\"raw_actual_display\":{},\"live_actual_display\":{},\"resolved_display\":{},\"visible_display\":{},\"observation\":{},\"vram\":{},\"actual_score\":{},\"live_actual_score\":{},\"visible_score\":{},\"observation_score\":{},\"current_is_texture_atlas\":{},\"best_is_texture_atlas\":{},\"presented_is_texture_atlas\":{},\"best_has_live_draw_overlap\":{},\"presented_has_live_draw_overlap\":{},\"should_resolve_from_candidates\":{},\"has_resolvable_cached_display_candidate\":{},\"has_resolvable_framebuffer_candidate\":{},\"display_resolve_gate\":{},\"display_candidate_diagnostics\":[{}],\"high_vertical_full_output_gate\":{},\"presented_frame_capture_index\":{},\"presented_frame_fresh\":{},\"field_composed_display_capture_index\":{},\"low_height_field_pair_probe\":{},\"has_actual_scene_density\":{},\"has_actual_scene_detail\":{},\"has_actual_full_scene_detail\":{},\"has_actual_gameplay_profile\":{},\"has_actual_color_diversity\":{},\"has_actual_intro_caption_band\":{},\"actual_low_palette_noise\":{},\"actual_display_periodic_ghosting\":{},\"actual_title_logo_overlay\":{},\"scene_title_logo_overlay\":{},\"has_actual_playfield\":{},\"has_scene_density\":{},\"has_scene_detail\":{},\"has_full_scene_detail\":{},\"has_scene_gameplay_profile\":{},\"has_scene_color_diversity\":{},\"has_scene_intro_caption_band\":{},\"scene_low_palette_noise\":{},\"strong_low_color_playfield_signal\":{},\"caption_band_ui_allowed\":{},\"narrow_field_intro_caption_band\":{},\"actual_caption_blocks_playability\":{},\"scene_caption_blocks_playability\":{},\"has_playfield_draws\":{},\"has_textured_content\":{},\"has_3d_playfield_draws\":{},\"has_live_presentation\":{},\"actual_field_artifact\":{},\"actual_color\":{},\"visible_color\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"image_upload_commands\":{},\"vram_copy_commands\":{},\"textured_triangle_commands\":{},\"textured_rect_commands\":{},\"textured_written_pixels\":{},\"textured_color_changes\":{},\"presentation_captures\":{}}}",
             playable_candidate,
             classification,
-            width,
-            height,
+            reported_width,
+            reported_height,
             if use_output {
                 output.source
             } else {
@@ -4562,9 +9666,11 @@ impl Gpu {
             has_resolvable_framebuffer_candidate,
             self.display_resolve_gate_json(resolve_current),
             self.display_candidate_diagnostics_json(resolve_current),
+            self.high_vertical_full_output_gate_json(),
             self.presented_frame_capture_index,
             self.presented_frame_is_fresh(),
             self.field_composed_display_capture_index,
+            self.low_height_field_pair_probe_json(),
             has_actual_scene_density,
             has_actual_scene_detail,
             has_actual_full_scene_detail,
@@ -4572,6 +9678,9 @@ impl Gpu {
             has_actual_color_diversity,
             has_actual_intro_caption_band,
             actual_low_palette_noise,
+            actual_display_periodic_ghosting,
+            actual_title_logo_overlay,
+            scene_title_logo_overlay,
             has_actual_playfield,
             has_scene_density,
             has_scene_detail,
@@ -4580,13 +9689,16 @@ impl Gpu {
             has_scene_color_diversity,
             has_scene_intro_caption_band,
             scene_low_palette_noise,
+            strong_low_color_playfield_signal,
             caption_band_ui_allowed,
             narrow_field_intro_caption_band,
             actual_caption_blocks_playability,
             scene_caption_blocks_playability,
             has_playfield_draws,
             has_textured_content,
+            has_3d_playfield_draws,
             has_live_presentation,
+            actual_field_artifact,
             actual_color_stats.json(),
             scene_color_stats.json(),
             self.commands_seen,
@@ -4605,9 +9717,11 @@ impl Gpu {
         let (register_width, register_height) = self.display_dimensions();
         let resolved = self.display_resolve();
         let output = self.current_display_output_window();
-        let field_composed_output_used = self.should_use_field_composed_output(output);
+        let display_output_used = self.should_use_display_output(output, resolved);
+        let field_composed_output_used = output.field_composed && display_output_used;
         let use_output =
-            field_composed_output_used || (!output.field_composed && !resolved.promoted);
+            display_output_used || self.should_use_unresolved_non_field_output(output, resolved);
+        let safe_field_fallback = display_output_used && output.source == DISPLAY_SOURCE_SAFE_FIELD;
         let actual = if use_output {
             output.window
         } else {
@@ -4641,26 +9755,50 @@ impl Gpu {
         let current_is_texture_atlas =
             self.display_window_is_texture_atlas_with_dimensions(raw_actual, width, height);
         let resolved_is_live_actual = self.resolved_display_is_live_actual(resolved);
-        let has_actual_scene_density = has_native_playfield_density(live_actual.stats);
-        let has_actual_scene_detail = is_detailed_observation(live_actual.stats);
-        let has_actual_full_scene_detail = has_native_full_scene_detail(live_actual.stats);
-        let has_actual_gameplay_profile = has_native_gameplay_display_profile(live_actual.stats);
+        let caption_current_streamed_scene_recovery = !use_output
+            && self.resolved_display_has_caption_current_streamed_scene_recovery(resolved);
         let actual_color_stats =
             self.display_window_color_stats(live_actual, width, height, use_output);
+        let high_vertical_actual_live_scene =
+            use_output && self.high_vertical_active_field_live_scene(output, actual_color_stats);
+        let has_actual_scene_density = has_native_playfield_density(live_actual.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene;
+        let has_actual_scene_detail = is_detailed_observation(live_actual.stats);
+        let has_actual_full_scene_detail = has_native_full_scene_detail(live_actual.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene;
+        let has_actual_gameplay_profile = has_native_gameplay_display_profile(live_actual.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene;
         let has_actual_color_diversity = actual_color_stats.has_scene_color_diversity();
         let has_actual_intro_caption_band = actual_color_stats.has_intro_caption_band();
         let actual_low_palette_noise =
             self.low_palette_noise_candidate(live_actual.stats, actual_color_stats);
-        let has_actual_playfield = if use_output {
-            has_actual_gameplay_profile && !current_is_texture_atlas
+        let strong_live_field_output =
+            use_output && self.field_composed_periodic_output_is_strong_live_playfield(output);
+        let has_actual_playfield = if caption_current_streamed_scene_recovery {
+            true
+        } else if high_vertical_actual_live_scene {
+            true
+        } else if use_output {
+            has_actual_gameplay_profile && (!current_is_texture_atlas || strong_live_field_output)
         } else {
             self.has_live_actual_playfield(raw_actual, resolved)
         };
-        let has_scene_density = has_native_playfield_density(visible.stats);
-        let has_scene_detail = is_detailed_observation(visible.stats);
-        let has_full_scene_detail = has_native_full_scene_detail(visible.stats);
-        let has_scene_gameplay_profile = has_native_gameplay_display_profile(visible.stats);
         let scene_color_stats = self.display_window_color_stats(visible, width, height, use_output);
+        let high_vertical_scene_live_scene =
+            use_output && self.high_vertical_active_field_live_scene(output, scene_color_stats);
+        let has_scene_density = has_native_playfield_density(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
+        let has_scene_detail = is_detailed_observation(visible.stats);
+        let has_full_scene_detail = has_native_full_scene_detail(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
+        let has_scene_gameplay_profile = has_native_gameplay_display_profile(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
         let has_scene_color_diversity = scene_color_stats.has_scene_color_diversity();
         let has_scene_intro_caption_band = scene_color_stats.has_intro_caption_band();
         let scene_low_palette_noise =
@@ -4669,10 +9807,21 @@ impl Gpu {
         let has_textured_content = self.textured_draw_stats.written_pixels
             >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
             && self.textured_draw_stats.color_changes >= 16;
-        let caption_band_ui_allowed = self.caption_band_playfield_ui_allowed(width, height)
+        let has_3d_playfield_draws = self.has_native_play_3d_draw_signal();
+        let caption_current_streamed_caption_ui_allowed = caption_current_streamed_scene_recovery
+            && has_actual_color_diversity
+            && has_scene_color_diversity
+            && !actual_low_palette_noise
+            && !scene_low_palette_noise
             && has_actual_playfield
             && has_scene_detail
             && has_full_scene_detail;
+        let caption_band_ui_allowed = (self
+            .caption_band_playfield_ui_allowed_for_output(use_output, output, width, height)
+            && has_actual_playfield
+            && has_scene_detail
+            && has_full_scene_detail)
+            || caption_current_streamed_caption_ui_allowed;
         let narrow_field_intro_caption_band = self.narrow_field_intro_caption_band(
             use_output,
             output,
@@ -4681,12 +9830,64 @@ impl Gpu {
             actual_color_stats,
             scene_color_stats,
         );
+        let actual_display_periodic_ghosting =
+            self.field_composed_periodic_blocks_playability(output, resolved);
+        let actual_atlas_caption_ghosting = self.display_window_has_atlas_caption_ghosting(
+            live_actual,
+            width,
+            height,
+            !use_output,
+            actual_color_stats,
+        );
+        let scene_atlas_caption_ghosting = self.display_window_has_atlas_caption_ghosting(
+            visible,
+            width,
+            height,
+            !use_output,
+            scene_color_stats,
+        );
+        let high_vertical_full_logo_transition =
+            self.high_vertical_full_output_has_saturated_logo_transition();
+        let actual_display_logo_transition = high_vertical_full_logo_transition
+            || self.display_window_has_saturated_logo_transition(
+                live_actual,
+                width,
+                height,
+                use_output,
+            );
+        let scene_display_logo_transition =
+            self.display_window_has_saturated_logo_transition(visible, width, height, use_output);
+        let actual_title_logo_overlay =
+            self.display_window_has_title_logo_overlay(live_actual, width, height, use_output);
+        let scene_title_logo_overlay =
+            self.display_window_has_title_logo_overlay(visible, width, height, use_output);
+        let actual_title_logo_blocks_playability = actual_title_logo_overlay;
+        let scene_title_logo_blocks_playability = scene_title_logo_overlay;
         let actual_caption_blocks_playability = (has_actual_intro_caption_band
             && !caption_band_ui_allowed)
-            || narrow_field_intro_caption_band;
+            || narrow_field_intro_caption_band
+            || actual_atlas_caption_ghosting;
         let scene_caption_blocks_playability = (has_scene_intro_caption_band
             && !caption_band_ui_allowed)
-            || narrow_field_intro_caption_band;
+            || narrow_field_intro_caption_band
+            || scene_atlas_caption_ghosting;
+        let strong_low_color_playfield_signal = self.strong_low_color_playfield_signal(
+            use_output,
+            resolved,
+            has_actual_playfield,
+            has_actual_gameplay_profile,
+            has_scene_gameplay_profile,
+            actual_color_stats,
+            scene_color_stats,
+            actual_low_palette_noise,
+            scene_low_palette_noise,
+            actual_caption_blocks_playability,
+            scene_caption_blocks_playability,
+        );
+        let has_actual_color_playfield_signal =
+            has_actual_color_diversity || strong_low_color_playfield_signal;
+        let has_scene_color_playfield_signal =
+            has_scene_color_diversity || strong_low_color_playfield_signal;
         let has_live_presentation = self.has_visible_presentation();
         let playable_candidate = has_actual_playfield
             && has_scene_density
@@ -4695,14 +9896,21 @@ impl Gpu {
             && has_full_scene_detail
             && has_actual_gameplay_profile
             && has_scene_gameplay_profile
-            && has_actual_color_diversity
-            && has_scene_color_diversity
+            && has_actual_color_playfield_signal
+            && has_scene_color_playfield_signal
             && !actual_low_palette_noise
             && !scene_low_palette_noise
+            && !safe_field_fallback
+            && !actual_display_periodic_ghosting
+            && !actual_display_logo_transition
+            && !scene_display_logo_transition
+            && !actual_title_logo_blocks_playability
+            && !scene_title_logo_blocks_playability
             && !actual_caption_blocks_playability
             && !scene_caption_blocks_playability
             && has_playfield_draws
             && has_textured_content
+            && has_3d_playfield_draws
             && has_live_presentation;
         let classification = if playable_candidate {
             "native_playable_candidate"
@@ -4716,6 +9924,16 @@ impl Gpu {
             "hud_or_offscreen_draws_only"
         } else if narrow_field_intro_caption_band {
             "actual_display_intro_video_caption_band"
+        } else if actual_display_periodic_ghosting {
+            "actual_display_periodic_ghosting"
+        } else if actual_display_logo_transition {
+            "actual_display_logo_transition"
+        } else if safe_field_fallback {
+            "actual_display_safe_field_fallback"
+        } else if actual_title_logo_blocks_playability && !has_actual_intro_caption_band {
+            "actual_display_title_logo_overlay"
+        } else if scene_title_logo_blocks_playability && !has_scene_intro_caption_band {
+            "display_title_logo_overlay"
         } else if resolved.promoted && !resolved_is_live_actual {
             "candidate_not_live_actual"
         } else if !has_actual_scene_density {
@@ -4726,7 +9944,7 @@ impl Gpu {
             "actual_display_low_scene_complexity"
         } else if !has_actual_gameplay_profile {
             "actual_display_not_gameplay_profile"
-        } else if !has_actual_color_diversity {
+        } else if !has_actual_color_playfield_signal {
             "actual_display_low_color_diversity"
         } else if actual_low_palette_noise {
             "actual_display_low_palette_noise"
@@ -4740,24 +9958,34 @@ impl Gpu {
             "display_low_scene_complexity"
         } else if !has_scene_gameplay_profile {
             "display_not_gameplay_profile"
-        } else if !has_scene_color_diversity {
+        } else if !has_scene_color_playfield_signal {
             "display_low_color_diversity"
         } else if scene_low_palette_noise {
             "display_low_palette_noise"
+        } else if scene_display_logo_transition {
+            "display_logo_transition"
         } else if scene_caption_blocks_playability {
             "display_intro_caption_band"
+        } else if actual_title_logo_blocks_playability {
+            "actual_display_title_logo_overlay"
+        } else if scene_title_logo_blocks_playability {
+            "display_title_logo_overlay"
+        } else if !has_3d_playfield_draws {
+            "no_3d_playfield_draws"
         } else if !has_live_presentation {
             "candidate_not_presented"
         } else {
             "not_playable_candidate"
         };
+        let (reported_width, reported_height) =
+            self.playability_report_dimensions(width, height, narrow_field_intro_caption_band);
 
         format!(
-            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"display_width\":{},\"display_height\":{},\"source\":\"{}\",\"field_composed\":{},\"cached\":{},\"promoted\":{},\"actual\":{},\"visible\":{},\"actual_color\":{},\"visible_color\":{},\"actual_score\":{},\"visible_score\":{},\"has_actual_scene_density\":{},\"has_actual_scene_detail\":{},\"has_actual_full_scene_detail\":{},\"has_actual_gameplay_profile\":{},\"has_actual_color_diversity\":{},\"has_actual_intro_caption_band\":{},\"actual_low_palette_noise\":{},\"has_actual_playfield\":{},\"has_scene_density\":{},\"has_scene_detail\":{},\"has_full_scene_detail\":{},\"has_scene_gameplay_profile\":{},\"has_scene_color_diversity\":{},\"has_scene_intro_caption_band\":{},\"scene_low_palette_noise\":{},\"caption_band_ui_allowed\":{},\"narrow_field_intro_caption_band\":{},\"actual_caption_blocks_playability\":{},\"scene_caption_blocks_playability\":{},\"has_playfield_draws\":{},\"has_textured_content\":{},\"has_live_presentation\":{},\"image_upload_commands\":{},\"textured_triangle_commands\":{},\"textured_written_pixels\":{},\"textured_color_changes\":{},\"presentation_captures\":{}}}",
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"display_width\":{},\"display_height\":{},\"source\":\"{}\",\"field_composed\":{},\"cached\":{},\"promoted\":{},\"actual\":{},\"visible\":{},\"actual_color\":{},\"visible_color\":{},\"actual_score\":{},\"visible_score\":{},\"high_vertical_full_output_gate\":{},\"has_actual_scene_density\":{},\"has_actual_scene_detail\":{},\"has_actual_full_scene_detail\":{},\"has_actual_gameplay_profile\":{},\"has_actual_color_diversity\":{},\"has_actual_intro_caption_band\":{},\"actual_low_palette_noise\":{},\"actual_display_periodic_ghosting\":{},\"actual_title_logo_overlay\":{},\"scene_title_logo_overlay\":{},\"has_actual_playfield\":{},\"has_scene_density\":{},\"has_scene_detail\":{},\"has_full_scene_detail\":{},\"has_scene_gameplay_profile\":{},\"has_scene_color_diversity\":{},\"has_scene_intro_caption_band\":{},\"scene_low_palette_noise\":{},\"strong_low_color_playfield_signal\":{},\"caption_band_ui_allowed\":{},\"narrow_field_intro_caption_band\":{},\"actual_caption_blocks_playability\":{},\"scene_caption_blocks_playability\":{},\"has_playfield_draws\":{},\"has_textured_content\":{},\"has_3d_playfield_draws\":{},\"has_live_presentation\":{},\"image_upload_commands\":{},\"textured_triangle_commands\":{},\"textured_written_pixels\":{},\"textured_color_changes\":{},\"presentation_captures\":{}}}",
             playable_candidate,
             classification,
-            width,
-            height,
+            reported_width,
+            reported_height,
             if use_output {
                 output.source
             } else {
@@ -4772,6 +10000,7 @@ impl Gpu {
             scene_color_stats.json(),
             screen_observation_score(actual.stats),
             screen_observation_score(visible.stats),
+            self.high_vertical_full_output_gate_json(),
             has_actual_scene_density,
             has_actual_scene_detail,
             has_actual_full_scene_detail,
@@ -4779,6 +10008,9 @@ impl Gpu {
             has_actual_color_diversity,
             has_actual_intro_caption_band,
             actual_low_palette_noise,
+            actual_display_periodic_ghosting,
+            actual_title_logo_overlay,
+            scene_title_logo_overlay,
             has_actual_playfield,
             has_scene_density,
             has_scene_detail,
@@ -4787,12 +10019,14 @@ impl Gpu {
             has_scene_color_diversity,
             has_scene_intro_caption_band,
             scene_low_palette_noise,
+            strong_low_color_playfield_signal,
             caption_band_ui_allowed,
             narrow_field_intro_caption_band,
             actual_caption_blocks_playability,
             scene_caption_blocks_playability,
             has_playfield_draws,
             has_textured_content,
+            has_3d_playfield_draws,
             has_live_presentation,
             self.image_upload_commands,
             self.textured_triangle_commands,
@@ -4802,11 +10036,48 @@ impl Gpu {
         )
     }
 
+    fn playability_report_dimensions(
+        &self,
+        width: usize,
+        height: usize,
+        narrow_field_intro_caption_band: bool,
+    ) -> (usize, usize) {
+        if narrow_field_intro_caption_band {
+            if let Some(field_pair) = self.recent_low_height_field_pair_output_window(width, height)
+            {
+                return (field_pair.width, field_pair.height);
+            }
+        }
+
+        (width, height)
+    }
+
     fn native_playable_candidate(&self) -> bool {
+        self.native_rendered_scene_candidate() && self.has_native_play_3d_draw_signal()
+    }
+
+    fn native_sparse_scene_replay_gate(&self) -> bool {
+        let current = self.current_display_window();
+        let actual_is_sparse =
+            !has_native_playfield_density(current.stats) || is_sparse_display(current.stats);
+        let has_textured_content = self.textured_draw_stats.written_pixels
+            >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
+            && self.textured_draw_stats.color_changes >= 16;
+
+        actual_is_sparse
+            && self.has_playfield_draws()
+            && has_textured_content
+            && self.has_native_play_3d_draw_signal()
+            && self.presentation_captures > 0
+    }
+
+    fn native_rendered_scene_candidate(&self) -> bool {
         let resolved = self.display_resolve();
         let output = self.current_display_output_window();
-        let use_output = self.should_use_field_composed_output(output)
-            || (!output.field_composed && !resolved.promoted);
+        let display_output_used = self.should_use_display_output(output, resolved);
+        let use_output =
+            display_output_used || self.should_use_unresolved_non_field_output(output, resolved);
+        let safe_field_fallback = display_output_used && output.source == DISPLAY_SOURCE_SAFE_FIELD;
         let raw_actual = if use_output {
             output.window
         } else {
@@ -4822,8 +10093,12 @@ impl Gpu {
         } else {
             self.visible_display_window()
         };
-        let has_actual_full_scene_detail = has_native_full_scene_detail(live_actual.stats);
-        let has_actual_gameplay_profile = has_native_gameplay_display_profile(live_actual.stats);
+        let caption_current_streamed_scene_recovery = !use_output
+            && self.resolved_display_has_caption_current_streamed_scene_recovery(resolved);
+        let has_actual_full_scene_detail = has_native_full_scene_detail(live_actual.stats)
+            || caption_current_streamed_scene_recovery;
+        let has_actual_gameplay_profile = has_native_gameplay_display_profile(live_actual.stats)
+            || caption_current_streamed_scene_recovery;
         let width = if use_output {
             output.width
         } else {
@@ -4836,21 +10111,45 @@ impl Gpu {
         };
         let actual_color_stats =
             self.display_window_color_stats(live_actual, width, height, use_output);
+        let high_vertical_actual_live_scene =
+            use_output && self.high_vertical_active_field_live_scene(output, actual_color_stats);
+        let has_actual_scene_density = has_native_playfield_density(live_actual.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene;
+        let has_actual_full_scene_detail =
+            has_actual_full_scene_detail || high_vertical_actual_live_scene;
+        let has_actual_gameplay_profile =
+            has_actual_gameplay_profile || high_vertical_actual_live_scene;
         let has_actual_color_diversity = actual_color_stats.has_scene_color_diversity();
         let has_actual_intro_caption_band = actual_color_stats.has_intro_caption_band();
         let actual_low_palette_noise =
             self.low_palette_noise_candidate(live_actual.stats, actual_color_stats);
         let current_is_texture_atlas =
             self.display_window_is_texture_atlas_with_dimensions(raw_actual, width, height);
-        let has_actual_playfield = if use_output {
-            has_actual_gameplay_profile && !current_is_texture_atlas
+        let strong_live_field_output =
+            use_output && self.field_composed_periodic_output_is_strong_live_playfield(output);
+        let has_actual_playfield = if caption_current_streamed_scene_recovery {
+            true
+        } else if high_vertical_actual_live_scene {
+            true
+        } else if use_output {
+            has_actual_gameplay_profile && (!current_is_texture_atlas || strong_live_field_output)
         } else {
             self.has_live_actual_playfield(raw_actual, resolved)
         };
-        let has_scene_density = has_native_playfield_density(visible.stats);
-        let has_scene_detail = is_detailed_observation(visible.stats);
-        let has_full_scene_detail = has_native_full_scene_detail(visible.stats);
         let scene_color_stats = self.display_window_color_stats(visible, width, height, use_output);
+        let high_vertical_scene_live_scene =
+            use_output && self.high_vertical_active_field_live_scene(output, scene_color_stats);
+        let has_scene_density = has_native_playfield_density(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
+        let has_scene_detail = is_detailed_observation(visible.stats);
+        let has_full_scene_detail = has_native_full_scene_detail(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
+        let has_scene_gameplay_profile = has_native_gameplay_display_profile(visible.stats)
+            || caption_current_streamed_scene_recovery
+            || high_vertical_scene_live_scene;
         let has_scene_color_diversity = scene_color_stats.has_scene_color_diversity();
         let has_scene_intro_caption_band = scene_color_stats.has_intro_caption_band();
         let scene_low_palette_noise =
@@ -4859,10 +10158,20 @@ impl Gpu {
         let has_textured_content = self.textured_draw_stats.written_pixels
             >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS
             && self.textured_draw_stats.color_changes >= 16;
-        let caption_band_ui_allowed = self.caption_band_playfield_ui_allowed(width, height)
+        let caption_current_streamed_caption_ui_allowed = caption_current_streamed_scene_recovery
+            && has_actual_color_diversity
+            && has_scene_color_diversity
+            && !actual_low_palette_noise
+            && !scene_low_palette_noise
             && has_actual_playfield
             && has_scene_detail
             && has_full_scene_detail;
+        let caption_band_ui_allowed = (self
+            .caption_band_playfield_ui_allowed_for_output(use_output, output, width, height)
+            && has_actual_playfield
+            && has_scene_detail
+            && has_full_scene_detail)
+            || caption_current_streamed_caption_ui_allowed;
         let narrow_field_intro_caption_band = self.narrow_field_intro_caption_band(
             use_output,
             output,
@@ -4871,28 +10180,85 @@ impl Gpu {
             actual_color_stats,
             scene_color_stats,
         );
+        let actual_display_periodic_ghosting =
+            self.field_composed_periodic_blocks_playability(output, resolved);
+        let actual_atlas_caption_ghosting = self.display_window_has_atlas_caption_ghosting(
+            live_actual,
+            width,
+            height,
+            !use_output,
+            actual_color_stats,
+        );
+        let scene_atlas_caption_ghosting = self.display_window_has_atlas_caption_ghosting(
+            visible,
+            width,
+            height,
+            !use_output,
+            scene_color_stats,
+        );
+        let actual_display_logo_transition = self
+            .high_vertical_full_output_has_saturated_logo_transition()
+            || self.display_window_has_saturated_logo_transition(
+                live_actual,
+                width,
+                height,
+                use_output,
+            );
+        let scene_display_logo_transition =
+            self.display_window_has_saturated_logo_transition(visible, width, height, use_output);
+        let actual_title_logo_overlay =
+            self.display_window_has_title_logo_overlay(live_actual, width, height, use_output);
+        let scene_title_logo_overlay =
+            self.display_window_has_title_logo_overlay(visible, width, height, use_output);
+        let actual_title_logo_blocks_playability = actual_title_logo_overlay;
+        let scene_title_logo_blocks_playability = scene_title_logo_overlay;
         let actual_caption_blocks_playability = (has_actual_intro_caption_band
             && !caption_band_ui_allowed)
-            || narrow_field_intro_caption_band;
+            || narrow_field_intro_caption_band
+            || actual_atlas_caption_ghosting;
         let scene_caption_blocks_playability = (has_scene_intro_caption_band
             && !caption_band_ui_allowed)
-            || narrow_field_intro_caption_band;
+            || narrow_field_intro_caption_band
+            || scene_atlas_caption_ghosting;
+        let strong_low_color_playfield_signal = self.strong_low_color_playfield_signal(
+            use_output,
+            resolved,
+            has_actual_playfield,
+            has_actual_gameplay_profile,
+            has_scene_gameplay_profile,
+            actual_color_stats,
+            scene_color_stats,
+            actual_low_palette_noise,
+            scene_low_palette_noise,
+            actual_caption_blocks_playability,
+            scene_caption_blocks_playability,
+        );
+        let has_actual_color_playfield_signal =
+            has_actual_color_diversity || strong_low_color_playfield_signal;
+        let has_scene_color_playfield_signal =
+            has_scene_color_diversity || strong_low_color_playfield_signal;
         let has_live_presentation = self.has_visible_presentation();
 
         has_actual_playfield
-            && has_native_playfield_density(live_actual.stats)
+            && has_actual_scene_density
             && is_detailed_observation(live_actual.stats)
             && has_actual_full_scene_detail
             && has_actual_gameplay_profile
-            && has_actual_color_diversity
+            && has_actual_color_playfield_signal
             && has_scene_density
             && has_scene_detail
             && has_full_scene_detail
-            && has_native_gameplay_display_profile(visible.stats)
-            && has_scene_color_diversity
+            && has_scene_gameplay_profile
+            && has_scene_color_playfield_signal
             && !actual_low_palette_noise
             && !scene_low_palette_noise
             && !narrow_field_intro_caption_band
+            && !safe_field_fallback
+            && !actual_display_periodic_ghosting
+            && !actual_display_logo_transition
+            && !scene_display_logo_transition
+            && !actual_title_logo_blocks_playability
+            && !scene_title_logo_blocks_playability
             && !actual_caption_blocks_playability
             && !scene_caption_blocks_playability
             && has_playfield_draws
@@ -4900,15 +10266,1172 @@ impl Gpu {
             && has_live_presentation
     }
 
-    fn caption_band_playfield_ui_allowed(&self, width: usize, height: usize) -> bool {
-        let wide_game_display = width >= 512 && height >= DEFAULT_DISPLAY_HEIGHT * 2;
-        wide_game_display
-            && self.textured_triangle_commands >= DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4
+    fn native_replay_validation_candidate(&self) -> bool {
+        if self.native_rendered_scene_candidate() {
+            return true;
+        }
+        if self.native_replay_gui_render_recovery_candidate() {
+            return true;
+        }
+
+        let (width, height) = self.display_dimensions();
+        let current = self.current_display_window();
+        if self.display_window_is_texture_atlas_with_dimensions(current, width, height) {
+            return false;
+        }
+        if !screen_observation_worth_saving(current.stats)
+            || !is_detailed_observation(current.stats)
+            || self.current_display_is_stale_periodic_video(current)
+        {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(current, width, height, true);
+        let coherent_title_or_menu = current.stats.nonzero_pixels >= 2048
+            && current.stats.bright_pixels >= 512
+            && current.stats.detail_edges >= detail_edge_cutoff(current.stats)
+            && color_stats.bucket_count >= 8
+            && !self.low_palette_noise_candidate(current.stats, color_stats);
+
+        let replay_render_signal = self.has_native_replay_render_signal();
+        let replay_streamed_signal = self.has_native_replay_streamed_render_signal();
+
+        coherent_title_or_menu
+            && self.has_textured_scene_draws()
+            && replay_render_signal
+            && (self.display_candidate_has_live_draw_overlap(current) || replay_streamed_signal)
+            && self.has_visible_presentation()
+    }
+
+    fn native_replay_validation_incremental_candidate(&self, before: &Gpu) -> bool {
+        if self.native_replay_incremental_display_output_candidate(before) {
+            return true;
+        }
+
+        let (width, height) = self.display_dimensions();
+        let before_current = before.current_display_window();
+        let current = self.current_display_window();
+        if self.display_window_is_texture_atlas_with_dimensions(current, width, height) {
+            return false;
+        }
+        let replay_render_signal = self.has_native_replay_render_signal();
+        let replay_streamed_signal = self.has_native_replay_streamed_render_signal();
+        let live_draw_overlap = self.display_candidate_has_live_draw_overlap(current);
+
+        if !screen_observation_worth_saving(current.stats)
+            || self.current_display_is_stale_periodic_video(current)
+            || !self.has_textured_scene_draws()
+            || !replay_render_signal
+            || (!live_draw_overlap && !replay_streamed_signal)
+        {
+            return false;
+        }
+
+        let before_score = screen_observation_score(before_current.stats);
+        let current_score = screen_observation_score(current.stats);
+        let score_gain = current_score.saturating_sub(before_score);
+        let nonzero_gain = current
+            .stats
+            .nonzero_pixels
+            .saturating_sub(before_current.stats.nonzero_pixels);
+        let detail_gain = current
+            .stats
+            .detail_edges
+            .saturating_sub(before_current.stats.detail_edges);
+        let bright_gain = current
+            .stats
+            .bright_pixels
+            .saturating_sub(before_current.stats.bright_pixels);
+
+        score_gain >= before_score.saturating_div(16).max(4096)
+            || nonzero_gain >= 512 && detail_gain >= 256
+            || bright_gain >= 512 && detail_gain >= 256
+            || self.native_replay_gui_render_recovery_candidate()
+                && current_score > before_score.saturating_add(4096)
+    }
+
+    fn native_replay_lightweight_validation_candidate(&self, before: &Gpu) -> bool {
+        if self.presentation_captures == 0
+            || !self.has_textured_scene_draws()
+            || !self.has_native_replay_render_signal()
+        {
+            return false;
+        }
+
+        let before_current = before.current_display_window();
+        let before_output = before.current_display_output_window().window;
+        let (current_width, current_height) = self.display_dimensions();
+        let current = self.current_display_window();
+        let output = self.current_display_output_window();
+        let before_score = screen_observation_score(before_current.stats)
+            .max(screen_observation_score(before_output.stats));
+        let before_nonzero = before_current
+            .stats
+            .nonzero_pixels
+            .max(before_output.stats.nonzero_pixels);
+        let before_detail = before_current
+            .stats
+            .detail_edges
+            .max(before_output.stats.detail_edges);
+        let before_bright = before_current
+            .stats
+            .bright_pixels
+            .max(before_output.stats.bright_pixels);
+
+        [
+            (current, current_width, current_height),
+            (output.window, output.width, output.height),
+        ]
+        .into_iter()
+        .any(|(candidate, width, height)| {
+            if !screen_observation_worth_saving(candidate.stats)
+                || !is_detailed_observation(candidate.stats)
+            {
+                return false;
+            }
+
+            let score = screen_observation_score(candidate.stats);
+            let nonzero_gain = candidate
+                .stats
+                .nonzero_pixels
+                .saturating_sub(before_nonzero);
+            let detail_gain = candidate.stats.detail_edges.saturating_sub(before_detail);
+            let bright_gain = candidate.stats.bright_pixels.saturating_sub(before_bright);
+            let has_scene_shape = has_native_playfield_density(candidate.stats)
+                || candidate.stats.nonzero_pixels
+                    >= candidate.stats.pixel_count.saturating_div(4).max(2048);
+            let color_stats = self.display_window_color_stats(candidate, width, height, true);
+            let sparse_scene_shape = candidate.stats.nonzero_pixels >= 2048
+                && candidate.stats.detail_edges
+                    >= detail_edge_cutoff(candidate.stats)
+                        .saturating_div(2)
+                        .max(128)
+                && candidate.stats.max_luma >= 128;
+            let sparse_color_signal = color_stats.has_low_bucket_scene_range_signal()
+                || (color_stats.bucket_count >= 6 && color_stats.has_scene_color_range_balance());
+            let sparse_progress = sparse_scene_shape
+                && sparse_color_signal
+                && self.has_native_play_3d_draw_signal()
+                && self.has_visible_presentation()
+                && !self.low_palette_noise_candidate(candidate.stats, color_stats);
+            let enough_gain = score
+                > before_score
+                    .saturating_add(before_score / 32)
+                    .saturating_add(4096)
+                || nonzero_gain >= 512 && detail_gain >= 256
+                || bright_gain >= 512 && detail_gain >= 256;
+
+            (has_scene_shape || sparse_progress) && enough_gain
+        })
+    }
+
+    pub fn native_replay_validation_probe_json(&self, before: Option<&Gpu>) -> String {
+        let output = self.current_display_output_window();
+        let current = self.current_display_window();
+        let output_score = screen_observation_score(output.window.stats);
+        let current_score = screen_observation_score(current.stats);
+        let before_current_score = before
+            .map(|gpu| screen_observation_score(gpu.current_display_window().stats))
+            .unwrap_or(0);
+        let before_output_score = before
+            .map(|gpu| screen_observation_score(gpu.current_display_output_window().window.stats))
+            .unwrap_or(0);
+        let strict_candidate = self.native_replay_validation_candidate();
+        let incremental_candidate =
+            before.is_some_and(|gpu| self.native_replay_validation_incremental_candidate(gpu));
+        let staged_candidate =
+            before.is_some_and(|gpu| self.native_replay_incremental_display_output_candidate(gpu));
+        let color_stats =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        let resolved = self.display_resolve();
+        let output_live_draw_overlap_area = self
+            .display_candidate_live_draw_overlap_area_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            );
+        let output_minimum_live_draw_overlap_area =
+            minimum_live_draw_overlap_area_for_dimensions(output.width, output.height);
+        let output_live_draw_overlap =
+            output_live_draw_overlap_area >= output_minimum_live_draw_overlap_area;
+        let current_live_draw_overlap_area = self.display_candidate_live_draw_overlap_area(current);
+        let current_minimum_live_draw_overlap_area = self.minimum_live_draw_overlap_area();
+        let current_live_draw_overlap =
+            current_live_draw_overlap_area >= current_minimum_live_draw_overlap_area;
+        let output_display_flow = self.should_use_display_output(output, resolved)
+            || self.native_replay_direct_display_output_flow_candidate(output)
+            || output.field_composed
+            || output.source == DISPLAY_SOURCE_ACTIVE_FIELD
+            || output.source == DISPLAY_SOURCE_PRESENTED_FIELD
+            || output.source == DISPLAY_SOURCE_SAFE_FIELD
+            || output.source == DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+            || output_live_draw_overlap;
+        let output_psx_wrap = output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL;
+        let output_periodic = self.display_window_has_periodic_horizontal_ghosting(
+            output.window,
+            output.width,
+            output.height,
+            output_psx_wrap,
+        );
+        let output_logo_transition = self.display_window_has_saturated_logo_transition(
+            output.window,
+            output.width,
+            output.height,
+            output_psx_wrap,
+        );
+        let output_low_palette = self.low_palette_noise_candidate(output.window.stats, color_stats);
+        let output_texture_atlas = self.display_window_is_texture_atlas_with_dimensions(
+            output.window,
+            output.width,
+            output.height,
+        );
+        let output_early_staged = self.native_replay_early_staged_window_render_recovery_candidate(
+            output.window,
+            output.width,
+            output.height,
+            color_stats,
+        );
+        let output_staged_window = self.native_replay_staged_window_render_recovery_candidate(
+            output.window,
+            output.width,
+            output.height,
+            output_psx_wrap,
+            output_display_flow,
+        );
+        let output_atlas_like_field_recovery = self
+            .native_replay_atlas_like_field_render_recovery_candidate(
+                output.window,
+                output.width,
+                output.height,
+                color_stats,
+                self.has_textured_scene_draws() && self.has_native_replay_render_signal(),
+                output_early_staged,
+                output_periodic,
+            );
+
+        format!(
+            "{{\"strict_candidate\":{},\"incremental_candidate\":{},\"staged_candidate\":{},\"output_source\":\"{}\",\"output_field_composed\":{},\"output_cached\":{},\"output_width\":{},\"output_height\":{},\"output_x\":{},\"output_y\":{},\"output_score\":{},\"output_nonzero\":{},\"output_bright\":{},\"output_detail\":{},\"output_bucket_count\":{},\"output_scene_color_diversity\":{},\"output_intro_caption_band\":{},\"output_playfield_density\":{},\"output_full_scene_detail\":{},\"output_gameplay_profile\":{},\"output_live_draw_overlap_area\":{},\"output_minimum_live_draw_overlap_area\":{},\"output_live_draw_overlap\":{},\"output_display_flow\":{},\"output_periodic\":{},\"output_logo_transition\":{},\"output_low_palette\":{},\"output_texture_atlas\":{},\"output_early_staged\":{},\"output_atlas_like_field_recovery\":{},\"output_staged_window\":{},\"current_score\":{},\"current_nonzero\":{},\"current_detail\":{},\"current_live_draw_overlap_area\":{},\"current_minimum_live_draw_overlap_area\":{},\"current_live_draw_overlap\":{},\"before_current_score\":{},\"before_output_score\":{},\"has_textured_scene_draws\":{},\"has_native_replay_render_signal\":{},\"has_visible_presentation\":{},\"recent_overlap_draw_commands\":[{}],\"top_draw_commands\":[{}]}}",
+            strict_candidate,
+            incremental_candidate,
+            staged_candidate,
+            output.source,
+            output.field_composed,
+            output.cached,
+            output.width,
+            output.height,
+            output.window.x,
+            output.window.y,
+            output_score,
+            output.window.stats.nonzero_pixels,
+            output.window.stats.bright_pixels,
+            output.window.stats.detail_edges,
+            color_stats.bucket_count,
+            color_stats.has_scene_color_diversity(),
+            color_stats.has_intro_caption_band(),
+            has_native_playfield_density(output.window.stats),
+            has_native_full_scene_detail(output.window.stats),
+            has_native_gameplay_display_profile(output.window.stats),
+            output_live_draw_overlap_area,
+            output_minimum_live_draw_overlap_area,
+            output_live_draw_overlap,
+            output_display_flow,
+            output_periodic,
+            output_logo_transition,
+            output_low_palette,
+            output_texture_atlas,
+            output_early_staged,
+            output_atlas_like_field_recovery,
+            output_staged_window,
+            current_score,
+            current.stats.nonzero_pixels,
+            current.stats.detail_edges,
+            current_live_draw_overlap_area,
+            current_minimum_live_draw_overlap_area,
+            current_live_draw_overlap,
+            before_current_score,
+            before_output_score,
+            self.has_textured_scene_draws(),
+            self.has_native_replay_render_signal(),
+            self.has_visible_presentation(),
+            self.overlap_draw_commands_compact_json(8),
+            self.top_draw_commands_compact_json(8)
+        )
+    }
+
+    fn native_replay_incremental_display_output_candidate(&self, before: &Gpu) -> bool {
+        let output = self.current_display_output_window();
+        if self.native_replay_incremental_display_output_window_candidate(before, output) {
+            return true;
+        }
+
+        self.high_vertical_current_display_field_outputs()
+            .into_iter()
+            .any(|field_output| {
+                self.native_replay_incremental_display_output_window_candidate(before, field_output)
+            })
+    }
+
+    fn native_replay_incremental_display_output_window_candidate(
+        &self,
+        before: &Gpu,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        let resolved = self.display_resolve();
+        let output_live_draw_overlap = self
+            .display_candidate_has_live_draw_overlap_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            );
+        let display_flow = self.should_use_display_output(output, resolved)
+            || self.native_replay_direct_display_output_flow_candidate(output)
+            || output.field_composed
+            || output.source == DISPLAY_SOURCE_ACTIVE_FIELD
+            || output.source == DISPLAY_SOURCE_PRESENTED_FIELD
+            || output.source == DISPLAY_SOURCE_SAFE_FIELD
+            || output.source == DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+            || output_live_draw_overlap;
+        if !self.native_replay_staged_window_render_recovery_candidate(
+            output.window,
+            output.width,
+            output.height,
+            output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            display_flow,
+        ) {
+            return false;
+        }
+
+        let before_current = before.current_display_window();
+        let before_output = before.current_display_output_window();
+        let before_score = screen_observation_score(before_current.stats)
+            .max(screen_observation_score(before_output.window.stats));
+        let output_score = screen_observation_score(output.window.stats);
+        let before_nonzero = before_current
+            .stats
+            .nonzero_pixels
+            .max(before_output.window.stats.nonzero_pixels);
+        let before_detail = before_current
+            .stats
+            .detail_edges
+            .max(before_output.window.stats.detail_edges);
+        let before_bright = before_current
+            .stats
+            .bright_pixels
+            .max(before_output.window.stats.bright_pixels);
+        let nonzero_gain = output
+            .window
+            .stats
+            .nonzero_pixels
+            .saturating_sub(before_nonzero);
+        let detail_gain = output
+            .window
+            .stats
+            .detail_edges
+            .saturating_sub(before_detail);
+        let bright_gain = output
+            .window
+            .stats
+            .bright_pixels
+            .saturating_sub(before_bright);
+        let before_sparse = !screen_observation_worth_saving(before_current.stats)
+            && !screen_observation_worth_saving(before_output.window.stats);
+
+        before_sparse
+            || output_score
+                > before_score
+                    .saturating_add(before_score / 32)
+                    .saturating_add(4096)
+            || nonzero_gain >= 512 && detail_gain >= 256
+            || bright_gain >= 512 && detail_gain >= 256
+    }
+
+    fn high_vertical_current_display_field_outputs(&self) -> Vec<DisplayOutputWindow> {
+        let (width, height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+        {
+            return Vec::new();
+        }
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(full)
+        else {
+            return Vec::new();
+        };
+
+        [top, bottom]
+            .into_iter()
+            .filter(|field| {
+                screen_observation_worth_saving(field.stats)
+                    && !self.display_window_has_glyph_texture_grid(*field, width, field_height)
+                    && !self.display_window_has_glyph_texture_grid_with_psx_depth(
+                        *field,
+                        width,
+                        field_height,
+                    )
+            })
+            .map(|field| DisplayOutputWindow {
+                source: DISPLAY_SOURCE_ACTIVE_FIELD,
+                field_composed: false,
+                cached: false,
+                width,
+                height: field_height,
+                window: field,
+            })
+            .collect()
+    }
+
+    fn native_replay_direct_display_output_flow_candidate(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        output.source == DISPLAY_SOURCE_GP1_DISPLAY_AREA
+            && !output.cached
+            && !output.field_composed
+            && output.width >= NATIVE_REPLAY_STAGED_MIN_DISPLAY_WIDTH
+            && output.height >= DEFAULT_DISPLAY_HEIGHT
+    }
+
+    fn native_replay_gui_render_recovery_candidate(&self) -> bool {
+        if let Some(output) = self.current_gui_display_output_window()
+            && self.native_replay_display_output_render_recovery_candidate(output)
+        {
+            return true;
+        }
+
+        let resolved = self.display_resolve();
+        let output = self.current_display_output_window();
+        if self.should_use_display_output(output, resolved)
+            && self.native_replay_display_output_render_recovery_candidate(output)
+        {
+            return true;
+        }
+        if resolved.promoted && self.should_present_resolved_display(resolved) {
+            let (width, height) = self.resolved_display_dimensions(resolved);
+            return self.native_replay_window_render_recovery_candidate(
+                resolved.window,
+                width,
+                height,
+                true,
+                self.display_candidate_has_live_draw_overlap_with_dimensions(
+                    resolved.window,
+                    width,
+                    height,
+                ) || self.display_candidate_was_recently_presented(resolved.window, height),
+            );
+        }
+
+        false
+    }
+
+    fn native_replay_display_output_render_recovery_candidate(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        if output.cached || output.width == 0 || output.height == 0 {
+            return false;
+        }
+
+        let display_flow = output.field_composed
+            || output.source == DISPLAY_SOURCE_ACTIVE_FIELD
+            || output.source == DISPLAY_SOURCE_PRESENTED_FIELD
+            || output.source == DISPLAY_SOURCE_SAFE_FIELD
+            || output.source == DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+            || self.display_candidate_has_live_draw_overlap_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            );
+        self.native_replay_window_render_recovery_candidate(
+            output.window,
+            output.width,
+            output.height,
+            output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            display_flow,
+        )
+    }
+
+    fn native_replay_window_render_recovery_candidate(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+        display_flow: bool,
+    ) -> bool {
+        if !display_flow
+            || width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || self.display_window_is_texture_atlas_with_dimensions(window, width, height)
+            || !screen_observation_worth_saving(window.stats)
+            || !is_detailed_observation(window.stats)
+            || self.display_window_has_periodic_horizontal_ghosting(window, width, height, psx_wrap)
+            || self.display_window_has_saturated_logo_transition(window, width, height, psx_wrap)
+        {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(window, width, height, psx_wrap);
+        window.stats.nonzero_pixels >= 2048
+            && window.stats.bright_pixels >= 512
+            && window.stats.detail_edges >= detail_edge_cutoff(window.stats)
+            && color_stats.bucket_count >= 8
+            && !self.low_palette_noise_candidate(window.stats, color_stats)
+            && self.has_textured_scene_draws()
+            && self.has_native_replay_render_signal()
+            && self.has_visible_presentation()
+    }
+
+    fn native_replay_staged_window_render_recovery_candidate(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+        display_flow: bool,
+    ) -> bool {
+        if !display_flow
+            || width < NATIVE_REPLAY_STAGED_MIN_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(window.stats)
+            || !is_detailed_observation(window.stats)
+            || self.display_window_has_saturated_logo_transition(window, width, height, psx_wrap)
+        {
+            return false;
+        }
+
+        let color_stats = self.display_window_color_stats(window, width, height, psx_wrap);
+        let atlas_like =
+            self.display_window_is_texture_atlas_with_dimensions(window, width, height);
+        let has_mature_replay_signal =
+            self.has_textured_scene_draws() && self.has_native_replay_render_signal();
+        let has_early_staged_output_signal = self
+            .native_replay_early_staged_window_render_recovery_candidate(
+                window,
+                width,
+                height,
+                color_stats,
+            );
+        let has_periodic_ghosting =
+            self.display_window_has_periodic_horizontal_ghosting(window, width, height, psx_wrap);
+        let early_256x240_periodic_false_positive = width == NATIVE_REPLAY_STAGED_MIN_DISPLAY_WIDTH
+            && height == DEFAULT_DISPLAY_HEIGHT
+            && has_early_staged_output_signal
+            && !has_mature_replay_signal;
+        if has_periodic_ghosting && !early_256x240_periodic_false_positive {
+            return false;
+        }
+        if atlas_like
+            && !self.native_replay_atlas_like_field_render_recovery_candidate(
+                window,
+                width,
+                height,
+                color_stats,
+                has_mature_replay_signal,
+                has_early_staged_output_signal,
+                has_periodic_ghosting,
+            )
+        {
+            return false;
+        }
+
+        window.stats.nonzero_pixels >= 1024
+            && window.stats.bright_pixels >= 256
+            && window.stats.detail_edges >= detail_edge_cutoff(window.stats).min(512)
+            && color_stats.bucket_count >= 6
+            && !self.low_palette_noise_candidate(window.stats, color_stats)
+            && (has_mature_replay_signal || has_early_staged_output_signal)
+            && self.has_visible_presentation()
+    }
+
+    fn native_replay_atlas_like_field_render_recovery_candidate(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        color_stats: DisplayColorStats,
+        has_mature_replay_signal: bool,
+        has_early_staged_output_signal: bool,
+        has_periodic_ghosting: bool,
+    ) -> bool {
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+        width >= DEFAULT_DISPLAY_WIDTH
+            && height == DEFAULT_DISPLAY_HEIGHT
+            && has_mature_replay_signal
+            && has_early_staged_output_signal
+            && !has_periodic_ghosting
+            && has_native_full_scene_detail(window.stats)
+            && color_stats.has_scene_color_diversity()
+            && (color_stats.has_intro_caption_band()
+                || self
+                    .display_candidate_has_live_draw_overlap_with_dimensions(window, width, height))
+            && !self.low_palette_noise_candidate(window.stats, color_stats)
+            && window.stats.nonzero_pixels >= pixel_count.saturating_div(4)
+            && window.stats.detail_edges >= full_scene_detail_cutoff(window.stats)
+            && self.has_visible_presentation()
+    }
+
+    fn native_replay_early_staged_window_render_recovery_candidate(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        if width < NATIVE_REPLAY_STAGED_MIN_DISPLAY_WIDTH || height < DEFAULT_DISPLAY_HEIGHT {
+            return false;
+        }
+
+        let pixel_count = (width as u64).saturating_mul(height as u64).max(1);
+        let score = screen_observation_score(window.stats);
+        let has_visible_density = window.stats.nonzero_pixels
+            >= pixel_count.saturating_div(4).max(2048)
+            && window.stats.bright_pixels >= pixel_count.saturating_div(256).max(256);
+        let has_detail =
+            window.stats.detail_edges >= detail_edge_cutoff(window.stats).max(pixel_count / 96);
+        let has_color_signal =
+            color_stats.bucket_count >= 16 || color_stats.has_low_bucket_scene_range_signal();
+        let mostly_solid_bright = window.stats.nonzero_pixels
+            >= pixel_count.saturating_mul(95) / 100
+            && window.stats.bright_pixels >= pixel_count.saturating_mul(95) / 100
+            && color_stats.bucket_count <= 8;
+
+        has_visible_density
+            && has_detail
+            && has_color_signal
+            && !mostly_solid_bright
+            && score >= pixel_count.saturating_mul(4)
+    }
+
+    fn has_native_replay_render_signal(&self) -> bool {
+        self.has_native_play_3d_draw_signal() || self.has_native_replay_streamed_render_signal()
+    }
+
+    fn has_native_replay_streamed_render_signal(&self) -> bool {
+        self.has_textured_scene_draws()
+            && self.has_playfield_draws()
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.textured_rect_commands >= DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS.saturating_mul(4)
+            && self.textured_draw_stats.color_changes >= 16_384
+            && self.has_visible_presentation()
+    }
+
+    fn strong_low_color_playfield_signal(
+        &self,
+        use_output: bool,
+        resolved: DisplayResolve,
+        has_actual_playfield: bool,
+        has_actual_gameplay_profile: bool,
+        has_scene_gameplay_profile: bool,
+        actual_color_stats: DisplayColorStats,
+        scene_color_stats: DisplayColorStats,
+        actual_low_palette_noise: bool,
+        scene_low_palette_noise: bool,
+        actual_caption_blocks_playability: bool,
+        scene_caption_blocks_playability: bool,
+    ) -> bool {
+        if !has_actual_playfield
+            || !has_actual_gameplay_profile
+            || !has_scene_gameplay_profile
+            || actual_low_palette_noise
+            || scene_low_palette_noise
+            || actual_caption_blocks_playability
+            || scene_caption_blocks_playability
+        {
+            return false;
+        }
+        if !actual_color_stats.has_low_bucket_scene_range_signal()
+            || !scene_color_stats.has_low_bucket_scene_range_signal()
+            || !actual_color_stats.has_low_bucket_playfield_brightness()
+            || !scene_color_stats.has_low_bucket_playfield_brightness()
+        {
+            return false;
+        }
+        if actual_color_stats.has_scene_color_diversity()
+            && scene_color_stats.has_scene_color_diversity()
+        {
+            return false;
+        }
+        if !self.has_strong_native_3d_textured_playfield_activity() {
+            return false;
+        }
+
+        use_output || self.resolved_display_has_strong_live_playfield_signal(resolved)
+    }
+
+    fn has_strong_native_3d_textured_playfield_activity(&self) -> bool {
+        let high_triangle_activity = self.has_playfield_draws()
+            && self.has_native_play_3d_draw_signal()
+            && self.textured_triangle_commands
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4
             && self.textured_draw_stats.written_pixels
                 >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16
             && self.textured_draw_stats.color_changes >= 16_384
+            && self.presentation_captures >= 32;
+
+        high_triangle_activity || self.has_pixel_heavy_low_triangle_playfield_activity()
+    }
+
+    fn has_strong_streamed_scene_rect_activity(&self) -> bool {
+        self.has_playfield_draws()
+            && self.has_textured_scene_draws()
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.textured_rect_commands >= DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 4
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64
+            && self.textured_draw_stats.color_changes >= 262_144
+            && self.presentation_captures >= 120
+    }
+
+    fn caption_band_playfield_ui_allowed(&self, width: usize, height: usize) -> bool {
+        let wide_game_display = width >= 512 && height >= DEFAULT_DISPLAY_HEIGHT * 2;
+        let progressive_game_display = width >= 512 && height >= DEFAULT_DISPLAY_HEIGHT;
+        (wide_game_display || progressive_game_display)
+            && self.has_strong_native_3d_textured_playfield_activity()
             && self.has_playfield_draws()
             && self.has_visible_presentation()
+    }
+
+    fn caption_band_playfield_ui_allowed_for_output(
+        &self,
+        use_output: bool,
+        output: DisplayOutputWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if use_output
+            && output.source == DISPLAY_SOURCE_ACTIVE_FIELD
+            && self.high_vertical_interlace_enabled()
+        {
+            return self.high_vertical_active_field_caption_ui_allowed(output, width, height);
+        }
+
+        self.caption_band_playfield_ui_allowed(width, height)
+    }
+
+    fn high_vertical_active_field_caption_ui_allowed(
+        &self,
+        output: DisplayOutputWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        output.source == DISPLAY_SOURCE_ACTIVE_FIELD
+            && !output.field_composed
+            && !output.cached
+            && self.display_window_is_high_vertical_live_single_field_scene(
+                output.window,
+                width,
+                height,
+            )
+            && self.caption_band_playfield_ui_allowed(width, height)
+    }
+
+    fn high_vertical_active_field_live_scene(
+        &self,
+        output: DisplayOutputWindow,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        output.source == DISPLAY_SOURCE_ACTIVE_FIELD
+            && !output.field_composed
+            && !output.cached
+            && self.high_vertical_live_single_field_scene_signal(
+                output.window,
+                output.width,
+                output.height,
+                color_stats,
+            )
+    }
+
+    fn high_vertical_live_single_field_scene_signal(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width != display_width
+            || height == 0
+            || height.saturating_mul(2) != display_height
+            || display_height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !self.has_strong_native_3d_textured_playfield_activity()
+            || self.presentation_captures == 0
+        {
+            return false;
+        }
+
+        let pixel_count = window.stats.pixel_count.max(1);
+        let sparse_but_visible_field = window.stats.nonzero_pixels.saturating_mul(4) >= pixel_count
+            && window.stats.bright_pixels >= pixel_count.saturating_div(128).max(512)
+            && window.stats.detail_edges >= full_scene_detail_cutoff(window.stats);
+        if !sparse_but_visible_field
+            || !screen_observation_worth_saving(window.stats)
+            || !is_detailed_observation(window.stats)
+            || !self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
+            || self.display_candidate_has_scene_upload_overlap(window)
+            || !color_stats.has_scene_color_diversity()
+            || self.low_palette_noise_candidate(window.stats, color_stats)
+            || self
+                .display_window_has_high_vertical_static_title_screen(window, width, height, true)
+            || self.display_window_has_title_logo_overlay(window, width, height, true)
+            || self.display_window_has_atlas_caption_ghosting(
+                window,
+                width,
+                height,
+                true,
+                color_stats,
+            )
+            || self.field_half_is_probable_texture_atlas_artifact(window, width, height)
+            || self.display_candidate_has_dominant_unpresented_texture_upload(window, width, height)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn display_window_has_high_vertical_static_title_screen(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        if !self.high_vertical_interlace_enabled()
+            || width < 512
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || height.saturating_mul(2) != self.display_dimensions().1
+        {
+            return false;
+        }
+
+        #[derive(Default)]
+        struct RegionSignal {
+            samples: u64,
+            nonzero: u64,
+            red: u64,
+            bright: u64,
+            white: u64,
+        }
+
+        let x_step = (width / 160).max(1);
+        let y_step = (height / 120).max(1);
+        let sample_region = |x_start: usize, y_start: usize, x_end: usize, y_end: usize| {
+            let mut signal = RegionSignal::default();
+            for y in (y_start..y_end.min(height)).step_by(y_step) {
+                for x in (x_start..x_end.min(width)).step_by(x_step) {
+                    let color = self.display_window_pixel(window, x, y, psx_wrap);
+                    let red = (color >> 16) & 0xff;
+                    let green = (color >> 8) & 0xff;
+                    let blue = color & 0xff;
+                    let max_channel = red.max(green).max(blue);
+
+                    signal.samples = signal.samples.saturating_add(1);
+                    if max_channel > 24 {
+                        signal.nonzero = signal.nonzero.saturating_add(1);
+                    }
+                    if red >= 96 && red > green.saturating_add(32) && red > blue.saturating_add(32)
+                    {
+                        signal.red = signal.red.saturating_add(1);
+                    }
+                    if max_channel >= 160 {
+                        signal.bright = signal.bright.saturating_add(1);
+                    }
+                    if red >= 160 && green >= 160 && blue >= 160 {
+                        signal.white = signal.white.saturating_add(1);
+                    }
+                }
+            }
+            signal
+        };
+
+        let all = sample_region(0, 0, width, height);
+        let left = sample_region(0, 0, width * 25 / 100, height);
+        let top = sample_region(0, 0, width, height * 20 / 100);
+        let right_logo = sample_region(
+            width * 60 / 100,
+            height * 10 / 100,
+            width,
+            height * 55 / 100,
+        );
+        let center_mark = sample_region(
+            width * 25 / 100,
+            height * 50 / 100,
+            width * 70 / 100,
+            height * 82 / 100,
+        );
+        if all.samples == 0
+            || left.samples == 0
+            || top.samples == 0
+            || right_logo.samples == 0
+            || center_mark.samples == 0
+        {
+            return false;
+        }
+
+        let mostly_black_scene = all.nonzero.saturating_mul(100) <= all.samples.saturating_mul(40);
+        let left_title_mass = left.nonzero.saturating_mul(100) >= left.samples.saturating_mul(60)
+            && left.red.saturating_mul(100) >= left.samples.saturating_mul(25)
+            && left.bright.saturating_mul(100) >= left.samples.saturating_mul(35);
+        let top_title_text = top.nonzero.saturating_mul(100) >= top.samples.saturating_mul(20)
+            && top.bright.saturating_mul(100) >= top.samples.saturating_mul(12)
+            && top.white.saturating_mul(100) >= top.samples.saturating_mul(8);
+        let right_title_mark = right_logo.nonzero.saturating_mul(100)
+            <= right_logo.samples.saturating_mul(20)
+            && right_logo.bright.saturating_mul(100) >= right_logo.samples.saturating_mul(4)
+            && right_logo.white.saturating_mul(100) >= right_logo.samples.saturating_mul(3);
+        let center_copyright_mark = center_mark.nonzero.saturating_mul(100)
+            <= center_mark.samples.saturating_mul(20)
+            && center_mark.bright.saturating_mul(100) >= center_mark.samples.saturating_mul(5)
+            && center_mark.white.saturating_mul(100) >= center_mark.samples.saturating_mul(4);
+
+        mostly_black_scene
+            && left_title_mass
+            && top_title_text
+            && (right_title_mark || center_copyright_mark)
+    }
+
+    fn display_window_has_atlas_caption_ghosting(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        width >= 512
+            && height >= DEFAULT_DISPLAY_HEIGHT
+            && color_stats.has_intro_caption_band()
+            && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
+            && self.has_native_play_3d_draw_signal()
+            && self.display_window_has_periodic_horizontal_ghosting(window, width, height, psx_wrap)
+    }
+
+    fn display_window_has_title_logo_overlay(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        self.display_window_has_title_logo_overlay_signal(window, width, height, psx_wrap, true)
+    }
+
+    fn display_window_has_title_logo_overlay_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        self.display_window_has_title_logo_overlay_signal(window, width, height, psx_wrap, false)
+    }
+
+    fn display_window_has_title_logo_overlay_signal(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+        require_marked_dark_rows: bool,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH || height < DEFAULT_DISPLAY_HEIGHT {
+            return false;
+        }
+
+        let x_step = (width / 320).max(1);
+        let y_step = (height / 240).max(1);
+        let title_region_x_start = width.saturating_mul(52) / 100;
+        let title_region_x_end = width.saturating_mul(99) / 100;
+        let title_region_y_start = height.saturating_mul(48) / 100;
+        let title_region_y_end = height.saturating_mul(84) / 100;
+        let mut samples = 0usize;
+        let mut black = 0usize;
+        let mut horizontal_color_changes = 0usize;
+        let mut title_region_samples = 0usize;
+        let mut title_dark = 0usize;
+        let mut title_red = 0usize;
+        let mut title_bright = 0usize;
+        let mut title_region_rows = 0usize;
+        let mut title_marked_dark_rows = 0usize;
+
+        for y in (0..height).step_by(y_step) {
+            let mut previous = None;
+            let mut row_title_samples = 0usize;
+            let mut row_title_dark = 0usize;
+            let mut row_title_red = 0usize;
+            let mut row_title_bright = 0usize;
+            for x in (0..width).step_by(x_step) {
+                let color = self.display_window_pixel(window, x, y, psx_wrap);
+                let red = (color >> 16) & 0xff;
+                let green = (color >> 8) & 0xff;
+                let blue = color & 0xff;
+                let max_channel = red.max(green).max(blue);
+                let min_channel = red.min(green).min(blue);
+                let luma = (red * 30 + green * 59 + blue * 11) / 100;
+
+                samples = samples.saturating_add(1);
+                if color == 0 || max_channel <= 24 {
+                    black = black.saturating_add(1);
+                }
+                if previous.is_some_and(|previous| previous != color) {
+                    horizontal_color_changes = horizontal_color_changes.saturating_add(1);
+                }
+                previous = Some(color);
+
+                if x >= title_region_x_start
+                    && x < title_region_x_end
+                    && y >= title_region_y_start
+                    && y < title_region_y_end
+                {
+                    title_region_samples = title_region_samples.saturating_add(1);
+                    row_title_samples = row_title_samples.saturating_add(1);
+                    if max_channel <= 40 {
+                        title_dark = title_dark.saturating_add(1);
+                        row_title_dark = row_title_dark.saturating_add(1);
+                    }
+                    if red >= 128 && red > green.saturating_add(48) && red > blue.saturating_add(48)
+                    {
+                        title_red = title_red.saturating_add(1);
+                        row_title_red = row_title_red.saturating_add(1);
+                    }
+                    if luma >= 150 && max_channel.saturating_sub(min_channel) <= 104 {
+                        title_bright = title_bright.saturating_add(1);
+                        row_title_bright = row_title_bright.saturating_add(1);
+                    }
+                }
+            }
+            if row_title_samples > 0 {
+                title_region_rows = title_region_rows.saturating_add(1);
+                let row_title_marks = row_title_red.saturating_add(row_title_bright);
+                if row_title_dark.saturating_mul(100) >= row_title_samples.saturating_mul(18)
+                    && row_title_marks.saturating_mul(100) >= row_title_samples.saturating_mul(6)
+                    && (row_title_red.saturating_mul(100) >= row_title_samples.saturating_mul(4)
+                        || row_title_bright.saturating_mul(100)
+                            >= row_title_samples.saturating_mul(4))
+                {
+                    title_marked_dark_rows = title_marked_dark_rows.saturating_add(1);
+                }
+            }
+        }
+
+        if samples == 0 || title_region_samples == 0 || title_region_rows == 0 {
+            return false;
+        }
+
+        let title_mark_pixels = title_red.saturating_add(title_bright);
+        let title_marks_on_dark_rows = !require_marked_dark_rows
+            || title_marked_dark_rows.saturating_mul(100) >= title_region_rows.saturating_mul(12);
+        let region_title_overlay = title_red.saturating_mul(100)
+            >= title_region_samples.saturating_mul(18)
+            && title_bright.saturating_mul(100) >= title_region_samples.saturating_mul(2)
+            && title_mark_pixels.saturating_mul(100) >= title_region_samples.saturating_mul(22)
+            && title_marks_on_dark_rows
+            && (title_dark.saturating_mul(100) >= title_region_samples.saturating_mul(20)
+                || black.saturating_mul(100) >= samples.saturating_mul(8))
+            && horizontal_color_changes.saturating_mul(100) >= samples.saturating_mul(20);
+        let frame_title_overlay = title_red.saturating_mul(1_000) >= samples.saturating_mul(8)
+            && title_bright.saturating_mul(1_000) >= samples.saturating_mul(2)
+            && title_mark_pixels.saturating_mul(100) >= samples
+            && title_marks_on_dark_rows
+            && black.saturating_mul(100) >= samples.saturating_mul(10)
+            && horizontal_color_changes.saturating_mul(100) >= samples.saturating_mul(20);
+        region_title_overlay || frame_title_overlay
+    }
+
+    fn display_window_has_saturated_logo_transition(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH || height < DEFAULT_DISPLAY_HEIGHT {
+            return false;
+        }
+
+        let x_step = (width / 160).max(1);
+        let y_step = (height / 120).max(1);
+        let mut samples = 0u64;
+        let mut high_saturation = 0u64;
+        let mut red_or_white = 0u64;
+        let mut black = 0u64;
+        let mut top_samples = 0u64;
+        let mut top_high_saturation = 0u64;
+        let mut logo_samples = 0u64;
+        let mut logo_red = 0u64;
+        let mut logo_white = 0u64;
+        let mut logo_nonblack = 0u64;
+
+        for y in (0..height).step_by(y_step) {
+            for x in (0..width).step_by(x_step) {
+                let color = self.display_window_pixel(window, x, y, psx_wrap);
+                let red = (color >> 16) & 0xff;
+                let green = (color >> 8) & 0xff;
+                let blue = color & 0xff;
+                let max_channel = red.max(green).max(blue);
+                let min_channel = red.min(green).min(blue);
+                let chroma = max_channel.saturating_sub(min_channel);
+                let saturated = max_channel >= 160 && chroma >= 96;
+
+                samples = samples.saturating_add(1);
+                if saturated {
+                    high_saturation = high_saturation.saturating_add(1);
+                }
+                if (red >= 144 && green <= 112 && blue <= 112)
+                    || (red >= 208 && green >= 208 && blue >= 208)
+                {
+                    red_or_white = red_or_white.saturating_add(1);
+                }
+                if max_channel <= 40 {
+                    black = black.saturating_add(1);
+                }
+                if y < height / 3 {
+                    top_samples = top_samples.saturating_add(1);
+                    if saturated {
+                        top_high_saturation = top_high_saturation.saturating_add(1);
+                    }
+                }
+                if x >= width.saturating_mul(58) / 100 && y >= height.saturating_mul(62) / 100 {
+                    logo_samples = logo_samples.saturating_add(1);
+                    if red >= 128 && green <= 112 && blue <= 112 {
+                        logo_red = logo_red.saturating_add(1);
+                    }
+                    if red >= 200 && green >= 200 && blue >= 200 {
+                        logo_white = logo_white.saturating_add(1);
+                    }
+                    if max_channel >= 48 {
+                        logo_nonblack = logo_nonblack.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        if samples == 0 || top_samples == 0 || logo_samples == 0 {
+            return false;
+        }
+
+        let saturated_transition = high_saturation.saturating_mul(100)
+            >= samples.saturating_mul(45)
+            && top_high_saturation.saturating_mul(100) >= top_samples.saturating_mul(60)
+            && red_or_white.saturating_mul(100) >= samples.saturating_mul(10)
+            && black.saturating_mul(100) >= samples.saturating_mul(2);
+        let logo_like_corner = logo_red.saturating_mul(100) >= logo_samples.saturating_mul(6)
+            && logo_white.saturating_mul(100) >= logo_samples.saturating_mul(6)
+            && logo_nonblack.saturating_mul(100) >= logo_samples.saturating_mul(25);
+
+        saturated_transition && logo_like_corner
     }
 
     fn narrow_field_intro_caption_band(
@@ -4920,13 +11443,138 @@ impl Gpu {
         actual_color_stats: DisplayColorStats,
         scene_color_stats: DisplayColorStats,
     ) -> bool {
-        use_output
+        if use_output
             && output.field_composed
             && !output.cached
             && width <= DEFAULT_DISPLAY_WIDTH
             && height >= DEFAULT_DISPLAY_HEIGHT * 2
             && (actual_color_stats.has_intro_caption_band()
                 || scene_color_stats.has_intro_caption_band())
+        {
+            return true;
+        }
+
+        width <= DEFAULT_DISPLAY_WIDTH
+            && self
+                .recent_low_height_field_pair_output_window(width, height)
+                .is_some_and(|field_pair| {
+                    !field_pair.cached
+                        && field_pair.height >= DEFAULT_DISPLAY_HEIGHT * 2
+                        && self.field_composed_output_is_intro_video_caption(field_pair)
+                })
+    }
+
+    fn field_composed_periodic_blocks_playability(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !output.field_composed || !self.display_output_has_periodic_horizontal_ghosting(output) {
+            return false;
+        }
+        if self.field_composed_periodic_output_is_strong_live_playfield(output) {
+            return false;
+        }
+
+        !self.resolved_display_safely_overrides_periodic_field_output(resolved)
+    }
+
+    fn field_composed_periodic_output_is_strong_live_playfield(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        if output.cached
+            || !has_native_full_scene_detail(output.window.stats)
+            || !has_native_gameplay_display_profile(output.window.stats)
+            || !self.display_candidate_has_live_draw_overlap(output.window)
+            || self.display_candidate_has_scene_upload_overlap(output.window)
+        {
+            return false;
+        }
+
+        let color_stats =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        let very_active_3d_scene = self.textured_triangle_commands
+            >= DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64
+            && self.textured_draw_stats.color_changes >= 262_144
+            && self.presentation_captures >= 120;
+
+        very_active_3d_scene
+            && color_stats.has_scene_color_diversity()
+            && !color_stats.has_intro_caption_band()
+    }
+
+    fn resolved_display_safely_overrides_periodic_field_output(
+        &self,
+        resolved: DisplayResolve,
+    ) -> bool {
+        resolved.promoted
+            && resolved.source == "presented_frame"
+            && self.presented_frame_is_fresh()
+            && self.should_present_resolved_display(resolved)
+            && has_native_full_scene_detail(resolved.window.stats)
+            && has_native_gameplay_display_profile(resolved.window.stats)
+            && !self.display_window_is_texture_atlas(resolved.window)
+            && {
+                let width = self.presented_frame_width.max(self.display_dimensions().0);
+                let height = self.presented_frame_height.max(self.display_dimensions().1);
+                self.display_window_color_stats(resolved.window, width, height, true)
+                    .has_scene_color_diversity()
+            }
+    }
+
+    fn resolved_display_safely_overrides_low_quality_field_output(
+        &self,
+        output: DisplayOutputWindow,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !self.should_present_resolved_display(resolved)
+            || self.display_window_is_texture_atlas(resolved.window)
+            || !has_native_full_scene_detail(resolved.window.stats)
+        {
+            return false;
+        }
+
+        let (resolved_width, resolved_height) = self.resolved_display_dimensions(resolved);
+        let resolved_color =
+            self.display_window_color_stats(resolved.window, resolved_width, resolved_height, true);
+        if !resolved_color.has_scene_color_diversity() {
+            return false;
+        }
+
+        let output_color =
+            self.display_window_color_stats(output.window, output.width, output.height, false);
+        let output_is_low_quality = !has_native_full_scene_detail(output.window.stats)
+            || !has_native_gameplay_display_profile(output.window.stats)
+            || !output_color.has_scene_color_diversity()
+            || output_color.has_intro_caption_band();
+        if !output_is_low_quality {
+            return false;
+        }
+
+        let output_score = screen_observation_score(output.window.stats);
+        let resolved_score = screen_observation_score(resolved.window.stats);
+        let score_is_stronger = resolved_score > output_score.saturating_add(output_score / 2);
+        let detail_is_stronger = resolved.window.stats.detail_edges
+            > output.window.stats.detail_edges.saturating_mul(3).max(4096);
+
+        score_is_stronger || detail_is_stronger
+    }
+
+    fn resolved_display_dimensions(&self, resolved: DisplayResolve) -> (usize, usize) {
+        if resolved.source == "presented_frame" {
+            return self.presented_frame_dimensions();
+        }
+        if resolved.source == "best_observation"
+            && self.best_observation_width > 0
+            && self.best_observation_height > 0
+        {
+            return (self.best_observation_width, self.best_observation_height);
+        }
+
+        self.display_dimensions()
     }
 
     fn low_palette_noise_candidate(
@@ -4972,17 +11620,240 @@ impl Gpu {
                 window.y.saturating_add(y)
             };
             for x in (0..width).step_by(x_step) {
-                let source_x = if psx_wrap {
-                    (window.x + x) % VRAM_WIDTH
+                let rgb = if psx_wrap {
+                    self.display_window_pixel(window, x, y, true)
                 } else {
-                    window.x.saturating_add(x)
+                    let source_x = window.x.saturating_add(x);
+                    self.framebuffer.pixel(source_x as i32, source_y as i32)
                 };
-                let rgb = self.framebuffer.pixel(source_x as i32, source_y as i32);
                 stats.record(rgb, bottom_band);
             }
         }
 
         stats
+    }
+
+    fn display_window_dominant_bucket_per_mille(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> u64 {
+        if width == 0 || height == 0 {
+            return 0;
+        }
+
+        let x_step = (width / 64).max(1);
+        let y_step = (height / 64).max(1);
+        let mut buckets = [0_u16; 512];
+        let mut samples = 0_u64;
+        for y in (0..height).step_by(y_step) {
+            for x in (0..width).step_by(x_step) {
+                let rgb = self.display_window_pixel(window, x, y, psx_wrap);
+                let bucket = primitive_workspace_color_bucket(rgb) as usize;
+                buckets[bucket] = buckets[bucket].saturating_add(1);
+                samples = samples.saturating_add(1);
+            }
+        }
+
+        if samples == 0 {
+            return 0;
+        }
+        let dominant = buckets.into_iter().max().unwrap_or(0) as u64;
+        dominant.saturating_mul(1000) / samples
+    }
+
+    fn display_output_has_periodic_horizontal_ghosting(&self, output: DisplayOutputWindow) -> bool {
+        if output.cached
+            && let Some(rgb) = self.field_composed_display_rgb.as_ref()
+            && rgb.len() >= output.width.saturating_mul(output.height)
+        {
+            return rgb_frame_has_periodic_horizontal_ghosting(rgb, output.width, output.height);
+        }
+
+        self.display_window_has_periodic_horizontal_ghosting(
+            output.window,
+            output.width,
+            output.height,
+            false,
+        )
+    }
+
+    fn display_window_has_periodic_horizontal_ghosting(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        if width < 128 || height == 0 {
+            return false;
+        }
+
+        let mut horizontal_changes = 0usize;
+        for y in (0..height).step_by(2) {
+            let mut previous = None;
+            for x in (0..width).step_by(2) {
+                let color = self.display_window_pixel(window, x, y, psx_wrap);
+                if previous.is_some_and(|previous| previous != color) {
+                    horizontal_changes = horizontal_changes.saturating_add(1);
+                }
+                previous = Some(color);
+            }
+        }
+        if horizontal_changes.saturating_mul(100) < width.saturating_mul(height) / 2 {
+            return false;
+        }
+
+        [64usize, 96, 128, 160, 192]
+            .into_iter()
+            .filter(|period| *period < width)
+            .any(|period| {
+                let mut matches = 0usize;
+                let mut samples = 0usize;
+                for y in (0..height).step_by(2) {
+                    for x in (0..width - period).step_by(2) {
+                        samples = samples.saturating_add(1);
+                        let left = self.display_window_pixel(window, x, y, psx_wrap);
+                        let right = self.display_window_pixel(window, x + period, y, psx_wrap);
+                        if left != 0 && left == right {
+                            matches = matches.saturating_add(1);
+                        }
+                    }
+                }
+                samples > 0 && matches.saturating_mul(1000) / samples >= 350
+            })
+    }
+
+    fn display_window_pixel(
+        &self,
+        window: FrameBufferWindow,
+        x: usize,
+        y: usize,
+        psx_wrap: bool,
+    ) -> u32 {
+        if psx_wrap {
+            return self.framebuffer.psx_display_pixel(
+                window.x,
+                window.y,
+                x,
+                y,
+                self.display_24bit_enabled(),
+            ) & 0x00ff_ffff;
+        }
+        let source_x = if psx_wrap {
+            (window.x + x) % VRAM_WIDTH
+        } else {
+            window.x.saturating_add(x)
+        };
+        let source_y = if psx_wrap {
+            (window.y + y) % PSX_VRAM_HEIGHT
+        } else {
+            window.y.saturating_add(y)
+        };
+        self.framebuffer.pixel(source_x as i32, source_y as i32) & 0x00ff_ffff
+    }
+
+    fn display_window_has_glyph_texture_grid(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        self.display_window_has_glyph_texture_grid_with_mode(window, width, height, false)
+    }
+
+    fn display_window_has_glyph_texture_grid_with_psx_depth(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        self.display_window_has_glyph_texture_grid_with_mode(window, width, height, true)
+    }
+
+    fn display_window_has_glyph_texture_grid_with_mode(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        const CELL_WIDTH: usize = 16;
+        const CELL_HEIGHT: usize = 12;
+
+        if width < 256 || height < 120 {
+            return false;
+        }
+
+        let cols = width / CELL_WIDTH;
+        let rows = height / CELL_HEIGHT;
+        if cols.saturating_mul(rows) < 64 {
+            return false;
+        }
+
+        let mut sampled_cells = 0usize;
+        let mut glyph_like_cells = 0usize;
+        for cell_y in 0..rows {
+            for cell_x in 0..cols {
+                sampled_cells = sampled_cells.saturating_add(1);
+                let mut samples = 0usize;
+                let mut ink_pixels = 0usize;
+                let mut dark_pixels = 0usize;
+                let mut ink_rows = [false; CELL_HEIGHT];
+                let mut ink_cols = [false; CELL_WIDTH];
+
+                for y in (0..CELL_HEIGHT).step_by(2) {
+                    for x in (0..CELL_WIDTH).step_by(2) {
+                        samples = samples.saturating_add(1);
+                        let rgb = self.display_window_pixel(
+                            window,
+                            cell_x * CELL_WIDTH + x,
+                            cell_y * CELL_HEIGHT + y,
+                            psx_wrap,
+                        );
+                        let red = (rgb >> 16) & 0xff;
+                        let green = (rgb >> 8) & 0xff;
+                        let blue = rgb & 0xff;
+                        let max_channel = red.max(green).max(blue);
+                        let min_channel = red.min(green).min(blue);
+                        let luma = (red * 30 + green * 59 + blue * 11) / 100;
+                        let chroma = max_channel.saturating_sub(min_channel);
+                        let ink = luma > 64 || chroma > 48;
+                        let dark_background = luma < 40 && chroma < 32;
+
+                        if ink {
+                            ink_pixels = ink_pixels.saturating_add(1);
+                            ink_rows[y] = true;
+                            ink_cols[x] = true;
+                        }
+                        if dark_background {
+                            dark_pixels = dark_pixels.saturating_add(1);
+                        }
+                    }
+                }
+
+                let ink_row_count = ink_rows.into_iter().filter(|present| *present).count();
+                let ink_col_count = ink_cols.into_iter().filter(|present| *present).count();
+                let enough_dark_background = dark_pixels.saturating_mul(2) >= samples;
+                let enough_ink = ink_pixels.saturating_mul(24) >= samples;
+                let not_filled = ink_pixels.saturating_mul(4) <= samples.saturating_mul(3);
+                let sampled_rows = CELL_HEIGHT.div_ceil(2);
+                let sampled_cols = CELL_WIDTH.div_ceil(2);
+                let strokes_are_localized = ink_row_count >= 2
+                    && ink_col_count >= 2
+                    && ink_row_count.saturating_mul(6) <= sampled_rows.saturating_mul(5)
+                    && ink_col_count.saturating_mul(6) <= sampled_cols.saturating_mul(5);
+
+                if enough_dark_background && enough_ink && not_filled && strokes_are_localized {
+                    glyph_like_cells = glyph_like_cells.saturating_add(1);
+                }
+            }
+        }
+
+        glyph_like_cells >= 12
+            && glyph_like_cells.saturating_mul(100) >= sampled_cells.saturating_mul(18)
     }
 
     fn cached_rgb_for_display_color_stats(
@@ -5042,7 +11913,9 @@ impl Gpu {
     }
 
     fn live_actual_display_window(&self, resolved: DisplayResolve) -> FrameBufferWindow {
-        if self.resolved_display_is_live_actual(resolved) {
+        if self.resolved_display_is_live_actual(resolved)
+            || self.should_present_resolved_display(resolved)
+        {
             resolved.window
         } else {
             self.current_display_window()
@@ -5051,12 +11924,197 @@ impl Gpu {
 
     fn resolved_display_is_live_actual(&self, resolved: DisplayResolve) -> bool {
         resolved.source == "gp1_display_area"
-            || (resolved.source == "presented_frame" && self.presented_frame_is_fresh())
+            || (resolved.source == "presented_frame"
+                && self.presented_frame_is_fresh()
+                && self.presented_frame_is_safe_display_candidate(resolved.window))
+            || self.resolved_display_has_strong_live_playfield_signal(resolved)
+            || self.resolved_display_has_caption_current_streamed_scene_recovery(resolved)
+            || self.resolved_display_has_high_confidence_live_texture_scene(resolved)
     }
 
     fn should_present_resolved_display(&self, resolved: DisplayResolve) -> bool {
+        if resolved.source == "presented_frame" {
+            return self.presented_frame_is_fresh()
+                && self.presented_frame_is_safe_display_candidate(resolved.window);
+        }
+
         self.resolved_display_is_live_actual(resolved)
             || self.display_candidate_has_live_draw_overlap(resolved.window)
+            || self.display_candidate_has_streamed_scene_presentation(resolved.window)
+            || self.resolved_display_has_blank_current_scene_fallback(resolved)
+            || self.resolved_display_has_blank_current_3d_scene_fallback(resolved)
+            || self.resolved_display_has_blank_current_streamed_scene_fallback(resolved)
+            || self.resolved_display_has_caption_current_streamed_scene_recovery(resolved)
+            || self.resolved_display_has_high_confidence_live_texture_scene(resolved)
+    }
+
+    fn resolved_display_has_blank_current_scene_fallback(&self, resolved: DisplayResolve) -> bool {
+        if !resolved.promoted || resolved.source == "presented_frame" {
+            return false;
+        }
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        self.display_candidate_has_blank_current_scene_fallback(
+            current,
+            current_score,
+            resolved.window,
+        )
+    }
+
+    fn resolved_display_has_blank_current_3d_scene_fallback(
+        &self,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !resolved.promoted || resolved.source == "presented_frame" {
+            return false;
+        }
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        self.display_candidate_has_blank_current_3d_scene_fallback(
+            current,
+            current_score,
+            resolved.window,
+        )
+    }
+
+    fn resolved_display_has_blank_current_streamed_scene_fallback(
+        &self,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !resolved.promoted || resolved.source == "presented_frame" {
+            return false;
+        }
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        self.display_candidate_has_blank_current_streamed_scene_fallback(
+            current,
+            current_score,
+            resolved.window,
+        )
+    }
+
+    fn resolved_display_has_high_confidence_live_texture_scene(
+        &self,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !resolved.promoted || resolved.source == "presented_frame" {
+            return false;
+        }
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        self.display_candidate_has_high_confidence_live_texture_scene(
+            current,
+            current_score,
+            resolved.window,
+        )
+    }
+
+    fn resolved_display_has_caption_current_streamed_scene_recovery(
+        &self,
+        resolved: DisplayResolve,
+    ) -> bool {
+        if !resolved.promoted || resolved.source == "presented_frame" {
+            return false;
+        }
+        let current = self.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let (width, height) = self.display_dimensions();
+        self.display_candidate_has_caption_current_streamed_scene_recovery(
+            current,
+            current_score,
+            resolved.window,
+            width,
+            height,
+        )
+    }
+
+    fn resolved_display_has_strong_live_playfield_signal(&self, resolved: DisplayResolve) -> bool {
+        if !resolved.promoted || !self.has_strong_native_3d_textured_playfield_activity() {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        if self.display_window_is_texture_atlas_with_dimensions(resolved.window, width, height)
+            || self.display_candidate_is_probable_texture_upload_page(
+                resolved.window,
+                width,
+                height,
+            )
+            || !self.display_candidate_has_live_draw_overlap(resolved.window)
+            || !has_native_full_scene_detail(resolved.window.stats)
+            || !has_native_gameplay_display_profile(resolved.window.stats)
+        {
+            return false;
+        }
+
+        let is_display_flow_candidate = resolved.source == "presented_frame"
+            || self.display_candidate_is_low_height_field_counterpart(
+                resolved.window,
+                width,
+                height,
+            )
+            || self.display_candidate_was_recently_presented(resolved.window, height);
+        if !is_display_flow_candidate {
+            return false;
+        }
+
+        self.display_window_color_stats(resolved.window, width, height, true)
+            .has_low_bucket_scene_range_signal()
+    }
+
+    fn presented_frame_is_safe_display_candidate(&self, presented: FrameBufferWindow) -> bool {
+        if self.display_window_is_texture_atlas(presented)
+            || self.presented_frame_has_high_vertical_mixed_artifact(presented)
+            || self.presented_frame_has_high_vertical_single_field_scene_artifact(presented)
+            || !screen_observation_worth_saving(presented.stats)
+        {
+            return false;
+        }
+
+        let (width, height) = self.presented_frame_dimensions();
+        let color_stats = self.display_window_color_stats(presented, width, height, true);
+        let high_detail_3d_scene_active = self.textured_triangle_commands
+            >= DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4
+            || self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16
+            || self.textured_draw_stats.color_changes >= 16_384;
+        let low_color_periodic_ghosting = high_detail_3d_scene_active
+            && !color_stats.has_scene_color_diversity()
+            && self.presented_frame_has_periodic_horizontal_ghosting(presented);
+
+        !low_color_periodic_ghosting
+    }
+
+    fn presented_frame_has_periodic_horizontal_ghosting(
+        &self,
+        presented: FrameBufferWindow,
+    ) -> bool {
+        let (width, height) = self.presented_frame_dimensions();
+        if let Some(expected_len) = width.checked_mul(height)
+            && let Some(rgb) = self.presented_frame_rgb.as_ref()
+            && rgb.len() >= expected_len
+            && rgb_frame_has_periodic_horizontal_ghosting(&rgb[..expected_len], width, height)
+        {
+            return true;
+        }
+
+        self.display_window_has_periodic_horizontal_ghosting(presented, width, height, true)
+    }
+
+    fn presented_frame_dimensions(&self) -> (usize, usize) {
+        let (fallback_width, fallback_height) = self.display_dimensions();
+        let width = if self.presented_frame_width > 0 {
+            self.presented_frame_width
+        } else {
+            fallback_width
+        };
+        let height = if self.presented_frame_height > 0 {
+            self.presented_frame_height
+        } else {
+            fallback_height
+        };
+
+        (width, height)
     }
 
     fn has_live_actual_playfield(
@@ -5071,12 +12129,19 @@ impl Gpu {
             return true;
         }
 
-        resolved.source == "presented_frame"
+        if !has_native_playfield_density(resolved.window.stats)
+            || !is_detailed_observation(resolved.window.stats)
+            || !has_native_gameplay_display_profile(resolved.window.stats)
+        {
+            return false;
+        }
+
+        (resolved.source == "presented_frame"
             && self.presented_frame_is_fresh()
-            && has_native_playfield_density(resolved.window.stats)
-            && is_detailed_observation(resolved.window.stats)
-            && has_native_gameplay_display_profile(resolved.window.stats)
-            && self.display_candidate_has_live_draw_overlap(resolved.window)
+            && self.presented_frame_is_safe_display_candidate(resolved.window)
+            && self.display_candidate_has_live_draw_overlap(resolved.window))
+            || self.display_candidate_has_streamed_scene_presentation(resolved.window)
+            || self.resolved_display_has_high_confidence_live_texture_scene(resolved)
     }
 }
 
@@ -5087,20 +12152,27 @@ pub struct GpuCommandSource {
     pc: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DisplayAreaTrace {
     value: u32,
     x: usize,
     y: usize,
     command_index: u64,
     draw_sequence: u64,
+    source: Option<GpuCommandSource>,
 }
 
 impl DisplayAreaTrace {
     fn json(&self) -> String {
         format!(
-            "{{\"value\":{},\"value_hex\":\"0x{:06x}\",\"x\":{},\"y\":{},\"command_index\":{},\"draw_sequence\":{}}}",
-            self.value, self.value, self.x, self.y, self.command_index, self.draw_sequence
+            "{{\"value\":{},\"value_hex\":\"0x{:06x}\",\"x\":{},\"y\":{},\"command_index\":{},\"draw_sequence\":{},\"source\":{}}}",
+            self.value,
+            self.value,
+            self.x,
+            self.y,
+            self.command_index,
+            self.draw_sequence,
+            optional_gpu_source_json(self.source.as_ref())
         )
     }
 }
@@ -5199,30 +12271,49 @@ pub struct NativeGpuDrawCapture {
     pub display_width: usize,
     pub display_height: usize,
     pub display_png: Vec<u8>,
+    pub actual_display_png: Vec<u8>,
+    pub raw_actual_display_png: Vec<u8>,
+    pub gui_display_png: Vec<u8>,
     pub bounds_x: usize,
     pub bounds_y: usize,
     pub bounds_width: usize,
     pub bounds_height: usize,
     pub bounds_png: Vec<u8>,
     pub texture_png: Option<Vec<u8>>,
+    pub raw_texture_png: Option<Vec<u8>>,
     pub palette_png: Option<Vec<u8>>,
+    pub resolved_palette_png: Option<Vec<u8>>,
+    pub texture_diagnostics_json: Option<String>,
+    pub texture_candidate_images: Vec<TextureCandidateImage>,
 }
 
 impl NativeGpuDrawCapture {
     pub fn json(
         &self,
         display_output: &str,
+        actual_display_output: &str,
+        raw_actual_display_output: &str,
+        gui_display_output: &str,
         bounds_output: &str,
         texture_output: Option<&str>,
+        raw_texture_output: Option<&str>,
         palette_output: Option<&str>,
+        resolved_palette_output: Option<&str>,
+        texture_candidate_outputs_json: &str,
     ) -> String {
         format!(
-            "{{\"sequence\":{},\"display_output\":\"{}\",\"bounds_output\":\"{}\",\"texture_output\":{},\"palette_output\":{},\"display_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"bounds_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"trace\":{}}}",
+            "{{\"sequence\":{},\"display_output\":\"{}\",\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"gui_display_output\":\"{}\",\"bounds_output\":\"{}\",\"texture_output\":{},\"raw_texture_output\":{},\"palette_output\":{},\"resolved_palette_output\":{},\"texture_candidate_outputs\":[{}],\"display_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"bounds_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"texture_diagnostics\":{},\"trace\":{}}}",
             self.sequence,
             escape_json(display_output),
+            escape_json(actual_display_output),
+            escape_json(raw_actual_display_output),
+            escape_json(gui_display_output),
             escape_json(bounds_output),
             optional_str_json(texture_output),
+            optional_str_json(raw_texture_output),
             optional_str_json(palette_output),
+            optional_str_json(resolved_palette_output),
+            texture_candidate_outputs_json,
             self.display_x,
             self.display_y,
             self.display_width,
@@ -5231,6 +12322,7 @@ impl NativeGpuDrawCapture {
             self.bounds_y,
             self.bounds_width,
             self.bounds_height,
+            optional_raw_json(self.texture_diagnostics_json.as_deref()),
             self.trace_json
         )
     }
@@ -5270,6 +12362,48 @@ struct DisplayColorStats {
     blue_max: u8,
     bucket_count: u16,
     buckets: [u64; 8],
+}
+
+fn rgb_frame_has_periodic_horizontal_ghosting(pixels: &[u32], width: usize, height: usize) -> bool {
+    if width < 128 || height == 0 || pixels.len() < width.saturating_mul(height) {
+        return false;
+    }
+
+    let mut horizontal_changes = 0usize;
+    for y in (0..height).step_by(2) {
+        let row = y.saturating_mul(width);
+        let mut previous = None;
+        for x in (0..width).step_by(2) {
+            let color = pixels[row + x] & 0x00ff_ffff;
+            if previous.is_some_and(|previous| previous != color) {
+                horizontal_changes = horizontal_changes.saturating_add(1);
+            }
+            previous = Some(color);
+        }
+    }
+    if horizontal_changes.saturating_mul(100) < width.saturating_mul(height) / 2 {
+        return false;
+    }
+
+    [64usize, 96, 128, 160, 192]
+        .into_iter()
+        .filter(|period| *period < width)
+        .any(|period| {
+            let mut matches = 0usize;
+            let mut samples = 0usize;
+            for y in (0..height).step_by(2) {
+                let row = y.saturating_mul(width);
+                for x in (0..width - period).step_by(2) {
+                    samples = samples.saturating_add(1);
+                    let left = pixels[row + x] & 0x00ff_ffff;
+                    let right = pixels[row + x + period] & 0x00ff_ffff;
+                    if left != 0 && left == right {
+                        matches = matches.saturating_add(1);
+                    }
+                }
+            }
+            samples > 0 && matches.saturating_mul(1000) / samples >= 350
+        })
 }
 
 impl DisplayColorStats {
@@ -5321,10 +12455,27 @@ impl DisplayColorStats {
     }
 
     fn has_scene_color_diversity(self) -> bool {
-        if self.samples < 16 || self.bucket_count < 6 {
+        if self.samples < 16 || self.bucket_count < DISPLAY_SCENE_MIN_COLOR_BUCKETS {
             return false;
         }
 
+        self.has_scene_color_range_balance()
+    }
+
+    fn has_low_bucket_scene_range_signal(self) -> bool {
+        self.samples >= 16 && self.bucket_count >= 8 && self.has_scene_color_range_balance()
+    }
+
+    fn has_low_bucket_playfield_brightness(self) -> bool {
+        if self.samples == 0 {
+            return false;
+        }
+        let strongest = self.red_sum.max(self.green_sum).max(self.blue_sum);
+        let weakest = self.red_sum.min(self.green_sum).min(self.blue_sum);
+        weakest >= self.samples.saturating_mul(64) && strongest >= self.samples.saturating_mul(96)
+    }
+
+    fn has_scene_color_range_balance(self) -> bool {
         let red_range = self.red_max.saturating_sub(self.red_min);
         let green_range = self.green_max.saturating_sub(self.green_min);
         let blue_range = self.blue_max.saturating_sub(self.blue_min);
@@ -5367,6 +12518,16 @@ impl DisplayColorStats {
                 >= self.bottom_band_samples.saturating_mul(4);
 
         has_caption_pixels && (dark_subtitle_band || bright_caption_panel)
+    }
+
+    fn has_caption_text_band(self) -> bool {
+        if self.samples == 0 || self.bottom_band_samples == 0 {
+            return false;
+        }
+
+        self.bottom_caption_samples.saturating_mul(1_000) >= self.samples.saturating_mul(3)
+            && self.bottom_dark_samples.saturating_mul(100)
+                >= self.bottom_band_samples.saturating_mul(15)
     }
 
     fn json(self) -> String {
@@ -5414,10 +12575,14 @@ struct GpuDrawTrace {
     stats: TexturedDrawStats,
     words: Vec<u32>,
     points: Vec<Point>,
+    uvs: Vec<TextureCoordinate>,
+    texture_window: Option<TextureWindow>,
+    texture_options: Option<TextureDrawOptions>,
     source: Option<GpuCommandSource>,
 }
 
 impl GpuDrawTrace {
+    #[cfg(test)]
     fn textured(
         kind: &'static str,
         texture_page: u16,
@@ -5426,6 +12591,37 @@ impl GpuDrawTrace {
         stats: TexturedDrawStats,
         words: &[u32],
         points: &[Point],
+        source: Option<&GpuCommandSource>,
+    ) -> Self {
+        let textured_points = points
+            .iter()
+            .copied()
+            .map(|point| TexturedPoint { point, u: 0, v: 0 })
+            .collect::<Vec<_>>();
+        Self::textured_with_options(
+            kind,
+            texture_page,
+            clut,
+            bounds,
+            stats,
+            words,
+            &textured_points,
+            TextureWindow::default(),
+            TextureDrawOptions::opaque_raw(),
+            source,
+        )
+    }
+
+    fn textured_with_options(
+        kind: &'static str,
+        texture_page: u16,
+        clut: u16,
+        bounds: DrawBounds,
+        stats: TexturedDrawStats,
+        words: &[u32],
+        textured_points: &[TexturedPoint],
+        texture_window: TextureWindow,
+        texture_options: TextureDrawOptions,
         source: Option<&GpuCommandSource>,
     ) -> Self {
         Self {
@@ -5437,7 +12633,16 @@ impl GpuDrawTrace {
             bounds,
             stats,
             words: words.to_vec(),
-            points: points.to_vec(),
+            points: textured_points.iter().map(|point| point.point).collect(),
+            uvs: textured_points
+                .iter()
+                .map(|point| TextureCoordinate {
+                    u: point.u,
+                    v: point.v,
+                })
+                .collect(),
+            texture_window: Some(texture_window),
+            texture_options: Some(texture_options),
             source: source.cloned(),
         }
     }
@@ -5460,6 +12665,9 @@ impl GpuDrawTrace {
             stats: TexturedDrawStats::default(),
             words: words.to_vec(),
             points: points.to_vec(),
+            uvs: Vec::new(),
+            texture_window: None,
+            texture_options: None,
             source: source.cloned(),
         }
     }
@@ -5482,7 +12690,7 @@ impl GpuDrawTrace {
     }
 
     fn is_focus_candidate(&self) -> bool {
-        if self.kind != "textured_quad" && self.kind != "textured_triangle" {
+        if !self.is_textured_polygon() {
             return false;
         }
         if self.stats.written_pixels == 0 {
@@ -5497,6 +12705,20 @@ impl GpuDrawTrace {
             right: 448,
             bottom: 430,
         })
+    }
+
+    fn is_textured_polygon(&self) -> bool {
+        matches!(
+            self.kind,
+            "textured_quad"
+                | "textured_triangle"
+                | "shaded_textured_quad"
+                | "shaded_textured_triangle"
+        )
+    }
+
+    fn is_textured_display_draw(&self) -> bool {
+        self.is_textured_polygon() || self.kind == "textured_rect"
     }
 
     fn overlaps_playfield(&self) -> bool {
@@ -5518,26 +12740,38 @@ impl GpuDrawTrace {
 
     fn json(&self) -> String {
         format!(
-            "{{\"sequence\":{},\"kind\":\"{}\",\"source\":{},\"texture_page\":{},\"texture_page_hex\":{},\"clut\":{},\"clut_hex\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"points\":[{}],\"words\":[{}],\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"first_color\":{},\"first_color_hex\":\"0x{:04x}\",\"last_color\":{},\"last_color_hex\":\"0x{:04x}\",\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
+            "{{\"sequence\":{},\"kind\":\"{}\",\"source\":{},\"texture_page\":{},\"texture_page_hex\":{},\"texture_page_mode\":{},\"texture_origin\":{},\"clut\":{},\"clut_hex\":{},\"clut_origin\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"points\":[{}],\"uvs\":[{}],\"texture_window\":{},\"texture_options\":{},\"words\":[{}],\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"texture_nonzero_samples\":{},\"zero_texel_samples\":{},\"clut_nonzero_samples\":{},\"clut_blank_samples\":{},\"palette_fallback_samples\":{},\"nonzero_texel_transparent_samples\":{},\"first_color\":{},\"first_color_hex\":\"0x{:04x}\",\"last_color\":{},\"last_color_hex\":\"0x{:04x}\",\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
             self.sequence,
             self.kind,
             optional_gpu_source_json(self.source.as_ref()),
             optional_u16_json(self.texture_page),
             optional_u16_hex_json(self.texture_page),
+            optional_texture_page_mode_json(self.texture_page),
+            optional_texture_origin_json(self.texture_page),
             optional_u16_json(self.clut),
             optional_u16_hex_json(self.clut),
+            optional_clut_origin_json(self.clut),
             optional_u32_json(self.color),
             optional_u32_hex_json(self.color),
             self.bounds.json(),
             self.bounds.area(),
             self.score(),
             points_json(&self.points),
+            texture_coordinates_json(&self.uvs),
+            optional_texture_window_json(self.texture_window),
+            optional_texture_options_json(self.texture_options),
             words_json(&self.words),
             self.stats.sampled_pixels,
             self.stats.drawn_pixels,
             self.stats.written_pixels,
             self.stats.clipped_pixels,
             self.stats.transparent_pixels,
+            self.stats.texture_nonzero_samples,
+            self.stats.zero_texel_samples,
+            self.stats.clut_nonzero_samples,
+            self.stats.clut_blank_samples,
+            self.stats.palette_fallback_samples,
+            self.stats.nonzero_texel_transparent_samples,
             self.stats.first_color,
             self.stats.first_color,
             self.stats.last_color,
@@ -5550,24 +12784,38 @@ impl GpuDrawTrace {
 
     fn compact_json(&self) -> String {
         format!(
-            "{{\"sequence\":{},\"kind\":\"{}\",\"source\":{},\"texture_page\":{},\"texture_page_hex\":{},\"clut\":{},\"clut_hex\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
+            "{{\"sequence\":{},\"kind\":\"{}\",\"source\":{},\"texture_page\":{},\"texture_page_hex\":{},\"texture_page_mode\":{},\"texture_origin\":{},\"clut\":{},\"clut_hex\":{},\"clut_origin\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"points\":[{}],\"uvs\":[{}],\"texture_window\":{},\"texture_options\":{},\"words\":[{}],\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"texture_nonzero_samples\":{},\"zero_texel_samples\":{},\"clut_nonzero_samples\":{},\"clut_blank_samples\":{},\"palette_fallback_samples\":{},\"nonzero_texel_transparent_samples\":{},\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
             self.sequence,
             self.kind,
             optional_gpu_source_json(self.source.as_ref()),
             optional_u16_json(self.texture_page),
             optional_u16_hex_json(self.texture_page),
+            optional_texture_page_mode_json(self.texture_page),
+            optional_texture_origin_json(self.texture_page),
             optional_u16_json(self.clut),
             optional_u16_hex_json(self.clut),
+            optional_clut_origin_json(self.clut),
             optional_u32_json(self.color),
             optional_u32_hex_json(self.color),
             self.bounds.json(),
             self.bounds.area(),
             self.score(),
+            points_json(&self.points),
+            texture_coordinates_json(&self.uvs),
+            optional_texture_window_json(self.texture_window),
+            optional_texture_options_json(self.texture_options),
+            words_json(&self.words),
             self.stats.sampled_pixels,
             self.stats.drawn_pixels,
             self.stats.written_pixels,
             self.stats.clipped_pixels,
             self.stats.transparent_pixels,
+            self.stats.texture_nonzero_samples,
+            self.stats.zero_texel_samples,
+            self.stats.clut_nonzero_samples,
+            self.stats.clut_blank_samples,
+            self.stats.palette_fallback_samples,
+            self.stats.nonzero_texel_transparent_samples,
             self.stats.color_hash,
             self.stats.color_hash,
             self.stats.color_changes
@@ -5694,20 +12942,26 @@ impl Gp0CommandTrace {
 struct Gp1CommandTrace {
     command: u32,
     value: u32,
+    source: Option<GpuCommandSource>,
 }
 
 impl Gp1CommandTrace {
-    fn new(value: u32) -> Self {
+    fn new(value: u32, source: Option<&GpuCommandSource>) -> Self {
         Self {
             command: value >> 24,
             value,
+            source: source.cloned(),
         }
     }
 
     fn json(&self) -> String {
         format!(
-            "{{\"command\":{},\"command_hex\":\"0x{:02x}\",\"value\":{},\"value_hex\":\"0x{:08x}\"}}",
-            self.command, self.command, self.value, self.value
+            "{{\"command\":{},\"command_hex\":\"0x{:02x}\",\"value\":{},\"value_hex\":\"0x{:08x}\",\"source\":{}}}",
+            self.command,
+            self.command,
+            self.value,
+            self.value,
+            optional_gpu_source_json(self.source.as_ref())
         )
     }
 }
@@ -5867,7 +13121,7 @@ fn display_dimensions_from_registers(
 ) -> (usize, usize) {
     let (status_width, status_height) = display_dimensions_from_status(status);
     let width = display_width_from_horizontal_range(status_width, horizontal_range);
-    let height = display_height_from_vertical_range(status_height, vertical_range);
+    let height = display_height_from_vertical_range(status, status_height, vertical_range);
     (width, height)
 }
 
@@ -5902,7 +13156,11 @@ fn display_width_from_horizontal_range(status_width: usize, horizontal_range: u3
     ranged_width.min(status_width).min(VRAM_WIDTH)
 }
 
-fn display_height_from_vertical_range(status_height: usize, vertical_range: u32) -> usize {
+fn display_height_from_vertical_range(
+    status: u32,
+    status_height: usize,
+    vertical_range: u32,
+) -> usize {
     let start = vertical_range & 0x03ff;
     let end = (vertical_range >> 10) & 0x03ff;
     if end <= start {
@@ -5910,7 +13168,21 @@ fn display_height_from_vertical_range(status_height: usize, vertical_range: u32)
     }
 
     let ranged_height = (end - start).max(1) as usize;
+    if high_vertical_resolution_status(status)
+        && status_height >= DEFAULT_DISPLAY_HEIGHT * 2
+        && ranged_height <= status_height / 2
+    {
+        return ranged_height
+            .saturating_mul(2)
+            .min(status_height)
+            .min(VRAM_HEIGHT);
+    }
+
     ranged_height.min(status_height).min(VRAM_HEIGHT)
+}
+
+fn high_vertical_resolution_status(status: u32) -> bool {
+    status & (1 << 19) != 0 && status & (1 << 22) != 0
 }
 
 fn xy(value: u32) -> (i32, i32) {
@@ -5967,6 +13239,24 @@ fn combine_textured_draw_stats(
         transparent_pixels: first
             .transparent_pixels
             .saturating_add(second.transparent_pixels),
+        texture_nonzero_samples: first
+            .texture_nonzero_samples
+            .saturating_add(second.texture_nonzero_samples),
+        zero_texel_samples: first
+            .zero_texel_samples
+            .saturating_add(second.zero_texel_samples),
+        clut_nonzero_samples: first
+            .clut_nonzero_samples
+            .saturating_add(second.clut_nonzero_samples),
+        clut_blank_samples: first
+            .clut_blank_samples
+            .saturating_add(second.clut_blank_samples),
+        palette_fallback_samples: first
+            .palette_fallback_samples
+            .saturating_add(second.palette_fallback_samples),
+        nonzero_texel_transparent_samples: first
+            .nonzero_texel_transparent_samples
+            .saturating_add(second.nonzero_texel_transparent_samples),
         first_color: if first.drawn_pixels != 0 {
             first.first_color
         } else {
@@ -6076,6 +13366,10 @@ fn color(value: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
+fn command_color(value: u32) -> u32 {
+    value & 0x00ff_ffff
+}
+
 fn clut(value: u32) -> u16 {
     (value >> 16) as u16
 }
@@ -6086,16 +13380,133 @@ fn texture_page(value: u32) -> u16 {
 
 fn texture_draw_options(command_word: u32, texture_page: u16) -> TextureDrawOptions {
     let command = (command_word >> 24) as u8;
+    let allow_sprite_flip =
+        matches!(command, 0x64..=0x7f) && !texture_page_uses_zn_extended_origin_bits(texture_page);
+    let allow_palette_fallback = !matches!(command, 0x24..=0x3f)
+        && !zn_low_bank_title_rect_palette_fallback_is_risky(command, texture_page);
     TextureDrawOptions {
-        primitive_color: color(command_word),
+        primitive_color: command_word & 0x00ff_ffff,
         raw_texture: command & 0x01 != 0,
         semi_transparent: command & 0x02 != 0,
         semi_transparency_mode: ((texture_page >> 5) & 0x03) as u8,
         set_mask_bit: false,
         check_mask_bit: false,
-        texture_flip_x: texture_page & 0x1000 != 0,
-        texture_flip_y: texture_page & 0x2000 != 0,
+        texture_flip_x: allow_sprite_flip && texture_page & 0x1000 != 0,
+        texture_flip_y: allow_sprite_flip && texture_page & 0x2000 != 0,
+        allow_palette_fallback,
     }
+}
+
+fn zn_low_bank_title_rect_palette_fallback_is_risky(command: u8, texture_page: u16) -> bool {
+    let texture_mode = (texture_page >> 7) & 0x03;
+    matches!(command, 0x64..=0x7f)
+        && texture_mode == 1
+        && texture_page & 0x0200 != 0
+        && texture_page & 0x0010 != 0
+        && texture_page & 0x0800 == 0
+        && texture_page & 0x2000 == 0
+}
+
+fn should_allow_zn_low_bank_screen_rect_palette_fallback(
+    command_word: u32,
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) -> bool {
+    let command = (command_word >> 24) as u8;
+    if !matches!(command, 0x64..=0x67)
+        || !zn_low_bank_title_rect_palette_fallback_is_risky(command, texture_page)
+    {
+        return false;
+    }
+
+    let clut_row = clut_row(clut);
+    if !(480..512).contains(&clut_row) {
+        return false;
+    }
+
+    let width = bounds.right.saturating_sub(bounds.left).saturating_add(1);
+    let height = bounds.bottom.saturating_sub(bounds.top).saturating_add(1);
+    let screen_quadrant_rect = width >= 240
+        && height >= 220
+        && bounds.area() >= 50_000
+        && bounds.overlaps(DrawBounds {
+            left: 0,
+            top: 0,
+            right: 511,
+            bottom: 479,
+        });
+
+    screen_quadrant_rect
+}
+
+fn should_skip_noisy_4bpp_title_draw(texture_page: u16, clut: u16, bounds: DrawBounds) -> bool {
+    let texture_mode = (texture_page >> 7) & 0x03;
+    if texture_mode != 0 {
+        return false;
+    }
+
+    if should_skip_low_bank_fullscreen_atlas_blit(texture_page, clut, bounds) {
+        return true;
+    }
+
+    if texture_page != 0x0039 {
+        return false;
+    }
+
+    let row = clut_row(clut);
+    let uses_corrupt_title_clut_band =
+        (485..=501).contains(&row) || ((clut & 0x003f) == 0 && row >= 498);
+    let visible_title_overlay = bounds.overlaps(DrawBounds {
+        left: 0,
+        top: 96,
+        right: 511,
+        bottom: 479,
+    });
+
+    uses_corrupt_title_clut_band
+        && visible_title_overlay
+        && bounds.right >= 128
+        && bounds.bottom >= 120
+}
+
+fn should_skip_low_bank_fullscreen_atlas_blit(
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) -> bool {
+    if !matches!(texture_page, 0x002f | 0x003f) || !matches!(clut, 0x7c40 | 0x7c80 | 0x7cc0) {
+        return false;
+    }
+
+    let width = bounds.right.saturating_sub(bounds.left).saturating_add(1);
+    let height = bounds.bottom.saturating_sub(bounds.top).saturating_add(1);
+    let covers_screen_quadrant = width >= 240
+        && height >= 220
+        && bounds.overlaps(DrawBounds {
+            left: 0,
+            top: 0,
+            right: 511,
+            bottom: 479,
+        });
+
+    covers_screen_quadrant && bounds.area() >= 50_000
+}
+
+fn clut_row(clut: u16) -> u16 {
+    (clut >> 6) & 0x03ff
+}
+
+fn native_use_alternate_quad_split() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_ALT_QUAD_SPLIT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn texture_page_uses_zn_extended_origin_bits(texture_page: u16) -> bool {
+    texture_page & 0x2000 != 0 && texture_page & 0x0e00 != 0
 }
 
 fn texture_coordinate(value: u32) -> TextureCoordinate {
@@ -6129,6 +13540,58 @@ fn optional_u16_hex_json(value: Option<u16>) -> String {
     value.map_or_else(|| "null".to_string(), |value| format!("\"0x{value:04x}\""))
 }
 
+fn optional_texture_page_mode_json(value: Option<u16>) -> String {
+    value.map_or_else(
+        || "null".to_string(),
+        |value| texture_page_color_mode_for_diagnostics(value).to_string(),
+    )
+}
+
+fn optional_texture_origin_json(value: Option<u16>) -> String {
+    value.map_or_else(
+        || "null".to_string(),
+        |value| {
+            let (x, y) = texture_page_origin_for_diagnostics(value);
+            format!("{{\"x\":{},\"y\":{}}}", x, y)
+        },
+    )
+}
+
+fn optional_clut_origin_json(value: Option<u16>) -> String {
+    value.map_or_else(
+        || "null".to_string(),
+        |value| {
+            let (x, y) = clut_origin_for_diagnostics(value);
+            format!("{{\"x\":{},\"y\":{}}}", x, y)
+        },
+    )
+}
+
+fn optional_texture_window_json(value: Option<TextureWindow>) -> String {
+    value.map_or_else(|| "null".to_string(), TextureWindow::json)
+}
+
+fn optional_texture_options_json(value: Option<TextureDrawOptions>) -> String {
+    value.map_or_else(
+        || "null".to_string(),
+        |value| {
+            format!(
+                "{{\"primitive_color\":{},\"primitive_color_hex\":\"0x{:06x}\",\"raw_texture\":{},\"semi_transparent\":{},\"semi_transparency_mode\":{},\"set_mask_bit\":{},\"check_mask_bit\":{},\"texture_flip_x\":{},\"texture_flip_y\":{},\"allow_palette_fallback\":{}}}",
+                value.primitive_color,
+                value.primitive_color,
+                value.raw_texture,
+                value.semi_transparent,
+                value.semi_transparency_mode,
+                value.set_mask_bit,
+                value.check_mask_bit,
+                value.texture_flip_x,
+                value.texture_flip_y,
+                value.allow_palette_fallback
+            )
+        },
+    )
+}
+
 fn optional_gpu_source_json(value: Option<&GpuCommandSource>) -> String {
     value.map_or_else(|| "null".to_string(), GpuCommandSource::json)
 }
@@ -6138,6 +13601,10 @@ fn optional_str_json(value: Option<&str>) -> String {
         || "null".to_string(),
         |value| format!("\"{}\"", escape_json(value)),
     )
+}
+
+fn optional_raw_json(value: Option<&str>) -> &str {
+    value.unwrap_or("null")
 }
 
 fn escape_json(value: &str) -> String {
@@ -6170,6 +13637,13 @@ fn points_json(points: &[Point]) -> String {
         .join(",")
 }
 
+fn texture_coordinates_json(uvs: &[TextureCoordinate]) -> String {
+    uvs.iter()
+        .map(|uv| format!("{{\"u\":{},\"v\":{}}}", uv.u, uv.v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn framebuffer_window_json(window: FrameBufferWindow) -> String {
     format!(
         "{{\"x\":{},\"y\":{},\"pixel_count\":{},\"nonzero_pixels\":{},\"bright_pixels\":{},\"avg_luma\":{},\"max_luma\":{},\"detail_edges\":{},\"checksum\":{}}}",
@@ -6187,6 +13661,47 @@ fn framebuffer_window_json(window: FrameBufferWindow) -> String {
 
 fn average_luma(stats: FrameBufferStats) -> u64 {
     stats.luma_sum.checked_div(stats.pixel_count).unwrap_or(0)
+}
+
+fn primitive_workspace_plane_color(rgb: u32) -> bool {
+    let red = (rgb >> 16) & 0xff;
+    let green = (rgb >> 8) & 0xff;
+    let blue = rgb & 0xff;
+    let max_channel = red.max(green).max(blue);
+    let min_channel = red.min(green).min(blue);
+
+    max_channel >= 192 && max_channel.saturating_sub(min_channel) >= 112
+}
+
+fn primitive_workspace_tear_color(rgb: u32) -> bool {
+    let red = (rgb >> 16) & 0xff;
+    let green = (rgb >> 8) & 0xff;
+    let blue = rgb & 0xff;
+    let max_channel = red.max(green).max(blue);
+    let luma = (red * 30 + green * 59 + blue * 11) / 100;
+
+    luma <= 32
+        || (red >= 144 && green <= 96 && blue <= 128)
+        || (red >= 144 && green <= 96 && blue >= 144)
+        || (red <= 96 && green >= 144 && blue >= 144)
+        || (max_channel >= 208 && red.max(blue).saturating_sub(green) >= 96)
+}
+
+fn primitive_workspace_dark_tear_color(rgb: u32) -> bool {
+    let red = (rgb >> 16) & 0xff;
+    let green = (rgb >> 8) & 0xff;
+    let blue = rgb & 0xff;
+    let luma = (red * 30 + green * 59 + blue * 11) / 100;
+
+    luma <= 32
+}
+
+fn primitive_workspace_color_bucket(rgb: u32) -> u32 {
+    let red = (rgb >> 16) & 0xff;
+    let green = (rgb >> 8) & 0xff;
+    let blue = rgb & 0xff;
+
+    ((red >> 5) << 6) | ((green >> 5) << 3) | (blue >> 5)
 }
 
 fn screen_observation_worth_saving(stats: FrameBufferStats) -> bool {
@@ -6220,6 +13735,10 @@ fn screen_observation_score(stats: FrameBufferStats) -> u64 {
         } else {
             0
         })
+}
+
+fn minimum_live_draw_overlap_area_for_dimensions(width: usize, height: usize) -> i64 {
+    ((width as i64).saturating_mul(height as i64) / 64).max(512)
 }
 
 fn is_detailed_observation(stats: FrameBufferStats) -> bool {
@@ -6336,6 +13855,12 @@ fn resolved_display_candidate_has_scene_signal(
 fn is_sparse_display(display_stats: FrameBufferStats) -> bool {
     let sparse_display_cutoff = (DEFAULT_DISPLAY_WIDTH * DEFAULT_DISPLAY_HEIGHT / 64) as u64;
     display_stats.nonzero_pixels < sparse_display_cutoff
+}
+
+fn high_vertical_single_field_is_sparse(stats: FrameBufferStats) -> bool {
+    let pixel_count = stats.pixel_count.max(1);
+    stats.nonzero_pixels < pixel_count / 128
+        || (stats.bright_pixels < pixel_count / 512 && average_luma(stats) < 4)
 }
 
 fn is_likely_texture_page_origin(x: usize, y: usize) -> bool {
@@ -6661,8 +14186,42 @@ pub struct Controller {
     security_response: Vec<u8>,
     cat702: [Option<Cat702>; 2],
     zn_mcu: ZnMcu,
+    input_activity: ControllerInputActivity,
     response: u8,
     irq_requested: bool,
+    recent_security_transfers: Vec<SecurityTransferTraceEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControllerInputActivity {
+    pub p1_input_reads: u64,
+    pub p1_up_active_reads: u64,
+    pub p1_down_active_reads: u64,
+    pub p1_left_active_reads: u64,
+    pub p1_right_active_reads: u64,
+    pub p1_start_active_reads: u64,
+    pub p1_punch_active_reads: u64,
+    pub p1_kick_active_reads: u64,
+    pub p1_beast_active_reads: u64,
+    pub p1_guard_active_reads: u64,
+}
+
+impl ControllerInputActivity {
+    fn json(self) -> String {
+        format!(
+            "{{\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p1_guard_active_reads\":{}}}",
+            self.p1_input_reads,
+            self.p1_up_active_reads,
+            self.p1_down_active_reads,
+            self.p1_left_active_reads,
+            self.p1_right_active_reads,
+            self.p1_start_active_reads,
+            self.p1_punch_active_reads,
+            self.p1_kick_active_reads,
+            self.p1_beast_active_reads,
+            self.p1_guard_active_reads
+        )
+    }
 }
 
 impl Default for Controller {
@@ -6679,8 +14238,10 @@ impl Default for Controller {
             security_response: Vec::new(),
             cat702: [None, None],
             zn_mcu: ZnMcu::default(),
+            input_activity: ControllerInputActivity::default(),
             response: 0xff,
             irq_requested: false,
+            recent_security_transfers: Vec::new(),
         }
     }
 }
@@ -6721,6 +14282,81 @@ impl Controller {
         self.zn_mcu.diagnostic_json()
     }
 
+    pub fn diagnostic_json(&self) -> String {
+        format!(
+            "{{\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"last_write\":{},\"last_write_hex\":\"0x{:04x}\",\"status\":{},\"status_hex\":\"0x{:04x}\",\"mode\":{},\"mode_hex\":\"0x{:04x}\",\"control\":{},\"control_hex\":\"0x{:04x}\",\"baud\":{},\"baud_hex\":\"0x{:04x}\",\"transfer_index\":{},\"security_transfer_index\":{},\"security_response_loaded\":{},\"security_response_len\":{},\"response\":{},\"response_hex\":\"0x{:02x}\",\"irq_requested\":{},\"cat702\":[{}],\"zn_mcu\":{},\"input_activity\":{},\"recent_security_transfers\":[{}]}}",
+            self.p1_state,
+            self.p1_state,
+            self.last_write,
+            self.last_write,
+            self.status,
+            self.status,
+            self.mode,
+            self.mode,
+            self.control,
+            self.control,
+            self.baud,
+            self.baud,
+            self.transfer_index,
+            self.security_transfer_index,
+            !self.security_response.is_empty(),
+            self.security_response.len(),
+            self.response,
+            self.response,
+            self.irq_requested,
+            self.cat702_diagnostic_json(),
+            self.zn_mcu.diagnostic_json(),
+            self.input_activity.json(),
+            self.recent_security_transfers_json()
+        )
+    }
+
+    pub fn security_compact_json(&self) -> String {
+        format!(
+            "{{\"last_write\":{},\"last_write_hex\":\"0x{:04x}\",\"status\":{},\"status_hex\":\"0x{:04x}\",\"control\":{},\"control_hex\":\"0x{:04x}\",\"transfer_index\":{},\"security_transfer_index\":{},\"security_response_loaded\":{},\"security_response_len\":{},\"response\":{},\"response_hex\":\"0x{:02x}\",\"irq_requested\":{},\"cat702\":[{}],\"zn_mcu\":{},\"input_activity\":{}}}",
+            self.last_write,
+            self.last_write,
+            self.status,
+            self.status,
+            self.control,
+            self.control,
+            self.transfer_index,
+            self.security_transfer_index,
+            !self.security_response.is_empty(),
+            self.security_response.len(),
+            self.response,
+            self.response,
+            self.irq_requested,
+            self.cat702_diagnostic_json(),
+            self.zn_mcu.diagnostic_json(),
+            self.input_activity.json()
+        )
+    }
+
+    pub fn input_activity(&self) -> ControllerInputActivity {
+        self.input_activity
+    }
+
+    fn cat702_diagnostic_json(&self) -> String {
+        self.cat702
+            .iter()
+            .enumerate()
+            .map(|(index, cat702)| match cat702 {
+                Some(cat702) => cat702.diagnostic_json(index),
+                None => format!("{{\"index\":{},\"loaded\":false}}", index),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn recent_security_transfers_json(&self) -> String {
+        self.recent_security_transfers
+            .iter()
+            .map(SecurityTransferTraceEntry::json)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     fn irq_requested(&self) -> bool {
         self.irq_requested
     }
@@ -6750,11 +14386,24 @@ impl Controller {
         self.last_write = value;
         let value = value as u8;
         if self.cat702_selected() {
-            self.response = self.transfer_cat702_byte(value);
+            let cat702_response = self.transfer_cat702_byte(value);
+            self.response = if self.zn_mcu.is_selected() {
+                cat702_response & self.zn_mcu.shared_bus_dataout_byte(value)
+            } else {
+                cat702_response
+            };
+            let device = if self.zn_mcu.is_selected() {
+                "cat702+zn_mcu_passive"
+            } else {
+                "cat702"
+            };
+            self.record_security_transfer(device, value, self.response);
         } else if self.zn_mcu.is_selected() {
             self.response = self.zn_mcu.transfer_byte();
+            self.record_security_transfer("zn_mcu", value, self.response);
         } else if self.security_response.is_empty() || value == 0x01 {
-            self.response = match self.transfer_index {
+            let transfer_index = self.transfer_index;
+            self.response = match transfer_index {
                 0 => 0xff,
                 1 if value == 0x42 => 0x41,
                 1 => 0xff,
@@ -6763,17 +14412,48 @@ impl Controller {
                 4 => (self.p1_state >> 8) as u8,
                 _ => 0xff,
             };
+            if transfer_index == 3 {
+                self.record_p1_input_read();
+            }
             self.transfer_index = if value == 0x01 {
                 1
             } else {
                 self.transfer_index.saturating_add(1)
             };
+            self.record_security_transfer("controller", value, self.response);
         } else {
             self.response = self.security_response_byte();
             self.security_transfer_index = self.security_transfer_index.saturating_add(1);
+            self.record_security_transfer("bios_security", value, self.response);
         }
         self.irq_requested = true;
         self.status |= 0x0003 | SIO_STATUS_IRQ_REQUEST;
+    }
+
+    fn record_security_transfer(&mut self, device: &'static str, request: u8, response: u8) {
+        if self.recent_security_transfers.len() >= SIO_SECURITY_TRANSFER_TRACE_LIMIT {
+            self.recent_security_transfers.remove(0);
+        }
+
+        self.recent_security_transfers
+            .push(SecurityTransferTraceEntry {
+                device,
+                request,
+                response,
+                cat702_1_selected: self
+                    .cat702
+                    .first()
+                    .and_then(Option::as_ref)
+                    .is_some_and(Cat702::is_selected),
+                cat702_2_selected: self
+                    .cat702
+                    .get(1)
+                    .and_then(Option::as_ref)
+                    .is_some_and(Cat702::is_selected),
+                zn_mcu_selected: self.zn_mcu.is_selected(),
+                zn_mcu_analog_read: self.zn_mcu.analog_read,
+                zn_mcu_trackball_read: self.zn_mcu.trackball_read,
+            });
     }
 
     fn write_control(&mut self, value: u16) {
@@ -6840,6 +14520,83 @@ impl Controller {
         clear_if(&mut state, 0x8000, buttons.guard);
         clear_if(&mut state, 0x0008, buttons.start);
         self.p1_state = state;
+        self.zn_mcu.set_input(buttons);
+    }
+
+    fn record_p1_input_read(&mut self) {
+        self.input_activity.p1_input_reads = self.input_activity.p1_input_reads.saturating_add(1);
+        increment_if_u64(
+            &mut self.input_activity.p1_up_active_reads,
+            self.p1_state & 0x0010 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_down_active_reads,
+            self.p1_state & 0x0040 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_left_active_reads,
+            self.p1_state & 0x0080 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_right_active_reads,
+            self.p1_state & 0x0020 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_start_active_reads,
+            self.p1_state & 0x0008 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_punch_active_reads,
+            self.p1_state & 0x4000 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_kick_active_reads,
+            self.p1_state & 0x2000 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_beast_active_reads,
+            self.p1_state & 0x1000 == 0,
+        );
+        increment_if_u64(
+            &mut self.input_activity.p1_guard_active_reads,
+            self.p1_state & 0x8000 == 0,
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SecurityTransferTraceEntry {
+    device: &'static str,
+    request: u8,
+    response: u8,
+    cat702_1_selected: bool,
+    cat702_2_selected: bool,
+    zn_mcu_selected: bool,
+    zn_mcu_analog_read: bool,
+    zn_mcu_trackball_read: bool,
+}
+
+impl SecurityTransferTraceEntry {
+    fn json(&self) -> String {
+        format!(
+            "{{\"device\":\"{}\",\"request\":{},\"request_hex\":\"0x{:02x}\",\"response\":{},\"response_hex\":\"0x{:02x}\",\"cat702_1_selected\":{},\"cat702_2_selected\":{},\"zn_mcu_selected\":{},\"zn_mcu_analog_read\":{},\"zn_mcu_trackball_read\":{}}}",
+            self.device,
+            self.request,
+            self.request,
+            self.response,
+            self.response,
+            self.cat702_1_selected,
+            self.cat702_2_selected,
+            self.zn_mcu_selected,
+            self.zn_mcu_analog_read,
+            self.zn_mcu_trackball_read
+        )
+    }
+}
+
+fn increment_if_u64(counter: &mut u64, condition: bool) {
+    if condition {
+        *counter = counter.saturating_add(1);
     }
 }
 
@@ -6848,10 +14605,17 @@ struct ZnMcu {
     analog_read: bool,
     trackball_read: bool,
     selected: bool,
-    transfer_index: usize,
-    packet: Vec<u8>,
+    dsw: u8,
+    input: ActionButtons,
+    send: [u8; 9],
+    databytes: usize,
+    byte_index: usize,
+    bit_index: u8,
+    dsr: bool,
+    txd: bool,
     select_transitions: u64,
     transferred_bytes: u64,
+    transferred_bits: u64,
     last_response: u8,
 }
 
@@ -6861,10 +14625,17 @@ impl Default for ZnMcu {
             analog_read: false,
             trackball_read: false,
             selected: false,
-            transfer_index: 0,
-            packet: Vec::new(),
+            dsw: 0x0f,
+            input: ActionButtons::default(),
+            send: [0; 9],
+            databytes: 0,
+            byte_index: 0,
+            bit_index: 0,
+            dsr: true,
+            txd: true,
             select_transitions: 0,
             transferred_bytes: 0,
+            transferred_bits: 0,
             last_response: 0xff,
         }
     }
@@ -6883,11 +14654,9 @@ impl ZnMcu {
         }
 
         if became_selected || (selected && mode_changed) {
-            self.transfer_index = 0;
-            self.rebuild_packet();
+            self.begin_transfer();
         } else if !selected && self.selected {
-            self.transfer_index = 0;
-            self.packet.clear();
+            self.end_transfer();
         }
 
         self.selected = selected;
@@ -6898,30 +14667,100 @@ impl ZnMcu {
     }
 
     fn reset_transfer(&mut self) {
-        self.transfer_index = 0;
+        self.byte_index = 0;
+        self.bit_index = 0;
+        self.txd = true;
         if self.selected {
-            self.rebuild_packet();
+            self.rebuild_send_buffer();
+        }
+    }
+
+    fn set_input(&mut self, input: ActionButtons) {
+        if self.input == input {
+            return;
+        }
+
+        self.input = input;
+        if self.selected {
+            self.rebuild_send_buffer();
+            if self.byte_index > self.databytes {
+                self.byte_index = 0;
+                self.bit_index = 0;
+            }
         }
     }
 
     fn transfer_byte(&mut self) -> u8 {
-        if self.packet.is_empty() {
-            self.rebuild_packet();
+        if !self.selected {
+            self.last_response = 0xff;
+            return 0xff;
+        }
+        if self.byte_index == 0 && self.bit_index == 0 {
+            self.rebuild_send_buffer();
         }
 
-        let response = self
-            .packet
-            .get(self.transfer_index)
-            .copied()
-            .unwrap_or(0xff);
-        self.transfer_index = self.transfer_index.saturating_add(1);
+        let mut response = 0u8;
+        for bit in 0..8 {
+            if self.clock_falling_edge_dataout() {
+                response |= 1 << bit;
+            }
+        }
         self.transferred_bytes = self.transferred_bytes.saturating_add(1);
         self.last_response = response;
         response
     }
 
-    fn rebuild_packet(&mut self) {
-        let databytes = if self.analog_read {
+    fn shared_bus_dataout_byte(&mut self, _request: u8) -> u8 {
+        // The ZN MCU is physically connected to the shared SIO RXD line, but
+        // CAT702 security exchanges send BIOS/license bytes rather than the
+        // MCU controller-poll protocol. Until the MCU is modeled at clock-edge
+        // level, keep its shared-line output passive-high so CAT702 traffic is
+        // not corrupted by the simplified packet helper.
+        self.last_response = 0xff;
+        0xff
+    }
+
+    fn begin_transfer(&mut self) {
+        self.byte_index = 0;
+        self.bit_index = 0;
+        self.dsr = false;
+        self.txd = true;
+        self.rebuild_send_buffer();
+        self.dsr = true;
+    }
+
+    fn end_transfer(&mut self) {
+        self.byte_index = 0;
+        self.bit_index = 0;
+        self.databytes = 0;
+        self.send = [0; 9];
+        self.dsr = true;
+        self.txd = true;
+    }
+
+    fn clock_falling_edge_dataout(&mut self) -> bool {
+        let data = if self.byte_index <= self.databytes && self.byte_index < self.send.len() {
+            self.send[self.byte_index]
+        } else {
+            0
+        };
+        self.txd = data & (1 << self.bit_index) != 0;
+        self.transferred_bits = self.transferred_bits.saturating_add(1);
+
+        self.bit_index = self.bit_index.saturating_add(1);
+        if self.bit_index == 8 {
+            self.bit_index = 0;
+            self.byte_index = self.byte_index.saturating_add(1);
+            if self.byte_index <= self.databytes {
+                self.dsr = true;
+            }
+        }
+
+        self.txd
+    }
+
+    fn rebuild_send_buffer(&mut self) {
+        self.databytes = if self.analog_read {
             8
         } else if self.trackball_read {
             6
@@ -6929,27 +14768,35 @@ impl ZnMcu {
             1
         };
 
-        self.packet.clear();
-        self.packet.push((databytes << 4) | 0x0f);
+        self.send = [0; 9];
+        self.send[0] = ((self.databytes as u8) << 4) | (self.dsw & 0x0f);
 
         if self.analog_read {
-            self.packet.extend([0xff; 8]);
+            self.send[1..=8].fill(0xff);
         } else if self.trackball_read {
-            self.packet.extend([0x00; 6]);
+            self.send[1..=6].fill(0x00);
         } else {
-            self.packet.push(0x00);
+            // MAME's ZN MCU model sends the DIP value in the header nibble and
+            // a zero payload byte for the default digital-input packet.
+            self.send[1] = 0x00;
         }
     }
 
     fn diagnostic_json(&self) -> String {
         format!(
-            "{{\"selected\":{},\"analog_read\":{},\"trackball_read\":{},\"transfer_index\":{},\"packet_len\":{},\"select_transitions\":{},\"transferred_bytes\":{},\"last_response\":{},\"last_response_hex\":\"0x{:02x}\"}}",
+            "{{\"selected\":{},\"analog_read\":{},\"trackball_read\":{},\"dsw\":{},\"dsw_hex\":\"0x{:02x}\",\"databytes\":{},\"byte_index\":{},\"bit_index\":{},\"dsr\":{},\"txd\":{},\"select_transitions\":{},\"transferred_bits\":{},\"transferred_bytes\":{},\"last_response\":{},\"last_response_hex\":\"0x{:02x}\"}}",
             self.selected,
             self.analog_read,
             self.trackball_read,
-            self.transfer_index,
-            self.packet.len(),
+            self.dsw,
+            self.dsw,
+            self.databytes,
+            self.byte_index,
+            self.bit_index,
+            self.dsr,
+            self.txd,
             self.select_transitions,
+            self.transferred_bits,
             self.transferred_bytes,
             self.last_response,
             self.last_response
@@ -6964,6 +14811,9 @@ struct Cat702 {
     state: u8,
     bit: u8,
     dataout: bool,
+    select_transitions: u64,
+    transferred_bits: u64,
+    last_datain: bool,
 }
 
 impl Cat702 {
@@ -6976,6 +14826,9 @@ impl Cat702 {
             state: 0,
             bit: 0,
             dataout: true,
+            select_transitions: 0,
+            transferred_bits: 0,
+            last_datain: true,
         }
     }
 
@@ -6984,6 +14837,7 @@ impl Cat702 {
             return;
         }
 
+        self.select_transitions = self.select_transitions.saturating_add(1);
         if select {
             self.dataout = true;
         } else {
@@ -6997,12 +14851,31 @@ impl Cat702 {
         !self.select
     }
 
+    fn diagnostic_json(&self, index: usize) -> String {
+        format!(
+            "{{\"index\":{},\"loaded\":true,\"select_line\":{},\"selected\":{},\"state\":{},\"state_hex\":\"0x{:02x}\",\"bit\":{},\"dataout\":{},\"select_transitions\":{},\"transferred_bits\":{},\"transferred_bytes\":{},\"last_datain\":{}}}",
+            index,
+            self.select,
+            self.is_selected(),
+            self.state,
+            self.state,
+            self.bit,
+            self.dataout,
+            self.select_transitions,
+            self.transferred_bits,
+            self.transferred_bits / 8,
+            self.last_datain
+        )
+    }
+
     fn transfer_bit(&mut self, datain: bool) -> bool {
         if self.select {
             self.dataout = true;
             return true;
         }
 
+        self.transferred_bits = self.transferred_bits.saturating_add(1);
+        self.last_datain = datain;
         if self.bit == 0 {
             self.apply_sbox(&Self::INITIAL_SBOX);
         }
@@ -7213,6 +15086,7 @@ impl Mdec {
                     &self.input_words,
                     &self.quant_luma,
                     &self.quant_chroma,
+                    &self.scale_table,
                     self.command,
                 );
             }
@@ -7312,6 +15186,7 @@ fn decode_mdec_macroblocks(
     words: &[u32],
     quant_luma: &[u8; 64],
     quant_chroma: &[u8; 64],
+    scale_table: &[i16; 64],
     command: u32,
 ) -> Vec<u32> {
     let halfwords = mdec_halfwords(words);
@@ -7320,22 +15195,22 @@ fn decode_mdec_macroblocks(
     let output_pixel_mask = mdec_rgb555_output_pixel_mask(command);
 
     while cursor < halfwords.len() {
-        let Some(cr) = read_mdec_block(&halfwords, &mut cursor, quant_chroma) else {
+        let Some(cr) = read_mdec_block(&halfwords, &mut cursor, quant_chroma, scale_table) else {
             break;
         };
-        let Some(cb) = read_mdec_block(&halfwords, &mut cursor, quant_chroma) else {
+        let Some(cb) = read_mdec_block(&halfwords, &mut cursor, quant_chroma, scale_table) else {
             break;
         };
-        let Some(y0) = read_mdec_block(&halfwords, &mut cursor, quant_luma) else {
+        let Some(y0) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
             break;
         };
-        let Some(y1) = read_mdec_block(&halfwords, &mut cursor, quant_luma) else {
+        let Some(y1) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
             break;
         };
-        let Some(y2) = read_mdec_block(&halfwords, &mut cursor, quant_luma) else {
+        let Some(y2) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
             break;
         };
-        let Some(y3) = read_mdec_block(&halfwords, &mut cursor, quant_luma) else {
+        let Some(y3) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
             break;
         };
 
@@ -7376,26 +15251,62 @@ fn flatten_mdec_rgb555_macroblocks_as_240p_strips(
     macroblocks: &[[u16; 16 * 16]],
 ) -> Option<Vec<u16>> {
     const MDEC_240P_MACROBLOCK_ROWS: usize = 15;
+    const MDEC_STRIP_MACROBLOCK_COLUMNS: usize = 4;
+    const MDEC_STRIP_WIDTH_PIXELS: usize = MDEC_STRIP_MACROBLOCK_COLUMNS * 16;
+    const MDEC_STRIP_HEIGHT_PIXELS: usize = 256;
+    const MDEC_320X240_MACROBLOCKS: usize = 20 * MDEC_240P_MACROBLOCK_ROWS;
 
-    if macroblocks.len() < MDEC_240P_MACROBLOCK_ROWS
-        || !macroblocks.len().is_multiple_of(MDEC_240P_MACROBLOCK_ROWS)
+    if macroblocks.len() < MDEC_240P_MACROBLOCK_ROWS {
+        return None;
+    }
+
+    let packed_len = if macroblocks.len().is_multiple_of(MDEC_240P_MACROBLOCK_ROWS) {
+        macroblocks.len()
+    } else if macroblocks.len() > MDEC_320X240_MACROBLOCKS {
+        MDEC_320X240_MACROBLOCKS
+    } else {
+        return None;
+    };
+    let macroblock_columns = packed_len / MDEC_240P_MACROBLOCK_ROWS;
+    if !(2..=64).contains(&macroblock_columns)
+        || !macroblock_columns.is_multiple_of(MDEC_STRIP_MACROBLOCK_COLUMNS)
     {
         return None;
     }
 
-    let macroblock_columns = macroblocks.len() / MDEC_240P_MACROBLOCK_ROWS;
-    if !(2..=64).contains(&macroblock_columns) {
-        return None;
-    }
-
-    let mut pixels = Vec::with_capacity(macroblocks.len().saturating_mul(16 * 16));
-    for column in 0..macroblock_columns {
-        for row in 0..MDEC_240P_MACROBLOCK_ROWS {
-            let source_index = row
-                .saturating_mul(macroblock_columns)
-                .saturating_add(column);
-            pixels.extend_from_slice(&macroblocks[source_index]);
+    let strip_count = macroblock_columns / MDEC_STRIP_MACROBLOCK_COLUMNS;
+    let packed_pixels = strip_count
+        .saturating_mul(MDEC_STRIP_WIDTH_PIXELS)
+        .saturating_mul(MDEC_STRIP_HEIGHT_PIXELS);
+    let mut pixels = Vec::with_capacity(
+        packed_pixels.saturating_add(
+            macroblocks
+                .len()
+                .saturating_sub(packed_len)
+                .saturating_mul(16 * 16),
+        ),
+    );
+    for strip in 0..strip_count {
+        let base_column = strip * MDEC_STRIP_MACROBLOCK_COLUMNS;
+        for macroblock_row in 0..MDEC_240P_MACROBLOCK_ROWS {
+            for pixel_row in 0..16 {
+                for strip_column in 0..MDEC_STRIP_MACROBLOCK_COLUMNS {
+                    let source_index = macroblock_row
+                        .saturating_mul(macroblock_columns)
+                        .saturating_add(base_column)
+                        .saturating_add(strip_column);
+                    let row_start = pixel_row * 16;
+                    pixels.extend_from_slice(&macroblocks[source_index][row_start..row_start + 16]);
+                }
+            }
         }
+        let padding_rows = MDEC_STRIP_HEIGHT_PIXELS - (MDEC_240P_MACROBLOCK_ROWS * 16);
+        pixels.extend(
+            std::iter::repeat(0).take(padding_rows.saturating_mul(MDEC_STRIP_WIDTH_PIXELS)),
+        );
+    }
+    for macroblock in &macroblocks[packed_len..] {
+        pixels.extend_from_slice(macroblock);
     }
     Some(pixels)
 }
@@ -7421,13 +15332,27 @@ fn mdec_halfwords(words: &[u32]) -> Vec<u16> {
     halfwords
 }
 
-fn read_mdec_block(halfwords: &[u16], cursor: &mut usize, quant: &[u8; 64]) -> Option<[i16; 64]> {
-    let first = *halfwords.get(*cursor)?;
-    *cursor += 1;
-    let qscale = ((first >> 10) & 0x3f).max(1) as i32;
+fn read_mdec_block(
+    halfwords: &[u16],
+    cursor: &mut usize,
+    quant: &[u8; 64],
+    scale_table: &[i16; 64],
+) -> Option<[i16; 64]> {
+    let first = loop {
+        let word = *halfwords.get(*cursor)?;
+        *cursor += 1;
+        if word != 0xfe00 {
+            break word;
+        }
+    };
+    let qscale = ((first >> 10) & 0x3f) as i32;
     let dc = sign_extend_10(first & 0x03ff) as i32;
     let mut coefficients = [0_i32; 64];
-    coefficients[0] = dc.saturating_mul(i32::from(quant[0]));
+    coefficients[0] = if qscale == 0 {
+        saturate_mdec_coefficient(dc.saturating_mul(2))
+    } else {
+        saturate_mdec_coefficient(dc.saturating_mul(i32::from(quant[0])))
+    };
     let mut zigzag_index = 0usize;
 
     while let Some(word) = halfwords.get(*cursor).copied() {
@@ -7441,14 +15366,38 @@ fn read_mdec_block(halfwords: &[u16], cursor: &mut usize, quant: &[u8; 64]) -> O
             continue;
         }
         let value = sign_extend_10(word & 0x03ff) as i32;
-        let natural_index = MDEC_ZIGZAG[zigzag_index];
-        coefficients[natural_index] = value
-            .saturating_mul(i32::from(quant[zigzag_index]))
-            .saturating_mul(qscale)
-            / 8;
+        if qscale == 0 {
+            coefficients[zigzag_index] = saturate_mdec_coefficient(value.saturating_mul(2));
+        } else {
+            let natural_index = MDEC_ZIGZAG[zigzag_index];
+            let quant_index = if native_mdec_quant_table_uses_natural_order() {
+                natural_index
+            } else {
+                zigzag_index
+            };
+            coefficients[natural_index] = saturate_mdec_coefficient(
+                value
+                    .saturating_mul(i32::from(quant[quant_index]))
+                    .saturating_mul(qscale)
+                    .saturating_add(4)
+                    / 8,
+            );
+        }
     }
 
-    Some(idct_8x8(&coefficients))
+    Some(idct_8x8_with_optional_scale(&coefficients, scale_table))
+}
+
+fn saturate_mdec_coefficient(value: i32) -> i32 {
+    value.clamp(-0x400, 0x3ff)
+}
+
+fn native_mdec_quant_table_uses_natural_order() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BR2_NATIVE_MDEC_QUANT_NATURAL_ORDER")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 fn idct_8x8(coefficients: &[i32; 64]) -> [i16; 64] {
@@ -7460,6 +15409,28 @@ fn idct_8x8(coefficients: &[i32; 64]) -> [i16; 64] {
             sum += coefficients[coefficient_index] as f64 * basis[output_index][coefficient_index];
         }
         block[output_index] = sum.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+    }
+    block
+}
+
+fn idct_8x8_with_optional_scale(coefficients: &[i32; 64], scale_table: &[i16; 64]) -> [i16; 64] {
+    if scale_table.iter().all(|value| *value == 0) {
+        return idct_8x8(coefficients);
+    }
+
+    let mut block = [0_i16; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            let mut sum = 0.0_f64;
+            for v in 0..8 {
+                for u in 0..8 {
+                    let vertical = f64::from(scale_table[y * 8 + v]) / 32768.0;
+                    let horizontal = f64::from(scale_table[x * 8 + u]) / 32768.0;
+                    sum += coefficients[v * 8 + u] as f64 * vertical * horizontal / 4.0;
+                }
+            }
+            block[y * 8 + x] = sum.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        }
     }
     block
 }
@@ -7575,22 +15546,39 @@ fn clear_if(state: &mut u16, mask: u16, pressed: bool) {
 
 #[cfg(test)]
 mod tests {
+    use crate::ActionButtons;
+
     use super::{
         ACCESS_WIDTH_16, ACCESS_WIDTH_32, Controller, DEFAULT_DISPLAY_HEIGHT,
-        DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS, DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS,
-        DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS,
-        DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS, DMA_GPU_CHCR, DMA_INTERRUPT, DrawBounds,
+        DEFAULT_DISPLAY_WIDTH, DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS,
+        DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS, DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS,
+        DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS, DISPLAY_SCENE_MIN_COLOR_BUCKETS,
+        DISPLAY_SOURCE_ACTIVE_FIELD, DISPLAY_SOURCE_CLEAR_WIDTH_DISPLAY_AREA,
+        DISPLAY_SOURCE_GP1_DISPLAY_AREA, DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+        DISPLAY_SOURCE_PRESENTED_FIELD, DISPLAY_SOURCE_SAFE_FIELD, DMA_GPU_CHCR, DMA_INTERRUPT,
+        DisplayAreaTrace, DisplayColorStats, DisplayOutputWindow, DisplayResolve, DrawBounds,
         GP0_BEST_OBSERVATION_DRAW_INTERVAL, GP0_BEST_OBSERVATION_EAGER_COMMANDS, GPU_GP0, GPU_GP1,
         GpuDrawTrace, IO_REGISTER_MAP, IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io, IoAccess,
         IoDevice, MDEC_COMMAND, MDEC_STATUS, SIO_CONTROL, SIO_DATA, SIO_STATUS_IRQ_REQUEST,
-        SPU_REGION_START, VRAM_HEIGHT, VRAM_WIDTH, has_native_full_scene_detail, io_register,
-        io_register_range, is_detailed_observation, is_io_register_address, is_sparse_display,
-        resolved_display_candidate_has_scene_signal, screen_observation_score,
-        screen_observation_worth_saving,
+        SPU_REGION_START, STALE_PRESENTATION_CAPTURE_GRACE, VRAM_HEIGHT, VRAM_WIDTH,
+        has_native_full_scene_detail, has_native_playfield_density, io_register, io_register_range,
+        is_detailed_observation, is_io_register_address, is_likely_texture_page_candidate,
+        is_sparse_display, minimum_live_draw_overlap_area_for_dimensions,
+        presented_frame_has_live_scene, resolved_display_candidate_has_scene_signal,
+        screen_observation_score, screen_observation_worth_saving,
     };
     use crate::native::framebuffer::{
         FrameBufferStats, FrameBufferWindow, Point, TexturedDrawStats,
     };
+
+    fn line_doubled_rgb_frame(field: &[u32], width: usize) -> Vec<u32> {
+        let mut doubled = Vec::with_capacity(field.len().saturating_mul(2));
+        for row in field.chunks(width) {
+            doubled.extend_from_slice(row);
+            doubled.extend_from_slice(row);
+        }
+        doubled
+    }
 
     #[test]
     fn register_metadata_identifies_core_io_devices_and_access() {
@@ -7615,6 +15603,144 @@ mod tests {
         );
 
         assert!(io_register(0x1f80_1fff).is_none());
+    }
+
+    #[test]
+    fn gpu_texture_draw_options_do_not_treat_zn_extended_page_bits_as_flip() {
+        let polygon = super::texture_draw_options(0x2c80_8080, 0x2e80);
+        assert!(!polygon.texture_flip_x);
+        assert!(!polygon.texture_flip_y);
+
+        let sprite = super::texture_draw_options(0x6480_8080, 0x3000);
+        assert!(sprite.texture_flip_x);
+        assert!(sprite.texture_flip_y);
+
+        let zn_extended_sprite = super::texture_draw_options(0x6480_8080, 0x2e80);
+        assert!(!zn_extended_sprite.texture_flip_x);
+        assert!(!zn_extended_sprite.texture_flip_y);
+    }
+
+    #[test]
+    fn gpu_texture_draw_options_disable_noisy_low_bank_title_rect_palette_fallback() {
+        let title_rect = super::texture_draw_options(0x6480_8080, 0x0299);
+        assert!(!title_rect.allow_palette_fallback);
+
+        assert!(
+            super::should_allow_zn_low_bank_screen_rect_palette_fallback(
+                0x6480_8080,
+                0x0299,
+                0x7c80,
+                super::DrawBounds {
+                    left: 0,
+                    top: 240,
+                    right: 255,
+                    bottom: 479,
+                },
+            )
+        );
+        assert!(
+            !super::should_allow_zn_low_bank_screen_rect_palette_fallback(
+                0x6480_8080,
+                0x0299,
+                0x7c80,
+                super::DrawBounds {
+                    left: 10,
+                    top: 10,
+                    right: 10,
+                    bottom: 10,
+                },
+            )
+        );
+
+        let zn_high_polygon = super::texture_draw_options(0x2c80_8080, 0x2e80);
+        assert!(!zn_high_polygon.allow_palette_fallback);
+
+        let ordinary_sprite = super::texture_draw_options(0x6480_8080, 0x000f);
+        assert!(ordinary_sprite.allow_palette_fallback);
+    }
+
+    #[test]
+    fn gpu_skips_noisy_4bpp_title_overlay_primitives() {
+        assert!(super::should_skip_noisy_4bpp_title_draw(
+            0x0039,
+            0x795a,
+            super::DrawBounds {
+                left: 399,
+                top: 182,
+                right: 425,
+                bottom: 257,
+            },
+        ));
+        assert!(super::should_skip_noisy_4bpp_title_draw(
+            0x002f,
+            0x7cc0,
+            super::DrawBounds {
+                left: 256,
+                top: 240,
+                right: 511,
+                bottom: 479,
+            },
+        ));
+        assert!(super::should_skip_noisy_4bpp_title_draw(
+            0x003f,
+            0x7cc0,
+            super::DrawBounds {
+                left: 256,
+                top: 240,
+                right: 511,
+                bottom: 479,
+            },
+        ));
+        assert!(!super::should_skip_noisy_4bpp_title_draw(
+            0x002f,
+            0x791f,
+            super::DrawBounds {
+                left: 263,
+                top: 360,
+                right: 266,
+                bottom: 375,
+            },
+        ));
+        assert!(!super::should_skip_noisy_4bpp_title_draw(
+            0x002f,
+            0x7cc0,
+            super::DrawBounds {
+                left: 263,
+                top: 360,
+                right: 266,
+                bottom: 375,
+            },
+        ));
+        assert!(super::should_skip_noisy_4bpp_title_draw(
+            0x0039,
+            0x7cc0,
+            super::DrawBounds {
+                left: 0,
+                top: 240,
+                right: 255,
+                bottom: 479,
+            },
+        ));
+        assert!(!super::should_skip_noisy_4bpp_title_draw(
+            0x000f,
+            0x795a,
+            super::DrawBounds {
+                left: 0,
+                top: 96,
+                right: 511,
+                bottom: 479,
+            },
+        ));
+        assert!(!super::should_skip_noisy_4bpp_title_draw(
+            0x0039,
+            0x0100,
+            super::DrawBounds {
+                left: 399,
+                top: 182,
+                right: 425,
+                bottom: 257,
+            },
+        ));
     }
 
     fn mark_gpu_as_having_live_textured_playfield(io: &mut Io, width: usize, height: usize) {
@@ -7643,6 +15769,124 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn gpu_live_draw_overlap_uses_output_field_dimensions_for_textured_rects() {
+        let mut io = Io::default();
+        let field_candidate = FrameBufferWindow {
+            x: 0,
+            y: DEFAULT_DISPLAY_HEIGHT,
+            stats: FrameBufferStats {
+                pixel_count: 512 * DEFAULT_DISPLAY_HEIGHT as u64,
+                nonzero_pixels: 0,
+                bright_pixels: 0,
+                luma_sum: 0,
+                max_luma: 0,
+                detail_edges: 0,
+                checksum: 0,
+            },
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_rect",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: DEFAULT_DISPLAY_HEIGHT as i32 + 64,
+                right: 511,
+                bottom: DEFAULT_DISPLAY_HEIGHT as i32 + 67,
+            },
+            TexturedDrawStats {
+                written_pixels: 2048,
+                color_changes: 16,
+                ..TexturedDrawStats::default()
+            },
+            &[0x2c00_0000],
+            &[Point {
+                x: 64,
+                y: DEFAULT_DISPLAY_HEIGHT as i32 + 64,
+            }],
+            None,
+        ));
+
+        let active_field_area = io
+            .gpu
+            .display_candidate_live_draw_overlap_area_with_dimensions(
+                field_candidate,
+                512,
+                DEFAULT_DISPLAY_HEIGHT,
+            );
+        let full_height_area = io
+            .gpu
+            .display_candidate_live_draw_overlap_area_with_dimensions(
+                field_candidate,
+                512,
+                DEFAULT_DISPLAY_HEIGHT * 2,
+            );
+
+        assert_eq!(active_field_area, 2048);
+        assert_eq!(full_height_area, 2048);
+        assert_eq!(
+            minimum_live_draw_overlap_area_for_dimensions(512, DEFAULT_DISPLAY_HEIGHT),
+            1920
+        );
+        assert_eq!(
+            minimum_live_draw_overlap_area_for_dimensions(512, DEFAULT_DISPLAY_HEIGHT * 2),
+            3840
+        );
+        assert!(
+            io.gpu
+                .display_candidate_has_live_draw_overlap_with_dimensions(
+                    field_candidate,
+                    512,
+                    DEFAULT_DISPLAY_HEIGHT
+                )
+        );
+        assert!(
+            !io.gpu
+                .display_candidate_has_live_draw_overlap_with_dimensions(
+                    field_candidate,
+                    512,
+                    DEFAULT_DISPLAY_HEIGHT * 2
+                )
+        );
+    }
+
+    fn mark_gpu_as_having_pixel_heavy_low_triangle_playfield(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        io.gpu.commands_seen = 70_796;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 5;
+        io.gpu.textured_triangle_commands = 20;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 96,
+            color_changes: 390_276,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 1_338;
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: x_offset as i32 + 48,
+                top: y_offset as i32 + 72,
+                right: x_offset as i32 + width as i32 - 32,
+                bottom: y_offset as i32 + height as i32 - 48,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: x_offset as i32 + 96,
+                y: y_offset as i32 + 128,
+            }],
+            None,
+        ));
+    }
+
     fn fill_multicolor_scene(
         io: &mut Io,
         x_offset: usize,
@@ -7650,25 +15894,527 @@ mod tests {
         width: usize,
         height: usize,
     ) {
-        for x in 0..width {
-            let color = match (x / 4) % 8 {
-                0 => 0x00ff_ffff,
-                1 => 0x0020_80e0,
-                2 => 0x00e0_6040,
-                3 => 0x0030_b060,
-                4 => 0x0060_60d0,
-                5 => 0x00f0_b050,
-                6 => 0x0040_d0c0,
-                _ => 0x0090_7040,
-            };
+        for y in 0..height {
+            for x in 0..width {
+                let red = 24 + ((x * 13 + y * 5) % 224) as u32;
+                let green = 16 + ((x * 7 + y * 17) % 224) as u32;
+                let blue = 32 + ((x * 19 + y * 11) % 208) as u32;
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    (red << 16) | (green << 8) | blue,
+                );
+            }
+        }
+    }
+
+    fn fill_sparse_multicolor_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        const BLOCK_WIDTH: usize = 32;
+        const BLOCK_HEIGHT: usize = 24;
+
+        for block_y in (0..height).step_by(BLOCK_HEIGHT) {
+            for block_x in (0..width).step_by(BLOCK_WIDTH) {
+                let block_index_x = block_x / BLOCK_WIDTH;
+                let block_index_y = block_y / BLOCK_HEIGHT;
+                let hash = (block_index_x as u32)
+                    .wrapping_mul(73)
+                    .wrapping_add((block_index_y as u32).wrapping_mul(151))
+                    .wrapping_add(
+                        (block_index_x as u32)
+                            .wrapping_mul(block_index_y as u32)
+                            .wrapping_mul(17),
+                    );
+                if hash % 100 >= 24 {
+                    continue;
+                }
+
+                let block_width = BLOCK_WIDTH.min(width.saturating_sub(block_x));
+                let block_height = BLOCK_HEIGHT.min(height.saturating_sub(block_y));
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(block_x) as i32,
+                    y_offset.saturating_add(block_y) as i32,
+                    block_width as i32,
+                    block_height as i32,
+                    0x0060_8058,
+                );
+                for y in 0..block_height {
+                    for x in 0..block_width {
+                        let absolute_x = block_x.saturating_add(x);
+                        let absolute_y = block_y.saturating_add(y);
+                        let red = 48 + ((absolute_x * 11 + absolute_y * 3) % 96) as u32;
+                        let green = 96 + ((absolute_x * 7 + absolute_y * 19) % 128) as u32;
+                        let blue = 72 + ((absolute_x * 13 + absolute_y * 5) % 128) as u32;
+                        io.gpu.framebuffer.fill_rect_unclipped(
+                            x_offset.saturating_add(absolute_x) as i32,
+                            y_offset.saturating_add(absolute_y) as i32,
+                            1,
+                            1,
+                            (red << 16) | (green << 8) | blue,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn fill_high_vertical_static_title_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        let left_width = width * 24 / 100;
+        for y in 0..height {
+            for x in 0..left_width {
+                let color = if (x + y * 3) % 11 < 5 {
+                    0x00d8_1020
+                } else if (x * 3 + y) % 13 < 3 {
+                    0x00e8_e8_e8
+                } else {
+                    0x0030_80_b0
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+
+        for y in (4..height * 18 / 100).step_by(12) {
+            for x in (width * 18 / 100..width.saturating_sub(12)).step_by(18) {
+                let color = if (x / 18 + y / 12) % 3 == 0 {
+                    0x00d8_1010
+                } else {
+                    0x00f0_f0_f0
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    10,
+                    4,
+                    color,
+                );
+            }
+        }
+
+        let right_x = width * 66 / 100;
+        let right_y = height * 20 / 100;
+        for row in 0..5 {
             io.gpu.framebuffer.fill_rect_unclipped(
-                x_offset.saturating_add(x) as i32,
-                y_offset as i32,
-                1,
-                height as i32,
-                color,
+                x_offset.saturating_add(right_x + row * 12) as i32,
+                y_offset.saturating_add(right_y + row * 5) as i32,
+                48,
+                4,
+                0x00f8_f8_d0,
             );
         }
+
+        let center_x = width * 30 / 100;
+        let center_y = height * 62 / 100;
+        for index in 0..7 {
+            io.gpu.framebuffer.fill_rect_unclipped(
+                x_offset.saturating_add(center_x + index * 18) as i32,
+                y_offset.saturating_add(center_y + (index % 2) * 8) as i32,
+                10,
+                5,
+                0x00f0_f0_f0,
+            );
+        }
+    }
+
+    fn fill_saturated_logo_transition_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        const PALETTE: [u32; 7] = [
+            0x00a0_10e0,
+            0x00f0_1010,
+            0x0008_d020,
+            0x00f0_f010,
+            0x0010_60f0,
+            0x00ff_ffff,
+            0x0008_0808,
+        ];
+
+        for y in 0..height {
+            for x in 0..width {
+                let mut color = if y < height / 3 {
+                    0x00a0_10e0
+                } else {
+                    PALETTE[((x / 5) + (y / 7)) % PALETTE.len()]
+                };
+                if y > height / 5 && x.saturating_add(y / 2) > width / 2 {
+                    color = PALETTE[((x / 3) + (y / 4) + 2) % PALETTE.len()];
+                }
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+
+        let logo_x = x_offset + width * 58 / 100;
+        let logo_y = y_offset + height * 64 / 100;
+        let logo_width = width - width * 58 / 100;
+        let logo_height = height - height * 64 / 100;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            logo_x as i32,
+            logo_y as i32,
+            logo_width as i32,
+            logo_height as i32,
+            0,
+        );
+        for y in logo_y..logo_y + logo_height {
+            for x in logo_x..logo_x + logo_width {
+                let local_x = x - logo_x;
+                let local_y = y - logo_y;
+                if local_y % 13 < 6 && local_x < logo_width * 3 / 5 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00d8_1818);
+                } else if (local_x + local_y * 2) % 17 < 5 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00f0_f0f0);
+                }
+            }
+        }
+    }
+
+    fn fill_title_logo_overlay_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        fill_multicolor_scene(io, x_offset, y_offset, width, height);
+
+        let title_x = x_offset + width * 52 / 100;
+        let title_y = y_offset + height * 48 / 100;
+        let title_width = width * 47 / 100;
+        let title_height = height * 36 / 100;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            title_x as i32,
+            title_y as i32,
+            title_width as i32,
+            title_height as i32,
+            0,
+        );
+
+        for y in title_y..title_y + title_height {
+            for x in title_x..title_x + title_width {
+                let local_x = x - title_x;
+                let local_y = y - title_y;
+                if local_y % 18 < 10 && local_x < title_width * 2 / 3 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00d8_1818);
+                } else if (local_x + local_y * 3) % 23 < 5 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00f0_f0f0);
+                }
+            }
+        }
+    }
+
+    fn fill_primitive_workspace_artifact(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        for y in 0..height {
+            for x in 0..width {
+                let color = if y < height / 5 {
+                    match (x.saturating_mul(5) / width.max(1)).min(4) {
+                        0 | 1 => 0x00ff_00d8,
+                        2 => 0x00e0_0038,
+                        3 => 0x0018_1870,
+                        _ => 0x0020_d888,
+                    }
+                } else if y.saturating_mul(5) > height + x.saturating_mul(2) {
+                    match (x.saturating_mul(17).saturating_add(y.saturating_mul(29))) % 19 {
+                        0..=5 => 0,
+                        6..=10 => 0x0000_e8f0,
+                        11..=14 => 0x00f0_00e8,
+                        15..=16 => 0x0088_0800,
+                        _ => 0x0008_0808,
+                    }
+                } else {
+                    match ((x / 32).saturating_add(y / 24)) % 4 {
+                        0 => 0x00a8_c0c8,
+                        1 => 0x00f8_f8f8,
+                        2 => 0x00c8_d8e8,
+                        _ => 0x00e8_20e0,
+                    }
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+    }
+
+    fn fill_glyph_texture_atlas_page(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        io.gpu.framebuffer.fill_rect_unclipped(
+            x_offset as i32,
+            y_offset as i32,
+            width as i32,
+            height as i32,
+            0x0008_0808,
+        );
+        for cell_y in (0..height).step_by(12) {
+            for cell_x in (0..width).step_by(16) {
+                let red = 32 + ((cell_x * 5 + cell_y * 3) % 224) as u32;
+                let green = 24 + ((cell_x * 7 + cell_y * 11) % 224) as u32;
+                let blue = 40 + ((cell_x * 13 + cell_y * 17) % 208) as u32;
+                let color = (red << 16) | (green << 8) | blue;
+                let x = x_offset.saturating_add(cell_x) as i32;
+                let y = y_offset.saturating_add(cell_y) as i32;
+                io.gpu.framebuffer.fill_rect_unclipped(x, y, 10, 2, color);
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x, y + 4, 2, 7, color);
+                if (cell_x / 16 + cell_y / 12) % 2 == 0 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x + 4, y + 6, 7, 2, 0x00ff_ffff);
+                }
+            }
+        }
+    }
+
+    fn fill_low_bucket_glyph_texture_atlas_page(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        const PALETTE: [u32; 6] = [
+            0x0008_0808,
+            0x0030_3030,
+            0x0068_6868,
+            0x00a0_a0a0,
+            0x00d8_d8d8,
+            0x00ff_ffff,
+        ];
+        io.gpu.framebuffer.fill_rect_unclipped(
+            x_offset as i32,
+            y_offset as i32,
+            width as i32,
+            height as i32,
+            PALETTE[0],
+        );
+        for cell_y in (0..height).step_by(12) {
+            for cell_x in (0..width).step_by(16) {
+                let color = PALETTE[((cell_x / 16) + (cell_y / 12)) % PALETTE.len()];
+                let x = x_offset.saturating_add(cell_x) as i32;
+                let y = y_offset.saturating_add(cell_y) as i32;
+                io.gpu.framebuffer.fill_rect_unclipped(x, y, 10, 2, color);
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x, y + 4, 2, 7, color);
+                if (cell_x / 16 + cell_y / 12) % 3 == 0 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x + 4, y + 6, 7, 2, PALETTE[5]);
+                }
+            }
+        }
+    }
+
+    fn fill_dense_caption_texture_page(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        for y in 0..height {
+            for x in 0..width {
+                let in_caption_band = y >= height.saturating_mul(4) / 5;
+                let logo_column = x >= width / 2 && ((x / 8 + y / 6) % 4 == 0);
+                let caption_stroke = in_caption_band && (x / 12 + y / 4) % 2 == 0;
+                let color = if caption_stroke {
+                    0x00f0_f0f0
+                } else if logo_column {
+                    0x00d8_d010
+                } else {
+                    0x0008_0808
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+    }
+
+    fn fill_dense_noisy_caption_texture_page(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        for y in 0..height {
+            for x in 0..width {
+                let in_caption_band = y >= height.saturating_mul(4) / 5;
+                let noise = (x
+                    .saturating_mul(17)
+                    .saturating_add(y.saturating_mul(31))
+                    .saturating_add((x ^ y).saturating_mul(7)))
+                    % 100;
+                let color = if in_caption_band && noise < 35 {
+                    0x00f0_f0f0
+                } else if noise < 25 {
+                    0x00d8_d010
+                } else {
+                    0x0008_0808
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+    }
+
+    fn fill_psx24_glyph_texture_atlas_page(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        let row_bytes = width.saturating_mul(3);
+        let mut bytes = vec![8_u8; row_bytes.saturating_mul(height)];
+        for cell_y in (0..height).step_by(12) {
+            for cell_x in (0..width).step_by(16) {
+                let red = 32 + ((cell_x * 5 + cell_y * 3) % 224) as u8;
+                let green = 24 + ((cell_x * 7 + cell_y * 11) % 224) as u8;
+                let blue = 40 + ((cell_x * 13 + cell_y * 17) % 208) as u8;
+                for dy in 0..2 {
+                    for dx in 0..10 {
+                        write_psx24_test_pixel(
+                            &mut bytes,
+                            width,
+                            cell_x + dx,
+                            cell_y + dy,
+                            red,
+                            green,
+                            blue,
+                        );
+                    }
+                }
+                for dy in 4..11 {
+                    for dx in 0..2 {
+                        write_psx24_test_pixel(
+                            &mut bytes,
+                            width,
+                            cell_x + dx,
+                            cell_y + dy,
+                            red,
+                            green,
+                            blue,
+                        );
+                    }
+                }
+                if (cell_x / 16 + cell_y / 12) % 2 == 0 {
+                    for dy in 6..8 {
+                        for dx in 4..11 {
+                            write_psx24_test_pixel(
+                                &mut bytes,
+                                width,
+                                cell_x + dx,
+                                cell_y + dy,
+                                0xff,
+                                0xff,
+                                0xff,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for y in 0..height {
+            let row = y.saturating_mul(row_bytes);
+            for word_x in 0..row_bytes.div_ceil(2) {
+                let low = bytes[row + word_x * 2];
+                let high = bytes.get(row + word_x * 2 + 1).copied().unwrap_or(0);
+                io.gpu.framebuffer.set_raw_pixel(
+                    x_offset.saturating_add(word_x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    u16::from(low) | (u16::from(high) << 8),
+                );
+            }
+        }
+    }
+
+    fn write_psx24_test_pixel(
+        bytes: &mut [u8],
+        width: usize,
+        x: usize,
+        y: usize,
+        red: u8,
+        green: u8,
+        blue: u8,
+    ) {
+        if x >= width {
+            return;
+        }
+        let row_bytes = width.saturating_mul(3);
+        let Some(index) = y
+            .checked_mul(row_bytes)
+            .and_then(|row| row.checked_add(x.saturating_mul(3)))
+        else {
+            return;
+        };
+        if index + 2 >= bytes.len() {
+            return;
+        }
+        bytes[index] = red;
+        bytes[index + 1] = green;
+        bytes[index + 2] = blue;
     }
 
     fn fill_intro_caption_scene(
@@ -7695,6 +16441,120 @@ mod tests {
                         .framebuffer
                         .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00ef_efef);
                 }
+            }
+        }
+    }
+
+    fn fill_thin_caption_text_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        fill_multicolor_scene(io, x_offset, y_offset, width, height);
+        let bottom_band_start = y_offset + height * 4 / 5;
+        let dark_band_height = (height / 20).max(1);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            x_offset as i32,
+            bottom_band_start as i32,
+            width as i32,
+            dark_band_height as i32,
+            0,
+        );
+        let text_start = bottom_band_start + dark_band_height + (height / 80).max(1);
+        for y in text_start..(text_start + (height / 25).max(4)).min(y_offset + height) {
+            for x in (x_offset + width / 5..x_offset + width * 4 / 5).step_by(9) {
+                for stroke_x in x..(x + 4).min(x_offset + width) {
+                    io.gpu.framebuffer.fill_rect_unclipped(
+                        stroke_x as i32,
+                        y as i32,
+                        1,
+                        1,
+                        0x00ef_efef,
+                    );
+                }
+            }
+        }
+    }
+
+    fn fill_periodic_horizontal_ghosting_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        for y in 0..height {
+            for x in 0..width {
+                let phase = x % 64;
+                let red = 24 + ((phase * 5 + y * 3) % 224) as u32;
+                let green = 16 + ((phase * 11 + y * 7) % 224) as u32;
+                let blue = 32 + ((phase * 17 + y * 13) % 208) as u32;
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    (red << 16) | (green << 8) | blue,
+                );
+            }
+        }
+    }
+
+    fn fill_low_color_periodic_horizontal_ghosting_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        const COLORS: [u32; 4] = [0x00f0_9078, 0x00d8_7858, 0x00ff_a088, 0x00c8_6848];
+        for y in 0..height {
+            for x in 0..width {
+                let color = COLORS[((x / 8) + (y / 16)) % COLORS.len()];
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+    }
+
+    fn fill_low_bucket_playfield_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        const COLORS: [u32; 12] = [
+            0x00f0_2020,
+            0x0020_f020,
+            0x0020_20f0,
+            0x00f0_e020,
+            0x0020_f0e0,
+            0x00e0_20f0,
+            0x00f0_8020,
+            0x0080_f020,
+            0x0020_80f0,
+            0x00f0_2080,
+            0x0020_f080,
+            0x0080_20f0,
+        ];
+        for y in 0..height {
+            for x in 0..width {
+                let color = COLORS[((x / 4) + (y / 3) * 5) % COLORS.len()];
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
             }
         }
     }
@@ -7782,8 +16642,102 @@ mod tests {
         assert!(
             controller
                 .zn_mcu_diagnostic_json()
+                .contains("\"dsw_hex\":\"0x0f\"")
+        );
+        assert!(
+            controller
+                .zn_mcu_diagnostic_json()
                 .contains("\"select_transitions\":1")
         );
+    }
+
+    #[test]
+    fn controller_does_not_reflect_buttons_in_zn_mcu_default_packet() {
+        let mut controller = Controller::default();
+
+        controller.set_buttons(ActionButtons {
+            start: true,
+            coin: true,
+            ..ActionButtons::default()
+        });
+        controller.set_security_selects(false, false, false, false, true);
+        controller.write_data(0);
+
+        assert_eq!(controller.response, 0x1f);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0x00);
+    }
+
+    #[test]
+    fn controller_combines_cat702_and_zn_mcu_when_both_selected() {
+        let mut controller = Controller::default();
+
+        controller.set_cat702_transforms(Some([0xff; 8]), None);
+        controller.set_security_selects(false, true, false, false, true);
+        controller.write_data(0xff);
+
+        assert_eq!(controller.response, 0xab);
+        assert!(
+            controller
+                .diagnostic_json()
+                .contains("\"device\":\"cat702+zn_mcu_passive\"")
+        );
+        assert!(
+            controller
+                .zn_mcu_diagnostic_json()
+                .contains("\"transferred_bytes\":0")
+        );
+    }
+
+    fn cat702_responses_for(transform: [u8; 8], requests: &[u8]) -> Vec<u8> {
+        let mut controller = Controller::default();
+        controller.set_cat702_transforms(Some(transform), None);
+        controller.set_security_selects(false, true, false, false, false);
+        requests
+            .iter()
+            .map(|request| {
+                controller.write_data(*request as u16);
+                controller.response
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cat702_matches_mame_edge_order_response_vectors() {
+        let requests = [0xff, 0x00, 0x5a, 0xa5, 0x01, 0x42, 0x00, 0xff];
+        let et01 = [0x02, 0x08, 0x18, 0x1c, 0xfd, 0xc1, 0x40, 0x80];
+        let et03 = [0xc0, 0x08, 0xfa, 0xe2, 0xe1, 0xfd, 0x7c, 0x80];
+
+        assert_eq!(
+            cat702_responses_for(et01, &requests),
+            [0xab, 0x00, 0x1c, 0xc6, 0x01, 0x80, 0xff, 0xf7]
+        );
+        assert_eq!(
+            cat702_responses_for(et03, &requests),
+            [0xab, 0xb6, 0x55, 0x08, 0x29, 0xd6, 0xae, 0xd9]
+        );
+    }
+
+    #[test]
+    fn controller_ands_both_cat702_devices_on_shared_rxd_line() {
+        let mut controller = Controller::default();
+        let requests = [0xff, 0x00, 0x5a, 0xa5];
+
+        controller.set_cat702_transforms(
+            Some([0x02, 0x08, 0x18, 0x1c, 0xfd, 0xc1, 0x40, 0x80]),
+            Some([0xc0, 0x08, 0xfa, 0xe2, 0xe1, 0xfd, 0x7c, 0x80]),
+        );
+        controller.set_security_selects(false, false, false, false, false);
+
+        let responses = requests
+            .iter()
+            .map(|request| {
+                controller.write_data(*request as u16);
+                controller.response
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(responses, [0xab, 0x00, 0x14, 0x00]);
     }
 
     #[test]
@@ -7814,15 +16768,19 @@ mod tests {
     }
 
     #[test]
-    fn gpu_status_read_toggles_scanline_parity_bit() {
+    fn gpu_status_read_keeps_scanline_parity_stable_until_vblank() {
         let io = Io::default();
 
         let first = io.read_u32(GPU_GP1);
         let second = io.read_u32(GPU_GP1);
 
-        assert_ne!(first & 0x8000_0000, second & 0x8000_0000);
+        assert_eq!(first & 0x8000_0000, second & 0x8000_0000);
         assert_eq!(first & 0x0400_0000, 0x0400_0000);
         assert_eq!(second & 0x0400_0000, 0x0400_0000);
+
+        io.gpu.advance_vblank_field();
+        let after_vblank = io.read_u32(GPU_GP1);
+        assert_ne!(first & 0x8000_0000, after_vblank & 0x8000_0000);
     }
 
     #[test]
@@ -7831,12 +16789,101 @@ mod tests {
 
         io.write_u32(GPU_GP1, 0x0800_0006);
         assert_eq!(io.gpu.display_dimensions(), (512, 240));
+        io.write_u32(GPU_GP1, 0x0704_0010);
+        assert_eq!(io.gpu.display_dimensions(), (512, 240));
 
         io.write_u32(GPU_GP1, 0x0800_0026);
         assert_eq!(io.gpu.display_dimensions(), (512, 480));
 
         io.write_u32(GPU_GP1, 0x0704_0010);
-        assert_eq!(io.gpu.display_dimensions(), (512, 240));
+        assert_eq!(io.gpu.display_dimensions(), (512, 480));
+    }
+
+    #[test]
+    fn gpu_output_uses_recent_clear_width_without_rewriting_register_mode() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        assert_eq!(
+            io.gpu.display_dimensions(),
+            (512, DEFAULT_DISPLAY_HEIGHT * 2)
+        );
+
+        io.write_u32(GPU_GP0, 0x0240_4040);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x01e0_0140);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            320,
+            0,
+            192,
+            DEFAULT_DISPLAY_HEIGHT as i32 * 2,
+            0x00ff_0000,
+        );
+
+        let output = io.gpu.current_display_output_window();
+
+        assert_eq!(
+            io.gpu.display_dimensions(),
+            (512, DEFAULT_DISPLAY_HEIGHT * 2)
+        );
+        assert_eq!(output.source, DISPLAY_SOURCE_CLEAR_WIDTH_DISPLAY_AREA);
+        assert_eq!(output.width, DEFAULT_DISPLAY_WIDTH);
+        assert_eq!(output.height, DEFAULT_DISPLAY_HEIGHT * 2);
+        assert_eq!(output.window.x, 0);
+        assert_eq!(output.window.y, 0);
+        assert_eq!(
+            output.window.stats.pixel_count,
+            (DEFAULT_DISPLAY_WIDTH * DEFAULT_DISPLAY_HEIGHT * 2) as u64
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_single_field_scene_keeps_register_width_over_clear_width_hint() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, DEFAULT_DISPLAY_HEIGHT * 2));
+
+        io.write_u32(GPU_GP0, 0x0240_4040);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x01e0_0140);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let bottom_frame =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, bottom_frame);
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!(gui_frame, line_doubled_rgb_frame(&bottom_frame, width));
+        assert!(
+            playability.contains("\"display_width\":512"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_active_field\""),
+            "{playability}"
+        );
     }
 
     #[test]
@@ -8492,6 +17539,64 @@ mod tests {
     }
 
     #[test]
+    fn gpu_display_does_not_pin_intro_caption_current_over_scene_candidate() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+
+        let presented_x = 512;
+        fill_multicolor_scene(&mut io, presented_x, 0, width, height);
+        let presented = FrameBufferWindow {
+            x: presented_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(presented_x, 0, width, height),
+        };
+        let presented_rgb = io.gpu.framebuffer.rgb_window(presented_x, 0, width, height);
+        io.gpu.presented_frame_window = Some(presented);
+        io.gpu.presented_frame_rgb = Some(presented_rgb.clone());
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = height;
+        assert!(is_detailed_observation(presented.stats));
+        assert!(!io.gpu.display_window_is_texture_atlas(presented));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        let caption_width = width.min(220);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            ((width - caption_width) / 2) as i32,
+            (height - 24) as i32,
+            caption_width as i32,
+            8,
+            0x00ff_ffff,
+        );
+        let current = io.gpu.current_display_window();
+        assert!(!is_sparse_display(current.stats));
+        assert!(current.stats.nonzero_pixels.saturating_mul(32) <= current.stats.pixel_count);
+        let current_color = io
+            .gpu
+            .display_window_color_stats(current, width, height, true);
+        assert!(current_color.has_intro_caption_band());
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.presentation_captures = STALE_PRESENTATION_CAPTURE_GRACE + 8;
+        io.gpu.presented_frame_capture_index = 0;
+
+        let playability = io.gpu.native_playability_json();
+        assert!(
+            !io.gpu
+                .should_show_current_display_over_stale_candidates_with(current),
+            "{playability}"
+        );
+        assert!(!io.gpu.should_prefer_current_display(), "{playability}");
+        assert!(io.gpu.should_prefer_presented_frame(), "{playability}");
+        assert_eq!(io.gpu.visible_display_window(), presented);
+        assert_eq!(io.gpu.display_rgb_frame().2, presented_rgb);
+    }
+
+    #[test]
     fn gpu_display_prefers_detailed_observation_over_dense_low_detail_current() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
@@ -8597,25 +17702,38 @@ mod tests {
     }
 
     #[test]
+    fn gpu_best_observation_does_not_cross_display_mode_dimensions() {
+        let mut io = Io::default();
+        let (narrow_width, height) = io.gpu.display_dimensions();
+
+        fill_multicolor_scene(&mut io, 0, 0, narrow_width, height);
+        io.gpu.capture_best_observation();
+        let best_window = io.gpu.best_observation_window.expect("best observation");
+        let best_png = io.gpu.best_observation_png().expect("best png");
+        assert_eq!(io.gpu.best_observation_width, narrow_width);
+        assert_eq!(io.gpu.best_observation_height, height);
+
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (wide_width, wide_height) = io.gpu.display_dimensions();
+        assert_ne!(wide_width, narrow_width);
+        assert_eq!(wide_height, height);
+
+        let resolved = io.gpu.display_resolve();
+        let actual_png = io.gpu.actual_display_png();
+
+        assert!(!io.gpu.best_observation_matches_current_display_dimensions());
+        assert!(!io.gpu.should_prefer_best_observation());
+        assert!(!resolved.promoted || resolved.source != "best_observation");
+        assert_ne!(actual_png, best_png);
+        assert_eq!(io.gpu.best_observation_window, Some(best_window));
+    }
+
+    #[test]
     fn native_playability_accepts_multicolor_live_playfield_candidate() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
 
-        for y in 0..height {
-            for x in 0..width {
-                let color = match ((x / 5) + (y / 7)) % 6 {
-                    0 => 0x00f8_e0c0,
-                    1 => 0x0020_80e0,
-                    2 => 0x00f0_f8ff,
-                    3 => 0x0040_c060,
-                    4 => 0x00d0_3040,
-                    _ => 0x0030_2018,
-                };
-                io.gpu
-                    .framebuffer
-                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
-            }
-        }
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
         mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
 
         let current = io.gpu.current_display_window();
@@ -8628,25 +17746,759 @@ mod tests {
     }
 
     #[test]
-    fn native_playability_rejects_intro_caption_band_candidate() {
+    fn native_playability_rejects_streamed_rect_scene_without_3d_playfield_draws() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
 
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS;
+        io.gpu.textured_triangle_commands = 0;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 2;
+        io.gpu.presentation_captures = 64;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 32_768,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_rect",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: 64,
+                right: width as i32,
+                bottom: height as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x6400_0000],
+            &[Point { x: 64, y: 128 }],
+            None,
+        ));
+
+        let playability = io.gpu.native_playability_json();
+
+        assert!(has_native_full_scene_detail(
+            io.gpu.current_display_window().stats
+        ));
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(playability.contains("\"has_textured_content\":true"));
+        assert!(playability.contains("\"has_3d_playfield_draws\":false"));
+        assert!(
+            playability.contains("\"classification\":\"no_3d_playfield_draws\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_replay_validation_accepts_sparse_title_screen() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let before = io.gpu.clone();
+        const PALETTE: [u32; 10] = [
+            0x00ff_ff40,
+            0x00ff_8020,
+            0x0040_80ff,
+            0x00ff_ffff,
+            0x00d0_d0d0,
+            0x0080_80ff,
+            0x00ff_4040,
+            0x0040_ff80,
+            0x00ff_c040,
+            0x00c0_40ff,
+        ];
+
+        for glyph in 0..96 {
+            let x = 24 + (glyph % 24) * 11;
+            let y = 72 + (glyph / 24) * 28;
+            let color = PALETTE[glyph % PALETTE.len()];
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, y as i32, 7, 2, color);
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, y as i32 + 6, 6, 2, color);
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32 + 2, y as i32, 2, 12, color);
+        }
+        for x in (width / 4)..(width * 3 / 4) {
+            if x % 3 != 0 {
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x as i32,
+                    (height * 2 / 3) as i32,
+                    1,
+                    2,
+                    0x00ff_ff40,
+                );
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+
+        let current = io.gpu.current_display_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(screen_observation_worth_saving(current.stats));
+        assert!(is_detailed_observation(current.stats), "{playability}");
+        assert!(
+            !has_native_playfield_density(current.stats),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_rendered_scene_candidate(), "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(io.gpu.native_replay_validation_candidate(), "{playability}");
+        assert!(
+            io.gpu
+                .native_replay_validation_incremental_candidate(&before),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_replay_validation_accepts_gui_field_composed_title_caption() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, display_height);
+        let band_start = display_height * 4 / 5;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            band_start as i32,
+            width as i32,
+            (display_height - band_start) as i32,
+            0,
+        );
+        for y in display_height * 9 / 10..(display_height * 9 / 10 + 8).min(display_height) {
+            for x in width / 5..width * 4 / 5 {
+                if (x + y) % 6 < 3 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00ef_efef);
+                }
+            }
+        }
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+
+        let output = io
+            .gpu
+            .current_gui_display_output_window()
+            .expect("GUI field-composed output");
+        let playability = io.gpu.native_playability_json();
+
+        assert!(output.field_composed);
+        assert!(io.gpu.should_use_gui_field_composed_output(output));
+        assert!(!io.gpu.should_use_field_composed_output(output));
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(io.gpu.native_replay_validation_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn native_replay_validation_incremental_accepts_active_field_title_recovery() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+        let before = io.gpu.clone();
+
+        const PALETTE: [u32; 6] = [
+            0x00e0_e0e0,
+            0x0060_a0ff,
+            0x00f0_7020,
+            0x0040_d060,
+            0x00d0_d040,
+            0x00a0_40d0,
+        ];
+        for y in 0..field_height {
+            for x in 0..width {
+                if (x + y) % 5 == 0 || (x / 11 + y / 7) % 9 == 0 {
+                    io.gpu.framebuffer.fill_rect_unclipped(
+                        x as i32,
+                        (field_height + y) as i32,
+                        1,
+                        1,
+                        PALETTE[(x / 17 + y / 13) % PALETTE.len()],
+                    );
+                }
+            }
+        }
+        for glyph in 0..48 {
+            let x = 48 + (glyph % 16) * 24;
+            let y = field_height + 64 + (glyph / 16) * 34;
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, y as i32, 14, 3, 0x00ff_ffff);
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, y as i32 + 10, 12, 3, 0x00ff_ffff);
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32 + 4, y as i32, 3, 20, 0x00ff_ffff);
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, field_height);
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_GP1_DISPLAY_AREA,
+            "{playability}"
+        );
+        assert_eq!(output.window.y, 0, "{playability}");
+        assert!(
+            !io.gpu.native_replay_validation_candidate(),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .native_replay_validation_incremental_candidate(&before),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_replay_validation_accepts_atlas_like_active_field_title_recovery() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+        let before = io.gpu.clone();
+
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        let band_start = field_height + field_height * 4 / 5;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            band_start as i32,
+            width as i32,
+            (display_height - band_start) as i32,
+            0,
+        );
+        for glyph in 0..64 {
+            let x = 48 + (glyph % 16) * 24;
+            let y = band_start + 12 + (glyph / 16) * 9;
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, y as i32, 12, 2, 0x00f0_f0f0);
+        }
+
+        io.gpu
+            .push_image_upload_rect(0, field_height as i32, width as i32, field_height as i32);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.presentation_captures = 64;
+
+        let output = io.gpu.current_display_output_window();
+        let color_stats =
+            io.gpu
+                .display_window_color_stats(output.window, output.width, output.height, true);
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_ACTIVE_FIELD,
+            "{playability}"
+        );
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert!(
+            io.gpu.display_window_is_texture_atlas_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            ),
+            "{playability}"
+        );
+        assert!(color_stats.has_scene_color_diversity(), "{playability}");
+        assert!(color_stats.has_intro_caption_band(), "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"caption_band_ui_allowed\":false"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"actual_display_intro_caption_band\""),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .native_replay_validation_incremental_candidate(&before),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_replay_validation_checks_high_vertical_single_field_candidates() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+        let before = io.gpu.clone();
+
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS;
+        io.gpu.presentation_captures = 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            drawn_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 32_768,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_rect",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: field_height as i32 + 64,
+                right: width as i32 - 1,
+                bottom: field_height as i32 + 95,
+            },
+            TexturedDrawStats {
+                written_pixels: (width * 32) as u64,
+                drawn_pixels: (width * 32) as u64,
+                color_changes: 256,
+                ..TexturedDrawStats::default()
+            },
+            &[0x6400_0000],
+            &[Point {
+                x: 0,
+                y: field_height as i32 + 64,
+            }],
+            None,
+        ));
+
+        let field_outputs = io.gpu.high_vertical_current_display_field_outputs();
+        let bottom_field = field_outputs
+            .iter()
+            .find(|output| output.window.y == field_height)
+            .copied()
+            .expect("bottom field replay output");
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(bottom_field.source, DISPLAY_SOURCE_ACTIVE_FIELD);
+        assert_eq!(
+            (bottom_field.width, bottom_field.height),
+            (width, field_height)
+        );
+        assert!(
+            io.gpu
+                .native_replay_incremental_display_output_window_candidate(&before, bottom_field),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .native_replay_validation_incremental_candidate(&before),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_replay_lightweight_accepts_sparse_active_field_progress() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+        let before = io.gpu.clone();
+
+        const PALETTE: [u32; 8] = [
+            0x00ff_4020,
+            0x00e0_a030,
+            0x0080_d0ff,
+            0x00ff_e060,
+            0x0040_ff90,
+            0x00c0_60ff,
+            0x00f0_f0f0,
+            0x0060_80d0,
+        ];
+        for y in 0..field_height {
+            for x in 0..width {
+                if (x / 9 + y / 7) % 23 == 0 || (x + y * 3) % 67 == 0 {
+                    io.gpu.framebuffer.fill_rect_unclipped(
+                        x as i32,
+                        (field_height + y) as i32,
+                        1,
+                        1,
+                        PALETTE[(x / 17 + y / 11) % PALETTE.len()],
+                    );
+                }
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.presentation_captures = 64;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_GP1_DISPLAY_AREA,
+            "{playability}"
+        );
+        assert_eq!(output.window.y, 0, "{playability}");
+        assert!(
+            !has_native_playfield_density(output.window.stats),
+            "{playability}"
+        );
+        assert!(
+            is_detailed_observation(output.window.stats),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.native_replay_validation_candidate(),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .native_replay_lightweight_validation_candidate(&before),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_replay_validation_incremental_accepts_early_256x240_title_recovery() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0000);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (256, DEFAULT_DISPLAY_HEIGHT));
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((height as u32) << 10));
+        let before = io.gpu.clone();
+
         for y in 0..height {
             for x in 0..width {
-                let color = match ((x / 5) + (y / 7)) % 6 {
-                    0 => 0x00f8_e0c0,
-                    1 => 0x0020_80e0,
-                    2 => 0x00f0_f8ff,
-                    3 => 0x0040_c060,
-                    4 => 0x00d0_3040,
-                    _ => 0x0030_2018,
+                let column = x % 64;
+                let mix = (column as u32)
+                    .wrapping_mul(1_103_515_245)
+                    .wrapping_add((y as u32).wrapping_mul(2_654_435_761))
+                    .rotate_left(((column ^ y) & 15) as u32);
+                let red = 96 + ((mix >> 16) & 0x7f);
+                let green = 32 + ((mix >> 8) & 0x7f);
+                let blue = 24 + (mix & 0x7f);
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x as i32,
+                    height.saturating_add(y) as i32,
+                    1,
+                    1,
+                    (red << 16) | (green << 8) | blue,
+                );
+            }
+        }
+        io.gpu.commands_seen = 1;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_GP1_DISPLAY_AREA,
+            "{playability}"
+        );
+        assert_eq!(output.width, 256, "{playability}");
+        assert_eq!(output.height, DEFAULT_DISPLAY_HEIGHT, "{playability}");
+        assert_eq!(output.window.y, height, "{playability}");
+        assert!(!io.gpu.has_textured_scene_draws(), "{playability}");
+        assert!(!io.gpu.has_native_replay_render_signal(), "{playability}");
+        assert!(
+            !io.gpu.native_replay_validation_candidate(),
+            "{playability}"
+        );
+        let color_stats =
+            io.gpu
+                .display_window_color_stats(output.window, output.width, output.height, true);
+        assert!(
+            io.gpu.display_window_has_periodic_horizontal_ghosting(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            ),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.display_window_has_saturated_logo_transition(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            ),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .low_palette_noise_candidate(output.window.stats, color_stats),
+            "{playability}"
+        );
+        assert!(color_stats.bucket_count > 48, "{playability}");
+        assert!(io.gpu.has_visible_presentation(), "{playability}");
+        assert!(
+            io.gpu
+                .native_replay_staged_window_render_recovery_candidate(
+                    output.window,
+                    output.width,
+                    output.height,
+                    true,
+                    true,
+                ),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .native_replay_validation_incremental_candidate(&before),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_replay_validation_accepts_streamed_rect_title_before_3d_signal() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let before = io.gpu.clone();
+
+        const PALETTE: [u32; 12] = [
+            0x00ff_4020,
+            0x00ff_b020,
+            0x00ff_f060,
+            0x00f0_f0f0,
+            0x0040_80ff,
+            0x0080_f0ff,
+            0x00ff_80b0,
+            0x0080_ff80,
+            0x00c0_40ff,
+            0x00ff_ff40,
+            0x00c0_c0c0,
+            0x0040_4040,
+        ];
+
+        for glyph in 0..144 {
+            let x = 20 + (glyph % 24) * 12;
+            let y = 58 + (glyph / 24) * 24;
+            let color = PALETTE[glyph % PALETTE.len()];
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, y as i32, 8, 2, color);
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, y as i32 + 7, 7, 2, color);
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32 + 2, y as i32, 2, 14, color);
+        }
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = 0;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 2;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16;
+        io.gpu.textured_draw_stats.color_changes = 32_768;
+        io.gpu.presentation_captures = 4;
+
+        let playability = io.gpu.native_playability_json();
+
+        assert!(!io.gpu.has_native_play_3d_draw_signal());
+        assert!(io.gpu.has_native_replay_streamed_render_signal());
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(io.gpu.native_replay_validation_candidate(), "{playability}");
+        assert!(
+            io.gpu
+                .native_replay_validation_incremental_candidate(&before),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_accepts_runtime_triangle_count_as_3d_playfield_signal() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = 180;
+        io.gpu.textured_draw_stats.color_changes = 394_420;
+
+        let playability = io.gpu.native_playability_json();
+
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+        assert!(playability.contains("\"has_3d_playfield_draws\":true"));
+        assert!(
+            playability.contains("\"classification\":\"native_playable_candidate\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_accepts_strong_low_color_live_field_counterpart() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(32, 32, 96, 8, 0x00ff_ffff);
+        fill_low_bucket_playfield_scene(&mut io, 0, height, width, height);
+
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 8;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.presentation_captures = 64;
+        io.gpu.presented_frame_capture_index = 64;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 32_768,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu
+            .push_image_upload_rect(0, height as i32, width as i32, height as i32);
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: height as i32 + 32,
+                right: width as i32 - 1,
+                bottom: (height * 2) as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 64,
+                y: height as i32 + 64,
+            }],
+            None,
+        ));
+
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(resolved.promoted, "{playability}");
+        assert_eq!(resolved.source, "page_0_240", "{playability}");
+        assert_eq!((resolved.window.x, resolved.window.y), (0, height));
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+        assert!(playability.contains("\"actual_display_is_live\":true"));
+        assert!(playability.contains("\"has_actual_color_diversity\":false"));
+        assert!(playability.contains("\"has_scene_color_diversity\":false"));
+        assert!(playability.contains("\"strong_low_color_playfield_signal\":true"));
+        assert!(
+            playability.contains("\"classification\":\"native_playable_candidate\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn low_bucket_playfield_signal_requires_minimum_brightness() {
+        let mut dark_warning = DisplayColorStats::default();
+        for index in 0..512 {
+            let color = match index % 10 {
+                0 => 0x00ff_2020,
+                1 => 0x0020_ff20,
+                2 => 0x0020_20ff,
+                3 => 0x00d0_d0d0,
+                _ => 0x0030_3030,
+            };
+            dark_warning.record(color, false);
+        }
+        let mut playfield = DisplayColorStats::default();
+        for index in 0..512 {
+            let color = match index % 12 {
+                0 => 0x00f0_2020,
+                1 => 0x0020_f020,
+                2 => 0x0020_20f0,
+                3 => 0x00f0_e020,
+                4 => 0x0020_f0e0,
+                5 => 0x00e0_20f0,
+                6 => 0x00f0_8020,
+                7 => 0x0080_f020,
+                8 => 0x0020_80f0,
+                9 => 0x00f0_2080,
+                10 => 0x0020_f080,
+                _ => 0x0080_20f0,
+            };
+            playfield.record(color, false);
+        }
+
+        assert!(!dark_warning.has_low_bucket_playfield_brightness());
+        assert!(playfield.has_low_bucket_scene_range_signal());
+        assert!(playfield.has_low_bucket_playfield_brightness());
+    }
+
+    #[test]
+    fn native_playability_rejects_dark_warning_partial_playfield() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x0030_3030);
+        for line in 0..3 {
+            let y = 92 + line * 18;
+            for glyph in 0..26 {
+                let x = 40 + glyph * 9;
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x, y, 5, 2, 0x00f0_f0f0);
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x, y + 5, 4, 2, 0x00f0_f0f0);
+            }
+        }
+        for y in 144..height {
+            for x in 0..width {
+                let color = match ((x / 5) + (y / 3)) % 9 {
+                    0 => 0x00ff_2020,
+                    1 => 0x0020_ff20,
+                    2 => 0x0020_20ff,
+                    3 => 0x00d0_d0d0,
+                    _ => 0x0030_3030,
                 };
                 io.gpu
                     .framebuffer
                     .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
             }
         }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.presentation_captures = 64;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 32_768,
+            ..TexturedDrawStats::default()
+        };
+
+        let playability = io.gpu.native_playability_json();
+
+        assert!(has_native_full_scene_detail(
+            io.gpu.current_display_window().stats
+        ));
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"strong_low_color_playfield_signal\":false"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"actual_display_low_color_diversity\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_rejects_intro_caption_band_candidate() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
         for y in height * 4 / 5..height {
             for x in 0..width {
                 io.gpu
@@ -8681,22 +18533,38 @@ mod tests {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
         let palette = [
-            0x00ff_2020,
-            0x0020_ff20,
-            0x0020_20ff,
-            0x00e0_c040,
-            0x0040_c0e0,
-            0x00e0_40c0,
-            0x00f0_f0f0,
-            0x0030_3030,
-            0x00c0_8040,
-            0x0040_80c0,
-            0x0080_c040,
-            0x00c0_4080,
+            0x0020_4040,
+            0x0020_40a0,
+            0x0020_a040,
+            0x0020_a0a0,
+            0x0040_2020,
+            0x0040_20c0,
+            0x0040_c020,
+            0x0040_c0c0,
+            0x0060_6040,
+            0x0060_60e0,
+            0x0060_e060,
+            0x0060_e0e0,
+            0x0080_4020,
             0x0080_40c0,
-            0x0040_c080,
-            0x00f0_8080,
-            0x0080_f080,
+            0x0080_c040,
+            0x0080_c0c0,
+            0x00a0_6060,
+            0x00a0_60e0,
+            0x00a0_e060,
+            0x00a0_e0e0,
+            0x00c0_2020,
+            0x00c0_20a0,
+            0x00c0_a020,
+            0x00c0_a0a0,
+            0x00e0_4040,
+            0x00e0_40e0,
+            0x00e0_e040,
+            0x00e0_e0e0,
+            0x0030_80c0,
+            0x00c0_8030,
+            0x0080_c030,
+            0x00d0_70a0,
         ];
 
         for y in 0..height {
@@ -8726,26 +18594,60 @@ mod tests {
     }
 
     #[test]
-    fn native_playability_allows_caption_like_playfield_ui_with_strong_3d_signal() {
+    fn native_playability_rejects_repeated_low_bucket_atlas_candidate() {
         let mut io = Io::default();
-        io.write_u32(GPU_GP1, 0x0800_0026);
         let (width, height) = io.gpu.display_dimensions();
-
+        let palette = [
+            0x0000_c8ff,
+            0x0000_50e0,
+            0x0000_1090,
+            0x0010_d0f0,
+            0x0020_80c0,
+            0x0030_30a0,
+            0x0040_e0d0,
+            0x0050_a0b0,
+            0x0060_6090,
+            0x0070_f0c0,
+            0x0080_b0a0,
+            0x0090_7080,
+            0x00a0_f0b0,
+            0x00b0_c090,
+            0x00c0_8070,
+            0x00d0_f0a0,
+            0x00e0_b080,
+            0x00f0_7060,
+            0x00ff_d090,
+        ];
         for y in 0..height {
             for x in 0..width {
-                let color = match ((x / 5) + (y / 7)) % 6 {
-                    0 => 0x00f8_e0c0,
-                    1 => 0x0020_80e0,
-                    2 => 0x00f0_f8ff,
-                    3 => 0x0040_c060,
-                    4 => 0x00d0_3040,
-                    _ => 0x0030_2018,
-                };
+                let color = palette[((x / 4) + (y / 3)) % palette.len()];
                 io.gpu
                     .framebuffer
                     .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
             }
         }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+
+        let playability = io.gpu.native_playability_json();
+
+        assert!(has_native_full_scene_detail(
+            io.gpu.current_display_window().stats
+        ));
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(playability.contains("\"has_actual_color_diversity\":false"));
+        assert!(
+            playability.contains("\"classification\":\"actual_display_low_color_diversity\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_allows_caption_like_playfield_ui_with_strong_3d_signal() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
         for y in height * 4 / 5..height {
             for x in 0..width {
                 io.gpu
@@ -8769,12 +18671,113 @@ mod tests {
             color_changes: 32_768,
             ..TexturedDrawStats::default()
         };
+        io.gpu.presentation_captures = 64;
 
         let playability = io.gpu.native_playability_json();
 
         assert!(io.gpu.native_playable_candidate(), "{playability}");
         assert!(playability.contains("\"has_actual_intro_caption_band\":true"));
         assert!(playability.contains("\"has_scene_intro_caption_band\":true"));
+        assert!(playability.contains("\"caption_band_ui_allowed\":true"));
+        assert!(playability.contains("\"classification\":\"native_playable_candidate\""));
+    }
+
+    #[test]
+    fn native_playability_rejects_caption_atlas_ghosting_with_strong_3d_signal() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_periodic_horizontal_ghosting_scene(&mut io, 0, 0, width, height);
+        for y in height * 4 / 5..height {
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(0, y as i32, width as i32, 1, 0);
+        }
+        for y in height * 9 / 10..(height * 9 / 10 + 8).min(height) {
+            for x in (width / 5)..(width * 4 / 5) {
+                if (x + y) % 6 < 3 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00ef_efef);
+                }
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 32_768,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS * 4;
+        io.gpu.presentation_captures = 64;
+
+        let current = io.gpu.current_display_window();
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(current, width, height, true);
+        let playability = io.gpu.native_playability_json();
+
+        assert!(color_stats.has_intro_caption_band(), "{playability}");
+        assert!(
+            io.gpu
+                .display_window_has_periodic_horizontal_ghosting(current, width, height, true),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_has_atlas_caption_ghosting(
+                current,
+                width,
+                height,
+                true,
+                color_stats
+            ),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(playability.contains("\"caption_band_ui_allowed\":true"));
+        assert!(
+            playability.contains("\"classification\":\"actual_display_periodic_ghosting\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_allows_progressive_512_caption_ui_with_strong_3d_signal() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        for y in height * 4 / 5..height {
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(0, y as i32, width as i32, 1, 0);
+        }
+        for y in height * 9 / 10..(height * 9 / 10 + 8).min(height) {
+            for x in (width / 5)..(width * 4 / 5) {
+                if (x + y) % 6 < 3 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00ef_efef);
+                }
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 32_768,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 64;
+
+        let playability = io.gpu.native_playability_json();
+
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+        assert!(playability.contains("\"has_actual_intro_caption_band\":true"));
         assert!(playability.contains("\"caption_band_ui_allowed\":true"));
         assert!(playability.contains("\"classification\":\"native_playable_candidate\""));
     }
@@ -8841,21 +18844,7 @@ mod tests {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
 
-        for y in 0..height {
-            for x in 0..width {
-                let color = match ((x / 5) + (y / 7)) % 6 {
-                    0 => 0x00f8_e0c0,
-                    1 => 0x0020_80e0,
-                    2 => 0x00f0_f8ff,
-                    3 => 0x0040_c060,
-                    4 => 0x00d0_3040,
-                    _ => 0x0030_2018,
-                };
-                io.gpu
-                    .framebuffer
-                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
-            }
-        }
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
         for y in height * 4 / 5..height {
             for x in 0..width {
                 let color = if (x + y) % 20 == 0 { 0 } else { 0x00f0_f0e8 };
@@ -9192,12 +19181,90 @@ mod tests {
     }
 
     #[test]
+    fn gpu_rejects_unpresented_live_texture_counterpart_atlas_candidate() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x0040_4040);
+        fill_glyph_texture_atlas_page(&mut io, 0, height, width, height);
+
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 32;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.presentation_captures = 64;
+        io.gpu.presented_frame_capture_index = 64;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 32_768,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: height as i32 + 64,
+                right: width as i32 - 1,
+                bottom: (height * 2) as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 64,
+                y: height as i32 + 96,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 0,
+            y: height,
+            stats: io.gpu.framebuffer.display_stats(0, height, width, height),
+        };
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            has_native_full_scene_detail(candidate.stats),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .display_candidate_was_recently_presented(candidate, height),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, candidate),
+            "atlas_caption_ghosting",
+            "{playability}"
+        );
+        let resolved = io.gpu.display_resolve();
+        assert_ne!(resolved.source, "page_0_240", "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
     fn gpu_resolves_live_scene_candidate_when_current_display_is_texture_atlas() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
 
         fill_multicolor_scene(&mut io, 0, 0, width, height);
-        fill_multicolor_scene(&mut io, 0, height, width, height);
+        fill_multicolor_scene(&mut io, 0, height, width, height * 2 / 3);
         for index in 0..8 {
             io.gpu
                 .push_image_upload_rect(0, index * 30, width as i32, 24);
@@ -9251,6 +19318,74 @@ mod tests {
         assert!(resolved.promoted);
         assert_eq!(resolved.source, "page_0_240");
         assert_eq!((resolved.window.x, resolved.window.y), (0, height));
+    }
+
+    #[test]
+    fn gpu_resolves_strong_framebuffer_scene_over_stale_best_observation() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 240));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, height, width, height);
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+        let best_stats = io.gpu.framebuffer.display_stats(0, height, width, height);
+        io.gpu.best_observation_window = Some(FrameBufferWindow {
+            x: 0,
+            y: height,
+            stats: best_stats,
+        });
+        io.gpu.best_observation_rgb = Some(io.gpu.framebuffer.rgb_window(0, height, width, height));
+        io.gpu.best_observation_width = width;
+        io.gpu.best_observation_height = height;
+
+        fill_multicolor_scene(&mut io, 512, height, width, height);
+        io.gpu
+            .push_image_upload_rect(0, 0, width as i32, height as i32);
+        io.gpu
+            .push_image_upload_rect(0, height as i32, (width / 4) as i32, height as i32);
+        io.gpu
+            .push_image_upload_rect(512, height as i32, (width / 4) as i32, height as i32);
+        io.gpu.presentation_captures = 32;
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS;
+        io.gpu.textured_triangle_commands = 180;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 8,
+            color_changes: 394_420,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 512,
+                top: height as i32 + 64,
+                right: 512 + width as i32 - 1,
+                bottom: (height * 2) as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 512,
+                y: height as i32 + 64,
+            }],
+            None,
+        ));
+
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert_ne!(resolved.source, "best_observation", "{playability}");
+        assert!(resolved.promoted, "{playability}");
+        assert_eq!(resolved.window.y, height);
+        assert!(!playability.contains("\"actual_display_source\":\"best_observation\""));
     }
 
     #[test]
@@ -9507,12 +19642,8 @@ mod tests {
             .psx_display_rgb_window(0, 0, width, height);
         let resolved_candidate_frame = io.gpu.framebuffer.rgb_window(512, 0, width, height);
 
-        assert!(resolved.promoted, "{playability}");
-        assert_eq!(resolved.source, "page_512_0");
-        assert!(
-            !io.gpu.should_present_resolved_display(resolved),
-            "{playability}"
-        );
+        assert!(!resolved.promoted, "{playability}");
+        assert_eq!(resolved.source, "gp1_display_area");
         assert_eq!(actual_frame, live_warning_frame);
         assert_ne!(actual_frame, resolved_candidate_frame);
         assert_eq!(
@@ -9522,6 +19653,10 @@ mod tests {
         assert_eq!(
             io.gpu.display_png(),
             io.gpu.framebuffer.psx_display_png(0, 0, width, height)
+        );
+        assert!(
+            playability.contains("\"rejection_reason\":\"texture_page_not_presented\""),
+            "{playability}"
         );
     }
 
@@ -9591,7 +19726,10 @@ mod tests {
         let resolved = io.gpu.display_resolve();
         let playability = io.gpu.native_playability_json();
 
-        assert!(io.gpu.display_window_is_texture_atlas(candidate));
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
         assert!(
             !io.gpu.display_candidate_has_live_draw_overlap(candidate),
             "{playability}"
@@ -9667,6 +19805,1421 @@ mod tests {
         assert_eq!(resolved.source, "gp1_display_area");
         assert!(!io.gpu.native_playable_candidate(), "{playability}");
         assert!(playability.contains("\"playable_candidate\":false"));
+    }
+
+    #[test]
+    fn gpu_rejects_high_detail_streamed_texture_page_without_live_draw_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 240));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        fill_multicolor_scene(&mut io, 512, 0, width, height);
+        for x in (512..1024).step_by(16) {
+            io.gpu.push_image_upload_rect(x, 0, 16, height as i32);
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.image_upload_commands = 64;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 64;
+
+        let current = io.gpu.current_display_window();
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let playability = io.gpu.native_playability_json();
+
+        assert!(has_native_full_scene_detail(candidate.stats));
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu.display_candidate_resolution_reason(
+                current,
+                screen_observation_score(current.stats),
+                candidate
+            ),
+            "texture_atlas",
+            "{playability}"
+        );
+        assert_eq!(io.gpu.display_resolve().source, "gp1_display_area");
+    }
+
+    #[test]
+    fn gpu_rejects_rect_streamed_texture_atlas_when_gp1_display_is_blank() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        let candidate_x = 512usize;
+        for y in 0..height {
+            for x in 0..width {
+                if x % 3 == 0 || (x + y) % 11 == 0 {
+                    let red = 32 + ((x * 13 + y * 5) % 224) as u32;
+                    let green = 24 + ((x * 7 + y * 17) % 224) as u32;
+                    let blue = 40 + ((x * 19 + y * 11) % 208) as u32;
+                    io.gpu.framebuffer.fill_rect_unclipped(
+                        candidate_x.saturating_add(x) as i32,
+                        y as i32,
+                        1,
+                        1,
+                        (red << 16) | (green << 8) | blue,
+                    );
+                }
+            }
+        }
+        for y in height * 4 / 5..height {
+            for x in 0..width {
+                if x % 3 == 0 || (x + y) % 11 == 0 {
+                    let color = match (x / 7 + y / 5) % 3 {
+                        0 => 0x00d8_2040,
+                        1 => 0x0020_c060,
+                        _ => 0x0030_50d8,
+                    };
+                    io.gpu.framebuffer.fill_rect_unclipped(
+                        candidate_x.saturating_add(x) as i32,
+                        y as i32,
+                        1,
+                        1,
+                        color,
+                    );
+                }
+            }
+        }
+        io.gpu
+            .push_image_upload_rect(candidate_x as i32, 0, (width / 2) as i32, height as i32);
+
+        io.gpu.commands_seen = 70_796;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 5;
+        io.gpu.textured_triangle_commands = 20;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 7;
+        io.gpu.presentation_captures = 1_338;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 96,
+            color_changes: 390_276,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_rect",
+            0,
+            0,
+            DrawBounds {
+                left: 84,
+                top: 456,
+                right: 303,
+                bottom: 467,
+            },
+            TexturedDrawStats {
+                written_pixels: 1_713,
+                color_changes: 879,
+                ..TexturedDrawStats::default()
+            },
+            &[0x6400_0000],
+            &[Point { x: 84, y: 456 }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: candidate_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(candidate_x, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(current.stats.nonzero_pixels, 0);
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(io.gpu.has_strong_streamed_scene_rect_activity());
+        assert!(
+            io.gpu.has_pixel_heavy_low_triangle_playfield_activity(),
+            "{playability}"
+        );
+        assert!(io.gpu.has_native_play_3d_draw_signal(), "{playability}");
+        assert!(
+            !io.gpu
+                .display_candidate_has_blank_current_streamed_scene_fallback(
+                    current,
+                    current_score,
+                    candidate
+                ),
+            "{playability}"
+        );
+        assert_eq!(reason, "texture_atlas", "{playability}");
+        assert_eq!(resolved.source, "gp1_display_area", "{playability}");
+        assert!(!resolved.promoted, "{playability}");
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_live_texture_atlas_when_gp1_display_is_sparse_caption_like() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        for row in 0..5 {
+            let y = 64 + row * 28;
+            io.gpu.framebuffer.fill_rect_unclipped(
+                64,
+                y,
+                width.saturating_sub(128) as i32,
+                3,
+                0x00ef_efef,
+            );
+        }
+        for y in height * 4 / 5..height {
+            if y % 11 < 2 {
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    width as i32 / 4,
+                    y as i32,
+                    width as i32 / 2,
+                    1,
+                    0x00f0_f0f0,
+                );
+            }
+        }
+
+        fill_multicolor_scene(&mut io, 512, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 2) as i32, height as i32);
+        io.gpu.commands_seen = 70_796;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 5;
+        io.gpu.textured_triangle_commands = 20;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 7;
+        io.gpu.presentation_captures = 1_338;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 96,
+            color_changes: 390_276,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_rect",
+            0,
+            0,
+            DrawBounds {
+                left: 84,
+                top: 456,
+                right: 303,
+                bottom: 467,
+            },
+            TexturedDrawStats {
+                written_pixels: 1_713,
+                color_changes: 879,
+                ..TexturedDrawStats::default()
+            },
+            &[0x6400_0000],
+            &[Point { x: 84, y: 456 }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            !has_native_playfield_density(current.stats),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.has_strong_streamed_scene_rect_activity(),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_candidate_is_probable_texture_upload_page(candidate, width, height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .display_candidate_has_high_confidence_live_texture_scene(
+                    current,
+                    current_score,
+                    candidate
+                ),
+            "{playability}"
+        );
+        assert_eq!(reason, "texture_atlas", "{playability}");
+        assert_eq!(resolved.source, "gp1_display_area", "{playability}");
+        assert!(!resolved.promoted, "{playability}");
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_streamed_texture_atlas_when_score_signal_beats_strict_detail_ratio() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        for y in (0..height).step_by(4) {
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(0, y as i32, width as i32, 1, 0x0020_2020);
+        }
+        for y in 0..height {
+            for x in 0..width {
+                let red = 24 + ((x * 53 + y * 97) % 224) as u32;
+                let green = 16 + ((x * 89 + y * 31) % 224) as u32;
+                let blue = 32 + ((x * 17 + y * 113) % 208) as u32;
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    512 + x as i32,
+                    y as i32,
+                    1,
+                    1,
+                    (red << 16) | (green << 8) | blue,
+                );
+            }
+        }
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 2) as i32, height as i32);
+
+        io.gpu.commands_seen = 70_796;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 5;
+        io.gpu.textured_triangle_commands = 20;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 7;
+        io.gpu.presentation_captures = 1_363;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 96,
+            color_changes: 390_276,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_rect",
+            0,
+            0,
+            DrawBounds {
+                left: 84,
+                top: 456,
+                right: 303,
+                bottom: 467,
+            },
+            TexturedDrawStats {
+                written_pixels: 1_713,
+                color_changes: 879,
+                ..TexturedDrawStats::default()
+            },
+            &[0x6400_0000],
+            &[Point { x: 84, y: 456 }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            current.stats.nonzero_pixels.saturating_mul(100)
+                < current.stats.pixel_count.saturating_mul(30),
+            "{playability}"
+        );
+        assert!(
+            !resolved_display_candidate_has_scene_signal(current, current_score, candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_candidate_is_probable_texture_upload_page(candidate, width, height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .display_candidate_has_high_confidence_live_texture_scene(
+                    current,
+                    current_score,
+                    candidate
+                ),
+            "{playability}"
+        );
+        assert_eq!(reason, "texture_atlas", "{playability}");
+        assert_eq!(resolved.source, "gp1_display_area", "{playability}");
+        assert!(!resolved.promoted, "{playability}");
+    }
+
+    #[test]
+    fn gpu_resolves_caption_current_streamed_low_density_320_scene_candidate() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0001);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (320, 240));
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((height as u32) << 10));
+
+        io.gpu.framebuffer.fill_rect_unclipped(
+            50,
+            (height + height - 24) as i32,
+            220,
+            8,
+            0x00ff_ffff,
+        );
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let current_color = io
+            .gpu
+            .display_window_color_stats(current, width, height, true);
+        assert!(current_color.has_intro_caption_band());
+        assert!(
+            !has_native_playfield_density(current.stats),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+
+        let candidate_x = 640usize;
+        let candidate_y = height;
+        for by in (0..height).step_by(4) {
+            for bx in (0..width).step_by(4) {
+                let hash = bx
+                    .wrapping_mul(37)
+                    .wrapping_add(by.wrapping_mul(91))
+                    .wrapping_add(bx.wrapping_mul(by).wrapping_mul(17));
+                let ox = hash % 3;
+                let oy = (hash / 7) % 3;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let x = bx + ox + dx;
+                        let y = by + oy + dy;
+                        if x >= width || y >= height {
+                            continue;
+                        }
+                        let red = 24 + ((x * 13 + y * 5) % 224) as u32;
+                        let green = 16 + ((x * 7 + y * 17) % 224) as u32;
+                        let blue = 32 + ((x * 19 + y * 11) % 208) as u32;
+                        io.gpu.framebuffer.fill_rect_unclipped(
+                            candidate_x.saturating_add(x) as i32,
+                            candidate_y.saturating_add(y) as i32,
+                            1,
+                            1,
+                            (red << 16) | (green << 8) | blue,
+                        );
+                    }
+                }
+            }
+        }
+        io.gpu.push_image_upload_rect(
+            candidate_x as i32,
+            candidate_y as i32,
+            width as i32,
+            (height / 2) as i32,
+        );
+        io.gpu.commands_seen = 51_083;
+        io.gpu.image_upload_commands = 20;
+        io.gpu.textured_triangle_commands = 20;
+        io.gpu.textured_rect_commands = 176;
+        io.gpu.presentation_captures = 533;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: 301_488,
+            color_changes: 154_704,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_rect",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: height as i32,
+                right: width as i32 - 1,
+                bottom: (height + 120) as i32,
+            },
+            TexturedDrawStats {
+                written_pixels: 1_713,
+                color_changes: 879,
+                ..TexturedDrawStats::default()
+            },
+            &[0x6400_0000],
+            &[Point {
+                x: 84,
+                y: height as i32 + 16,
+            }],
+            None,
+        ));
+
+        let candidate = FrameBufferWindow {
+            x: candidate_x,
+            y: candidate_y,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(candidate_x, candidate_y, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .current_display_is_sparse_intro_caption_candidate(current),
+            "{playability}"
+        );
+        assert!(
+            !has_native_playfield_density(candidate.stats),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_candidate_is_probable_texture_upload_page(candidate, width, height),
+            "{playability}"
+        );
+        let candidate_color = io
+            .gpu
+            .display_window_color_stats(candidate, width, height, true);
+        assert!(
+            !io.gpu
+                .low_palette_noise_candidate(candidate.stats, candidate_color),
+            "{}",
+            candidate_color.json()
+        );
+        assert!(
+            !io.gpu
+                .display_window_has_periodic_horizontal_ghosting(candidate, width, height, true),
+            "{}",
+            candidate_color.json()
+        );
+        assert!(
+            !io.gpu
+                .display_candidate_has_caption_current_streamed_scene_recovery(
+                    current,
+                    current_score,
+                    candidate,
+                    width,
+                    height
+                ),
+            "{playability}"
+        );
+        assert_eq!(reason, "texture_atlas", "{playability}");
+        assert!(!resolved.promoted, "{playability}");
+        assert_eq!(resolved.source, "gp1_display_area", "{playability}");
+        assert!(
+            io.gpu.resolved_display_is_live_actual(resolved),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.should_present_resolved_display(resolved),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_rendered_scene_candidate(), "{playability}");
+        assert!(
+            !io.gpu.native_playable_candidate(),
+            "low-triangle streamed recovery must not present a detached texture atlas: {playability}"
+        );
+        assert!(
+            io.gpu
+                .native_playability_json()
+                .contains("\"rejection_reason\":\"texture_atlas\""),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_title_overlay_texture_candidate_with_live_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        let candidate_x = 512usize;
+        fill_title_logo_overlay_scene(&mut io, candidate_x, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(candidate_x as i32, 0, (width / 2) as i32, height as i32);
+        io.gpu.display_area_history.push(DisplayAreaTrace {
+            value: candidate_x as u32,
+            x: candidate_x,
+            y: 0,
+            command_index: 10,
+            draw_sequence: 10,
+            source: None,
+        });
+        io.gpu.commands_seen = 70_796;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 5;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 7;
+        io.gpu.presentation_captures = 1_338;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 390_276,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: candidate_x as i32,
+                top: 64,
+                right: candidate_x.saturating_add(width).saturating_sub(1) as i32,
+                bottom: height.saturating_sub(1) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: candidate_x as i32,
+                y: 64,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: candidate_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(candidate_x, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(current.stats.nonzero_pixels, 0);
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.has_strong_native_3d_textured_playfield_activity(),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_window_has_title_logo_overlay(candidate, width, height, true),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .display_candidate_has_blank_current_3d_scene_fallback(
+                    current,
+                    current_score,
+                    candidate
+                ),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .display_candidate_has_high_confidence_live_texture_scene(
+                    current,
+                    current_score,
+                    candidate
+                ),
+            "{playability}"
+        );
+        assert_eq!(reason, "title_logo_overlay", "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_diluted_title_overlay_atlas_candidate_from_runtime_smoke() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        let candidate_x = 320usize;
+        fill_multicolor_scene(&mut io, candidate_x, 0, width, height);
+
+        let title_x = candidate_x + width * 52 / 100;
+        let title_y = height * 48 / 100;
+        let title_width = width * 47 / 100;
+        let title_height = height * 36 / 100;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            title_x as i32,
+            title_y as i32,
+            title_width as i32,
+            title_height as i32,
+            0,
+        );
+        for y in title_y..title_y + title_height {
+            for x in title_x..title_x + title_width {
+                let local_x = x - title_x;
+                let local_y = y - title_y;
+                if local_y % 20 < 5 && local_x < title_width * 2 / 3 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00d8_1818);
+                } else if (local_x + local_y * 3) % 13 == 0 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00f0_f0f0);
+                }
+            }
+        }
+
+        io.gpu
+            .push_image_upload_rect(candidate_x as i32, 0, (width / 2) as i32, height as i32);
+        io.gpu.commands_seen = 260_000;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 54;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 8;
+        io.gpu.presentation_captures = 1_431;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 924_263,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: candidate_x as i32,
+                top: 64,
+                right: candidate_x.saturating_add(width).saturating_sub(1) as i32,
+                bottom: height.saturating_sub(1) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: candidate_x as i32,
+                y: 64,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: candidate_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(candidate_x, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_window_has_title_logo_overlay(candidate, width, height, true),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_window_is_texture_atlas_with_dimensions(candidate, width, height),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert_eq!(reason, "title_logo_overlay", "{playability}");
+        assert!(
+            !io.gpu.display_candidate_is_visible_gui_fallback(
+                current,
+                current_score,
+                candidate,
+                width,
+                height
+            ),
+            "title/logo texture-atlas pages must not become GUI fallback frames: {playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_stable_display_uses_title_overlay_visibility_candidate_without_playability() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        let candidate_x = 512usize;
+        fill_title_logo_overlay_scene(&mut io, candidate_x, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(candidate_x as i32, 0, (width / 2) as i32, height as i32);
+        io.gpu.commands_seen = 120_000;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS + 5;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 4;
+        io.gpu.presentation_captures = 160;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: candidate_x as i32,
+                top: 64,
+                right: candidate_x.saturating_add(width).saturating_sub(1) as i32,
+                bottom: height.saturating_sub(1) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: candidate_x as i32,
+                y: 64,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: candidate_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(candidate_x, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let strict = io.gpu.display_resolve();
+        let visible = io.gpu.display_resolve_for_visibility_with_strict(strict);
+        let playability = io.gpu.native_playability_json();
+        let (stable_width, stable_height, stable_frame) = io.gpu.stable_display_rgb_frame();
+        let candidate_frame = io.gpu.framebuffer.rgb_window(candidate_x, 0, width, height);
+
+        assert_eq!(current.stats.nonzero_pixels, 0, "{playability}");
+        assert_eq!(reason, "title_logo_overlay", "{playability}");
+        assert_eq!(strict.source, "gp1_display_area", "{playability}");
+        assert!(!strict.promoted, "{playability}");
+        assert_eq!(visible.source, "page_512_0", "{playability}");
+        assert!(visible.promoted, "{playability}");
+        assert!(
+            io.gpu.should_present_visibility_resolved_display(visible),
+            "{playability}"
+        );
+        assert_eq!((stable_width, stable_height), (width, height));
+        assert_eq!(stable_frame, candidate_frame);
+        assert!(
+            !io.gpu.native_playable_candidate(),
+            "GUI visibility fallback must not fake gameplay readiness: {playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_resolves_very_active_uploaded_scene_when_gp1_display_is_black() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        fill_multicolor_scene(&mut io, 512, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 2) as i32, height as i32);
+        io.gpu.display_area_history.push(DisplayAreaTrace {
+            value: 512,
+            x: 512,
+            y: 0,
+            command_index: 1,
+            draw_sequence: 1,
+            source: None,
+        });
+
+        io.gpu.commands_seen = 660_699;
+        io.gpu.image_upload_commands = 46;
+        io.gpu.textured_triangle_commands = 102_104;
+        io.gpu.textured_rect_commands = 8_081;
+        io.gpu.presentation_captures = 1_434;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: 52_103_125,
+            color_changes: 21_484_114,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 64,
+                top: 96,
+                right: 320,
+                bottom: 360,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 96, y: 128 }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let resolved = io.gpu.display_resolve();
+        let (_, _, stable_frame) = io.gpu.stable_display_rgb_frame();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .display_candidate_was_recently_presented(candidate, height)
+        );
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert_eq!(reason, "valid", "{playability}");
+        assert!(resolved.promoted, "{playability}");
+        assert_eq!(resolved.source, "page_512_0");
+        assert!(io.gpu.should_present_resolved_display(resolved));
+        assert!(stable_frame.iter().any(|pixel| *pixel != 0));
+    }
+
+    #[test]
+    fn gpu_resolves_pixel_heavy_low_triangle_scene_when_gp1_display_is_black() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        fill_multicolor_scene(&mut io, 512, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 2) as i32, height as i32);
+        io.gpu.display_area_history.push(DisplayAreaTrace {
+            value: 512,
+            x: 512,
+            y: 0,
+            command_index: 1,
+            draw_sequence: 1,
+            source: None,
+        });
+        mark_gpu_as_having_pixel_heavy_low_triangle_playfield(&mut io, 512, 0, width, height);
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+        let (_, _, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let candidate_frame = io.gpu.framebuffer.rgb_window(512, 0, width, height);
+
+        assert_eq!(current.stats.nonzero_pixels, 0);
+        assert!(io.gpu.has_native_play_3d_draw_signal(), "{playability}");
+        assert!(
+            io.gpu.has_pixel_heavy_low_triangle_playfield_activity(),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.has_strong_native_3d_textured_playfield_activity(),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_candidate_was_recently_presented(candidate, height)
+        );
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert_eq!(reason, "valid", "{playability}");
+        assert!(resolved.promoted, "{playability}");
+        assert_eq!(resolved.source, "page_512_0");
+        assert!(io.gpu.should_present_resolved_display(resolved));
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+        assert_eq!(actual_frame, candidate_frame);
+    }
+
+    #[test]
+    fn gpu_resolves_very_active_uploaded_scene_when_gp1_display_is_low_density_actual() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        for y in 112..392 {
+            for x in 48..192 {
+                if (x + y) % 5 == 0 || (x / 7 + y / 11) % 13 == 0 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x, y, 1, 1, 0x00ff_f0d0);
+                }
+            }
+        }
+        for y in (360..448).step_by(8) {
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(272, y, 184, 2, 0x00ff_ffff);
+        }
+        fill_multicolor_scene(&mut io, 512, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 2) as i32, height as i32);
+        io.gpu.display_area_history.push(DisplayAreaTrace {
+            value: 512,
+            x: 512,
+            y: 0,
+            command_index: 1,
+            draw_sequence: 1,
+            source: None,
+        });
+
+        io.gpu.commands_seen = 660_699;
+        io.gpu.image_upload_commands = 46;
+        io.gpu.textured_triangle_commands = 102_104;
+        io.gpu.textured_rect_commands = 8_081;
+        io.gpu.presentation_captures = 1_434;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: 52_103_125,
+            color_changes: 21_484_114,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 64,
+                top: 96,
+                right: 320,
+                bottom: 360,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 96, y: 128 }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+        let (_, _, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let candidate_frame = io.gpu.framebuffer.rgb_window(512, 0, width, height);
+
+        assert!(current.stats.nonzero_pixels > 0, "{playability}");
+        assert!(!is_sparse_display(current.stats), "{playability}");
+        assert!(
+            !has_native_playfield_density(current.stats),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_candidate_was_recently_presented(candidate, height)
+        );
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert_eq!(reason, "valid", "{playability}");
+        assert!(resolved.promoted, "{playability}");
+        assert_eq!(resolved.source, "page_512_0");
+        assert!(io.gpu.should_present_resolved_display(resolved));
+        assert_eq!(actual_frame, candidate_frame);
+    }
+
+    #[test]
+    fn gpu_display_candidates_skip_unpresented_shifted_texture_search_candidate() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, 24, 8, 0x00ff_ffff);
+        fill_multicolor_scene(&mut io, 512, 8, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 8, (width / 2) as i32, height as i32);
+        io.gpu.commands_seen = 660_699;
+        io.gpu.image_upload_commands = 46;
+        io.gpu.textured_triangle_commands = 100_210;
+        io.gpu.textured_rect_commands = 8_081;
+        io.gpu.presentation_captures = 1_435;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: 52_167_873,
+            color_changes: 21_515_999,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 512,
+                top: 64,
+                right: (512 + width - 1) as i32,
+                bottom: (height - 1) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 512, y: 128 }],
+            None,
+        ));
+
+        let shifted = FrameBufferWindow {
+            x: 512,
+            y: 8,
+            stats: io.gpu.framebuffer.display_stats(512, 8, width, height),
+        };
+        let candidates = io.gpu.display_candidate_windows(width, height);
+
+        assert!(has_native_full_scene_detail(shifted.stats));
+        assert!(is_likely_texture_page_candidate(512, 8, width, height));
+        assert!(
+            !io.gpu
+                .display_candidate_was_recently_presented(shifted, height),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+        assert!(
+            !io.gpu
+                .search_display_candidate_is_safe(shifted, width, height)
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|(label, window)| *label == "densest" && window.x == 512 && window.y == 8),
+            "{}",
+            io.gpu.window_diagnostics_json()
+        );
+    }
+
+    #[test]
+    fn gpu_blank_current_scene_fallback_rejects_caption_texture_page() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        fill_intro_caption_scene(&mut io, 512, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 2) as i32, height as i32);
+        io.gpu.commands_seen = 660_699;
+        io.gpu.image_upload_commands = 46;
+        io.gpu.textured_triangle_commands = 20;
+        io.gpu.textured_rect_commands = 8_081;
+        io.gpu.presentation_captures = 1_435;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 96,
+            color_changes: 390_276,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 64,
+                top: 96,
+                right: 320,
+                bottom: 360,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 96, y: 128 }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(candidate, width, height, true);
+        let reason = io
+            .gpu
+            .display_candidate_resolution_reason(current, current_score, candidate);
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(current.stats.nonzero_pixels, 0);
+        assert!(io.gpu.display_window_is_texture_atlas(candidate));
+        assert!(io.gpu.display_candidate_has_scene_upload_overlap(candidate));
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.has_pixel_heavy_low_triangle_playfield_activity(),
+            "{playability}"
+        );
+        assert!(io.gpu.has_native_play_3d_draw_signal(), "{playability}");
+        assert!(color_stats.has_intro_caption_band(), "{playability}");
+        assert!(
+            !io.gpu.display_candidate_has_blank_current_scene_fallback(
+                current,
+                current_score,
+                candidate
+            ),
+            "{playability}"
+        );
+        assert_ne!(reason, "valid", "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_unpresented_texture_page_candidate_without_live_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 240));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x00ff_ffff);
+        fill_multicolor_scene(&mut io, 512, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 16) as i32, height as i32);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            !io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, candidate),
+            "texture_page_not_presented",
+            "{playability}"
+        );
+        assert_ne!(
+            io.gpu.display_resolve().source,
+            "page_512_0",
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_single_large_half_page_upload_texture_candidates_without_live_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 240));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x00ff_ffff);
+        fill_multicolor_scene(&mut io, 512, 0, width, height);
+        io.gpu
+            .push_image_upload_rect(512, 0, (width / 2) as i32, height as i32);
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = 64;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 64,
+                top: 128,
+                right: 192,
+                bottom: 224,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 64, y: 128 }],
+            None,
+        ));
+        io.gpu.presentation_captures = 64;
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let page_320 = FrameBufferWindow {
+            x: 320,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(320, 0, width, height),
+        };
+        let page_512 = FrameBufferWindow {
+            x: 512,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(512, 0, width, height),
+        };
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(page_320),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.display_candidate_has_live_draw_overlap(page_512),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(page_320),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(page_512),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, page_320),
+            "texture_atlas",
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, page_512),
+            "texture_atlas",
+            "{playability}"
+        );
+        assert_ne!(
+            io.gpu.display_resolve().source,
+            "page_512_0",
+            "{playability}"
+        );
     }
 
     #[test]
@@ -9783,7 +21336,7 @@ mod tests {
                 screen_observation_score(current.stats),
                 candidate
             ),
-            "texture_atlas",
+            "title_logo_overlay",
             "{playability}"
         );
     }
@@ -9845,6 +21398,154 @@ mod tests {
             ),
             "texture_atlas"
         );
+    }
+
+    #[test]
+    fn gpu_rejects_cross_page_texture_atlas_even_with_live_draw_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        let candidate_x = 256;
+        fill_glyph_texture_atlas_page(&mut io, candidate_x, 0, width, height);
+        for x in (candidate_x..candidate_x + width).step_by(16) {
+            io.gpu
+                .push_image_upload_rect(x as i32, 0, 16, height as i32);
+        }
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS * 4;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 8;
+        io.gpu.presentation_captures = 64;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: candidate_x as i32 + 48,
+                top: 112,
+                right: candidate_x as i32 + width as i32 - 40,
+                bottom: 420,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: candidate_x as i32 + 96,
+                y: 160,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let candidate = FrameBufferWindow {
+            x: candidate_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(candidate_x, 0, width, height),
+        };
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_candidate_is_cross_page_texture_atlas(candidate, width, height),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, candidate),
+            "cross_page_texture_atlas",
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_heavy_bottom_texture_page_even_with_live_draw_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        fill_multicolor_scene(&mut io, 320, height, width, height);
+        io.gpu
+            .push_image_upload_rect(320, height as i32, width as i32, height as i32);
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS * 4;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 32,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 360,
+                top: height as i32 + 40,
+                right: 760,
+                bottom: (height * 2 - 16) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 360,
+                y: height as i32 + 40,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let candidate = FrameBufferWindow {
+            x: 320,
+            y: height,
+            stats: io.gpu.framebuffer.display_stats(320, height, width, height),
+        };
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            has_native_full_scene_detail(candidate.stats),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_scene_upload_overlap(candidate),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu.display_candidate_resolution_reason(
+                current,
+                screen_observation_score(current.stats),
+                candidate
+            ),
+            "texture_atlas",
+            "{playability}"
+        );
+        assert_ne!(io.gpu.display_resolve().source, "page_320_240");
     }
 
     #[test]
@@ -9927,6 +21628,555 @@ mod tests {
         );
         assert!(
             playability.contains("\"actual_display_field_composed\":true"),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_stable_display_prefers_presented_scene_over_periodic_field_ghosting() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+
+        fill_periodic_horizontal_ghosting_scene(&mut io, 0, 0, width, field_height * 2);
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16;
+        io.gpu.textured_draw_stats.color_changes = 65_536;
+        io.gpu.presentation_captures = 64;
+
+        let presented_x = 128;
+        let presented_y = 480;
+        fill_multicolor_scene(&mut io, presented_x, presented_y, width, display_height);
+        let presented = FrameBufferWindow {
+            x: presented_x,
+            y: presented_y,
+            stats: io.gpu.framebuffer.display_stats(
+                presented_x,
+                presented_y,
+                width,
+                display_height,
+            ),
+        };
+        let presented_rgb = io.gpu.framebuffer.psx_display_rgb_window(
+            presented_x,
+            presented_y,
+            width,
+            display_height,
+        );
+        io.gpu.presented_frame_window = Some(presented);
+        io.gpu.presented_frame_rgb = Some(presented_rgb.clone());
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = display_height;
+        io.gpu.presented_frame_capture_index = io.gpu.presentation_captures;
+
+        let output = io.gpu.current_display_output_window();
+        let resolved = io.gpu.display_resolve();
+        let (stable_width, stable_height, stable_frame) = io.gpu.stable_display_rgb_frame();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(output.field_composed, "{playability}");
+        assert!(
+            io.gpu
+                .display_output_has_periodic_horizontal_ghosting(output),
+            "{playability}"
+        );
+        assert_eq!(resolved.source, "presented_frame", "{playability}");
+        assert!(resolved.promoted, "{playability}");
+        assert_eq!((stable_width, stable_height), (width, display_height));
+        assert_eq!(stable_frame, presented_rgb);
+        assert!(
+            playability.contains("\"actual_display_source\":\"presented_frame\""),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"actual_display_field_composed\":false"),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_low_color_periodic_presented_frame_for_display_resolve() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        let presented_y = height;
+        fill_low_color_periodic_horizontal_ghosting_scene(&mut io, 0, presented_y, width, height);
+        let presented = FrameBufferWindow {
+            x: 0,
+            y: presented_y,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(0, presented_y, width, height),
+        };
+        let presented_rgb =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, presented_y, width, height);
+        io.gpu.presented_frame_window = Some(presented);
+        io.gpu.presented_frame_rgb = Some(presented_rgb.clone());
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = height;
+        io.gpu.presentation_captures = 64;
+        io.gpu.presented_frame_capture_index = io.gpu.presentation_captures;
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16;
+        io.gpu.textured_draw_stats.color_changes = 65_536;
+
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let playability = io.gpu.native_playability_compact_json();
+        let resolved = io.gpu.display_resolve();
+        let (stable_width, stable_height, stable_frame) = io.gpu.stable_display_rgb_frame();
+
+        assert!(
+            !io.gpu
+                .display_window_is_texture_atlas_with_dimensions(presented, width, height),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .presented_frame_has_periodic_horizontal_ghosting(presented),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.presented_frame_is_safe_display_candidate(presented),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, presented),
+            "presented_frame_low_color_periodic_ghosting",
+            "{playability}"
+        );
+        assert_ne!(resolved.source, "presented_frame", "{playability}");
+        assert!(!resolved.promoted, "{playability}");
+        assert!(!io.gpu.should_prefer_presented_frame(), "{playability}");
+        assert_eq!((stable_width, stable_height), (width, height));
+        assert_ne!(stable_frame, presented_rgb, "{playability}");
+        assert!(
+            !playability.contains("\"source\":\"presented_frame\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_unverified_low_color_stale_periodic_framebuffer_candidate() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        fill_low_color_periodic_horizontal_ghosting_scene(&mut io, 0, 0, width, height);
+        fill_low_color_periodic_horizontal_ghosting_scene(&mut io, 0, height, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: height as i32 + 64,
+                right: width as i32 - 1,
+                bottom: (height * 2) as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 64,
+                y: height as i32 + 128,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let candidate = FrameBufferWindow {
+            x: 0,
+            y: height,
+            stats: io.gpu.framebuffer.display_stats(0, height, width, height),
+        };
+        let current_score = screen_observation_score(current.stats);
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu.current_display_is_stale_periodic_video(current),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert!(!io.gpu.display_candidate_has_scene_upload_overlap(candidate));
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, candidate),
+            "unverified_stale_periodic_substitute",
+            "{playability}"
+        );
+        let resolved = io.gpu.display_resolve();
+        assert_ne!(resolved.source, "page_0_240", "{playability}");
+        assert!(!resolved.promoted, "{playability}");
+    }
+
+    #[test]
+    fn gpu_resolves_low_detail_live_field_counterpart_when_current_display_is_weak() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x0060_6060);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            height as i32,
+            width as i32,
+            height as i32,
+            0x0030_3030,
+        );
+        for row in 0..3 {
+            let y = height + 74 + row * 34;
+            for x in (144..368).step_by(32) {
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x, y as i32, 7, 10, 0x00ef_efef);
+            }
+        }
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: height as i32 + 64,
+                right: width as i32 - 1,
+                bottom: (height * 2) as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 96,
+                y: height as i32 + 96,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let candidate = FrameBufferWindow {
+            x: 0,
+            y: height,
+            stats: io.gpu.framebuffer.display_stats(0, height, width, height),
+        };
+        let current_score = screen_observation_score(current.stats);
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            !io.gpu.current_display_has_scene_quality(current),
+            "{playability}"
+        );
+        assert!(screen_observation_worth_saving(candidate.stats));
+        assert!(!is_detailed_observation(candidate.stats), "{playability}");
+        assert!(
+            io.gpu.display_candidate_has_live_draw_overlap(candidate),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, candidate),
+            "valid",
+            "{playability}"
+        );
+        let resolved = io.gpu.display_resolve();
+        assert_eq!(resolved.source, "page_0_240", "{playability}");
+        assert_eq!(resolved.window.y, height, "{playability}");
+        assert!(resolved.promoted, "{playability}");
+    }
+
+    #[test]
+    fn gpu_resolver_lets_low_color_presented_frame_yield_to_live_counterpart_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x00b0_b0b0);
+        for y in (48..height.saturating_sub(32)).step_by(32) {
+            io.gpu.framebuffer.fill_rect_unclipped(
+                80,
+                y as i32,
+                (width / 2) as i32,
+                2,
+                0x00ff_ffff,
+            );
+        }
+        for i in 0..height.min(width) {
+            io.gpu.framebuffer.fill_rect_unclipped(
+                (width - 1 - i) as i32,
+                i as i32,
+                1,
+                1,
+                0x00ff_ffff,
+            );
+        }
+        let presented = FrameBufferWindow {
+            x: 0,
+            y: 0,
+            stats: io.gpu.framebuffer.display_stats(0, 0, width, height),
+        };
+        assert!(screen_observation_worth_saving(presented.stats));
+        assert!(is_detailed_observation(presented.stats));
+        io.gpu.presented_frame_window = Some(presented);
+        io.gpu.presented_frame_rgb = Some(
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, 0, width, height),
+        );
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = height;
+        io.gpu.presentation_captures = 64;
+        io.gpu.presented_frame_capture_index = io.gpu.presentation_captures;
+
+        fill_multicolor_scene(&mut io, 0, height, width, height);
+        io.gpu
+            .push_image_upload_rect(0, height as i32, width as i32, height as i32);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: height as i32 + 64,
+                right: width as i32 - 1,
+                bottom: (height * 2) as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 64,
+                y: height as i32 + 128,
+            }],
+            None,
+        ));
+
+        let candidate = FrameBufferWindow {
+            x: 0,
+            y: height,
+            stats: io.gpu.framebuffer.display_stats(0, height, width, height),
+        };
+        let current = io.gpu.current_display_window();
+        let current_score = screen_observation_score(current.stats);
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            !io.gpu.display_window_is_texture_atlas(candidate),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu
+                .display_candidate_resolution_reason(current, current_score, candidate),
+            "valid",
+            "{playability}"
+        );
+        let resolved = io.gpu.display_resolve();
+        assert_eq!(resolved.source, "page_0_240", "{playability}");
+        assert_eq!(resolved.window.y, height, "{playability}");
+        assert!(resolved.promoted, "{playability}");
+    }
+
+    #[test]
+    fn native_playability_rejects_field_composed_periodic_video_without_presented_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+
+        fill_periodic_horizontal_ghosting_scene(&mut io, 0, 0, width, field_height * 2);
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16;
+        io.gpu.textured_draw_stats.color_changes = 65_536;
+        io.gpu.presentation_captures = 64;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(output.field_composed, "{playability}");
+        assert!(
+            io.gpu
+                .display_output_has_periodic_horizontal_ghosting(output),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"actual_display_periodic_ghosting\":true"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"actual_display_periodic_ghosting\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_rejects_saturated_logo_transition_high_vertical_frame() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        assert_eq!((width, display_height), (512, DEFAULT_DISPLAY_HEIGHT * 2));
+
+        fill_saturated_logo_transition_scene(&mut io, 0, 0, width, display_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64;
+        io.gpu.textured_draw_stats.color_changes = 262_144;
+        io.gpu.presentation_captures = 140;
+
+        let current = io.gpu.current_display_window();
+        let high_vertical_output = DisplayOutputWindow {
+            source: "gp1_display_area_high_vertical_full",
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: current,
+        };
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu.display_window_has_saturated_logo_transition(
+                current,
+                width,
+                display_height,
+                true
+            ),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .should_use_high_vertical_full_output(high_vertical_output),
+            "{playability}"
+        );
+        assert_ne!(
+            output.source, "gp1_display_area_high_vertical_full",
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"classification\":\"actual_display_logo_transition\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_rejects_title_logo_overlay_frame() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        fill_title_logo_overlay_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64;
+        io.gpu.textured_draw_stats.color_changes = 262_144;
+        io.gpu.presentation_captures = 140;
+
+        let current = io.gpu.current_display_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .display_window_has_title_logo_overlay(current, width, height, true),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"actual_title_logo_overlay\":true"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"actual_display_title_logo_overlay\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_accepts_periodic_high_vertical_when_live_3d_scene_is_strong() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+
+        fill_periodic_horizontal_ghosting_scene(&mut io, 0, 0, width, field_height * 2);
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128;
+        io.gpu.textured_draw_stats.color_changes = 524_288;
+        io.gpu.presentation_captures = 180;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(output.field_composed, "{playability}");
+        assert!(
+            io.gpu
+                .display_output_has_periodic_horizontal_ghosting(output),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .field_composed_periodic_output_is_strong_live_playfield(output),
+            "{playability}"
+        );
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"actual_display_periodic_ghosting\":false"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"native_playable_candidate\""),
             "{playability}"
         );
     }
@@ -10017,6 +22267,113 @@ mod tests {
 
         assert!(io.gpu.best_observation_window.is_none());
         assert_eq!(io.gpu.display_png(), io.gpu.actual_display_png());
+    }
+
+    #[test]
+    fn gpu_best_observation_scans_live_candidates_when_screenshot_is_low_information() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, 32, 4, 0x00ff_ffff);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(512, 0, width as i32, height as i32, 0x00ff_ffff);
+        fill_multicolor_scene(&mut io, 0, height, width, height);
+
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.presentation_captures = 64;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu
+            .push_image_upload_rect(0, height as i32, width as i32, height as i32);
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: height as i32 + 64,
+                right: width as i32 - 1,
+                bottom: (height * 2 - 1) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 64,
+                y: height as i32 + 96,
+            }],
+            None,
+        ));
+
+        let screenshot = io.gpu.screenshot_window();
+        assert_eq!((screenshot.x, screenshot.y), (512, 0));
+        assert!(!screen_observation_worth_saving(screenshot.stats));
+
+        io.gpu.capture_best_observation();
+
+        let best = io.gpu.best_observation_window.expect("best observation");
+        let playability = io.gpu.native_playability_json();
+        assert_eq!((best.x, best.y), (0, height), "{playability}");
+        assert!(has_native_full_scene_detail(best.stats), "{playability}");
+        assert!(
+            io.gpu.best_observation_is_safe_display_candidate(best),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu.display_candidate_resolution_reason(
+                io.gpu.current_display_window(),
+                screen_observation_score(io.gpu.current_display_window().stats),
+                best
+            ),
+            "valid",
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_best_observation_rgb_cache_uses_psx_display_depth_conversion() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0010);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (256, DEFAULT_DISPLAY_HEIGHT));
+        assert!(io.gpu.display_24bit_enabled());
+
+        let words_per_row = width.saturating_mul(3).div_ceil(2);
+        for y in 0..height {
+            for x in 0..words_per_row {
+                let low = ((x * 17 + y * 13 + 0x11) & 0xff) as u16;
+                let high = ((x * 29 + y * 7 + 0x23) & 0xff) as u16;
+                io.gpu
+                    .framebuffer
+                    .set_raw_pixel(x as i32, y as i32, (high << 8) | low);
+            }
+        }
+
+        io.gpu.capture_best_observation();
+
+        let best = io.gpu.best_observation_window.expect("best observation");
+        let cached = io
+            .gpu
+            .best_observation_rgb
+            .as_ref()
+            .expect("best observation rgb cache");
+        let psx = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window_with_depth(best.x, best.y, width, height, true);
+        let raw = io.gpu.framebuffer.rgb_window(best.x, best.y, width, height);
+
+        assert_eq!(cached, &psx);
+        assert_ne!(cached, &raw);
     }
 
     #[test]
@@ -10145,6 +22502,74 @@ mod tests {
     }
 
     #[test]
+    fn gpu_display_prefers_stale_presented_scene_over_partial_current_caption() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_vblank_presented_frame();
+        let presented = io
+            .gpu
+            .presented_frame_window
+            .expect("presented scene candidate");
+        let presented_rgb = io.gpu.presented_frame_rgb.clone().expect("presented RGB");
+        assert!(is_detailed_observation(presented.stats));
+
+        io.gpu.presentation_captures = 120;
+        io.gpu.presented_frame_capture_index = 1;
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(84, (height - 24) as i32, 220, 8, 0x00ff_ffff);
+        let current = io.gpu.current_display_window();
+        assert!(!is_sparse_display(current.stats));
+        assert!(!has_native_playfield_density(current.stats));
+
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: 0,
+                right: width as i32 - 1,
+                bottom: height as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 0, y: 0 }],
+            None,
+        ));
+
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            !io.gpu
+                .should_show_current_display_over_stale_candidates_with(current),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.should_use_unresolved_non_field_output(
+                io.gpu.current_display_output_window(),
+                io.gpu.display_resolve(),
+            ),
+            "{playability}"
+        );
+        assert!(!io.gpu.should_prefer_current_display(), "{playability}");
+        assert!(io.gpu.should_prefer_presented_frame(), "{playability}");
+        assert_eq!(io.gpu.visible_display_window(), presented);
+        assert_eq!(io.gpu.display_rgb_frame().2, presented_rgb);
+    }
+
+    #[test]
     fn gpu_display_drops_stale_presented_frame_after_later_visible_progress() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
@@ -10239,6 +22664,1904 @@ mod tests {
         assert_ne!(top_pixel, bottom_pixel);
         assert!((top_pixel & 0x00ff_0000) > (top_pixel & 0x0000_ff00));
         assert!((bottom_pixel & 0x0000_ff00) > (bottom_pixel & 0x00ff_0000));
+    }
+
+    #[test]
+    fn gpu_actual_display_selects_safe_field_when_other_half_is_glyph_texture_atlas() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, field_height);
+        fill_glyph_texture_atlas_page(&mut io, 0, field_height, width, field_height);
+        for y in (0..field_height).step_by(24) {
+            io.gpu
+                .push_image_upload_rect(0, (field_height + y) as i32, width as i32, 12);
+        }
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+
+        let field_pair = io
+            .gpu
+            .interlaced_field_pair_output_window(width, field_height)
+            .expect("recent field-pair candidate");
+        let bottom = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(0, field_height, width, field_height),
+        };
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+
+        assert!(
+            io.gpu
+                .display_window_has_glyph_texture_grid(bottom, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.should_use_field_composed_output(field_pair),
+            "{playability}"
+        );
+        assert_eq!(
+            output.source, "gp1_display_area_safe_field",
+            "{playability}"
+        );
+        assert!(!output.field_composed, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!((gui_width, gui_height), (width, field_height));
+        assert_eq!(
+            actual_frame,
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, 0, width, field_height)
+        );
+        assert_eq!(gui_frame, actual_frame);
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_safe_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_detects_24bit_display_packed_glyph_texture_atlas_half() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0010);
+        assert!(io.gpu.display_24bit_enabled());
+        let width = 256;
+        let height = DEFAULT_DISPLAY_HEIGHT;
+
+        fill_psx24_glyph_texture_atlas_page(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu
+            .push_image_upload_rect(0, 0, width as i32, height as i32);
+
+        let window = FrameBufferWindow {
+            x: 0,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .psx_display_stats_with_depth(0, 0, width, height, true),
+        };
+
+        assert!(
+            io.gpu
+                .display_window_has_glyph_texture_grid_with_psx_depth(window, width, height),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(window, width, height),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+    }
+
+    #[test]
+    fn gpu_current_high_vertical_display_selects_safe_field_without_recent_pair_history() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, field_height);
+        fill_glyph_texture_atlas_page(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .push_image_upload_rect(0, field_height as i32, width as i32, field_height as i32);
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+
+        assert_eq!(
+            output.source, "gp1_display_area_safe_field",
+            "{playability}"
+        );
+        assert!(!output.field_composed, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!((gui_width, gui_height), (width, field_height));
+        assert_eq!(
+            actual_frame,
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, 0, width, field_height)
+        );
+        assert_eq!(gui_frame, actual_frame);
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_safe_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_dense_caption_texture_half_uses_safe_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(72, 108, 160, 8, 0x00ff_ffff);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(40, 132, 128, 8, 0x00ff_ffff);
+        fill_dense_caption_texture_page(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .push_image_upload_rect(0, field_height as i32, width as i32, field_height as i32);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+
+        let bottom = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                field_height,
+                width,
+                field_height,
+                io.gpu.display_24bit_enabled(),
+            ),
+        };
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let safe_frame = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, field_height);
+
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{playability}"
+        );
+        assert_eq!(output.source, DISPLAY_SOURCE_SAFE_FIELD, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, safe_frame);
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_safe_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_presented_high_vertical_sparse_warning_dense_caption_texture_frame() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(72, 108, 96, 4, 0x00ff_ffff);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(40, 132, 80, 4, 0x00ff_ffff);
+        fill_dense_noisy_caption_texture_page(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .push_image_upload_rect(0, field_height as i32, width as i32, field_height as i32);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+
+        let presented = FrameBufferWindow {
+            x: 0,
+            y: 0,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                0,
+                width,
+                display_height,
+                io.gpu.display_24bit_enabled(),
+            ),
+        };
+        io.gpu.presented_frame_window = Some(presented);
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = display_height;
+        io.gpu.presented_frame_rgb = Some(io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            0,
+            0,
+            width,
+            display_height,
+            io.gpu.display_24bit_enabled(),
+        ));
+        io.gpu.presentation_captures = 8;
+        io.gpu.presented_frame_capture_index = 8;
+
+        let output = io.gpu.current_display_output_window();
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let safe_frame = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, field_height);
+
+        assert!(
+            io.gpu
+                .presented_frame_has_high_vertical_mixed_artifact(presented),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.presented_frame_is_safe_display_candidate(presented),
+            "{playability}"
+        );
+        assert_eq!(output.source, DISPLAY_SOURCE_SAFE_FIELD, "{playability}");
+        assert!(
+            resolved.source != "presented_frame"
+                || !io.gpu.should_present_resolved_display(resolved),
+            "{playability}"
+        );
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, safe_frame);
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_safe_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_presented_high_vertical_single_field_caption_atlas() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_intro_caption_scene(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS * 2;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16;
+        io.gpu.textured_draw_stats.color_changes = 16_384;
+        io.gpu.presentation_captures = 32;
+
+        let presented = FrameBufferWindow {
+            x: 0,
+            y: 0,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                0,
+                width,
+                display_height,
+                io.gpu.display_24bit_enabled(),
+            ),
+        };
+        io.gpu.presented_frame_window = Some(presented);
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = display_height;
+        io.gpu.presented_frame_rgb = Some(io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            0,
+            0,
+            width,
+            display_height,
+            io.gpu.display_24bit_enabled(),
+        ));
+        io.gpu.presented_frame_capture_index = io.gpu.presentation_captures;
+
+        let output = io.gpu.current_display_output_window();
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .presented_frame_has_high_vertical_mixed_artifact(presented),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.presented_frame_is_safe_display_candidate(presented),
+            "{playability}"
+        );
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert!(
+            resolved.source != "presented_frame"
+                || !io.gpu.should_present_resolved_display(resolved),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_safe_field_rejects_unpresented_counterpart_half() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_glyph_texture_atlas_page(&mut io, 0, 0, width, field_height);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .push_image_upload_rect(0, 0, width as i32, field_height as i32);
+
+        let current = DisplayOutputWindow {
+            source: "gp1_display_area_high_vertical_fields",
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(current)
+            .expect("high-vertical halves");
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(top, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.safe_field_output_matches_display_flow(bottom),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .safe_field_output_from_field_composed_output(current)
+                .is_none(),
+            "{playability}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_SAFE_FIELD, "{playability}");
+    }
+
+    #[test]
+    fn gpu_high_vertical_texture_page_uses_active_field_output() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, field_height);
+        io.gpu.push_image_upload_rect(0, 0, 16, 16);
+
+        let current = io.gpu.current_display_window();
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let active_frame = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, field_height);
+
+        assert!(
+            io.gpu
+                .display_window_is_texture_atlas_with_dimensions(current, width, display_height),
+            "{playability}"
+        );
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, active_frame);
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_active_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_single_visible_bottom_field_uses_active_field_output() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(320, field_height as i32 + 64, 160, 24, 0x00ff_ffff);
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (raw_width, raw_height, raw_frame) = io.gpu.raw_actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let bottom_frame =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+        let full_frame = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, display_height);
+        let deinterlaced_bottom_frame = line_doubled_rgb_frame(&bottom_frame, width);
+
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!output.field_composed, "{playability}");
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, bottom_frame);
+        assert_eq!((raw_width, raw_height), (width, display_height));
+        assert_ne!(&raw_frame[..bottom_frame.len()], bottom_frame.as_slice());
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_ne!(gui_frame, full_frame);
+        assert_eq!(gui_frame, deinterlaced_bottom_frame);
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_active_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_single_field_scene_prefers_active_field_output() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        io.gpu.presented_frame_window = Some(full.window);
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = display_height;
+        io.gpu.presented_frame_rgb = Some(io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            0,
+            0,
+            width,
+            display_height,
+            io.gpu.display_24bit_enabled(),
+        ));
+        io.gpu.presented_frame_capture_index = io.gpu.presentation_captures;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let bottom_frame =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+        let full_frame = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, display_height);
+
+        assert!(
+            !io.gpu.should_use_high_vertical_full_output(full),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .high_vertical_full_output_has_single_visible_field(full),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .presented_frame_has_high_vertical_single_field_scene_artifact(full.window),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .presented_frame_is_safe_display_candidate(full.window),
+            "{playability}"
+        );
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!output.field_composed, "{playability}");
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!(actual_frame, bottom_frame);
+        assert_ne!(gui_frame, full_frame);
+        assert_eq!(gui_frame, line_doubled_rgb_frame(&bottom_frame, width));
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_active_field\""),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"reason\":\"single_field_scene_prefers_active_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_accepts_sparse_high_vertical_active_field_live_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_sparse_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let output = io.gpu.current_display_output_window();
+        let color_stats =
+            io.gpu
+                .display_window_color_stats(output.window, output.width, output.height, true);
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!((output.width, output.height), (width, field_height));
+        assert!(
+            output.window.stats.nonzero_pixels.saturating_mul(100)
+                < output.window.stats.pixel_count.saturating_mul(30),
+            "{playability}"
+        );
+        assert!(!has_native_playfield_density(output.window.stats));
+        assert!(
+            io.gpu
+                .high_vertical_active_field_live_scene(output, color_stats),
+            "{playability}"
+        );
+        assert!(io.gpu.native_rendered_scene_candidate(), "{playability}");
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"has_actual_scene_density\":true"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"has_actual_gameplay_profile\":true"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"has_actual_playfield\":true"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"native_playable_candidate\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_rejects_sparse_high_vertical_active_field_title_screen() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_high_vertical_static_title_scene(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let active_output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: FrameBufferWindow {
+                x: 0,
+                y: field_height,
+                stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                    0,
+                    field_height,
+                    width,
+                    field_height,
+                    io.gpu.display_24bit_enabled(),
+                ),
+            },
+        };
+        let color_stats = io.gpu.display_window_color_stats(
+            active_output.window,
+            active_output.width,
+            active_output.height,
+            true,
+        );
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu.display_window_has_high_vertical_static_title_screen(
+                active_output.window,
+                active_output.width,
+                active_output.height,
+                true
+            ),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .high_vertical_active_field_live_scene(active_output, color_stats),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_high_vertical_active_field_dominant_backdrop_texture_fragments() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            field_height as i32,
+            width as i32,
+            field_height as i32,
+            0x0080_8800,
+        );
+        let fragment_palette = [
+            0x00ff_ffff,
+            0x00e0_e000,
+            0x0000_00e0,
+            0x00e0_2020,
+            0x0000_c0c0,
+            0x00c0_00c0,
+        ];
+        for tile in 0..12 {
+            let base_x = 32 + (tile % 6) * 72;
+            let base_y = field_height + 28 + (tile / 6) * 72;
+            for y in 0..20 {
+                for x in 0..32 {
+                    let color = fragment_palette[(x + y + tile) % fragment_palette.len()];
+                    io.gpu.framebuffer.fill_rect_unclipped(
+                        (base_x + x) as i32,
+                        (base_y + y) as i32,
+                        1,
+                        1,
+                        color,
+                    );
+                }
+            }
+        }
+        io.gpu
+            .push_image_upload_rect(0, field_height as i32, width as i32, field_height as i32);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (_top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .display_window_dominant_bucket_per_mille(bottom, width, field_height, false,)
+                >= 350,
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.should_use_high_vertical_full_output(full),
+            "{playability}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_high_vertical_active_field_periodic_backdrop_fragments_without_upload_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        let palette = [
+            0x00ff_ffff,
+            0x00e8_d020,
+            0x00e0_3030,
+            0x0020_80e0,
+            0x0000_c0c0,
+            0x00c0_00c0,
+            0x00d0_8020,
+            0x0020_d060,
+        ];
+        for y in 0..field_height {
+            for x in 0..width {
+                let local_x = x % 64;
+                let color = if local_x < 34 {
+                    0x0010_1010
+                } else {
+                    palette[((local_x / 4) + (y / 8)) % palette.len()]
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x as i32,
+                    field_height.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (_top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let (upload_overlap, upload_rects, max_upload_overlap) = io
+            .gpu
+            .texture_upload_overlap_summary(bottom, width, field_height);
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(bottom, width, field_height);
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(upload_overlap, 0, "{diagnostics}");
+        assert_eq!(upload_rects, 0, "{diagnostics}");
+        assert_eq!(max_upload_overlap, 0, "{diagnostics}");
+        assert!(
+            io.gpu.display_window_has_periodic_horizontal_ghosting(
+                bottom,
+                width,
+                field_height,
+                true
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .display_window_dominant_bucket_per_mille(bottom, width, field_height, true)
+                >= 500,
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"periodic_backdrop_fragments\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{diagnostics}"
+        );
+        let narrow_bottom = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                field_height,
+                DEFAULT_DISPLAY_WIDTH,
+                field_height,
+                io.gpu.display_24bit_enabled(),
+            ),
+        };
+        let narrow_diagnostics = io.gpu.field_half_texture_artifact_diagnostics_json(
+            narrow_bottom,
+            DEFAULT_DISPLAY_WIDTH,
+            field_height,
+        );
+        assert!(
+            narrow_diagnostics.contains("\"periodic_backdrop_fragments\":true"),
+            "{narrow_diagnostics}"
+        );
+        assert!(
+            io.gpu.field_half_is_probable_texture_atlas_artifact(
+                narrow_bottom,
+                DEFAULT_DISPLAY_WIDTH,
+                field_height,
+            ),
+            "{narrow_diagnostics}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_high_vertical_active_field_caption_texture_page_without_upload_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_dense_caption_texture_page(&mut io, 0, field_height, width, field_height);
+        let caption_y = field_height + field_height - 48;
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, caption_y as i32, width as i32, 48, 0x0008_0808);
+        for x in (32..width.saturating_sub(32)).step_by(20) {
+            io.gpu.framebuffer.fill_rect_unclipped(
+                x as i32,
+                caption_y as i32 + 18,
+                8,
+                3,
+                0x00ef_efef,
+            );
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (_top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let (upload_overlap, upload_rects, max_upload_overlap) = io
+            .gpu
+            .texture_upload_overlap_summary(bottom, width, field_height);
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(bottom, width, field_height);
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(upload_overlap, 0, "{diagnostics}");
+        assert_eq!(upload_rects, 0, "{diagnostics}");
+        assert_eq!(max_upload_overlap, 0, "{diagnostics}");
+        assert!(
+            diagnostics.contains("\"caption_texture_page_artifact\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"probable_texture_atlas\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{diagnostics}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_narrow_high_vertical_active_field_font_texture_page_without_caption_band() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0025);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (320, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            field_height as i32,
+            width as i32,
+            field_height as i32,
+            0x0008_0808,
+        );
+        let glyph_palette = [0x00f0_e020, 0x00d8_1818, 0x0000_2080, 0x00ef_efef];
+        for cell_y in (0..field_height.saturating_mul(4) / 5).step_by(12) {
+            for cell_x in (0..width).step_by(14) {
+                if (cell_x / 14 + cell_y / 12) % 3 == 1 {
+                    continue;
+                }
+                let color = glyph_palette[((cell_x / 14) + (cell_y / 12) * 2) % 4];
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    cell_x as i32,
+                    field_height.saturating_add(cell_y) as i32,
+                    8,
+                    4,
+                    color,
+                );
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (_top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(bottom, width, field_height);
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            diagnostics.contains("\"raw_caption_like\":false"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"font_texture_page_artifact\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"probable_texture_atlas\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{diagnostics}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn native_playability_does_not_trust_clear_width_texture_atlas_as_actual() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (register_width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        let clear_width = DEFAULT_DISPLAY_WIDTH;
+        assert_eq!((register_width, display_height), (512, 480));
+
+        io.write_u32(GPU_GP0, 0x0240_4040);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(
+            GPU_GP0,
+            ((display_height as u32) << 16) | clear_width as u32,
+        );
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, clear_width as i32, field_height as i32, 0);
+        fill_low_bucket_glyph_texture_atlas_page(
+            &mut io,
+            0,
+            field_height,
+            clear_width,
+            field_height,
+        );
+        mark_gpu_as_having_live_textured_playfield(&mut io, register_width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let output = io.gpu.current_display_output_window();
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_CLEAR_WIDTH_DISPLAY_AREA,
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas_with_dimensions(
+                output.window,
+                output.width,
+                output.height
+            ),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .should_use_unresolved_non_field_output(output, resolved),
+            "{playability}"
+        );
+        assert!(
+            !playability.contains("\"actual_display_source\":\"gp1_display_area_clear_width\""),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_gui_deinterlaces_high_vertical_active_field_before_presented_fallback() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 16;
+
+        let full_presented = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, display_height);
+        let current = io.gpu.current_display_window();
+        io.gpu.presented_frame_window = Some(current);
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = display_height;
+        io.gpu.presented_frame_rgb = Some(full_presented.clone());
+        io.gpu.presented_frame_capture_index = io.gpu.presentation_captures;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let bottom_frame =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_ne!(gui_frame, full_presented);
+        assert_eq!(gui_frame, line_doubled_rgb_frame(&bottom_frame, width));
+    }
+
+    #[test]
+    fn native_playability_allows_high_vertical_active_field_caption_ui() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        let caption_y = field_height + field_height - 48;
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, caption_y as i32, width as i32, 48, 0);
+        for x in (24..width.saturating_sub(24)).step_by(24) {
+            io.gpu.framebuffer.fill_rect_unclipped(
+                x as i32,
+                caption_y as i32 + 16,
+                8,
+                3,
+                0x00ff_ffff,
+            );
+        }
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let output = io.gpu.current_display_output_window();
+        let color_stats =
+            io.gpu
+                .display_window_color_stats(output.window, output.width, output.height, true);
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(color_stats.has_intro_caption_band(), "{playability}");
+        assert!(
+            io.gpu
+                .high_vertical_active_field_caption_ui_allowed(output, width, field_height),
+            "{playability}"
+        );
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"caption_band_ui_allowed\":true"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"native_playable_candidate\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn native_playability_rejects_high_vertical_active_field_title_logo_overlay() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_title_logo_overlay_scene(&mut io, 0, field_height, width, field_height);
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(
+            io.gpu
+                .display_window_has_title_logo_overlay(output.window, width, field_height, true),
+            "{playability}"
+        );
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"actual_title_logo_overlay\":true"),
+            "{playability}"
+        );
+        assert!(
+            playability.contains("\"classification\":\"actual_display_title_logo_overlay\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_high_vertical_single_field_texture_upload_as_live_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .push_image_upload_rect(0, field_height as i32, width as i32, field_height as i32);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let bottom = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                field_height,
+                width,
+                field_height,
+                io.gpu.display_24bit_enabled(),
+            ),
+        };
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .display_candidate_has_dominant_unpresented_texture_upload(
+                    bottom,
+                    width,
+                    field_height
+                ),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .display_window_is_high_vertical_live_single_field_scene(
+                    bottom,
+                    width,
+                    field_height
+                ),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_window_is_texture_atlas_with_dimensions(bottom, width, field_height),
+            "{playability}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+        assert!(
+            playability.contains("\"playable_candidate\":false"),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_uses_presented_counterpart_field_over_weak_active_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, field_height as i32, 0);
+        for y in (0..field_height).step_by(6) {
+            for x in (0..width).step_by(9) {
+                let color = if (x + y) % 18 == 0 {
+                    0x00ff_d000
+                } else {
+                    0x0000_d800
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 3, 2, color);
+            }
+        }
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .push_image_upload_rect(0, 0, width as i32, field_height as i32);
+
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 128;
+        io.gpu.presented_frame_capture_index = 1;
+        let bottom = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                field_height,
+                width,
+                field_height,
+                false,
+            ),
+        };
+        io.gpu.presented_frame_window = Some(bottom);
+        io.gpu.presented_frame_width = width;
+        io.gpu.presented_frame_height = field_height;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let bottom_frame =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_PRESENTED_FIELD,
+            "{playability}"
+        );
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, bottom_frame);
+        assert!(
+            playability.contains("\"actual_display_source\":\"gp1_display_area_presented_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_safe_field_rejects_low_bucket_atlas_like_output() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+
+        fill_low_bucket_glyph_texture_atlas_page(&mut io, 0, 0, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 64;
+
+        let output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_SAFE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: FrameBufferWindow {
+                x: 0,
+                y: 0,
+                stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                    0,
+                    0,
+                    width,
+                    field_height,
+                    false,
+                ),
+            },
+        };
+        let color_stats =
+            io.gpu
+                .display_window_color_stats(output.window, width, field_height, true);
+        let playability = io.gpu.native_playability_json();
+
+        assert!(screen_observation_worth_saving(output.window.stats));
+        assert!(color_stats.bucket_count < DISPLAY_SCENE_MIN_COLOR_BUCKETS);
+        assert!(
+            !io.gpu.safe_field_output_has_scene_signal(output),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.should_use_safe_field_output(output),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_actual_display_uses_resolved_candidate_over_rejected_safe_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_low_bucket_glyph_texture_atlas_page(&mut io, 0, 0, width, field_height);
+        fill_glyph_texture_atlas_page(&mut io, 0, field_height, width, field_height);
+        fill_multicolor_scene(&mut io, 512, 0, width, display_height);
+
+        io.gpu.commands_seen = 1;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 512,
+                top: 64,
+                right: (512 + width - 1) as i32,
+                bottom: (display_height - 1) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point { x: 512, y: 128 }],
+            None,
+        ));
+
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let candidate_frame = io.gpu.framebuffer.rgb_window(512, 0, width, display_height);
+        let safe_field_frame = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, field_height);
+
+        assert_eq!(resolved.source, "page_512_0", "{playability}");
+        assert!(resolved.promoted, "{playability}");
+        assert!(io.gpu.should_present_resolved_display(resolved));
+        assert_eq!((actual_width, actual_height), (width, display_height));
+        assert_eq!(actual_frame, candidate_frame);
+        assert_ne!(
+            &actual_frame[..safe_field_frame.len()],
+            safe_field_frame.as_slice()
+        );
+        assert!(playability.contains("\"actual_display_source\":\"page_512_0\""));
+    }
+
+    #[test]
+    fn gpu_rejects_cached_high_vertical_frame_with_texture_atlas_half() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        let cached_x = 512;
+        fill_multicolor_scene(&mut io, cached_x, 0, width, field_height);
+        fill_glyph_texture_atlas_page(&mut io, cached_x, field_height, width, field_height);
+        io.gpu.push_image_upload_rect(
+            cached_x as i32,
+            field_height as i32,
+            width as i32,
+            field_height as i32,
+        );
+
+        let best = FrameBufferWindow {
+            x: cached_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(cached_x, 0, width, display_height),
+        };
+        io.gpu.best_observation_window = Some(best);
+        io.gpu.best_observation_width = width;
+        io.gpu.best_observation_height = display_height;
+        io.gpu.best_observation_rgb = Some(io.gpu.framebuffer.rgb_window(
+            cached_x,
+            0,
+            width,
+            display_height,
+        ));
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+
+        let current = io.gpu.current_display_window();
+        let reason = io.gpu.display_candidate_resolution_reason(
+            current,
+            screen_observation_score(current.stats),
+            best,
+        );
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+        let (frame_width, frame_height, frame) = io.gpu.actual_display_rgb_frame();
+        let cached_frame = io
+            .gpu
+            .framebuffer
+            .rgb_window(cached_x, 0, width, display_height);
+
+        assert!(
+            io.gpu
+                .display_candidate_has_texture_atlas_half_with_dimensions(
+                    best,
+                    width,
+                    display_height
+                ),
+            "{playability}"
+        );
+        assert_eq!(reason, "field_texture_atlas_artifact", "{playability}");
+        assert!(!io.gpu.best_observation_is_safe_display_candidate(best));
+        assert_ne!(resolved.source, "best_observation", "{playability}");
+        assert!(!io.gpu.should_prefer_best_observation(), "{playability}");
+        assert_eq!((frame_width, frame_height), (width, display_height));
+        assert_ne!(frame, cached_frame);
+        assert!(
+            !playability.contains("\"actual_display_source\":\"best_observation\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_primitive_workspace_artifact_as_display_candidate() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        assert_eq!((width, display_height), (512, DEFAULT_DISPLAY_HEIGHT * 2));
+
+        let candidate_x = 512;
+        fill_primitive_workspace_artifact(&mut io, candidate_x, 0, width, display_height);
+        io.gpu.commands_seen = 2048;
+        io.gpu.image_upload_commands = DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 96;
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: candidate_x as i32,
+                top: 48,
+                right: (candidate_x + width - 1) as i32,
+                bottom: (display_height - 1) as i32,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: candidate_x as i32 + 64,
+                y: 128,
+            }],
+            None,
+        ));
+
+        let current = io.gpu.current_display_window();
+        let candidate = FrameBufferWindow {
+            x: candidate_x,
+            y: 0,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(candidate_x, 0, width, display_height),
+        };
+        io.gpu.best_observation_window = Some(candidate);
+        io.gpu.best_observation_width = width;
+        io.gpu.best_observation_height = display_height;
+        io.gpu.best_observation_rgb = Some(io.gpu.framebuffer.rgb_window(
+            candidate_x,
+            0,
+            width,
+            display_height,
+        ));
+
+        let reason = io.gpu.display_candidate_resolution_reason(
+            current,
+            screen_observation_score(current.stats),
+            candidate,
+        );
+        let resolved = io.gpu.display_resolve();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu.display_window_has_primitive_workspace_artifact(
+                candidate,
+                width,
+                display_height
+            ),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas_with_dimensions(
+                candidate,
+                width,
+                display_height
+            ),
+            "{playability}"
+        );
+        assert_eq!(reason, "texture_atlas", "{playability}");
+        assert!(
+            !io.gpu.best_observation_is_safe_display_candidate(candidate),
+            "{playability}"
+        );
+        assert_ne!(resolved.source, "best_observation", "{playability}");
+        assert_ne!(resolved.source, "page_512_0", "{playability}");
+        assert!(!resolved.promoted, "{playability}");
+        assert!(
+            !playability.contains("\"actual_display_source\":\"best_observation\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_keeps_recent_live_active_field_from_tearing_atlas_classification() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        let active_y = height;
+        fill_primitive_workspace_artifact(&mut io, 0, active_y, width, height);
+        for y in height / 2..height {
+            for x in 0..width {
+                let red = ((x * 11 + y * 3) & 0xff) as u32;
+                let green = ((x * 5 + y * 17) & 0xff) as u32;
+                let blue = ((x * 19 + y * 7) & 0xff) as u32;
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x as i32,
+                    active_y.saturating_add(y) as i32,
+                    1,
+                    1,
+                    (red << 16) | (green << 8) | blue,
+                );
+            }
+        }
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((active_y as u32) << 10));
+        io.gpu
+            .push_image_upload_rect(0, active_y as i32, width as i32, height as i32);
+        mark_gpu_as_having_pixel_heavy_low_triangle_playfield(&mut io, 0, active_y, width, height);
+
+        let active = io.gpu.current_display_window();
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(active, width, height, false);
+        let (upload_overlap, upload_rects, _) =
+            io.gpu.texture_upload_overlap_summary(active, width, height);
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!((active.x, active.y), (0, active_y), "{playability}");
+        assert!(upload_overlap > 0, "{playability}");
+        assert_eq!(upload_rects, 1, "{playability}");
+        assert!(color_stats.has_scene_color_diversity(), "{playability}");
+        assert!(
+            io.gpu
+                .display_window_is_direct_live_display_scene(active, width, height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .display_window_is_texture_atlas_with_dimensions(active, width, height),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejects_unpresented_texture_atlas_page_with_sparse_tail_half() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        io.gpu
+            .push_image_upload_rect(0, field_height as i32, 16, 16);
+
+        let candidate = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(0, field_height, width, display_height),
+        };
+        let top = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(0, field_height, width, field_height),
+        };
+        let bottom = FrameBufferWindow {
+            x: 0,
+            y: display_height,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(0, display_height, width, field_height),
+        };
+        let reason = io.gpu.display_candidate_resolution_reason(
+            io.gpu.current_display_window(),
+            screen_observation_score(io.gpu.current_display_window().stats),
+            candidate,
+        );
+        let playability = io.gpu.native_playability_json();
+
+        assert!(io.gpu.display_half_is_sparse_tail(bottom), "{playability}");
+        assert!(
+            io.gpu
+                .display_candidate_has_unbalanced_unpresented_texture_half(
+                    candidate,
+                    width,
+                    display_height,
+                    top,
+                    bottom,
+                ),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.display_window_is_texture_atlas_with_dimensions(
+                candidate,
+                width,
+                display_height
+            ),
+            "{playability}"
+        );
+        assert_eq!(reason, "field_texture_atlas_artifact", "{playability}");
+    }
+
+    #[test]
+    fn gpu_actual_display_rejects_intro_caption_field_pair() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!(height, DEFAULT_DISPLAY_HEIGHT);
+
+        fill_intro_caption_scene(&mut io, 0, 0, width, height * 2);
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+
+        let field_pair = io
+            .gpu
+            .recent_low_height_field_pair_output_window(width, height)
+            .expect("recent field-pair candidate");
+        let output = io.gpu.current_display_output_window();
+        let color_stats = io.gpu.display_window_color_stats(
+            field_pair.window,
+            field_pair.width,
+            field_pair.height,
+            false,
+        );
+        let (actual_width, actual_height, _) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, _) = io.gpu.display_rgb_frame();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(field_pair.field_composed, "{playability}");
+        assert_eq!((field_pair.width, field_pair.height), (width, height * 2));
+        assert!(has_native_full_scene_detail(field_pair.window.stats));
+        assert!(color_stats.has_intro_caption_band());
+        assert!(
+            io.gpu
+                .field_composed_output_is_intro_video_caption(field_pair),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.should_use_field_composed_output(field_pair),
+            "{playability}"
+        );
+        assert!(!output.field_composed, "{playability}");
+        assert_eq!((actual_width, actual_height), (width, height));
+        assert_eq!(
+            (gui_width, gui_height),
+            (width, height * 2),
+            "GUI should show the full warning/caption field pair even though playability rejects it"
+        );
+    }
+
+    #[test]
+    fn gpu_actual_display_rejects_thin_caption_text_field_pair() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!(height, DEFAULT_DISPLAY_HEIGHT);
+
+        fill_thin_caption_text_scene(&mut io, 0, 0, width, height * 2);
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+
+        let field_pair = io
+            .gpu
+            .recent_low_height_field_pair_output_window(width, height)
+            .expect("recent field-pair candidate");
+        let color_stats = io.gpu.display_window_color_stats(
+            field_pair.window,
+            field_pair.width,
+            field_pair.height,
+            false,
+        );
+        let output = io.gpu.current_display_output_window();
+        let (gui_width, gui_height, _) = io.gpu.display_rgb_frame();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(field_pair.field_composed, "{playability}");
+        assert!(has_native_full_scene_detail(field_pair.window.stats));
+        assert!(!color_stats.has_intro_caption_band());
+        assert!(color_stats.has_caption_text_band());
+        assert!(
+            io.gpu
+                .field_composed_output_is_intro_video_caption(field_pair),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.should_use_field_composed_output(field_pair),
+            "{playability}"
+        );
+        assert!(!output.field_composed, "{playability}");
+        assert_eq!(
+            (gui_width, gui_height),
+            (width, height * 2),
+            "GUI should still render the complete interlaced field pair"
+        );
     }
 
     #[test]
@@ -10340,44 +24663,98 @@ mod tests {
     }
 
     #[test]
+    fn gpu_low_quality_field_composed_output_yields_to_live_resolved_observation() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0006);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, DEFAULT_DISPLAY_HEIGHT));
+
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            0,
+            width as i32,
+            (height * 2) as i32,
+            0x0008_0808,
+        );
+        for y in (16..height * 2).step_by(24) {
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(48, y as i32, 320, 2, 0x00f0_f0f0);
+        }
+
+        fill_multicolor_scene(&mut io, 0, height * 2, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16,
+            color_changes: 65_536,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.overlap_draw_commands.push(GpuDrawTrace::textured(
+            "textured_quad",
+            0,
+            0,
+            DrawBounds {
+                left: 0,
+                top: (height * 2 + 64) as i32,
+                right: width as i32 - 1,
+                bottom: (height * 3) as i32 - 1,
+            },
+            io.gpu.textured_draw_stats,
+            &[0x2c00_0000],
+            &[Point {
+                x: 64,
+                y: (height * 2 + 96) as i32,
+            }],
+            None,
+        ));
+
+        let output = DisplayOutputWindow {
+            source: "gp1_display_area_fields",
+            field_composed: true,
+            cached: false,
+            width,
+            height: height * 2,
+            window: FrameBufferWindow {
+                x: 0,
+                y: 0,
+                stats: io.gpu.framebuffer.display_stats(0, 0, width, height * 2),
+            },
+        };
+        let best = FrameBufferWindow {
+            x: 0,
+            y: height * 2,
+            stats: io
+                .gpu
+                .framebuffer
+                .display_stats(0, height * 2, width, height),
+        };
+        io.gpu.best_observation_window = Some(best);
+        io.gpu.best_observation_width = width;
+        io.gpu.best_observation_height = height;
+        let resolved = DisplayResolve {
+            source: "best_observation",
+            promoted: true,
+            window: best,
+        };
+
+        assert!(has_native_full_scene_detail(best.stats));
+        assert!(io.gpu.should_present_resolved_display(resolved));
+        assert!(
+            io.gpu
+                .should_field_composed_output_yield_to_resolved(output, resolved)
+        );
+    }
+
+    #[test]
     fn gpu_actual_display_keeps_cached_field_composed_frame_after_raw_field_clear() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
         let (width, display_height) = io.gpu.display_dimensions();
         let height = display_height / 2;
 
-        for x in 0..width {
-            let top_color = match (x / 8) % 8 {
-                0 => 0x00ff_ffff,
-                1 => 0x0008_2040,
-                2 => 0x00d0_4030,
-                3 => 0x0020_a040,
-                4 => 0x0040_40c0,
-                5 => 0x00e0_9050,
-                6 => 0x0030_c0c0,
-                _ => 0x0080_6030,
-            };
-            let bottom_color = match (x / 8) % 8 {
-                0 => 0x0008_4008,
-                1 => 0x00ff_e0c0,
-                2 => 0x00a0_2030,
-                3 => 0x0030_b050,
-                4 => 0x0050_60d0,
-                5 => 0x00f0_a040,
-                6 => 0x0040_c0a0,
-                _ => 0x0090_7030,
-            };
-            io.gpu
-                .framebuffer
-                .fill_rect_unclipped(x as i32, 0, 1, height as i32, top_color);
-            io.gpu.framebuffer.fill_rect_unclipped(
-                x as i32,
-                height as i32,
-                1,
-                height as i32,
-                bottom_color,
-            );
-        }
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        fill_multicolor_scene(&mut io, 0, height, width, height);
         io.write_u32(GPU_GP1, 0x0500_0000 | ((height as u32) << 10));
         io.write_u32(GPU_GP1, 0x0500_0000);
 
@@ -10417,6 +24794,56 @@ mod tests {
             playability.contains("\"has_scene_color_diversity\":true"),
             "{compact_playability}"
         );
+    }
+
+    #[test]
+    fn gpu_gui_prefers_cached_field_composed_frame_over_caption_active_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, field_height);
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+        io.gpu.capture_vblank_presented_frame();
+        let (cached_width, cached_height, cached_frame) = io.gpu.actual_display_rgb_frame();
+        assert_eq!((cached_width, cached_height), (width, display_height));
+        assert!(io.gpu.field_composed_display_window.is_some());
+
+        io.gpu.presentation_captures = 64;
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, display_height as i32, 0);
+        fill_intro_caption_scene(&mut io, 0, field_height, width, field_height);
+
+        let current_output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+
+        assert_eq!(
+            current_output.source, DISPLAY_SOURCE_ACTIVE_FIELD,
+            "{playability}"
+        );
+        assert_eq!(
+            (current_output.width, current_output.height),
+            (width, field_height),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .display_output_is_unusable_for_cached_gui_handoff(current_output),
+            "{playability}"
+        );
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!(gui_frame, cached_frame);
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_ne!(actual_frame, cached_frame);
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
     }
 
     #[test]
@@ -10511,7 +24938,7 @@ mod tests {
         assert_eq!((frame_width, frame_height), (width, display_height));
         assert_eq!((actual_width, actual_height), (width, field_height * 2));
         assert_eq!(actual_frame, cached_frame);
-        assert_ne!(frame, cached_frame);
+        assert_eq!(frame, cached_frame);
         assert!(
             playability.contains("\"actual_display_source\":\"cached_gp1_display_area_fields\""),
             "{playability}"
@@ -10692,6 +25119,70 @@ mod tests {
             "{playability}"
         );
         assert!(playability.contains("\"playable_candidate\":false"));
+    }
+
+    #[test]
+    fn gpu_captures_high_vertical_presented_frame_before_field_clear() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let before = io.gpu.framebuffer.psx_display_stats_with_depth(
+            0,
+            0,
+            width,
+            height,
+            io.gpu.display_24bit_enabled(),
+        );
+        assert!(presented_frame_has_live_scene(before));
+
+        io.write_u32(GPU_GP0, 0x0200_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, (((height / 2) as u32) << 16) | width as u32);
+
+        let presented = io
+            .gpu
+            .presented_frame_window
+            .expect("presented frame before field clear");
+        assert_eq!(io.gpu.presentation_captures, 1);
+        assert_eq!(io.gpu.presented_frame_capture_index, 1);
+        assert_eq!(presented.stats.checksum, before.checksum);
+        assert_eq!(io.gpu.presented_frame_width, width);
+        assert_eq!(io.gpu.presented_frame_height, height);
+    }
+
+    #[test]
+    fn gpu_captures_high_vertical_presented_frame_before_wide_partial_clear() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        assert_eq!((width, height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let before = io.gpu.framebuffer.psx_display_stats_with_depth(
+            0,
+            0,
+            width,
+            height,
+            io.gpu.display_24bit_enabled(),
+        );
+        assert!(presented_frame_has_live_scene(before));
+
+        io.write_u32(GPU_GP0, 0x0200_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, ((height as u32) << 16) | 320_u32);
+
+        let presented = io
+            .gpu
+            .presented_frame_window
+            .expect("presented frame before partial high-vertical clear");
+        assert_eq!(io.gpu.presentation_captures, 1);
+        assert_eq!(io.gpu.presented_frame_capture_index, 1);
+        assert_eq!(presented.stats.checksum, before.checksum);
+        assert_eq!(io.gpu.presented_frame_width, width);
+        assert_eq!(io.gpu.presented_frame_height, height);
     }
 
     #[test]
@@ -10878,6 +25369,28 @@ mod tests {
     }
 
     #[test]
+    fn gpu_gp0_shaded_quad_interpolates_vertex_colors() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0x3800_00ff);
+        io.write_u32(GPU_GP0, 0x000a_000a);
+        io.write_u32(GPU_GP0, 0x0000_ff00);
+        io.write_u32(GPU_GP0, 0x000a_000e);
+        io.write_u32(GPU_GP0, 0x00ff_0000);
+        io.write_u32(GPU_GP0, 0x000e_000a);
+        io.write_u32(GPU_GP0, 0x00ff_ffff);
+        io.write_u32(GPU_GP0, 0x000e_000e);
+
+        let top_left = io.gpu.framebuffer.pixel(10, 10);
+        let top_right = io.gpu.framebuffer.pixel(14, 10);
+        let bottom_left = io.gpu.framebuffer.pixel(10, 14);
+
+        assert!((top_left & 0x00ff_0000) > (top_left & 0x0000_ff00));
+        assert!((top_right & 0x0000_ff00) > (top_right & 0x00ff_0000));
+        assert!((bottom_left & 0x0000_00ff) > (bottom_left & 0x00ff_0000));
+    }
+
+    #[test]
     fn gpu_gp0_textured_quad_samples_vram_texture() {
         let mut io = Io::default();
 
@@ -10917,6 +25430,183 @@ mod tests {
 
         assert_eq!(io.gpu.gp0_pending_words(), 0);
         assert!(io.gpu.framebuffer_stats().nonzero_pixels > 16);
+    }
+
+    #[test]
+    fn gpu_gp0_textured_quad_does_not_recover_blank_clut_alias() {
+        let mut io = Io::default();
+        let texture_page = 0x000d_u32;
+        let clut = 0x7c17_u32;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        io.gpu.framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(clut_x + 1, clut_y - 16, 0x001f);
+        for index in 2..16 {
+            io.gpu
+                .framebuffer
+                .set_raw_pixel(clut_x + index, clut_y - 16, 0x03e0);
+        }
+
+        io.write_u32(GPU_GP0, 0x2d80_8080);
+        io.write_u32(GPU_GP0, 0x000a_000a);
+        io.write_u32(GPU_GP0, clut << 16);
+        io.write_u32(GPU_GP0, 0x000a_000c);
+        io.write_u32(GPU_GP0, (texture_page << 16) | 0x0002);
+        io.write_u32(GPU_GP0, 0x000c_000a);
+        io.write_u32(GPU_GP0, 0x0000_0200);
+        io.write_u32(GPU_GP0, 0x000c_000c);
+        io.write_u32(GPU_GP0, 0x0000_0202);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_eq!(io.gpu.framebuffer.pixel(10, 10), 0);
+    }
+
+    #[test]
+    fn gpu_gp0_8bpp_textured_rect_does_not_recover_blank_clut_alias() {
+        let mut io = Io::default();
+        let texture_page = 0x0299_u32;
+        let clut = 0x7c80_u32;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let page_y = 0;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let fallback_x = 384;
+
+        io.gpu.framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..128 {
+            io.gpu
+                .framebuffer
+                .set_raw_pixel(fallback_x + index, clut_y, 0x03e0);
+        }
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(fallback_x + 0x2a, clut_y, 0x001f);
+
+        io.write_u32(GPU_GP0, 0xe100_0299);
+        io.write_u32(GPU_GP0, 0x6480_8080);
+        io.write_u32(GPU_GP0, 0x000a_000a);
+        io.write_u32(GPU_GP0, clut << 16);
+        io.write_u32(GPU_GP0, 0x0001_0001);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_eq!(io.gpu.framebuffer.pixel(10, 10), 0);
+        assert_eq!(io.gpu.textured_draw_stats.clut_blank_samples, 1);
+        assert_eq!(io.gpu.textured_draw_stats.palette_fallback_samples, 0);
+    }
+
+    #[test]
+    fn gpu_gp0_8bpp_screen_rect_recovers_blank_clut_tiled_palette() {
+        let mut io = Io::default();
+        let texture_page = 0x0299_u32;
+        let clut = 0x7c80_u32;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let page_y = 0;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_x = 384;
+        let alias_y = clut_y & !0x1f;
+
+        io.gpu.framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            let col = index & 0x0f;
+            let row = index / 16;
+            io.gpu
+                .framebuffer
+                .set_raw_pixel(alias_x + col, alias_y + row, 0x03e0);
+        }
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(alias_x + 0x0a, alias_y + 0x02, 0x001f);
+
+        io.write_u32(GPU_GP0, 0xe100_0299);
+        io.write_u32(GPU_GP0, 0x6480_8080);
+        io.write_u32(GPU_GP0, 0x00f0_0000);
+        io.write_u32(GPU_GP0, clut << 16);
+        io.write_u32(GPU_GP0, 0x00f0_0100);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_ne!(io.gpu.framebuffer.pixel(0, 240), 0);
+        assert!(io.gpu.textured_draw_stats.clut_blank_samples > 0);
+        assert!(io.gpu.textured_draw_stats.palette_fallback_samples > 0);
+    }
+
+    #[test]
+    fn gpu_gp0_zn_8bpp_quad_uses_tiled_palette_even_when_polygon_fallback_is_disabled() {
+        let mut io = Io::default();
+        let texture_page = 0x2e80_u32;
+        let clut = 0x795a_u32;
+        let page_x = 704;
+        let page_y = 256;
+        let tiled_palette_x = 384;
+        let tiled_palette_y = 480;
+        let requested_palette_x = ((clut & 0x3f) as i32) * 16;
+        let requested_palette_y = ((clut >> 6) & 0x03ff) as i32;
+
+        io.gpu.framebuffer.set_raw_pixel(page_x, page_y, 0x0005);
+        for index in 0..160 {
+            io.gpu.framebuffer.set_raw_pixel(
+                requested_palette_x + index,
+                requested_palette_y,
+                0x001f,
+            );
+        }
+        for index in 0..224 {
+            io.gpu.framebuffer.set_raw_pixel(
+                tiled_palette_x + (index & 0x0f),
+                tiled_palette_y + (index / 16),
+                0x03e0,
+            );
+        }
+
+        io.write_u32(GPU_GP0, 0x2e80_8080);
+        io.write_u32(GPU_GP0, 0x000a_000a);
+        io.write_u32(GPU_GP0, clut << 16);
+        io.write_u32(GPU_GP0, 0x000a_000c);
+        io.write_u32(GPU_GP0, texture_page << 16);
+        io.write_u32(GPU_GP0, 0x000c_000a);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x000c_000c);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert!(io.gpu.textured_draw_stats.palette_fallback_samples > 0);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(10, 10) & 0x7fff, 0x03e0);
+    }
+
+    #[test]
+    fn gpu_gp0_shaded_textured_quad_modulates_with_interpolated_vertex_colors() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0002_0002);
+        io.write_u32(GPU_GP0, 0x7fff_7fff);
+        io.write_u32(GPU_GP0, 0x7fff_7fff);
+
+        let direct_15bit_page = 0x0100_u32;
+        let texture_page_uv = direct_15bit_page << 16;
+        io.write_u32(GPU_GP0, 0x3c00_00ff);
+        io.write_u32(GPU_GP0, 0x000a_000a);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0000_ff00);
+        io.write_u32(GPU_GP0, 0x000a_000c);
+        io.write_u32(GPU_GP0, texture_page_uv | 0x0001);
+        io.write_u32(GPU_GP0, 0x00ff_0000);
+        io.write_u32(GPU_GP0, 0x000c_000a);
+        io.write_u32(GPU_GP0, 0x0000_0100);
+        io.write_u32(GPU_GP0, 0x00ff_ffff);
+        io.write_u32(GPU_GP0, 0x000c_000c);
+        io.write_u32(GPU_GP0, 0x0000_0101);
+
+        let top_left = io.gpu.framebuffer.pixel(10, 10);
+        let top_right = io.gpu.framebuffer.pixel(12, 10);
+        let bottom_left = io.gpu.framebuffer.pixel(10, 12);
+
+        assert!((top_left & 0x00ff_0000) > (top_left & 0x0000_ff00));
+        assert!((top_right & 0x0000_ff00) > (top_right & 0x00ff_0000));
+        assert!((bottom_left & 0x0000_00ff) > (bottom_left & 0x00ff_0000));
     }
 
     #[test]
@@ -11011,6 +25701,31 @@ mod tests {
         assert_ne!(modulated, 0);
         assert!(modulated < 0x7fff);
         assert_eq!(raw, 0x7fff);
+    }
+
+    #[test]
+    fn gpu_gp0_textured_quad_modulates_with_psx_command_rgb_order() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0002_0002);
+        io.write_u32(GPU_GP0, 0x7fff_7fff);
+        io.write_u32(GPU_GP0, 0x7fff_7fff);
+
+        let direct_15bit_page = 0x0100_u32;
+        let texture_page_uv = direct_15bit_page << 16;
+        io.write_u32(GPU_GP0, 0x2c00_00ff);
+        io.write_u32(GPU_GP0, 0x000a_000a);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x000a_000c);
+        io.write_u32(GPU_GP0, texture_page_uv | 0x0001);
+        io.write_u32(GPU_GP0, 0x000c_000a);
+        io.write_u32(GPU_GP0, 0x0000_0100);
+        io.write_u32(GPU_GP0, 0x000c_000c);
+        io.write_u32(GPU_GP0, 0x0000_0101);
+
+        assert_eq!(io.gpu.framebuffer.raw_pixel(10, 10) & 0x7fff, 0x001f);
     }
 
     #[test]
@@ -11356,11 +26071,34 @@ mod tests {
 
         let pixels = super::flatten_mdec_rgb555_macroblocks(&macroblocks);
 
+        assert_eq!(pixels.len(), 5 * 64 * 256);
         assert_eq!(pixels[0], 0);
-        assert_eq!(pixels[(16 * 16) - 1], 0);
-        assert_eq!(pixels[16 * 16], 20);
-        assert_eq!(pixels[14 * 16 * 16], 280);
-        assert_eq!(pixels[15 * 16 * 16], 1);
+        assert_eq!(pixels[15], 0);
+        assert_eq!(pixels[16], 1);
+        assert_eq!(pixels[63], 3);
+        assert_eq!(pixels[64], 0);
+        assert_eq!(pixels[(16 * 64) - 1], 3);
+        assert_eq!(pixels[16 * 64], 20);
+        assert_eq!(pixels[(15 * 16 * 64) - 1], 283);
+        assert_eq!(pixels[15 * 16 * 64], 0);
+        assert_eq!(pixels[(64 * 256) - 1], 0);
+        assert_eq!(pixels[64 * 256], 4);
+    }
+
+    #[test]
+    fn mdec_240p_frame_packing_keeps_trailing_padding_macroblocks() {
+        let macroblocks = (0..303)
+            .map(|index| [index as u16; 16 * 16])
+            .collect::<Vec<_>>();
+
+        let pixels = super::flatten_mdec_rgb555_macroblocks(&macroblocks);
+        let tail_start = 5 * 64 * 256;
+
+        assert_eq!(pixels[0], 0);
+        assert_eq!(pixels[16 * 64], 20);
+        assert_eq!(pixels[64 * 256], 4);
+        assert_eq!(pixels[tail_start], 300);
+        assert_eq!(pixels[tail_start + (3 * 16 * 16) - 1], 302);
     }
 
     #[test]
@@ -11373,10 +26111,44 @@ mod tests {
             0xfe00_2080,
             0xfe00_20a0,
         ];
-        let output = super::decode_mdec_macroblocks(&words, &[8; 64], &[8; 64], 0x2200_0006);
+        let output =
+            super::decode_mdec_macroblocks(&words, &[8; 64], &[8; 64], &[0; 64], 0x2200_0006);
 
         assert_ne!(output[0], 0);
         assert_eq!(output[0] & 0x8000_8000, 0x8000_8000);
+    }
+
+    #[test]
+    fn mdec_zero_scale_table_preserves_legacy_idct_path() {
+        let mut coefficients = [0_i32; 64];
+        coefficients[0] = 128;
+        coefficients[1] = -32;
+        coefficients[8] = 24;
+
+        assert_eq!(
+            super::idct_8x8_with_optional_scale(&coefficients, &[0; 64]),
+            super::idct_8x8(&coefficients)
+        );
+    }
+
+    #[test]
+    fn mdec_nonzero_scale_table_changes_decode_output() {
+        let words = [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ];
+        let zero_scale =
+            super::decode_mdec_macroblocks(&words, &[8; 64], &[8; 64], &[0; 64], 0x2200_0006);
+        let scale = [0x4000; 64];
+        let scaled =
+            super::decode_mdec_macroblocks(&words, &[8; 64], &[8; 64], &scale, 0x2200_0006);
+
+        assert_ne!(scaled, zero_scale);
+        assert_ne!(scaled[0], 0);
     }
 
     #[test]
