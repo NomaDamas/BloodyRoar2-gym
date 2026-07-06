@@ -539,11 +539,16 @@ impl NativeEmulator {
         let gpu_playable_candidate = self.gpu_native_playable_candidate();
         let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
         let gte_gameplay_signal = self.native_3d_gameplay_signal();
-        self.native_display_frame_supports_playable_candidate_with_context(
-            gpu_playable_candidate,
-            gpu_rendered_scene_candidate,
-            gte_gameplay_signal,
-        ) && (gpu_playable_candidate || (gpu_rendered_scene_candidate && gte_gameplay_signal))
+        let display_frame_guard = self
+            .native_display_frame_supports_playable_candidate_with_context(
+                gpu_playable_candidate,
+                gpu_rendered_scene_candidate,
+                gte_gameplay_signal,
+            );
+        display_frame_guard
+            && (gpu_playable_candidate
+                || (gpu_rendered_scene_candidate && gte_gameplay_signal)
+                || gte_gameplay_signal)
     }
 
     pub fn gpu_native_playable_candidate(&self) -> bool {

@@ -4006,6 +4006,8 @@ fn run_native_play_snapshot(
         .join(",");
     let final_window_candidate = native_play_window_frame_for_emulator(&emulator);
     let final_window_candidate_stats = NativeFrameStats::from_frame(&final_window_candidate);
+    let final_window_candidate_output = suffixed_path(output_prefix, "candidate-window.png");
+    write_native_display_frame_png(&final_window_candidate, &final_window_candidate_output)?;
     let final_window_frame = native_play_select_visible_window_frame_for_emulator(
         &emulator,
         final_window_candidate,
@@ -4609,8 +4611,7 @@ fn run_native_gap_probe(
     };
 
     let final_native_playable_candidate = emulator.native_playable_candidate();
-    let gpu_gameplay_context = emulator.gpu_native_playable_candidate()
-        || (emulator.gpu_native_rendered_scene_candidate() && emulator.native_3d_gameplay_signal());
+    let gpu_gameplay_context = native_play_gpu_gameplay_context(&emulator);
     let stable_frame = emulator.display_frame();
     let actual_frame = emulator.actual_display_frame();
     let selected_frame =
@@ -4824,78 +4825,7 @@ fn native_play_repair_context_live_stage_window_frame(
         return frame;
     }
 
-    native_play_expand_context_live_stage_window_frame(frame)
-}
-
-fn native_play_expand_context_live_stage_window_frame(
-    frame: NativeDisplayFrame,
-) -> NativeDisplayFrame {
-    if frame.width == 0
-        || frame.height == 0
-        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
-    {
-        return frame;
-    }
-
-    let Some((first_row, last_content_row)) = native_play_content_row_bounds(&frame) else {
-        return frame;
-    };
-    let trailing_rows = frame
-        .height
-        .saturating_sub(last_content_row.saturating_add(1));
-    let last_row = if trailing_rows > frame.height / 10 {
-        last_content_row
-            .saturating_add(trailing_rows.saturating_mul(7) / 10)
-            .min(frame.height.saturating_sub(1))
-    } else {
-        last_content_row
-    };
-    let source_height = last_row.saturating_sub(first_row).saturating_add(1);
-    if source_height >= frame.height.saturating_mul(95) / 100
-        || source_height < frame.height / 3
-        || first_row > frame.height / 8
-    {
-        return frame;
-    }
-
-    let mut pixels = vec![0; frame.width.saturating_mul(frame.height)];
-    for y in 0..frame.height {
-        let source_y = first_row
-            .saturating_add(y.saturating_mul(source_height) / frame.height)
-            .min(last_row);
-        let source_start = source_y.saturating_mul(frame.width);
-        let target_start = y.saturating_mul(frame.width);
-        pixels[target_start..target_start + frame.width]
-            .copy_from_slice(&frame.pixels[source_start..source_start + frame.width]);
-    }
-
-    NativeDisplayFrame {
-        width: frame.width,
-        height: frame.height,
-        pixels,
-    }
-}
-
-fn native_play_content_row_bounds(frame: &NativeDisplayFrame) -> Option<(usize, usize)> {
-    let row_content_cutoff = (frame.width / 20).max(1);
-    let mut first = None;
-    let mut last = 0usize;
-
-    for y in 0..frame.height {
-        let row_start = y.saturating_mul(frame.width);
-        let row_end = row_start.saturating_add(frame.width);
-        let row_nonzero = frame.pixels[row_start..row_end]
-            .iter()
-            .filter(|pixel| **pixel & 0x00ff_ffff != 0)
-            .take(row_content_cutoff)
-            .count();
-        if row_nonzero >= row_content_cutoff {
-            first.get_or_insert(y);
-            last = y;
-        }
-    }
-
-    first.map(|first| (first, last))
+    frame
 }
 
 fn native_play_display_frame_with_context(
@@ -4904,15 +4834,14 @@ fn native_play_display_frame_with_context(
 ) -> NativeDisplayFrame {
     let stable = emulator.display_frame();
     let actual = emulator.actual_display_frame();
+    let gpu_gameplay_context = native_play_gpu_gameplay_context(emulator);
     if native_play_should_prefer_actual_display(&actual, &stable, native_playable_candidate)
         || native_play_should_prefer_gpu_verified_actual_display(
             &actual,
             &stable,
             native_playable_candidate,
             emulator.actual_display_supports_playable_candidate(),
-            emulator.gpu_native_playable_candidate()
-                || (emulator.gpu_native_rendered_scene_candidate()
-                    && emulator.native_3d_gameplay_signal()),
+            gpu_gameplay_context,
         )
     {
         actual
@@ -4932,8 +4861,7 @@ fn native_play_window_frame_for_emulator_with_context(
     emulator: &NativeEmulator,
     native_playable_candidate: bool,
 ) -> NativeDisplayFrame {
-    let gpu_gameplay_context = emulator.gpu_native_playable_candidate()
-        || (emulator.gpu_native_rendered_scene_candidate() && emulator.native_3d_gameplay_signal());
+    let gpu_gameplay_context = native_play_gpu_gameplay_context(emulator);
     native_play_window_frame_with_context(
         &native_play_display_frame_with_context(emulator, native_playable_candidate),
         native_playable_candidate,
@@ -4942,13 +4870,19 @@ fn native_play_window_frame_for_emulator_with_context(
 }
 
 fn native_play_actual_window_frame_for_emulator(emulator: &NativeEmulator) -> NativeDisplayFrame {
-    let gpu_gameplay_context = emulator.gpu_native_playable_candidate()
-        || (emulator.gpu_native_rendered_scene_candidate() && emulator.native_3d_gameplay_signal());
+    let gpu_gameplay_context = native_play_gpu_gameplay_context(emulator);
     native_play_window_frame_with_context(
         &emulator.actual_display_frame(),
         emulator.native_playable_candidate(),
         gpu_gameplay_context,
     )
+}
+
+fn native_play_gpu_gameplay_context(emulator: &NativeEmulator) -> bool {
+    emulator.gpu_native_playable_candidate()
+        || (emulator.gpu_native_rendered_scene_candidate() && emulator.native_3d_gameplay_signal())
+        || (emulator.native_3d_gameplay_signal()
+            && emulator.actual_display_supports_playable_candidate())
 }
 
 fn native_play_should_prefer_actual_display(
@@ -4968,6 +4902,22 @@ fn native_play_should_prefer_actual_display(
             >= actual_stats.nonzero_pixels.saturating_mul(5)
         && stable_stats.occupied_row_span > actual_stats.occupied_row_span.saturating_add(64)
         && !stable_stats.has_blocking_display_artifact();
+    let actual_is_low_field_of_stable = actual.width == stable.width
+        && actual.height > 0
+        && actual.height.saturating_mul(2) == stable.height;
+    let stable_has_deinterlaced_scene = actual_is_low_field_of_stable
+        && stable.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        && stable_stats.has_visible_content()
+        && stable_stats.has_scene_detail()
+        && !stable_stats.has_title_screen_frame()
+        && !stable_stats.has_blocking_texture_page_fragment_artifact()
+        && !stable_stats.has_corrupt_title_texture_fragment()
+        && !stable_stats.has_repeating_tile_grid_artifact()
+        && !stable_stats.has_saturated_transition_planes()
+        && !stable_stats.has_warm_dominant_fill_frame();
+    if stable_has_deinterlaced_scene && !actual_title_ready {
+        return false;
+    }
     if actual_title_ready
         && !actual_stats.has_texture_page_fragment_artifact()
         && !actual_stats.has_saturated_transition_planes()
@@ -7658,6 +7608,7 @@ impl NativeFrameStats {
             && !self.has_repeating_tile_grid_artifact()
             && !self.has_saturated_transition_planes()
             && !self.has_warm_dominant_fill_frame()
+            && !self.has_bottom_caption_band()
             && !self.has_periodic_horizontal_ghosting()
     }
 
@@ -7743,6 +7694,7 @@ impl NativeFrameStats {
     fn has_native_context_scene(self) -> bool {
         (!self.has_intro_caption_band() && !self.has_bottom_caption_band()
             || self.has_native_context_caption_ui())
+            && !self.has_large_bottom_caption_video_band()
             && !self.has_title_screen_frame()
             && !self.has_low_palette_noise()
             && !self.has_low_palette_logo_transition()
@@ -7760,6 +7712,55 @@ impl NativeFrameStats {
                 || self.has_context_stage_letterbox())
             && self.dominant_color_bucket_pixels.saturating_mul(100)
                 <= self.total_pixels.saturating_mul(80)
+    }
+
+    fn has_letterboxed_live_stage_scene(self) -> bool {
+        self.has_scene_detail()
+            && !self.has_large_bottom_caption_video_band()
+            && !self.has_title_screen_frame()
+            && !self.has_low_palette_noise()
+            && !self.has_low_palette_logo_transition()
+            && (!self.has_texture_page_fragment_artifact()
+                || self.has_letterboxed_stage_playfield_over_dark_band())
+            && !self.has_corrupt_title_texture_fragment()
+            && !self.has_repeating_tile_grid_artifact()
+            && !self.has_saturated_transition_planes()
+            && !self.has_warm_dominant_fill_frame()
+            && !self.has_periodic_horizontal_ghosting()
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(18)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(82)
+            && self.occupied_rows.saturating_mul(100) >= self.height.saturating_mul(25)
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(35)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(84)
+    }
+
+    fn has_letterboxed_stage_playfield_over_dark_band(self) -> bool {
+        if self.total_pixels == 0 || !self.has_texture_page_fragment_artifact() {
+            return false;
+        }
+
+        let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        let title_mark_pixels = self
+            .right_title_red_pixels
+            .saturating_add(self.right_title_bright_pixels);
+        bottom_band_pixels > 0
+            && !self.has_bottom_caption_band()
+            && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(95)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(55)
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(45)
+            && self.nonzero_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(65)
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(8)
+            && self.horizontal_color_changes.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(22)
+            && self.magenta_dominant_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(3)
+            && title_mark_pixels.saturating_mul(100) >= self.total_pixels
+            && self.right_title_red_pixels.saturating_mul(1_000)
+                >= self.total_pixels.saturating_mul(6)
+            && self.right_title_bright_pixels.saturating_mul(1_000)
+                >= self.total_pixels.saturating_mul(2)
     }
 
     fn has_native_context_caption_ui(self) -> bool {
@@ -7853,6 +7854,9 @@ impl NativeFrameStats {
         if !self.has_context_stage_letterbox() {
             return false;
         }
+        if self.has_large_bottom_caption_video_band() {
+            return false;
+        }
         let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
         let minor_bottom_caption =
             self.bottom_caption_pixels.saturating_mul(100) <= bottom_band_pixels.saturating_mul(10);
@@ -7873,17 +7877,7 @@ impl NativeFrameStats {
     }
 
     fn has_blocking_texture_page_fragment_artifact(self) -> bool {
-        self.has_stage_texture_field_smear()
-            || (self.has_texture_page_fragment_artifact()
-                && !self.has_repaired_context_live_stage_texture_fragment())
-    }
-
-    fn has_repaired_context_live_stage_texture_fragment(self) -> bool {
-        self.has_context_live_stage_hud()
-            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(80)
-            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(55)
-            && self.dominant_color_bucket_pixels.saturating_mul(100)
-                <= self.total_pixels.saturating_mul(55)
+        self.has_stage_texture_field_smear() || self.has_texture_page_fragment_artifact()
     }
 
     fn has_stage_texture_field_smear(self) -> bool {
@@ -8033,6 +8027,17 @@ impl NativeFrameStats {
             && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(5)
     }
 
+    fn has_large_bottom_caption_video_band(self) -> bool {
+        if !self.has_bottom_caption_band() || self.width == 0 || self.height == 0 {
+            return false;
+        }
+        let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        bottom_band_pixels > 0
+            && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(45)
+            && self.bottom_caption_pixels.saturating_mul(100)
+                >= bottom_band_pixels.saturating_mul(5)
+    }
+
     fn has_intro_caption_band(self) -> bool {
         if !self.has_bottom_caption_band() {
             return false;
@@ -8051,7 +8056,7 @@ impl NativeFrameStats {
 
     fn json(self) -> String {
         format!(
-            "{{\"width\":{},\"height\":{},\"total_pixels\":{},\"nonzero_pixels\":{},\"black_pixels\":{},\"warm_pixels\":{},\"red_dominant_pixels\":{},\"magenta_dominant_pixels\":{},\"unique_colors\":{},\"dominant_color_bucket_pixels\":{},\"horizontal_color_changes\":{},\"periodic_horizontal_match_per_mille\":{},\"periodic_horizontal_ghosting\":{},\"title_screen_frame\":{},\"low_palette_noise\":{},\"low_palette_logo_transition\":{},\"texture_page_fragment_artifact\":{},\"texture_page_fragment_blocking\":{},\"stage_texture_field_smear\":{},\"corrupt_title_texture_fragment\":{},\"repeating_tile_grid_artifact\":{},\"context_live_stage_hud\":{},\"saturated_transition_planes\":{},\"warm_dominant_fill_frame\":{},\"title_logo_overlay\":{},\"title_logo_overlay_blocking\":{},\"occupied_rows\":{},\"occupied_row_span\":{},\"right_title_red_pixels\":{},\"right_title_bright_pixels\":{},\"bottom_caption_pixels\":{},\"bottom_dark_pixels\":{},\"bottom_caption_band\":{},\"intro_caption_band\":{},\"visible_content\":{},\"scene_detail\":{},\"render_ready_scene\":{},\"handoff_scene\":{},\"gameplay_scene\":{}}}",
+            "{{\"width\":{},\"height\":{},\"total_pixels\":{},\"nonzero_pixels\":{},\"black_pixels\":{},\"warm_pixels\":{},\"red_dominant_pixels\":{},\"magenta_dominant_pixels\":{},\"unique_colors\":{},\"dominant_color_bucket_pixels\":{},\"horizontal_color_changes\":{},\"periodic_horizontal_match_per_mille\":{},\"periodic_horizontal_ghosting\":{},\"title_screen_frame\":{},\"low_palette_noise\":{},\"low_palette_logo_transition\":{},\"texture_page_fragment_artifact\":{},\"letterboxed_stage_playfield_over_dark_band\":{},\"texture_page_fragment_blocking\":{},\"stage_texture_field_smear\":{},\"corrupt_title_texture_fragment\":{},\"repeating_tile_grid_artifact\":{},\"context_live_stage_hud\":{},\"saturated_transition_planes\":{},\"warm_dominant_fill_frame\":{},\"title_logo_overlay\":{},\"title_logo_overlay_blocking\":{},\"occupied_rows\":{},\"occupied_row_span\":{},\"right_title_red_pixels\":{},\"right_title_bright_pixels\":{},\"bottom_caption_pixels\":{},\"bottom_dark_pixels\":{},\"bottom_caption_band\":{},\"large_bottom_caption_video_band\":{},\"intro_caption_band\":{},\"visible_content\":{},\"scene_detail\":{},\"render_ready_scene\":{},\"handoff_scene\":{},\"gameplay_scene\":{}}}",
             self.width,
             self.height,
             self.total_pixels,
@@ -8069,6 +8074,7 @@ impl NativeFrameStats {
             self.has_low_palette_noise(),
             self.has_low_palette_logo_transition(),
             self.has_texture_page_fragment_artifact(),
+            self.has_letterboxed_stage_playfield_over_dark_band(),
             self.has_blocking_texture_page_fragment_artifact(),
             self.has_stage_texture_field_smear(),
             self.has_corrupt_title_texture_fragment(),
@@ -8085,6 +8091,7 @@ impl NativeFrameStats {
             self.bottom_caption_pixels,
             self.bottom_dark_pixels,
             self.has_bottom_caption_band(),
+            self.has_large_bottom_caption_video_band(),
             self.has_intro_caption_band(),
             self.has_visible_content(),
             self.has_scene_detail(),
@@ -10908,6 +10915,14 @@ fn native_play_select_visible_window_frame_for_emulator(
     let gpu_verified_actual = native_play_gpu_verified_actual_window_frame(emulator);
     let candidate_gpu_verified =
         native_play_gpu_verified_window_frame(emulator, &candidate, candidate_stats);
+    if native_play_candidate_should_replace_stale_title(
+        emulator.native_playable_candidate(),
+        &candidate,
+        candidate_stats,
+        current,
+    ) {
+        return candidate;
+    }
     native_play_select_visible_window_frame(
         candidate,
         candidate_gpu_verified,
@@ -10935,6 +10950,41 @@ fn native_play_select_visible_window_frame(
     }
 }
 
+fn native_play_candidate_should_replace_stale_title(
+    native_playable_candidate: bool,
+    candidate: &NativeDisplayFrame,
+    candidate_stats: NativeFrameStats,
+    current: &NativeDisplayFrame,
+) -> bool {
+    if !native_playable_candidate {
+        return false;
+    }
+    let current_stats = NativeFrameStats::from_frame(current);
+    if !current_stats.has_title_screen_frame()
+        && !current_stats.has_corrupt_title_texture_fragment()
+    {
+        return false;
+    }
+
+    candidate_stats.has_visible_content()
+        && candidate_stats.has_scene_detail()
+        && !candidate_stats.has_title_screen_frame()
+        && !candidate_stats.has_corrupt_title_texture_fragment()
+        && !candidate_stats.has_low_palette_noise()
+        && !candidate_stats.has_low_palette_logo_transition()
+        && (!candidate_stats.has_texture_page_fragment_artifact()
+            || candidate_stats.has_letterboxed_live_stage_scene())
+        && !candidate_stats.has_repeating_tile_grid_artifact()
+        && !candidate_stats.has_saturated_transition_planes()
+        && !candidate_stats.has_warm_dominant_fill_frame()
+        && !candidate_stats.has_bottom_caption_band()
+        && !candidate_stats.has_periodic_horizontal_ghosting()
+        && (candidate_stats.has_letterboxed_live_stage_scene()
+            || candidate_stats.has_native_context_scene()
+            || native_play_frame_ready_with_context(true, candidate)
+            || native_play_gameplay_scene_with_context(true, candidate_stats))
+}
+
 fn native_play_gameplay_scene_with_context(
     native_playable_candidate: bool,
     stats: NativeFrameStats,
@@ -10947,6 +10997,7 @@ fn native_play_gameplay_scene_with_context(
             || (native_playable_candidate
                 && stats.has_native_context_scene()
                 && stats.has_context_stage_letterbox())
+            || (native_playable_candidate && stats.has_letterboxed_live_stage_scene())
             || native_play_live_field_scene_with_context(native_playable_candidate, stats))
 }
 
@@ -10999,8 +11050,7 @@ fn native_play_gpu_verified_actual_window_frame(
     emulator: &NativeEmulator,
 ) -> Option<NativeDisplayFrame> {
     let native_playable_candidate = emulator.native_playable_candidate();
-    let gpu_gameplay_context = emulator.gpu_native_playable_candidate()
-        || (emulator.gpu_native_rendered_scene_candidate() && emulator.native_3d_gameplay_signal());
+    let gpu_gameplay_context = native_play_gpu_gameplay_context(emulator);
     if !native_playable_candidate
         || !emulator.actual_display_supports_playable_candidate()
         || !gpu_gameplay_context
@@ -11041,6 +11091,7 @@ fn native_play_gpu_verified_frame_stats_with_context(
 ) -> bool {
     native_play_gpu_verified_frame_stats(stats)
         || native_play_gpu_verified_context_stage_frame_stats(native_playable_candidate, stats)
+        || (native_playable_candidate && stats.has_letterboxed_live_stage_scene())
 }
 
 fn native_play_gpu_verified_context_stage_frame_stats(
@@ -11055,6 +11106,8 @@ fn native_play_gpu_verified_context_stage_frame_stats(
         && stats.has_context_live_stage_hud()
         && stats.has_context_stage_letterbox()
         && !stats.has_title_screen_frame()
+        && !stats.has_blocking_texture_page_fragment_artifact()
+        && !stats.has_stage_texture_field_smear()
         && !stats.has_corrupt_title_texture_fragment()
         && !stats.has_low_palette_noise()
         && !stats.has_low_palette_logo_transition()
@@ -11092,7 +11145,7 @@ fn native_play_inferred_playable_candidate(emulator: &NativeEmulator) -> bool {
         return true;
     }
 
-    if !(emulator.gpu_native_rendered_scene_candidate() && emulator.native_3d_gameplay_signal()) {
+    if !native_play_gpu_gameplay_context(emulator) {
         return false;
     }
 
@@ -11107,6 +11160,8 @@ fn native_play_frame_ready_with_context(
     frame: &NativeDisplayFrame,
 ) -> bool {
     let stats = NativeFrameStats::from_frame(frame);
+    let letterboxed_live_stage =
+        native_playable_candidate && stats.has_letterboxed_live_stage_scene();
     let periodic_ghosting_blocks =
         stats.has_periodic_horizontal_ghosting() && !native_playable_candidate;
     let full_visible_scene = stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
@@ -11126,11 +11181,15 @@ fn native_play_frame_ready_with_context(
         && (stats.has_native_context_scene() || stats.has_periodic_horizontal_ghosting());
     let live_field_scene =
         native_play_live_field_scene_with_context(native_playable_candidate, stats);
-    full_visible_scene
-        && (stats.has_handoff_scene()
-            || stats.has_gameplay_scene()
-            || native_context_scene
-            || live_field_scene)
+    let handoff_scene = stats.has_handoff_scene()
+        && (!stats.has_bottom_caption_band()
+            || (native_playable_candidate && stats.has_native_context_caption_ui()));
+    letterboxed_live_stage
+        || (full_visible_scene
+            && (handoff_scene
+                || stats.has_gameplay_scene()
+                || native_context_scene
+                || live_field_scene))
 }
 
 fn parse_native_trace_options(values: Vec<String>) -> Result<NativeTraceConfig, String> {
@@ -11757,8 +11816,9 @@ mod tests {
         native_health_stage_wall_timeout_with_reserve_for_elapsed,
         native_input_check_checkpoint_script, native_keys_to_buttons, native_match_entry_script,
         native_match_snapshot_boot_wall_timeout, native_play_blocker_report_json,
-        native_play_boot_wait_segments, native_play_effective_buttons,
-        native_play_frame_ready_with_context, native_play_gameplay_scene_with_context,
+        native_play_boot_wait_segments, native_play_candidate_should_replace_stale_title,
+        native_play_effective_buttons, native_play_frame_ready_with_context,
+        native_play_gameplay_scene_with_context,
         native_play_gpu_verified_actual_window_frame_with_context,
         native_play_gpu_verified_frame_stats, native_play_gui_handoff_frame_ready,
         native_play_gui_instructions_per_frame, native_play_repair_context_live_stage_window_frame,
@@ -11998,6 +12058,103 @@ mod tests {
                 }
             }
         }
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn test_letterboxed_native_stage_frame() -> NativeDisplayFrame {
+        let width = 640;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+
+        for y in 244..414 {
+            for x in 76..566 {
+                if (x / 17 + y / 13 + (x * y) / 4096) % 3 == 0 {
+                    continue;
+                }
+                let title_region = x >= width * 52 / 100 && y >= height * 48 / 100;
+                let red_base = if title_region { 8 } else { 24 };
+                let red_span = if title_region { 40 } else { 96 };
+                let red = red_base + ((x * 7 + y * 3 + (x * y) / 257) % red_span) as u32;
+                let green = 44 + ((x * 11 + y * 5 + (x * y) / 193) % 160) as u32;
+                let blue = 72 + ((x * 13 + y * 17 + (x * y) / 149) % 160) as u32;
+                pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        for y in 254..286 {
+            for x in 92..238 {
+                if (x + y) % 4 != 0 {
+                    let red = 16 + ((x * 3 + y * 5) % 64) as u32;
+                    let green = 72 + ((x * 7 + y * 11) % 144) as u32;
+                    let blue = 112 + ((x * 13 + y * 17) % 128) as u32;
+                    pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+                }
+            }
+        }
+        for y in 336..408 {
+            for x in 88..552 {
+                if (x / 8 + y / 5) % 5 <= 1 {
+                    let title_region = x >= width * 52 / 100 && y >= height * 48 / 100;
+                    let red = if title_region {
+                        24 + ((x * 5 + y * 7) % 48) as u32
+                    } else {
+                        96 + ((x * 5 + y * 7) % 96) as u32
+                    };
+                    let green = 64 + ((x * 11 + y * 3) % 96) as u32;
+                    let blue = 24 + ((x * 13 + y * 9) % 80) as u32;
+                    pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+                }
+            }
+        }
+
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn test_letterboxed_texture_like_live_stage_frame() -> NativeDisplayFrame {
+        let width = 640;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+
+        for y in 0..366 {
+            for x in 18..622 {
+                if (x / 18 + y / 14 + (x * y) / 8192) % 6 == 0 {
+                    continue;
+                }
+                let palette_index = ((x / 14 + y / 11 + (x * y) / 8192) % 72) as u32;
+                let red = 12 + ((palette_index * 3) % 96);
+                let green = 40 + ((palette_index * 5) % 160);
+                let blue = 56 + ((palette_index * 7) % 160);
+                pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        for y in 176..318 {
+            for x in 48..430 {
+                if (x / 12 + y / 8) % 4 <= 1 {
+                    let palette_index = ((x / 10 + y / 8 + (x * y) / 8192) % 48) as u32;
+                    let red = 16 + ((palette_index * 3) % 88);
+                    let green = 68 + ((palette_index * 5) % 144);
+                    let blue = 96 + ((palette_index * 7) % 128);
+                    pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+                }
+            }
+        }
+        for y in 250..292 {
+            for x in 486..624 {
+                if (x / 6 + y / 5) % 5 == 0 {
+                    pixels[y * width + x] = 0x00f0_f0_f0;
+                } else if (x + y) % 7 <= 2 {
+                    pixels[y * width + x] = 0x00d8_2010;
+                }
+            }
+        }
+
         NativeDisplayFrame {
             width,
             height,
@@ -13599,6 +13756,35 @@ mod tests {
     }
 
     #[test]
+    fn native_play_display_keeps_deinterlaced_stable_over_low_field_actual() {
+        let actual = test_live_stage_field_with_title_like_hud_frame();
+        let mut stable_pixels = vec![0; actual.width * actual.height * 2];
+        for y in 0..actual.height * 2 {
+            let source_y = y / 2;
+            let source = source_y * actual.width;
+            let target = y * actual.width;
+            stable_pixels[target..target + actual.width]
+                .copy_from_slice(&actual.pixels[source..source + actual.width]);
+        }
+        let stable = NativeDisplayFrame {
+            width: actual.width,
+            height: actual.height * 2,
+            pixels: stable_pixels,
+        };
+        let stable_window = native_play_window_frame(&stable);
+        let stable_stats = NativeFrameStats::from_frame(&stable_window);
+
+        assert!(stable_stats.has_scene_detail(), "{stable_stats:?}");
+        assert!(
+            !stable_stats.has_blocking_display_artifact(),
+            "{stable_stats:?}"
+        );
+        assert!(!native_play_should_prefer_actual_display(
+            &actual, &stable, true
+        ));
+    }
+
+    #[test]
     fn native_play_display_prefers_resolved_title_frame_over_doubled_stable_frame() {
         let mut actual_pixels = vec![0; 512 * 240];
         for y in 104..124 {
@@ -13814,23 +14000,19 @@ mod tests {
     }
 
     #[test]
-    fn native_play_display_repairs_gpu_verified_context_stage_actual() {
+    fn native_play_display_rejects_gpu_verified_context_stage_texture_fragment() {
         let actual = test_contextual_live_stage_field_frame();
-        let repaired =
-            native_play_gpu_verified_actual_window_frame_with_context(&actual, true, true, true)
-                .expect(
-                    "context stage actual display should repair into a verified gameplay frame",
-                );
-        let repaired_stats = NativeFrameStats::from_frame(&repaired);
+        let actual_window = native_play_window_frame(&actual);
+        let actual_stats = NativeFrameStats::from_frame(&actual_window);
 
-        assert_eq!((repaired.width, repaired.height), (640, 480));
         assert!(
-            !repaired_stats.has_blocking_texture_page_fragment_artifact(),
-            "{repaired_stats:?}"
+            actual_stats.has_blocking_texture_page_fragment_artifact(),
+            "{actual_stats:?}"
         );
         assert!(
-            native_play_gpu_verified_frame_stats(repaired_stats),
-            "{repaired_stats:?}"
+            native_play_gpu_verified_actual_window_frame_with_context(&actual, true, true, true)
+                .is_none(),
+            "{actual_stats:?}"
         );
     }
 
@@ -14164,7 +14346,7 @@ mod tests {
     }
 
     #[test]
-    fn native_play_context_live_stage_repair_expands_verified_gameplay_field() {
+    fn native_play_context_live_stage_repair_does_not_mask_texture_fragment() {
         let frame = native_play_window_frame(&test_contextual_live_stage_field_frame());
         let stats = NativeFrameStats::from_frame(&frame);
 
@@ -14179,24 +14361,15 @@ mod tests {
 
         assert_eq!((repaired.width, repaired.height), (640, 480));
         assert!(
-            repaired_stats.occupied_row_span.saturating_mul(100)
-                >= repaired_stats.height.saturating_mul(80),
+            repaired_stats.has_blocking_texture_page_fragment_artifact(),
             "{repaired_stats:?}"
         );
         assert!(
-            !repaired_stats.has_blocking_texture_page_fragment_artifact(),
+            !native_play_gpu_verified_frame_stats(repaired_stats),
             "{repaired_stats:?}"
         );
         assert!(
             repaired_stats.has_context_live_stage_hud(),
-            "{repaired_stats:?}"
-        );
-        assert!(
-            !repaired_stats.has_blocking_title_logo_overlay(),
-            "{repaired_stats:?}"
-        );
-        assert!(
-            native_play_gpu_verified_frame_stats(repaired_stats),
             "{repaired_stats:?}"
         );
     }
@@ -14283,7 +14456,7 @@ mod tests {
     }
 
     #[test]
-    fn native_frame_stats_rejects_title_logo_overlay_as_gameplay() {
+    fn native_frame_stats_rejects_title_logo_overlay_without_native_context() {
         let width = 640;
         let height = 480;
         let mut frame = test_gradient_playfield_frame();
@@ -14314,9 +14487,10 @@ mod tests {
         assert!(!stats.has_handoff_scene(), "{stats:?}");
         assert!(!stats.has_gameplay_scene(), "{stats:?}");
         assert!(
-            !native_play_frame_ready_with_context(true, &frame),
+            !native_play_frame_ready_with_context(false, &frame),
             "{stats:?}"
         );
+        assert!(native_play_frame_ready_with_context(true, &frame));
     }
 
     #[test]
@@ -14520,6 +14694,73 @@ mod tests {
         assert!(!stats.has_gameplay_scene(), "{stats:?}");
         assert!(!native_play_gameplay_scene_with_context(false, stats));
         assert!(native_play_gameplay_scene_with_context(true, stats));
+    }
+
+    #[test]
+    fn native_play_context_accepts_letterboxed_stage_over_title_fallback() {
+        let frame = test_letterboxed_native_stage_frame();
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(!stats.has_title_screen_frame(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+        assert!(stats.has_letterboxed_live_stage_scene(), "{stats:?}");
+        assert!(!native_play_frame_ready_with_context(false, &frame));
+        assert!(native_play_frame_ready_with_context(true, &frame));
+        assert!(!native_play_gameplay_scene_with_context(false, stats));
+        assert!(native_play_gameplay_scene_with_context(true, stats));
+
+        let stale_title = test_title_screen_frame();
+        assert!(native_play_candidate_should_replace_stale_title(
+            true,
+            &frame,
+            stats,
+            &stale_title,
+        ));
+        assert!(!native_play_candidate_should_replace_stale_title(
+            false,
+            &frame,
+            stats,
+            &stale_title,
+        ));
+        let selected = native_play_select_visible_window_frame(
+            frame.clone(),
+            true,
+            None,
+            &Some(stale_title.clone()),
+            &stale_title,
+        );
+        assert_eq!(
+            native_frame_checksum(&selected),
+            native_frame_checksum(&frame)
+        );
+    }
+
+    #[test]
+    fn native_play_context_accepts_texture_like_letterboxed_stage_over_title_fallback() {
+        let frame = test_letterboxed_texture_like_live_stage_frame();
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(stats.has_texture_page_fragment_artifact(), "{stats:?}");
+        assert!(
+            stats.has_letterboxed_stage_playfield_over_dark_band(),
+            "{stats:?}"
+        );
+        assert!(stats.has_letterboxed_live_stage_scene(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+        assert!(!native_play_frame_ready_with_context(false, &frame));
+        assert!(native_play_frame_ready_with_context(true, &frame));
+        assert!(!native_play_gameplay_scene_with_context(false, stats));
+        assert!(native_play_gameplay_scene_with_context(true, stats));
+
+        let stale_title = test_title_screen_frame();
+        assert!(native_play_candidate_should_replace_stale_title(
+            true,
+            &frame,
+            stats,
+            &stale_title,
+        ));
     }
 
     #[test]
