@@ -8,7 +8,7 @@ use crate::native::io::{
     DMA_MDEC_OUT_BCR, DMA_MDEC_OUT_CHCR, DMA_MDEC_OUT_MADR, DMA_OTC_BCR, DMA_OTC_CHCR,
     DMA_OTC_MADR, DMA_REGION_END, DMA_REGION_START, GPU_GP0, GPU_GP1, GpuCommandSource,
     IO_REGION_END, IO_REGION_START, IRQ_STATUS, Io, NativeGpuDisplayCandidate,
-    NativeGpuDrawCapture, gp0_command_word_count, io_access_for,
+    NativeGpuDrawCapture, NativeGpuDrawCapturePredicate, gp0_command_word_count, io_access_for,
 };
 use crate::native::platform::{NativePlatformOps, PreferredNativePlatform};
 
@@ -523,6 +523,71 @@ pub struct NativeInputActivity {
     pub native_credit_adapter_edges: u64,
     pub last_system_input: u32,
     pub last_coin_register: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Br2NativeCreditHleCheck {
+    pub player: u32,
+    pub freeplay: bool,
+    pub required: u8,
+    pub credit_slot: u32,
+    pub credit_before: u8,
+    pub credit_after: u8,
+    pub pending_coin_edges: u64,
+    pub result: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Br2NativeCreditHleStats {
+    calls: u64,
+    accepted: u64,
+    rejected: u64,
+    freeplay: u64,
+    injected_coin_edges: u64,
+    last: Option<Br2NativeCreditHleCheck>,
+}
+
+impl Br2NativeCreditHleStats {
+    fn record(&mut self, check: Br2NativeCreditHleCheck) {
+        self.calls = self.calls.saturating_add(1);
+        self.injected_coin_edges = self
+            .injected_coin_edges
+            .saturating_add(check.pending_coin_edges);
+        if check.freeplay {
+            self.freeplay = self.freeplay.saturating_add(1);
+        }
+        if check.result == u32::MAX {
+            self.rejected = self.rejected.saturating_add(1);
+        } else {
+            self.accepted = self.accepted.saturating_add(1);
+        }
+        self.last = Some(check);
+    }
+
+    fn json(&self) -> String {
+        let last = self.last.map_or_else(
+            || "null".to_string(),
+            |check| {
+                format!(
+                    "{{\"player\":{},\"freeplay\":{},\"required\":{},\"credit_slot\":{},\"credit_slot_hex\":\"0x{:08x}\",\"credit_before\":{},\"credit_after\":{},\"pending_coin_edges\":{},\"result\":{},\"result_hex\":\"0x{:08x}\"}}",
+                    check.player,
+                    check.freeplay,
+                    check.required,
+                    check.credit_slot,
+                    check.credit_slot,
+                    check.credit_before,
+                    check.credit_after,
+                    check.pending_coin_edges,
+                    check.result,
+                    check.result
+                )
+            },
+        );
+        format!(
+            "{{\"calls\":{},\"accepted\":{},\"rejected\":{},\"freeplay\":{},\"injected_coin_edges\":{},\"last\":{}}}",
+            self.calls, self.accepted, self.rejected, self.freeplay, self.injected_coin_edges, last
+        )
+    }
 }
 
 impl NativeInputActivity {
@@ -1982,6 +2047,8 @@ pub struct Bus {
     br2_code_patch_snapshot_valid: [bool; BR2_CODE_PATCH_SNAPSHOT_LEN],
     br2_code_patch_snapshot_frozen: bool,
     zn_board: ZnBoard,
+    br2_native_credit_hle_consumed_coin_edges: u64,
+    br2_native_credit_hle: Br2NativeCreditHleStats,
     cache_control: u32,
     cache_isolated: bool,
     cache_isolation_transitions: u64,
@@ -2053,6 +2120,8 @@ impl Bus {
             br2_code_patch_snapshot_valid: [false; BR2_CODE_PATCH_SNAPSHOT_LEN],
             br2_code_patch_snapshot_frozen: false,
             zn_board: ZnBoard::with_board_assets(&board_assets),
+            br2_native_credit_hle_consumed_coin_edges: 0,
+            br2_native_credit_hle: Br2NativeCreditHleStats::default(),
             cache_control: 0,
             cache_isolated: false,
             cache_isolation_transitions: 0,
@@ -3633,10 +3702,11 @@ impl Bus {
 
     pub fn runtime_probe_json(&self) -> String {
         format!(
-            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"zn_input_reads\":{},\"native_sync\":{}}}",
+            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_reads\":{},\"native_sync\":{}}}",
             self.io.runtime_probe_json(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.br2_native_credit_hle_json(),
             self.zn_input_reads_json(),
             self.native_sync_json()
         )
@@ -3644,10 +3714,11 @@ impl Bus {
 
     pub fn runtime_compact_probe_json(&self) -> String {
         format!(
-            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"zn_input_reads\":{},\"native_sync\":{}}}",
+            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_reads\":{},\"native_sync\":{}}}",
             self.io.runtime_compact_probe_json(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.br2_native_credit_hle_json(),
             self.zn_input_reads_json(),
             self.native_sync_compact_json()
         )
@@ -3655,10 +3726,11 @@ impl Bus {
 
     pub fn input_probe_json(&self) -> String {
         format!(
-            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"zn_input_reads\":{},\"input_activity\":{},\"controller\":{}}}",
+            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_reads\":{},\"input_activity\":{},\"controller\":{}}}",
             self.vblank_count(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.br2_native_credit_hle_json(),
             self.zn_input_reads_json(),
             self.input_activity().json(),
             self.io.controller.diagnostic_json()
@@ -3667,10 +3739,11 @@ impl Bus {
 
     pub fn input_compact_probe_json(&self) -> String {
         format!(
-            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"zn_input_read_summary\":{},\"recent_active_zn_input_reads\":[{}],\"input_activity\":{}}}",
+            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_read_summary\":{},\"recent_active_zn_input_reads\":[{}],\"input_activity\":{}}}",
             self.vblank_count(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.br2_native_credit_hle_json(),
             self.zn_input_read_stats.borrow().json(),
             zn_input_tail_events_json(
                 &self.recent_active_zn_input_reads.borrow(),
@@ -3682,10 +3755,11 @@ impl Bus {
 
     pub fn input_summary_json(&self) -> String {
         format!(
-            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"zn_input_read_summary\":{},\"input_activity\":{},\"controller\":{}}}",
+            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_read_summary\":{},\"input_activity\":{},\"controller\":{}}}",
             self.vblank_count(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.br2_native_credit_hle_json(),
             self.zn_input_read_stats.borrow().json(),
             self.input_activity().json(),
             self.io.controller.diagnostic_json()
@@ -3694,10 +3768,11 @@ impl Bus {
 
     pub fn security_probe_json(&self) -> String {
         format!(
-            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"zn_input_read_summary\":{},\"input_activity\":{},\"controller\":{}}}",
+            "{{\"vblank_count\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_read_summary\":{},\"input_activity\":{},\"controller\":{}}}",
             self.vblank_count(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.br2_native_credit_hle_json(),
             self.zn_input_read_stats.borrow().json(),
             self.input_activity().json(),
             self.io.controller.security_compact_json()
@@ -3748,6 +3823,13 @@ impl Bus {
         self.io.gpu.set_draw_capture_range(start, end);
     }
 
+    pub fn set_gpu_draw_capture_predicates(
+        &mut self,
+        predicates: Vec<NativeGpuDrawCapturePredicate>,
+    ) {
+        self.io.gpu.set_draw_capture_predicates(predicates);
+    }
+
     pub fn gpu_draw_sequence(&self) -> u64 {
         self.io.gpu.draw_sequence()
     }
@@ -3782,6 +3864,25 @@ impl Bus {
                 p3_guard_active_reads: pad.p1_guard_active_reads,
                 ..NativeInputActivity::default()
             })
+    }
+
+    pub fn consume_br2_native_credit_hle_coin_edges(&mut self) -> u64 {
+        let edges = self.zn_board.coin_insert_edges;
+        let pending = edges.saturating_sub(self.br2_native_credit_hle_consumed_coin_edges);
+        self.br2_native_credit_hle_consumed_coin_edges = edges;
+        pending
+    }
+
+    pub fn record_br2_native_credit_hle_check(&mut self, check: Br2NativeCreditHleCheck) {
+        self.br2_native_credit_hle.record(check);
+    }
+
+    pub fn br2_native_credit_hle_json(&self) -> String {
+        self.br2_native_credit_hle.json()
+    }
+
+    pub fn br2_native_credit_hle_accepted_seen(&self) -> bool {
+        self.br2_native_credit_hle.accepted > 0
     }
 
     fn record_zn_board_input_read(&self, address: u32, width: u8, value: u32) {
@@ -4341,12 +4442,69 @@ impl Bus {
             .iter()
             .map(|(_, command)| *command)
             .collect::<Vec<_>>();
+        if self.gpu_linked_list_command_range_has_stale_draw_body(commands, range.clone(), &words) {
+            return;
+        }
         if gp0_command_is_linked_list_artifact_draw(&words) {
             return;
         }
         for (command_address, command) in &commands[range] {
             self.write_gpu_dma_linked_list_word(*command_address, *command);
         }
+    }
+
+    fn gpu_linked_list_command_range_has_stale_draw_body(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        words: &[u32],
+    ) -> bool {
+        let Some((range_start_address, _)) = commands.get(range.start) else {
+            return false;
+        };
+        let Some(header_address) = range_start_address.checked_sub(4) else {
+            return false;
+        };
+        let header_address = header_address & 0x00ff_fffc;
+        if !(BR2_PRIMITIVE_RAM_START..BR2_PRIMITIVE_RAM_END).contains(&header_address) {
+            return false;
+        }
+
+        let Some(command) = words.first() else {
+            return false;
+        };
+        if !looks_like_draw_primitive_opcode((command >> 24) as u8)
+            || !gp0_command_has_playfield_draw_bounds(words)
+        {
+            return false;
+        }
+
+        let min_vblank = self
+            .vblank_count
+            .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
+        let Some(header_vblank) = self
+            .primitive_ram_writes
+            .header_write_vblank(header_address)
+        else {
+            return false;
+        };
+        if header_vblank < min_vblank {
+            return false;
+        }
+
+        let latest_command_vblank = commands[range]
+            .iter()
+            .filter_map(|(command_address, _)| {
+                self.primitive_ram_writes
+                    .command_write_vblank(*command_address & 0x00ff_fffc)
+            })
+            .max();
+        let Some(latest_command_vblank) = latest_command_vblank else {
+            return false;
+        };
+        latest_command_vblank < min_vblank
+            && header_vblank.saturating_sub(latest_command_vblank)
+                >= BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW
     }
 
     fn gpu_linked_list_command_start_is_embedded_payload(&self, command_address: u32) -> bool {
@@ -10176,6 +10334,70 @@ mod tests {
         assert!(
             !candidates.contains_key(&packet),
             "fresh headers must not replay stale but plausible draw bodies"
+        );
+    }
+
+    #[test]
+    fn gpu_linked_list_dma_rejects_recent_header_with_stale_draw_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0039_05f8;
+        let stale_words = [
+            0x2c7f_7f7f,
+            0x014a_0100,
+            0x7d18_3840,
+            0x014a_0202,
+            0x000c_3880,
+            0x016c_0100,
+            0x0000_3f40,
+            0x016c_0202,
+            0x0000_3f80,
+        ];
+
+        bus.vblank_count = 18;
+        for (index, word) in stale_words.iter().copied().enumerate() {
+            bus.write_u32(packet + 4 + index as u32 * 4, word);
+        }
+
+        bus.vblank_count = BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW + 64;
+        bus.write_u32(packet, 0x09ff_ffff);
+        let commands_before = bus.io.gpu.commands_seen;
+        bus.write_u32(DMA_GPU_MADR, packet);
+        bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
+
+        assert_eq!(
+            bus.io.gpu.commands_seen, commands_before,
+            "recent linked-list headers must not revive stale playfield draw bodies"
+        );
+    }
+
+    #[test]
+    fn gpu_linked_list_dma_allows_recent_header_with_recent_draw_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0039_15f8;
+        let words = [
+            0x2c7f_7f7f,
+            0x014a_0100,
+            0x7d18_3840,
+            0x014a_0202,
+            0x000c_3880,
+            0x016c_0100,
+            0x0000_3f40,
+            0x016c_0202,
+            0x0000_3f80,
+        ];
+
+        bus.vblank_count = BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW + 64;
+        bus.write_u32(packet, 0x09ff_ffff);
+        for (index, word) in words.iter().copied().enumerate() {
+            bus.write_u32(packet + 4 + index as u32 * 4, word);
+        }
+        let commands_before = bus.io.gpu.commands_seen;
+        bus.write_u32(DMA_GPU_MADR, packet);
+        bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
+
+        assert!(
+            bus.io.gpu.commands_seen > commands_before,
+            "fresh linked-list draw bodies must still be submitted"
         );
     }
 

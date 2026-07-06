@@ -13,7 +13,7 @@ pub use emulator::{
     NativeDisplayFrame, NativeEmulator, NativeTraceConfig, native_window_frame_from_display,
 };
 pub use framebuffer::png_from_rgb888_pixels;
-pub use io::NativeGpuDisplayCandidate;
+pub use io::{NativeGpuDisplayCandidate, NativeGpuDrawCapturePredicate};
 pub use platform::{
     GenericNativePlatform, NativePlatformInfo, native_platform_json, preferred_platform_info,
 };

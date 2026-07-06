@@ -484,6 +484,13 @@ impl NativeEmulator {
         self.bus.set_gpu_draw_capture_range(start, end);
     }
 
+    pub fn set_draw_capture_predicates(
+        &mut self,
+        predicates: Vec<crate::native::io::NativeGpuDrawCapturePredicate>,
+    ) {
+        self.bus.set_gpu_draw_capture_predicates(predicates);
+    }
+
     pub fn draw_sequence(&self) -> u64 {
         self.bus.gpu_draw_sequence()
     }
@@ -502,6 +509,10 @@ impl NativeEmulator {
 
     pub fn input_activity(&self) -> NativeInputActivity {
         self.bus.input_activity()
+    }
+
+    pub fn br2_native_credit_hle_accepted_seen(&self) -> bool {
+        self.bus.br2_native_credit_hle_accepted_seen()
     }
 
     pub fn ram_snapshot(&self) -> Vec<u8> {
@@ -556,7 +567,7 @@ impl NativeEmulator {
         let render_context_allows_periodic =
             gpu_playable_candidate || (gpu_rendered_scene_candidate && gte_gameplay_signal);
         let frame = self.display_frame();
-        if native_display_frame_supports_playable_candidate_with_render_context(
+        if native_display_frame_or_window_supports_playable_candidate_with_render_context(
             &frame,
             render_context_allows_periodic,
         ) {
@@ -564,7 +575,7 @@ impl NativeEmulator {
         }
 
         let actual = self.actual_display_frame();
-        native_display_frame_supports_playable_candidate_with_render_context(
+        native_display_frame_or_window_supports_playable_candidate_with_render_context(
             &actual,
             render_context_allows_periodic,
         )
@@ -585,12 +596,12 @@ impl NativeEmulator {
         let stable_frame = self.display_frame();
         let actual_frame = self.actual_display_frame();
         let stable_frame_guard =
-            native_display_frame_supports_playable_candidate_with_render_context(
+            native_display_frame_or_window_supports_playable_candidate_with_render_context(
                 &stable_frame,
                 render_context_allows_periodic,
             );
         let actual_frame_guard =
-            native_display_frame_supports_playable_candidate_with_render_context(
+            native_display_frame_or_window_supports_playable_candidate_with_render_context(
                 &actual_frame,
                 render_context_allows_periodic,
             );
@@ -651,12 +662,12 @@ impl NativeEmulator {
         let stable_frame = self.display_frame();
         let actual_frame = self.actual_display_frame();
         let stable_frame_guard =
-            native_display_frame_supports_playable_candidate_with_render_context(
+            native_display_frame_or_window_supports_playable_candidate_with_render_context(
                 &stable_frame,
                 render_context_allows_periodic,
             );
         let actual_frame_guard =
-            native_display_frame_supports_playable_candidate_with_render_context(
+            native_display_frame_or_window_supports_playable_candidate_with_render_context(
                 &actual_frame,
                 render_context_allows_periodic,
             );
@@ -899,12 +910,12 @@ impl NativeEmulator {
         let stable_frame = self.display_frame();
         let actual_frame = self.actual_display_frame();
         let stable_frame_guard =
-            native_display_frame_supports_playable_candidate_with_render_context(
+            native_display_frame_or_window_supports_playable_candidate_with_render_context(
                 &stable_frame,
                 render_context_allows_periodic,
             );
         let actual_frame_guard =
-            native_display_frame_supports_playable_candidate_with_render_context(
+            native_display_frame_or_window_supports_playable_candidate_with_render_context(
                 &actual_frame,
                 render_context_allows_periodic,
             );
@@ -1481,9 +1492,65 @@ fn native_window_deinterlace_field_is_texture_atlas_artifact(
     }
 
     let field = native_window_field_frame(frame, field_offset, field_height);
+    if native_window_field_has_live_scene_density(&field) {
+        return false;
+    }
+
     native_display_frame_has_title_logo_overlay(&field)
         || native_display_frame_has_sparse_title_logo_artifact(&field)
         || native_display_frame_has_glyph_texture_atlas_artifact(&field)
+}
+
+fn native_window_field_has_live_scene_density(frame: &NativeDisplayFrame) -> bool {
+    if frame.width < 256
+        || frame.height < 200
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        return false;
+    }
+
+    let total = frame.width.saturating_mul(frame.height).max(1) as u64;
+    let mut nonzero = 0u64;
+    let mut bright = 0u64;
+    let mut horizontal_changes = 0u64;
+    let mut occupied_rows = 0u64;
+    let mut unique_colors = Vec::new();
+    let meaningful_row_pixels = (frame.width / 20).max(1);
+
+    for y in 0..frame.height {
+        let row_start = y.saturating_mul(frame.width);
+        let mut row_nonzero = 0usize;
+        let mut previous = None;
+        for x in 0..frame.width {
+            let color = frame.pixels[row_start + x] & 0x00ff_ffff;
+            if color != 0 {
+                nonzero = nonzero.saturating_add(1);
+                row_nonzero = row_nonzero.saturating_add(1);
+                let red = (color >> 16) & 0xff;
+                let green = (color >> 8) & 0xff;
+                let blue = color & 0xff;
+                if red.max(green).max(blue) >= 0x80 {
+                    bright = bright.saturating_add(1);
+                }
+                if unique_colors.len() < 97 && !unique_colors.contains(&color) {
+                    unique_colors.push(color);
+                }
+            }
+            if previous.is_some_and(|previous| previous != color) {
+                horizontal_changes = horizontal_changes.saturating_add(1);
+            }
+            previous = Some(color);
+        }
+        if row_nonzero >= meaningful_row_pixels {
+            occupied_rows = occupied_rows.saturating_add(1);
+        }
+    }
+
+    nonzero.saturating_mul(100) >= total.saturating_mul(28)
+        && bright.saturating_mul(100) >= total.saturating_mul(3)
+        && horizontal_changes.saturating_mul(100) >= total.saturating_mul(4)
+        && occupied_rows.saturating_mul(100) >= (frame.height as u64).saturating_mul(45)
+        && unique_colors.len() >= 32
 }
 
 fn native_window_field_frame(
@@ -1824,11 +1891,99 @@ fn native_display_frame_supports_playable_candidate_with_render_context(
     frame: &NativeDisplayFrame,
     render_context_allows_periodic: bool,
 ) -> bool {
-    let _ = render_context_allows_periodic;
+    let title_logo_blocks = native_display_frame_has_title_logo_overlay(frame)
+        && (!render_context_allows_periodic
+            || !native_display_frame_has_context_stage_letterbox(frame));
     native_display_frame_has_visible_detail(frame)
         && !native_display_frame_has_saturated_logo_transition(frame)
-        && !native_display_frame_has_title_logo_overlay(frame)
+        && !title_logo_blocks
         && !native_display_frame_has_periodic_horizontal_ghosting(frame)
+}
+
+fn native_display_frame_has_context_stage_letterbox(frame: &NativeDisplayFrame) -> bool {
+    if frame.width < 320
+        || frame.height < 240
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        return false;
+    }
+
+    let bottom_start = frame.height.saturating_mul(4) / 5;
+    let row_content_cutoff = (frame.width / 20).max(1);
+    let mut nonzero = 0usize;
+    let mut black = 0usize;
+    let mut bottom_dark = 0usize;
+    let mut occupied_rows = 0usize;
+    let mut first_occupied_row = None;
+    let mut last_occupied_row = None;
+    let mut color_buckets = [0usize; 4096];
+
+    for y in 0..frame.height {
+        let row = y.saturating_mul(frame.width);
+        let mut row_nonzero = 0usize;
+        for x in 0..frame.width {
+            let color = frame.pixels[row + x] & 0x00ff_ffff;
+            let red = (color >> 16) & 0xff;
+            let green = (color >> 8) & 0xff;
+            let blue = color & 0xff;
+            let luma =
+                (red.saturating_mul(30) + green.saturating_mul(59) + blue.saturating_mul(11)) / 100;
+            if color != 0 {
+                nonzero = nonzero.saturating_add(1);
+                row_nonzero = row_nonzero.saturating_add(1);
+            } else {
+                black = black.saturating_add(1);
+            }
+            if y >= bottom_start && luma < 40 {
+                bottom_dark = bottom_dark.saturating_add(1);
+            }
+            let bucket = (((red >> 4) as usize) << 8)
+                | (((green >> 4) as usize) << 4)
+                | ((blue >> 4) as usize);
+            color_buckets[bucket] = color_buckets[bucket].saturating_add(1);
+        }
+        if row_nonzero >= row_content_cutoff {
+            occupied_rows = occupied_rows.saturating_add(1);
+            first_occupied_row.get_or_insert(y);
+            last_occupied_row = Some(y);
+        }
+    }
+
+    let total = frame.width.saturating_mul(frame.height);
+    let bottom_pixels = frame.width.saturating_mul((frame.height / 5).max(1));
+    let occupied_row_span = first_occupied_row
+        .zip(last_occupied_row)
+        .map_or(0, |(first, last)| {
+            last.saturating_sub(first).saturating_add(1)
+        });
+    let dominant = color_buckets.into_iter().max().unwrap_or(0);
+
+    total > 0
+        && bottom_pixels > 0
+        && nonzero.saturating_mul(100) >= total.saturating_mul(35)
+        && black.saturating_mul(100) <= total.saturating_mul(55)
+        && bottom_dark.saturating_mul(100) >= bottom_pixels.saturating_mul(70)
+        && occupied_rows.saturating_mul(100) >= frame.height.saturating_mul(55)
+        && occupied_row_span.saturating_mul(100) >= frame.height.saturating_mul(60)
+        && dominant.saturating_mul(100) <= total.saturating_mul(55)
+}
+
+fn native_display_frame_or_window_supports_playable_candidate_with_render_context(
+    frame: &NativeDisplayFrame,
+    render_context_allows_periodic: bool,
+) -> bool {
+    if native_display_frame_supports_playable_candidate_with_render_context(
+        frame,
+        render_context_allows_periodic,
+    ) {
+        return true;
+    }
+
+    let window = native_window_frame_from_display(frame);
+    native_display_frame_supports_playable_candidate_with_render_context(
+        &window,
+        render_context_allows_periodic,
+    )
 }
 
 fn native_display_frame_has_title_logo_overlay(frame: &NativeDisplayFrame) -> bool {
@@ -2451,6 +2606,73 @@ mod tests {
             occupied_height <= 260,
             "single-field atlas should not be expanded to full height: {occupied_height}px"
         );
+    }
+
+    #[test]
+    fn native_window_deinterlaces_dense_bottom_live_scene_despite_title_like_hud() {
+        let width = 512usize;
+        let height = 480usize;
+        let field_height = height / 2;
+        let mut pixels = vec![0; width * height];
+
+        for local_y in 0..216 {
+            for x in 12..width {
+                let red = 12 + ((x * 5 + local_y * 3) % 92) as u32;
+                let green = 24 + ((x * 7 + local_y * 11) % 184) as u32;
+                let blue = 40 + ((x * 13 + local_y * 17) % 176) as u32;
+                pixels[(field_height + local_y) * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        for local_y in 70..126 {
+            for x in 0..178 {
+                if (x + local_y) % 5 != 0 {
+                    pixels[(field_height + local_y) * width + x] = 0x00f8_f8f8;
+                }
+            }
+        }
+        for local_y in 150..205 {
+            for x in 330..506 {
+                let local_x = x - 330;
+                let color = if local_x < 88 {
+                    0x00d0_1818
+                } else if (local_x + local_y) % 3 == 0 {
+                    0x00f0_f0_e0
+                } else {
+                    0x0018_2040
+                };
+                pixels[(field_height + local_y) * width + x] = color;
+            }
+        }
+
+        let frame = NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        };
+        let active = super::native_window_field_frame(&frame, field_height, field_height);
+
+        assert!(super::native_window_should_deinterlace_frame(&frame));
+        assert!(super::native_window_field_has_live_scene_density(&active));
+        assert!(
+            !super::native_window_deinterlace_field_is_texture_atlas_artifact(&frame, field_height)
+        );
+
+        let window = super::native_window_frame_from_display(&frame);
+        let (_, first_y, _, last_y) =
+            nonzero_bounds(&window).expect("live scene should remain visible");
+        let occupied_height = last_y.saturating_sub(first_y).saturating_add(1);
+
+        assert_eq!((window.width, window.height), (640, 480));
+        assert!(
+            first_y <= 16,
+            "deinterlaced live scene should start near the top instead of y={first_y}"
+        );
+        assert!(
+            occupied_height >= 360,
+            "deinterlaced live scene should use most of the output height, got {occupied_height}px"
+        );
+        assert_ne!(window.pixels[320 + 40 * 640], 0);
+        assert_ne!(window.pixels[320 + 420 * 640], 0);
     }
 
     fn nonzero_bounds(frame: &NativeDisplayFrame) -> Option<(usize, usize, usize, usize)> {

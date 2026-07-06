@@ -1,4 +1,4 @@
-use crate::native::bus::Bus;
+use crate::native::bus::{Br2NativeCreditHleCheck, Bus};
 use std::sync::OnceLock;
 
 const CP0_STATUS: usize = 12;
@@ -333,6 +333,41 @@ const BR2_IRQ_POLL_TIMEOUT_LOOP_INSTRUCTIONS: [u32; 7] = [
     0x3042_0080, // andi v0, v0, 0x80
     0x1040_fffa, // beq v0, zero, BR2_IRQ_POLL_TIMEOUT_LOOP_START
     0x2463_ffff, // addiu v1, v1, -1
+];
+const BR2_CREDIT_CHECK_ENTRY: u32 = 0x8030_8770;
+const BR2_CREDIT_CHECK_HLE_CYCLES: u64 = 24;
+const BR2_CREDIT_STATE_BASE: u32 = 0x803b_fa00;
+const BR2_CREDIT_FREEPLAY_FLAG_OFFSET: u32 = 0x00;
+const BR2_CREDIT_PLAYER_MODE_OFFSET: u32 = 0x01;
+const BR2_CREDIT_REQUIRED_P1_OFFSET: u32 = 0x08;
+const BR2_CREDIT_REQUIRED_P2_OFFSET: u32 = 0x09;
+const BR2_CREDIT_SHARED_SLOT_OFFSET: u32 = 0x18;
+const BR2_CREDIT_CHECK_ENTRY_SIGNATURE: [(u32, u32); 10] = [
+    (0x8030_8770, 0x27bd_ffe8), // addiu sp, sp, -0x18
+    (0x8030_8774, 0x3c05_803b), // lui a1, 0x803b
+    (0x8030_8778, 0x24a5_fa00), // addiu a1, a1, -0x600
+    (0x8030_877c, 0xafbf_0010), // sw ra, 0x10(sp)
+    (0x8030_8780, 0x90a6_0008), // lbu a2, 8(a1)
+    (0x8030_8784, 0x0c0c_21be), // jal 0x803086f8
+    (0x8030_8788, 0x0000_0000), // nop
+    (0x8030_878c, 0x8fbf_0010), // lw ra, 0x10(sp)
+    (0x8030_8794, 0x03e0_0008), // jr ra
+    (0x8030_8798, 0x27bd_0018), // addiu sp, sp, 0x18
+];
+const BR2_CREDIT_CHECK_CORE_SIGNATURE: [(u32, u32); 13] = [
+    (0x8030_86f8, 0x90a2_0000), // lbu v0, 0(a1)
+    (0x8030_8700, 0x1040_000a), // beq v0, zero, 0x8030872c
+    (0x8030_8704, 0x2402_0001), // addiu v0, zero, 1
+    (0x8030_872c, 0x90a3_0001), // lbu v1, 1(a1)
+    (0x8030_8734, 0x1462_0004), // bne v1, v0, 0x80308748
+    (0x8030_8738, 0x0044_1004), // sllv v0, a0, v0
+    (0x8030_873c, 0x2442_0018), // addiu v0, v0, 0x18
+    (0x8030_8740, 0x080c_21d3), // j 0x8030874c
+    (0x8030_8748, 0x24a5_0018), // addiu a1, a1, 0x18
+    (0x8030_874c, 0x90a2_0000), // lbu v0, 0(a1)
+    (0x8030_8754, 0x0046_1023), // subu v0, v0, a2
+    (0x8030_8758, 0x0440_0003), // bltz v0, 0x80308768
+    (0x8030_8764, 0xa0a2_0000), // sb v0, 0(a1)
 ];
 const BR2_BYTE_COPY_LOOP_START: u32 = 0x8030_6de0;
 const BR2_BYTE_COPY_LOOP_EXIT: u32 = 0x8030_6df8;
@@ -1190,6 +1225,12 @@ impl Cpu {
             let outcome = self.raise_exception(self.pc, None, Exception::Interrupt);
             self.regs[0] = 0;
             let report = self.step_report_from(start_pc, None, cycles_before, outcome);
+            bus.tick(report.cycles_elapsed);
+            bus.clear_trace_context();
+            return report;
+        }
+
+        if let Some(report) = self.try_hle_br2_credit_check(start_pc, cycles_before, bus) {
             bus.tick(report.cycles_elapsed);
             bus.clear_trace_context();
             return report;
@@ -4960,6 +5001,84 @@ impl Cpu {
         }
     }
 
+    fn try_hle_br2_credit_check(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        if br2_native_hle_disabled("credit_check")
+            || self.pc != BR2_CREDIT_CHECK_ENTRY
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.pending_load.is_some()
+            || bus.cache_isolated()
+            || !br2_credit_check_signature_matches(bus)
+        {
+            return None;
+        }
+
+        let player = self.regs[4].min(1);
+        let freeplay = bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_FREEPLAY_FLAG_OFFSET) != 0;
+        let required_offset = if player == 0 {
+            BR2_CREDIT_REQUIRED_P1_OFFSET
+        } else {
+            BR2_CREDIT_REQUIRED_P2_OFFSET
+        };
+        let required = bus.read_u8(BR2_CREDIT_STATE_BASE + required_offset);
+        let credit_slot = br2_credit_slot_address(player, bus);
+        let credit_before = bus.read_u8(credit_slot);
+        let mut pending_coin_edges = 0;
+
+        if !freeplay {
+            pending_coin_edges = bus.consume_br2_native_credit_hle_coin_edges();
+            if pending_coin_edges > 0 {
+                let coin_value = u64::from(required.max(1));
+                let inserted_value = pending_coin_edges.saturating_mul(coin_value).min(0xff) as u8;
+                let current = bus.read_u8(credit_slot);
+                bus.write_u8(credit_slot, current.saturating_add(inserted_value));
+            }
+        }
+
+        let result = if freeplay {
+            0
+        } else {
+            let current = bus.read_u8(credit_slot);
+            if current >= required {
+                let remaining = current.saturating_sub(required);
+                bus.write_u8(credit_slot, remaining);
+                u32::from(remaining)
+            } else {
+                u32::MAX
+            }
+        };
+        let credit_after = bus.read_u8(credit_slot);
+
+        bus.record_br2_native_credit_hle_check(Br2NativeCreditHleCheck {
+            player,
+            freeplay,
+            required,
+            credit_slot,
+            credit_before,
+            credit_after,
+            pending_coin_edges,
+            result,
+        });
+
+        self.regs[2] = result;
+        self.pc = self.regs[31];
+        self.next_pc = self.regs[31].wrapping_add(4);
+        self.cycles = self.cycles.saturating_add(BR2_CREDIT_CHECK_HLE_CYCLES);
+        self.regs[0] = 0;
+
+        Some(self.step_report_from(
+            start_pc,
+            Some(BR2_CREDIT_CHECK_ENTRY_SIGNATURE[0].1),
+            cycles_before,
+            StepOutcome::Continue,
+        ))
+    }
+
     fn try_hle_br2_post_vs_unaligned_group_prefix_load(
         &mut self,
         current_pc: u32,
@@ -6169,19 +6288,19 @@ impl Cpu {
             .contains(&self.pc)
             && br2_runtime_ram_pc(self.cp0[CP0_EPC])
             && bios_exception_vector_points_to_blank_c80_handler(bus);
-        let draw_sync_dispatch_return =
+        let irq_dispatch_return =
             (BIOS_IRQ_DISPATCH_LOOP_HLE_START..=BIOS_IRQ_DISPATCH_LOOP_HLE_END).contains(&self.pc)
-                && self.cp0[CP0_EPC] == BR2_DRAW_SYNC_WAIT_LOOP_EXIT
+                && br2_game_runtime_pc(self.cp0[CP0_EPC])
                 && bios_irq_dispatch_loop_has_signature(bus);
         if !post_vs_c80_return
             && !draw_sync_c80_return
             && !blank_c80_return
-            && !draw_sync_dispatch_return
+            && !irq_dispatch_return
             && !low_bios_irq_return
         {
             return false;
         }
-        if draw_sync_dispatch_return && !self.restore_bios_exception_context(bus) {
+        if irq_dispatch_return && !self.restore_bios_exception_context(bus) {
             return false;
         }
 
@@ -6662,6 +6781,23 @@ fn br2_signed_loop_remaining(start_index: u32, limit: u32) -> Option<u32> {
     let start_index = start_index as i32;
     let limit = limit as i32;
     (start_index < limit).then_some((i64::from(limit) - i64::from(start_index)) as u32)
+}
+
+fn br2_credit_check_signature_matches(bus: &Bus) -> bool {
+    BR2_CREDIT_CHECK_ENTRY_SIGNATURE
+        .iter()
+        .chain(BR2_CREDIT_CHECK_CORE_SIGNATURE.iter())
+        .copied()
+        .all(|(address, expected)| bus.read_u32_executable_no_trace(address) == expected)
+}
+
+fn br2_credit_slot_address(player: u32, bus: &Bus) -> u32 {
+    let player_mode = bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_PLAYER_MODE_OFFSET);
+    if player_mode == 1 {
+        BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET + player.min(1).saturating_mul(2)
+    } else {
+        BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET
+    }
 }
 
 fn br2_status_halfword_wait_loop_signature_matches(bus: &Bus) -> bool {
@@ -7685,7 +7821,10 @@ mod tests {
         BR2_BITSTREAM_DECODE_LOOP_TAIL_INSTRUCTIONS, BR2_BITSTREAM_DECODE_TABLE_CYCLES,
         BR2_BITSTREAM_DECODE_TABLE_SENTINEL, BR2_BOOT_WORD_COPY_LOOP_START,
         BR2_BOOT_ZERO_FILL_LOOP_START, BR2_BYTE_COPY_LOOP_EXIT, BR2_BYTE_COPY_LOOP_INSTRUCTIONS,
-        BR2_BYTE_COPY_LOOP_START, BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_DRAW_SYNC_WAIT_LOOP_EXIT,
+        BR2_BYTE_COPY_LOOP_START, BR2_CREDIT_CHECK_CORE_SIGNATURE, BR2_CREDIT_CHECK_ENTRY,
+        BR2_CREDIT_CHECK_ENTRY_SIGNATURE, BR2_CREDIT_CHECK_HLE_CYCLES,
+        BR2_CREDIT_REQUIRED_P1_OFFSET, BR2_CREDIT_SHARED_SLOT_OFFSET, BR2_CREDIT_STATE_BASE,
+        BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_DRAW_SYNC_WAIT_LOOP_EXIT,
         BR2_DRAW_SYNC_WAIT_LOOP_INSTRUCTIONS, BR2_DRAW_SYNC_WAIT_LOOP_START,
         BR2_FRAME_COUNTER_WAIT_LOOP_GLOBAL_COUNTER, BR2_FRAME_COUNTER_WAIT_LOOP_INSTRUCTIONS,
         BR2_FRAME_COUNTER_WAIT_LOOP_STACK_OFFSET, BR2_FRAME_COUNTER_WAIT_LOOP_START,
@@ -7787,8 +7926,19 @@ mod tests {
         STATUS_IE, StepOutcome, WORD_COPY_LOOP_CYCLES_PER_WORD,
         br2_post_vs_stack_packet_scan_noop_gap_run, gte_leading_zero_count, gte_sxy, rfe_status,
     };
+    use crate::action::ActionButtons;
     use crate::native::bus::Bus;
     use crate::native::io::{DMA_INTERRUPT, DMA_SPU_CHCR};
+
+    fn install_br2_credit_check(bus: &mut Bus) {
+        for (address, instruction) in BR2_CREDIT_CHECK_ENTRY_SIGNATURE
+            .iter()
+            .chain(BR2_CREDIT_CHECK_CORE_SIGNATURE.iter())
+            .copied()
+        {
+            bus.write_u32(address, instruction);
+        }
+    }
 
     fn install_br2_irq_poll_timeout_loop(bus: &mut Bus) {
         bus.write_u32(
@@ -7912,6 +8062,60 @@ mod tests {
                 instruction,
             );
         }
+    }
+
+    #[test]
+    fn hle_br2_credit_check_consumes_pending_coin_edge() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_credit_check(&mut bus);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET, 0);
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        bus.set_input(ActionButtons::default());
+
+        let return_pc = 0x802f_7770;
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_CREDIT_CHECK_ENTRY;
+        cpu.next_pc = BR2_CREDIT_CHECK_ENTRY + 4;
+        cpu.regs[4] = 0;
+        cpu.regs[31] = return_pc;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_CREDIT_CHECK_ENTRY);
+        assert_eq!(report.cycles_elapsed, BR2_CREDIT_CHECK_HLE_CYCLES);
+        assert_eq!(cpu.pc, return_pc);
+        assert_eq!(cpu.next_pc, return_pc + 4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            0
+        );
+    }
+
+    #[test]
+    fn hle_br2_credit_check_preserves_no_credit_rejection() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_credit_check(&mut bus);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 1);
+
+        let return_pc = 0x802f_7770;
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_CREDIT_CHECK_ENTRY;
+        cpu.next_pc = BR2_CREDIT_CHECK_ENTRY + 4;
+        cpu.regs[4] = 0;
+        cpu.regs[31] = return_pc;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_CREDIT_CHECK_ENTRY);
+        assert_eq!(cpu.pc, return_pc);
+        assert_eq!(cpu.regs[2], u32::MAX);
     }
 
     fn install_br2_post_vs_vertex_record_loop(bus: &mut Bus) {
@@ -13102,6 +13306,70 @@ mod tests {
         assert_eq!(cpu.lo, 0x3333_0000);
         assert_eq!(cpu.hi, 0x4444_0000);
         assert_eq!(bus.io.irq.status & 9, 0);
+    }
+
+    #[test]
+    fn hle_returns_from_br2_runtime_bios_irq_dispatch_loop() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_bios_irq_dispatch_loop_signature(&mut bus);
+        install_bios_exception_context(&mut bus, 0x803f_fef0, 0x8035_dbec);
+        bus.io.irq.status = 1;
+        bus.io.irq.mask = 1;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_1b80;
+        cpu.next_pc = 0x0000_1b84;
+        cpu.regs[16] = 0x0000_1234;
+        cpu.regs[18] = 0x0000_5678;
+        cpu.regs[29] = 0x0000_8b30;
+        cpu.regs[31] = 0x0000_18d0;
+        cpu.hi = 0xaaaa_aaaa;
+        cpu.lo = 0xbbbb_bbbb;
+        cpu.cp0[CP0_STATUS] = 0x4000_0404;
+        cpu.cp0[CP0_CAUSE] = CAUSE_IP2;
+        cpu.cp0[CP0_EPC] = 0x8035_db48;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_1b80);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, 0x8035_db48);
+        assert_eq!(cpu.next_pc, 0x8035_db4c);
+        assert_eq!(cpu.cp0[CP0_STATUS], 0x4000_0401);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(cpu.regs[16], 0x1111_0000);
+        assert_eq!(cpu.regs[18], 0x2222_0000);
+        assert_eq!(cpu.regs[29], 0x803f_fef0);
+        assert_eq!(cpu.regs[31], 0x8035_dbec);
+        assert_eq!(cpu.lo, 0x3333_0000);
+        assert_eq!(cpu.hi, 0x4444_0000);
+        assert_eq!(bus.io.irq.status & 1, 0);
+    }
+
+    #[test]
+    fn hle_does_not_return_from_bios_irq_dispatch_loop_to_low_bios_alias() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_bios_irq_dispatch_loop_signature(&mut bus);
+        install_bios_exception_context(&mut bus, 0x803f_fef0, 0x8035_dbec);
+        bus.io.irq.status = 1;
+        bus.io.irq.mask = 1;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_1b80;
+        cpu.next_pc = 0x0000_1b84;
+        cpu.cp0[CP0_STATUS] = 0x4000_0404;
+        cpu.cp0[CP0_CAUSE] = CAUSE_IP2;
+        cpu.cp0[CP0_EPC] = 0x8000_1e6c;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_1b80);
+        assert_eq!(report.instruction, Some(0x0000_0000));
+        assert_eq!(cpu.pc, 0x0000_1b84);
+        assert_eq!(cpu.next_pc, 0x0000_1b88);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, CAUSE_IP2);
+        assert_eq!(bus.io.irq.status & 1, 1);
     }
 
     #[test]

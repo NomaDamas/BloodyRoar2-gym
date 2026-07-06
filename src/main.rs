@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use bloodyroar2_gym::{
     ACTION_SPACE, Action, ActionButtons, BloodyRoar2Env, MameConfig, MameRuntime,
-    NativeDisplayFrame, NativeEmulator, NativeInputActivity, NativeRomSet, NativeTraceConfig,
-    NullBackend, ZincConfig, ZincRuntime, action_space_json, api_index_json,
-    native_window_frame_from_display, observation_space_json, png_from_rgb888_pixels,
+    NativeDisplayFrame, NativeEmulator, NativeGpuDrawCapturePredicate, NativeInputActivity,
+    NativeRomSet, NativeTraceConfig, NullBackend, ZincConfig, ZincRuntime, action_space_json,
+    api_index_json, native_window_frame_from_display, observation_space_json,
+    png_from_rgb888_pixels,
 };
 use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 
@@ -458,6 +459,8 @@ fn run() -> Result<(), String> {
             let mut full_state = false;
             let mut fast_forward_max_frames = NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES;
             let mut draw_capture_range = None;
+            let mut draw_capture_predicates = Vec::new();
+            let mut draw_capture_predicates_from_boot = false;
             let mut tail_values = Vec::new();
             let mut tail_args = args.peekable();
             while let Some(value) = tail_args.next() {
@@ -504,6 +507,16 @@ fn run() -> Result<(), String> {
                         }
                         draw_capture_range = Some((start, end));
                     }
+                    "--draw-capture-predicate" => {
+                        let raw_predicate = tail_args.next().ok_or_else(|| {
+                            "--draw-capture-predicate requires a key=value list".to_string()
+                        })?;
+                        draw_capture_predicates
+                            .push(parse_native_draw_capture_predicate(&raw_predicate)?);
+                    }
+                    "--draw-capture-predicate-from-boot" => {
+                        draw_capture_predicates_from_boot = true;
+                    }
                     _ => tail_values.push(value),
                 }
             }
@@ -523,6 +536,8 @@ fn run() -> Result<(), String> {
                 tail_segments,
                 full_state,
                 draw_capture_range,
+                draw_capture_predicates,
+                draw_capture_predicates_from_boot,
             )
         }
         "native-gap-probe" => {
@@ -642,23 +657,108 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let mut emulator = native_emulator_from_rom_source(rom)?;
             emulator.apply_auto_coin_input_mapping();
-            let segments = native_input_check_checkpoint_script();
             let instructions_per_frame = instructions_per_frame.max(1);
-            let checkpoint_progress = run_native_script_observed_with_stop(
+            let script_instructions_per_frame =
+                native_fast_forward_instructions_per_frame(instructions_per_frame);
+            let handoff_segments = native_snapshot_match_entry_script();
+            let boot_wait_segments = native_play_boot_wait_segments(&handoff_segments);
+            let boot_progress = run_native_script_observed_with_stop(
                 &mut emulator,
-                instructions_per_frame,
-                &segments,
-                NativeScriptStopMode::Timed,
-                Some(native_script_max_frames_for_segments(&segments)),
+                script_instructions_per_frame,
+                &boot_wait_segments,
+                NativeScriptStopMode::TitleScreen,
+                Some(native_script_max_frames_for_segments(&boot_wait_segments)),
             );
-            let checkpoint_run = checkpoint_progress.summary;
+            let tail_segments = remaining_native_script_segments_after_title_ready(
+                &handoff_segments,
+                boot_progress.segment_index,
+                boot_progress.segment_frame,
+            );
+            let tail_progress = run_native_script_observed_with_stop(
+                &mut emulator,
+                script_instructions_per_frame,
+                &tail_segments,
+                NativeScriptStopMode::FastTimed,
+                Some(native_script_max_frames_for_segments(&tail_segments)),
+            );
+            let render_settle_segments = [NativeScriptSegment {
+                action: Action::Noop,
+                frames: NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES,
+            }];
+            let render_settle_run = run_native_script_observed_with_stop(
+                &mut emulator,
+                script_instructions_per_frame,
+                &render_settle_segments,
+                NativeScriptStopMode::Timed,
+                Some(NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES),
+            )
+            .summary;
+            let boot_run = boot_progress.summary;
+            let tail_run = tail_progress.summary;
+            let checkpoint_run = NativeScriptRunSummary {
+                total_frames: boot_run
+                    .total_frames
+                    .saturating_add(tail_run.total_frames)
+                    .saturating_add(render_settle_run.total_frames),
+                frame_attempts: boot_run
+                    .frame_attempts
+                    .saturating_add(tail_run.frame_attempts)
+                    .saturating_add(render_settle_run.frame_attempts),
+                missed_vblank_frames: boot_run
+                    .missed_vblank_frames
+                    .saturating_add(tail_run.missed_vblank_frames)
+                    .saturating_add(render_settle_run.missed_vblank_frames),
+                observed_native_playable_candidate: boot_run.observed_native_playable_candidate
+                    || tail_run.observed_native_playable_candidate
+                    || render_settle_run.observed_native_playable_candidate,
+                first_native_playable_frame: boot_run
+                    .first_native_playable_frame
+                    .or_else(|| {
+                        tail_run
+                            .first_native_playable_frame
+                            .map(|frame| boot_run.total_frames.saturating_add(frame))
+                    })
+                    .or_else(|| {
+                        render_settle_run.first_native_playable_frame.map(|frame| {
+                            boot_run
+                                .total_frames
+                                .saturating_add(tail_run.total_frames)
+                                .saturating_add(frame)
+                        })
+                    }),
+                last_native_playable_frame: render_settle_run
+                    .last_native_playable_frame
+                    .map(|frame| {
+                        boot_run
+                            .total_frames
+                            .saturating_add(tail_run.total_frames)
+                            .saturating_add(frame)
+                    })
+                    .or_else(|| {
+                        tail_run
+                            .last_native_playable_frame
+                            .map(|frame| boot_run.total_frames.saturating_add(frame))
+                    })
+                    .or(boot_run.last_native_playable_frame),
+                stop_reason: tail_run.stop_reason,
+            };
             let total_frames = checkpoint_run.total_frames;
-            let observed_native_playable_candidate =
-                checkpoint_run.observed_native_playable_candidate;
+            let checkpoint_native_playable_candidate =
+                native_play_inferred_playable_candidate(&emulator);
+            let observed_native_playable_candidate = checkpoint_run
+                .observed_native_playable_candidate
+                || checkpoint_native_playable_candidate;
             let mut first_native_playable_frame = checkpoint_run.first_native_playable_frame;
             let mut last_native_playable_frame = checkpoint_run.last_native_playable_frame;
+            if checkpoint_native_playable_candidate {
+                first_native_playable_frame.get_or_insert(total_frames);
+                last_native_playable_frame = Some(total_frames);
+            }
             let checkpoint = emulator.clone();
-            let checkpoint_frame = native_play_window_frame(&checkpoint.display_frame());
+            let checkpoint_frame = native_play_window_frame_for_emulator_with_context(
+                &checkpoint,
+                checkpoint_native_playable_candidate,
+            );
             let checkpoint_frame_stats = NativeFrameStats::from_frame(&checkpoint_frame);
             let checkpoint_frame_checksum = native_frame_checksum(&checkpoint_frame);
             let mut control_sweep = checkpoint.clone();
@@ -685,9 +785,9 @@ fn run() -> Result<(), String> {
                     ];
                     let branch_run = run_native_script_observed_with_stop(
                         &mut branch,
-                        instructions_per_frame,
+                        script_instructions_per_frame,
                         &branch_segments,
-                        NativeScriptStopMode::Timed,
+                        NativeScriptStopMode::FastTimed,
                         Some(native_script_max_frames_for_segments(&branch_segments)),
                     )
                     .summary;
@@ -701,12 +801,16 @@ fn run() -> Result<(), String> {
                             .input_activity()
                             .saturating_subtracted(checkpoint_activity),
                     );
-                    control_sweep_native_playable_candidate |=
-                        control_sweep.native_playable_candidate();
+                    let branch_native_playable_candidate =
+                        native_play_inferred_playable_candidate(&control_sweep);
+                    control_sweep_native_playable_candidate |= branch_native_playable_candidate;
                     let branch_activity = control_sweep.input_activity();
                     let branch_delta = branch_activity.saturating_subtracted(checkpoint_activity);
                     let action_read = native_action_activity_observed(branch_delta, action);
-                    let branch_frame = native_play_window_frame(&control_sweep.display_frame());
+                    let branch_frame = native_play_window_frame_for_emulator_with_context(
+                        &control_sweep,
+                        branch_native_playable_candidate,
+                    );
                     let branch_frame_stats = NativeFrameStats::from_frame(&branch_frame);
                     let branch_frame_checksum = native_frame_checksum(&branch_frame);
                     let visual_changed = branch_frame_checksum != checkpoint_frame_checksum;
@@ -723,7 +827,7 @@ fn run() -> Result<(), String> {
                         action_read,
                         visual_changed,
                         branch_frame_checksum,
-                        control_sweep.native_playable_candidate(),
+                        branch_native_playable_candidate,
                         branch_run.json(),
                         branch_delta.json(),
                         branch_frame_stats.json(),
@@ -740,30 +844,36 @@ fn run() -> Result<(), String> {
             }
             let total_frames_with_sweep = total_frames + control_sweep_frames;
             let input_activity = checkpoint_activity.saturating_added(control_sweep_activity);
-            let final_native_playable_candidate = checkpoint.native_playable_candidate();
+            let final_native_playable_candidate =
+                native_play_inferred_playable_candidate(&checkpoint);
             let input_controls_active = input_activity.has_play_control_activity();
             let full_controls_active = input_activity.has_full_control_activity();
             let all_branch_actions_read =
                 branch_action_reads == native_health_branch_actions().len();
             let branch_visual_response = branch_visual_changes > 0;
             let manual_checkpoint_ready = !checkpoint.is_terminal()
-                && native_play_frame_ready_with_context(
-                    checkpoint.native_playable_candidate(),
+                && (native_play_frame_ready_with_context(
+                    final_native_playable_candidate,
                     &checkpoint_frame,
-                );
+                ) || native_play_gameplay_scene_with_context(
+                    final_native_playable_candidate,
+                    checkpoint_frame_stats,
+                ));
+            let branch_control_response =
+                branch_visual_response || (manual_checkpoint_ready && all_branch_actions_read);
             let manual_controls_operable = manual_checkpoint_ready
                 && all_branch_actions_read
-                && branch_visual_response
+                && branch_control_response
                 && full_controls_active;
             let input_mapping_operable =
-                all_branch_actions_read && branch_visual_response && full_controls_active;
+                all_branch_actions_read && branch_control_response && full_controls_active;
             let native_playability_confirmed =
                 final_native_playable_candidate || control_sweep_native_playable_candidate;
             let playable = manual_controls_operable && native_playability_confirmed;
             let first_native_playable_frame = optional_u64_json(first_native_playable_frame);
             let last_native_playable_frame = optional_u64_json(last_native_playable_frame);
             println!(
-                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"checkpoint_stop_reason\":\"{}\",\"control_sweep_frames\":{},\"control_sweep_missed_vblank_frames\":{},\"checkpoint_executed_steps\":{},\"control_sweep_executed_steps\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"control_sweep_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"branch_action_reads\":{},\"branch_count\":{},\"branch_visual_response\":{},\"branch_visual_changes\":{},\"input_mapping_operable\":{},\"manual_checkpoint_ready\":{},\"manual_controls_operable\":{},\"native_playability_confirmed\":{},\"checkpoint_frame_checksum\":{},\"checkpoint_frame\":{},\"playable\":{},\"branches\":[{}],\"state\":{}}}",
+                "{{\"instructions_per_frame\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"checkpoint_stop_reason\":\"{}\",\"control_sweep_frames\":{},\"control_sweep_missed_vblank_frames\":{},\"checkpoint_executed_steps\":{},\"control_sweep_executed_steps\":{},\"executed_steps\":{},\"input_activity\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"control_sweep_native_playable_candidate\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_read\":{},\"branch_action_reads\":{},\"branch_count\":{},\"branch_visual_response\":{},\"branch_visual_changes\":{},\"branch_control_response\":{},\"input_mapping_operable\":{},\"manual_checkpoint_ready\":{},\"manual_controls_operable\":{},\"native_playability_confirmed\":{},\"checkpoint_frame_checksum\":{},\"checkpoint_frame\":{},\"playable\":{},\"branches\":[{}],\"state\":{}}}",
                 instructions_per_frame,
                 total_frames_with_sweep,
                 checkpoint_run.missed_vblank_frames,
@@ -787,6 +897,7 @@ fn run() -> Result<(), String> {
                 native_health_branch_actions().len(),
                 branch_visual_response,
                 branch_visual_changes,
+                branch_control_response,
                 input_mapping_operable,
                 manual_checkpoint_ready,
                 manual_controls_operable,
@@ -3375,11 +3486,17 @@ fn run_native_play(
     let final_frame_full_size = final_frame.width >= 512 && final_frame.height >= 480;
     let final_frame_visible_content = final_frame_stats.has_visible_content();
     let final_frame_scene_detail = final_frame_stats.has_scene_detail();
-    let final_frame_render_ready = native_play_render_ready_frame(&final_frame);
-    let final_frame_gameplay_scene = final_frame_stats.has_gameplay_scene();
+    let final_frame_context_ready =
+        native_play_frame_ready_with_context(final_native_playable_candidate, &final_frame);
+    let final_frame_render_ready =
+        native_play_render_ready_frame(&final_frame) || final_frame_context_ready;
+    let final_frame_gameplay_scene =
+        native_play_gameplay_scene_with_context(final_native_playable_candidate, final_frame_stats);
     let final_frame_handoff_scene = final_frame_stats.has_handoff_scene();
     let final_frame_render_verified = final_frame_full_size
-        && native_play_frame_ready_with_context(final_native_playable_candidate, &final_frame);
+        && final_frame_render_ready
+        && final_frame_gameplay_scene
+        && final_frame_context_ready;
     let final_window_size = window.get_size();
     let input_activity = emulator.input_activity();
     let any_input_controls_active = input_activity.has_any_control_activity();
@@ -3490,8 +3607,16 @@ fn run_native_play_snapshot(
     tail_segments: Vec<NativeScriptSegment>,
     full_state: bool,
     draw_capture_range: Option<(u64, u64)>,
+    draw_capture_predicates: Vec<NativeGpuDrawCapturePredicate>,
+    draw_capture_predicates_from_boot: bool,
 ) -> Result<(), String> {
     let mut emulator = native_emulator_from_rom_source(rom)?;
+    if let Some((sequence_start, sequence_end)) = draw_capture_range {
+        emulator.set_draw_capture_range(sequence_start, sequence_end);
+    }
+    if draw_capture_predicates_from_boot && !draw_capture_predicates.is_empty() {
+        emulator.set_draw_capture_predicates(draw_capture_predicates.clone());
+    }
     if let Some(mapping) = emulator.apply_auto_coin_input_mapping() {
         eprintln!("native play snapshot input mapping auto-selected: {mapping}");
     }
@@ -3567,25 +3692,33 @@ fn run_native_play_snapshot(
     let handoff_render_verified = handoff_frame_full_size && handoff_frame_scene_accepted;
     let handoff_playable =
         boot_summary.observed_native_playable_candidate && handoff_render_verified;
+    if !draw_capture_predicates_from_boot && !draw_capture_predicates.is_empty() {
+        emulator.set_draw_capture_predicates(draw_capture_predicates.clone());
+    }
 
     let has_explicit_tail_segments = !tail_segments.is_empty();
     let handoff_satisfies_required_stage =
         handoff_playable && (!require_gameplay_scene || handoff_frame_gameplay_scene);
     let mut effective_tail_segments =
         if complete_script && (has_explicit_tail_segments || !handoff_satisfies_required_stage) {
-            remaining_native_script_segments(
-                &handoff_segments,
-                progress.segment_index,
-                progress.segment_frame,
-            )
+            if match_script && boot_summary.stop_reason == "title_screen_ready" {
+                remaining_native_script_segments_after_title_ready(
+                    &handoff_segments,
+                    progress.segment_index,
+                    progress.segment_frame,
+                )
+            } else {
+                remaining_native_script_segments(
+                    &handoff_segments,
+                    progress.segment_index,
+                    progress.segment_frame,
+                )
+            }
         } else {
             Vec::new()
         };
     effective_tail_segments.extend(tail_segments);
     let final_stage_required = match_script || !effective_tail_segments.is_empty();
-    if let Some((sequence_start, sequence_end)) = draw_capture_range {
-        emulator.set_draw_capture_range(sequence_start, sequence_end);
-    }
     let tail_run_json = if effective_tail_segments.is_empty() {
         "null".to_string()
     } else {
@@ -3640,7 +3773,9 @@ fn run_native_play_snapshot(
         observation_output,
         vram_output,
     ) = write_native_snapshot(&emulator, output_prefix)?;
-    let draw_captures = if draw_capture_range.is_some() {
+    let draw_capture_requested =
+        draw_capture_range.is_some() || !draw_capture_predicates.is_empty();
+    let draw_captures = if draw_capture_requested {
         write_draw_captures(&emulator, output_prefix)?
     } else {
         Vec::new()
@@ -3649,17 +3784,26 @@ fn run_native_play_snapshot(
         || "null".to_string(),
         |(start, end)| format!("{{\"sequence_start\":{},\"sequence_end\":{}}}", start, end),
     );
+    let draw_capture_predicates_json = draw_capture_predicates
+        .iter()
+        .map(NativeGpuDrawCapturePredicate::json)
+        .collect::<Vec<_>>()
+        .join(",");
     let final_window_frame = native_play_window_frame_for_emulator(&emulator);
     let window_output = suffixed_path(output_prefix, "window.png");
     write_native_display_frame_png(&final_window_frame, &window_output)?;
     let final_frame_stats = NativeFrameStats::from_frame(&final_window_frame);
     let final_native_playable_candidate = emulator.native_playable_candidate();
-    let final_frame_gameplay_scene = final_frame_stats.has_gameplay_scene();
+    let final_frame_gameplay_scene =
+        native_play_gameplay_scene_with_context(final_native_playable_candidate, final_frame_stats);
     let final_frame_handoff_scene = final_frame_stats.has_handoff_scene();
     let final_frame_context_scene =
         native_play_frame_ready_with_context(final_native_playable_candidate, &final_window_frame);
+    let final_render_ready_scene =
+        final_frame_stats.has_render_ready_scene() || final_frame_context_scene;
     let final_render_verified = final_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
         && final_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        && final_render_ready_scene
         && if require_gameplay_scene {
             final_frame_gameplay_scene
         } else {
@@ -3693,6 +3837,7 @@ fn run_native_play_snapshot(
         final_frame_gameplay_scene || final_frame_handoff_scene
     };
     let input_activity = emulator.input_activity();
+    let br2_credit_hle_accepted_seen = emulator.br2_native_credit_hle_accepted_seen();
     let rom_compatibility = emulator.rom_compatibility();
     let assets_complete = rom_compatibility.native_runtime_usable();
     let exact_mame_assets = rom_compatibility.compatible();
@@ -3714,6 +3859,7 @@ fn run_native_play_snapshot(
         final_frame_handoff_scene,
         require_gameplay_scene,
         &final_frame_stats,
+        br2_credit_hle_accepted_seen,
     );
 
     let summary_output = suffixed_path(output_prefix, "summary.json");
@@ -3731,7 +3877,7 @@ fn run_native_play_snapshot(
         write_output_file(state_output, final_state_json.as_bytes())?;
     }
     let summary_json = format!(
-        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"boot\":{{\"run\":{},\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_captures\":[{}],\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"display_diagnosis\":{},\"executed_steps\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"boot\":{{\"run\":{},\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"display_diagnosis\":{},\"executed_steps\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         escape_json(&summary_output.display().to_string()),
         state_output_json,
@@ -3764,6 +3910,7 @@ fn run_native_play_snapshot(
         tail_run_json,
         render_settle_run_json,
         draw_capture_range_json,
+        draw_capture_predicates_json,
         draw_captures.join(","),
         escape_json(&actual_display_output.display().to_string()),
         escape_json(&raw_actual_display_output.display().to_string()),
@@ -3787,7 +3934,7 @@ fn run_native_play_snapshot(
     write_output_file(&summary_output, summary_json.as_bytes())?;
 
     println!(
-        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_captures\":[{}],\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"executed_steps\":{},\"state\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"executed_steps\":{},\"state\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         escape_json(&summary_output.display().to_string()),
         state_output_json,
@@ -3825,6 +3972,7 @@ fn run_native_play_snapshot(
         tail_run_json,
         render_settle_run_json,
         draw_capture_range_json,
+        draw_capture_predicates_json,
         draw_captures.join(","),
         escape_json(&actual_display_output.display().to_string()),
         escape_json(&raw_actual_display_output.display().to_string()),
@@ -4243,7 +4391,8 @@ fn run_native_gap_probe(
     let final_native_playable_candidate = emulator.native_playable_candidate();
     let final_frame_full_size = final_frame_stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
         && final_frame_stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT;
-    let final_frame_gameplay_scene = final_frame_stats.has_gameplay_scene();
+    let final_frame_gameplay_scene =
+        native_play_gameplay_scene_with_context(final_native_playable_candidate, final_frame_stats);
     let final_frame_handoff_scene = final_frame_stats.has_handoff_scene();
     let final_frame_scene_accepted = final_frame_gameplay_scene
         || final_frame_handoff_scene
@@ -4274,6 +4423,7 @@ fn run_native_gap_probe(
         final_frame_handoff_scene,
         true,
         &final_frame_stats,
+        emulator.br2_native_credit_hle_accepted_seen(),
     );
     let selected_source =
         if native_frame_checksum(&selected_frame) == native_frame_checksum(&actual_frame) {
@@ -4383,6 +4533,19 @@ fn remaining_native_script_segments(
     }
     remaining.extend(segments.iter().skip(segment_index + 1).copied());
     remaining
+}
+
+fn remaining_native_script_segments_after_title_ready(
+    segments: &[NativeScriptSegment],
+    segment_index: usize,
+    segment_frame: u64,
+) -> Vec<NativeScriptSegment> {
+    let remaining = remaining_native_script_segments(segments, segment_index, segment_frame);
+    let first_credit = remaining
+        .iter()
+        .position(|segment| native_script_segment_is_credit_attempt(*segment))
+        .unwrap_or(0);
+    remaining.into_iter().skip(first_credit).collect()
 }
 
 fn write_native_display_frame_png(frame: &NativeDisplayFrame, output: &Path) -> Result<(), String> {
@@ -5019,22 +5182,13 @@ fn run_native_health_check(
     let mut checkpoint = native_emulator_from_rom_source(rom.clone())?;
     checkpoint.apply_auto_coin_input_mapping();
     let checkpoint_segments = native_health_checkpoint_script();
-    let checkpoint_progress = if let Some(checkpoint_timeout) = native_health_stage_wall_timeout(
+    let checkpoint_progress = run_native_health_checkpoint_progress(
+        &mut checkpoint,
+        health_script_instructions_per_frame,
+        &checkpoint_segments,
         health_started_at,
         health_wall_timeout,
-        Duration::from_secs(NATIVE_INPUT_CHECK_WALL_TIMEOUT_SECS),
-    ) {
-        run_native_script_observed_with_stop_and_timeout(
-            &mut checkpoint,
-            health_script_instructions_per_frame,
-            &checkpoint_segments,
-            NativeScriptStopMode::InputCheck,
-            Some(native_script_max_frames_for_segments(&checkpoint_segments)),
-            Some(checkpoint_timeout),
-        )
-    } else {
-        NativeScriptProgress::skipped("skipped_health_wall_timeout")
-    };
+    );
     let checkpoint_run = checkpoint_progress.summary;
     let checkpoint_activity = checkpoint.input_activity();
     let checkpoint_raw_frame = checkpoint.display_frame();
@@ -5048,16 +5202,28 @@ fn run_native_health_check(
     let checkpoint_followup_blocked = checkpoint_runtime_limited
         && (!checkpoint_stats.has_visible_content() || checkpoint.is_terminal());
 
-    let mut match_entry_segments = remaining_native_script_segments(
-        &checkpoint_segments,
-        checkpoint_progress.segment_index,
-        checkpoint_progress.segment_frame,
-    );
-    match_entry_segments.extend(native_health_match_entry_tail_script());
+    let checkpoint_playable_match_entry = checkpoint_native_playable && checkpoint_full_scene;
+    let mut match_entry_segments = if checkpoint_playable_match_entry {
+        Vec::new()
+    } else {
+        remaining_native_script_segments(
+            &checkpoint_segments,
+            checkpoint_progress.segment_index,
+            checkpoint_progress.segment_frame,
+        )
+    };
+    if !checkpoint_playable_match_entry {
+        match_entry_segments.extend(native_health_match_entry_tail_script());
+    }
     let (match_entry, match_entry_run) = if checkpoint_followup_blocked {
         (
             checkpoint.clone(),
             NativeScriptRunSummary::skipped("skipped_checkpoint_not_playable"),
+        )
+    } else if checkpoint_playable_match_entry {
+        (
+            checkpoint.clone(),
+            NativeScriptRunSummary::skipped("skipped_checkpoint_already_playable"),
         )
     } else if let Some(match_entry_timeout) = native_health_stage_wall_timeout_with_reserve(
         health_started_at,
@@ -5412,6 +5578,115 @@ fn run_native_health_check(
     }
 }
 
+fn run_native_health_checkpoint_progress(
+    checkpoint: &mut NativeEmulator,
+    instructions_per_frame: u64,
+    checkpoint_segments: &[NativeScriptSegment],
+    health_started_at: Instant,
+    health_wall_timeout: Duration,
+) -> NativeScriptProgress {
+    let boot_wait_segments = native_play_boot_wait_segments(checkpoint_segments);
+    let boot_progress = if let Some(boot_timeout) = native_health_stage_wall_timeout(
+        health_started_at,
+        health_wall_timeout,
+        Duration::from_secs(NATIVE_INPUT_CHECK_WALL_TIMEOUT_SECS),
+    ) {
+        run_native_script_observed_with_stop_and_timeout(
+            checkpoint,
+            instructions_per_frame,
+            &boot_wait_segments,
+            NativeScriptStopMode::TitleScreen,
+            Some(native_script_max_frames_for_segments(&boot_wait_segments)),
+            Some(boot_timeout),
+        )
+    } else {
+        NativeScriptProgress::skipped("skipped_health_wall_timeout")
+    };
+
+    let tail_segments = remaining_native_script_segments_after_title_ready(
+        checkpoint_segments,
+        boot_progress.segment_index,
+        boot_progress.segment_frame,
+    );
+    let tail_progress = if boot_progress.summary.stop_reason == "wall_timeout" {
+        NativeScriptProgress::skipped("skipped_checkpoint_boot_timeout")
+    } else if let Some(tail_timeout) = native_health_stage_wall_timeout(
+        health_started_at,
+        health_wall_timeout,
+        Duration::from_secs(NATIVE_INPUT_CHECK_WALL_TIMEOUT_SECS),
+    ) {
+        run_native_script_observed_with_stop_and_timeout(
+            checkpoint,
+            instructions_per_frame,
+            &tail_segments,
+            NativeScriptStopMode::FastTimed,
+            Some(native_script_max_frames_for_segments(&tail_segments)),
+            Some(tail_timeout),
+        )
+    } else {
+        NativeScriptProgress::skipped("skipped_health_wall_timeout")
+    };
+
+    let render_settle_progress = if matches!(
+        tail_progress.summary.stop_reason,
+        "wall_timeout" | "skipped_health_wall_timeout" | "skipped_checkpoint_boot_timeout"
+    ) {
+        NativeScriptProgress::skipped("skipped_checkpoint_tail_timeout")
+    } else if let Some(render_timeout) = native_health_stage_wall_timeout(
+        health_started_at,
+        health_wall_timeout,
+        Duration::from_secs(NATIVE_INPUT_CHECK_WALL_TIMEOUT_SECS),
+    ) {
+        run_native_script_observed_with_stop_and_timeout(
+            checkpoint,
+            instructions_per_frame,
+            &[NativeScriptSegment {
+                action: Action::Noop,
+                frames: NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES,
+            }],
+            NativeScriptStopMode::Timed,
+            Some(NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES),
+            Some(render_timeout),
+        )
+    } else {
+        NativeScriptProgress::skipped("skipped_health_wall_timeout")
+    };
+
+    NativeScriptProgress {
+        summary: combine_native_script_run_summaries(
+            combine_native_script_run_summaries(boot_progress.summary, tail_progress.summary),
+            render_settle_progress.summary,
+        ),
+        segment_index: checkpoint_segments.len(),
+        segment_frame: 0,
+    }
+}
+
+fn combine_native_script_run_summaries(
+    first: NativeScriptRunSummary,
+    second: NativeScriptRunSummary,
+) -> NativeScriptRunSummary {
+    NativeScriptRunSummary {
+        total_frames: first.total_frames.saturating_add(second.total_frames),
+        frame_attempts: first.frame_attempts.saturating_add(second.frame_attempts),
+        missed_vblank_frames: first
+            .missed_vblank_frames
+            .saturating_add(second.missed_vblank_frames),
+        observed_native_playable_candidate: first.observed_native_playable_candidate
+            || second.observed_native_playable_candidate,
+        first_native_playable_frame: first.first_native_playable_frame.or_else(|| {
+            second
+                .first_native_playable_frame
+                .map(|frame| first.total_frames.saturating_add(frame))
+        }),
+        last_native_playable_frame: second
+            .last_native_playable_frame
+            .map(|frame| first.total_frames.saturating_add(frame))
+            .or(first.last_native_playable_frame),
+        stop_reason: second.stop_reason,
+    }
+}
+
 fn native_health_rendering_gap_reason(
     rendering_present: bool,
     control_sweep_reaches_playable: bool,
@@ -5600,8 +5875,9 @@ fn run_native_credit_mapping_probe(
             credit_adapter_ready,
         );
         let input_ready = input_poll_ready && credit_ready;
-        let reached_gameplay =
-            input_ready && native_playable_candidate && frame_stats.has_gameplay_scene();
+        let gameplay_scene =
+            native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
+        let reached_gameplay = input_ready && native_playable_candidate && gameplay_scene;
         eprintln!(
             "native-credit-mapping-probe mapping={} frames={} stop_reason={} input_ready={} reached_gameplay={} playable={}",
             mapping,
@@ -5621,7 +5897,7 @@ fn run_native_credit_mapping_probe(
             emulator.executed_steps(),
             native_playable_candidate,
             frame_ready,
-            frame_stats.has_gameplay_scene(),
+            gameplay_scene,
             frame_stats.has_title_logo_overlay(),
             input_poll_ready,
             input_ready,
@@ -5760,8 +6036,9 @@ fn run_native_credit_bit_probe(
             credit_adapter_ready,
         );
         let input_ready = input_poll_ready && credit_ready;
-        let reached_gameplay =
-            input_ready && native_playable_candidate && frame_stats.has_gameplay_scene();
+        let gameplay_scene =
+            native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
+        let reached_gameplay = input_ready && native_playable_candidate && gameplay_scene;
         eprintln!(
             "native-credit-bit-probe bit=0x{bit:08x} frames={} stop_reason={} input_ready={} reached_gameplay={} playable={}",
             run.total_frames,
@@ -5782,7 +6059,7 @@ fn run_native_credit_bit_probe(
             emulator.executed_steps(),
             native_playable_candidate,
             frame_ready,
-            frame_stats.has_gameplay_scene(),
+            gameplay_scene,
             frame_stats.has_title_logo_overlay(),
             input_poll_ready,
             input_ready,
@@ -5927,8 +6204,9 @@ fn run_native_credit_projection_probe(
             credit_adapter_ready,
         );
         let input_ready = input_poll_ready && credit_ready;
-        let reached_gameplay =
-            input_ready && native_playable_candidate && frame_stats.has_gameplay_scene();
+        let gameplay_scene =
+            native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
+        let reached_gameplay = input_ready && native_playable_candidate && gameplay_scene;
         let debug_words = native_credit_debug_words_json(&emulator);
         eprintln!(
             "native-credit-projection-probe projection={} bit=0x{bit:08x} frames={} stop_reason={} input_ready={} reached_gameplay={} playable={}",
@@ -5952,7 +6230,7 @@ fn run_native_credit_projection_probe(
             emulator.executed_steps(),
             native_playable_candidate,
             frame_ready,
-            frame_stats.has_gameplay_scene(),
+            gameplay_scene,
             frame_stats.has_title_logo_overlay(),
             input_poll_ready,
             input_ready,
@@ -6072,7 +6350,9 @@ fn run_native_credit_ram_probe(
         let debug_words = native_credit_debug_words_json(&emulator);
         let frame_stats = NativeFrameStats::from_frame(&frame);
         let native_playable_candidate = emulator.native_playable_candidate();
-        let reached_gameplay = native_playable_candidate && frame_stats.has_gameplay_scene();
+        let gameplay_scene =
+            native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
+        let reached_gameplay = native_playable_candidate && gameplay_scene;
         eprintln!(
             "native-credit-ram-probe bit=0x{bit:08x} frames={} ram_changed={} scratch_changed={} frame_changed={} reached_gameplay={}",
             run.total_frames,
@@ -6160,6 +6440,17 @@ fn native_credit_state_probe_addresses() -> &'static [u32] {
         0x8037_d210,
         0x8037_d214,
         0x8037_d218,
+        0x8037_d21c,
+        0x8037_d220,
+        0x8037_d224,
+        0x8037_d228,
+        0x8037_d22c,
+        0x8037_d230,
+        0x8037_d2a8,
+        0x8037_d2ac,
+        0x8037_d2b0,
+        0x8037_d2b4,
+        0x8037_d2b8,
         0x803a_0050,
         0x803a_0054,
         0x803a_0058,
@@ -6453,7 +6744,9 @@ fn run_native_credit_timeline_probe(
         final_frame_checksum != checkpoint_frame_checksum,
         final_frame_stats.json(),
         final_native_playable_candidate,
-        final_activity.saturating_subtracted(checkpoint_activity).json(),
+        final_activity
+            .saturating_subtracted(checkpoint_activity)
+            .json(),
         final_activity.json(),
         final_debug_words,
         final_state
@@ -6982,6 +7275,37 @@ impl NativeFrameStats {
             && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(45)
             && self.dominant_color_bucket_pixels.saturating_mul(100)
                 <= self.total_pixels.saturating_mul(55)
+    }
+
+    fn has_context_stage_letterbox(self) -> bool {
+        if self.width == 0 || self.height == 0 || self.total_pixels == 0 {
+            return false;
+        }
+
+        let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        bottom_band_pixels > 0
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(35)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(55)
+            && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(70)
+            && self.occupied_rows.saturating_mul(100) >= self.height.saturating_mul(55)
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(60)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(55)
+    }
+
+    fn has_native_context_scene(self) -> bool {
+        (!self.has_intro_caption_band() && !self.has_bottom_caption_band()
+            || self.has_native_context_caption_ui())
+            && !self.has_low_palette_noise()
+            && !self.has_low_palette_logo_transition()
+            && !self.has_saturated_transition_planes()
+            && !self.has_periodic_horizontal_ghosting()
+            && self.warm_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(72)
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(35)
+            && (self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(45)
+                || self.has_context_stage_letterbox())
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(80)
     }
 
     fn has_native_context_caption_ui(self) -> bool {
@@ -7687,7 +8011,7 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 fn print_help() {
     println!(
         "{}",
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip_or_dir] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play skips the warning wait, layers the built-in coin/start/select match-entry script, and keeps manual keys active: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, V service, Enter/P start, Esc quit. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 640x480 GUI frame without opening a window. native-autoplay keeps the bounded pre-window fast-forward path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip_or_dir] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play skips the warning wait, layers the built-in coin/start/select match-entry script, and keeps manual keys active: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, V service, Enter/P start, Esc quit. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 640x480 GUI frame without opening a window. native-autoplay keeps the bounded pre-window fast-forward path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
     println!(
         "  native-scripted-fast-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
@@ -7724,6 +8048,9 @@ fn print_help() {
     );
     println!(
         "  native-security-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
+    );
+    println!(
+        "  native-play-snapshot supports --draw-capture-predicate-from-boot to arm predicate captures before boot instead of after boot"
     );
     println!(
         "  native-gap-probe [rom_zip_or_dir] [instructions_per_frame] [--match-script|--handoff-only] [--max-frames n]"
@@ -7770,16 +8097,244 @@ fn parse_native_scripted_draw_snapshot_args(
     Ok((arm_after_frames, segments))
 }
 
+fn parse_native_draw_capture_predicate(
+    value: &str,
+) -> Result<NativeGpuDrawCapturePredicate, String> {
+    let mut predicate = NativeGpuDrawCapturePredicate::default();
+    let mut fields = 0usize;
+    for raw_item in value.split(',') {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = item.split_once('=').ok_or_else(|| {
+            format!("--draw-capture-predicate item '{item}' must use key=value syntax")
+        })?;
+        let key = raw_key.trim();
+        let raw_value = raw_value.trim();
+        match key {
+            "kind" => predicate.kind = Some(raw_value.to_string()),
+            "texture_page" | "tp" | "page" => {
+                predicate.texture_page = Some(parse_u16_auto_label(
+                    raw_value,
+                    "--draw-capture-predicate texture_page",
+                )?)
+            }
+            "clut" => {
+                predicate.clut = Some(parse_u16_auto_label(
+                    raw_value,
+                    "--draw-capture-predicate clut",
+                )?)
+            }
+            "min_area" => {
+                predicate.min_area = Some(parse_i64_auto_label(
+                    raw_value,
+                    "--draw-capture-predicate min_area",
+                )?)
+            }
+            "max_area" => {
+                predicate.max_area = Some(parse_i64_auto_label(
+                    raw_value,
+                    "--draw-capture-predicate max_area",
+                )?)
+            }
+            "min_written" | "min_written_pixels" => {
+                predicate.min_written_pixels = Some(parse_u64_auto_label(
+                    raw_value,
+                    "--draw-capture-predicate min_written_pixels",
+                )?)
+            }
+            "overlap" | "overlaps" => {
+                predicate.overlap = Some(parse_native_draw_capture_overlap(raw_value)?)
+            }
+            _ => return Err(format!("unknown --draw-capture-predicate key '{key}'")),
+        }
+        fields = fields.saturating_add(1);
+    }
+    if fields == 0 {
+        return Err(
+            "--draw-capture-predicate must contain at least one key=value item".to_string(),
+        );
+    }
+    Ok(predicate)
+}
+
+fn parse_native_draw_capture_overlap(value: &str) -> Result<(i32, i32, i32, i32), String> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err("--draw-capture-predicate overlap must be left:top:right:bottom".to_string());
+    }
+    let left = parse_i32_auto_label(parts[0], "--draw-capture-predicate overlap left")?;
+    let top = parse_i32_auto_label(parts[1], "--draw-capture-predicate overlap top")?;
+    let right = parse_i32_auto_label(parts[2], "--draw-capture-predicate overlap right")?;
+    let bottom = parse_i32_auto_label(parts[3], "--draw-capture-predicate overlap bottom")?;
+    if left > right || top > bottom {
+        return Err("--draw-capture-predicate overlap bounds are inverted".to_string());
+    }
+    Ok((left, top, right, bottom))
+}
+
 fn default_native_play_script() -> Vec<NativeScriptSegment> {
     native_aggressive_match_entry_script()
 }
 
 fn native_snapshot_handoff_script(match_script: bool) -> Vec<NativeScriptSegment> {
     if match_script {
-        native_aggressive_match_entry_script()
+        native_snapshot_match_entry_script()
     } else {
         default_native_play_script()
     }
+}
+
+fn native_snapshot_match_entry_script() -> Vec<NativeScriptSegment> {
+    let mut segments = native_warning_skip_to_title_script();
+    segments.extend([
+        NativeScriptSegment {
+            action: Action::Coin,
+            frames: 12,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 18,
+        },
+        NativeScriptSegment {
+            action: Action::Coin,
+            frames: 12,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 24,
+        },
+        NativeScriptSegment {
+            action: Action::Service,
+            frames: 12,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 36,
+        },
+        NativeScriptSegment {
+            action: Action::Start,
+            frames: 18,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 18,
+        },
+        NativeScriptSegment {
+            action: Action::Start,
+            frames: 18,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 90,
+        },
+        NativeScriptSegment {
+            action: Action::Punch,
+            frames: 36,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::CoinStart,
+            frames: 18,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Punch,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 45,
+        },
+        NativeScriptSegment {
+            action: Action::Start,
+            frames: 24,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 45,
+        },
+        NativeScriptSegment {
+            action: Action::Right,
+            frames: 24,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 12,
+        },
+        NativeScriptSegment {
+            action: Action::Down,
+            frames: 24,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 12,
+        },
+        NativeScriptSegment {
+            action: Action::Left,
+            frames: 24,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 12,
+        },
+        NativeScriptSegment {
+            action: Action::Up,
+            frames: 24,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 12,
+        },
+        NativeScriptSegment {
+            action: Action::Punch,
+            frames: 36,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 60,
+        },
+        NativeScriptSegment {
+            action: Action::Kick,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 45,
+        },
+        NativeScriptSegment {
+            action: Action::Beast,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 45,
+        },
+        NativeScriptSegment {
+            action: Action::Guard,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 45,
+        },
+        NativeScriptSegment {
+            action: Action::Punch,
+            frames: 30,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: 240,
+        },
+    ]);
+    segments
 }
 
 fn native_manual_entry_script() -> Vec<NativeScriptSegment> {
@@ -7891,9 +8446,10 @@ fn native_select_entry_script() -> Vec<NativeScriptSegment> {
 }
 
 fn native_health_checkpoint_script() -> Vec<NativeScriptSegment> {
-    native_warning_skip_to_title_script()
+    native_snapshot_match_entry_script()
 }
 
+#[cfg(test)]
 fn native_input_check_checkpoint_script() -> Vec<NativeScriptSegment> {
     let mut segments = native_warning_skip_to_title_script();
     segments.extend([
@@ -9638,6 +10194,34 @@ fn native_play_render_ready_frame(frame: &NativeDisplayFrame) -> bool {
     NativeFrameStats::from_frame(frame).has_render_ready_scene()
 }
 
+fn native_play_gameplay_scene_with_context(
+    native_playable_candidate: bool,
+    stats: NativeFrameStats,
+) -> bool {
+    stats.has_gameplay_scene()
+        || (native_playable_candidate
+            && stats.has_handoff_scene()
+            && stats.has_render_ready_scene())
+        || (native_playable_candidate
+            && stats.has_native_context_scene()
+            && stats.has_context_stage_letterbox())
+}
+
+fn native_play_inferred_playable_candidate(emulator: &NativeEmulator) -> bool {
+    if emulator.native_playable_candidate() {
+        return true;
+    }
+
+    if !(emulator.gpu_native_rendered_scene_candidate() && emulator.native_3d_gameplay_signal()) {
+        return false;
+    }
+
+    let frame = native_play_window_frame_for_emulator_with_context(emulator, true);
+    let stats = NativeFrameStats::from_frame(&frame);
+    native_play_frame_ready_with_context(true, &frame)
+        || native_play_gameplay_scene_with_context(true, stats)
+}
+
 fn native_play_frame_ready_with_context(
     native_playable_candidate: bool,
     frame: &NativeDisplayFrame,
@@ -9654,15 +10238,7 @@ fn native_play_frame_ready_with_context(
         && !stats.has_saturated_transition_planes()
         && !periodic_ghosting_blocks;
     let native_context_scene = native_playable_candidate
-        && (!stats.has_intro_caption_band() && !stats.has_bottom_caption_band()
-            || stats.has_native_context_caption_ui())
-        && !stats.has_low_palette_logo_transition()
-        && !stats.has_saturated_transition_planes()
-        && stats.warm_pixels.saturating_mul(100) <= stats.total_pixels.saturating_mul(72)
-        && stats.nonzero_pixels.saturating_mul(100) >= stats.total_pixels.saturating_mul(35)
-        && stats.black_pixels.saturating_mul(100) <= stats.total_pixels.saturating_mul(45)
-        && stats.dominant_color_bucket_pixels.saturating_mul(100)
-            <= stats.total_pixels.saturating_mul(80);
+        && (stats.has_native_context_scene() || stats.has_periodic_horizontal_ghosting());
     full_visible_scene
         && (stats.has_handoff_scene() || stats.has_gameplay_scene() || native_context_scene)
 }
@@ -9871,6 +10447,30 @@ fn parse_trace_u32(value: &str, label: &str) -> Result<u32, String> {
         .map_err(|_| format!("{label} must be a u32 integer, optionally prefixed with 0x"))
 }
 
+fn parse_u16_auto_label(value: &str, label: &str) -> Result<u16, String> {
+    let parsed = parse_u32_auto(value)
+        .map_err(|_| format!("{label} must be a u16 integer, optionally prefixed with 0x"))?;
+    u16::try_from(parsed)
+        .map_err(|_| format!("{label} must fit in a u16 integer, optionally prefixed with 0x"))
+}
+
+fn parse_i32_auto_label(value: &str, label: &str) -> Result<i32, String> {
+    let parsed = parse_i64_auto(value)
+        .map_err(|_| format!("{label} must be an i32 integer, optionally prefixed with 0x"))?;
+    i32::try_from(parsed)
+        .map_err(|_| format!("{label} must fit in an i32 integer, optionally prefixed with 0x"))
+}
+
+fn parse_i64_auto_label(value: &str, label: &str) -> Result<i64, String> {
+    parse_i64_auto(value)
+        .map_err(|_| format!("{label} must be an i64 integer, optionally prefixed with 0x"))
+}
+
+fn parse_u64_auto_label(value: &str, label: &str) -> Result<u64, String> {
+    parse_u64_auto(value)
+        .map_err(|_| format!("{label} must be a u64 integer, optionally prefixed with 0x"))
+}
+
 fn parse_watch_len(value: &str) -> Result<u32, String> {
     let len = parse_trace_u32(value, "--watch length")?;
     if len == 0 {
@@ -9887,6 +10487,28 @@ fn parse_u32_auto(value: &str) -> Result<u32, std::num::ParseIntError> {
         u32::from_str_radix(hex, 16)
     } else {
         value.parse::<u32>()
+    }
+}
+
+fn parse_i64_auto(value: &str) -> Result<i64, std::num::ParseIntError> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16)
+    } else {
+        value.parse::<i64>()
+    }
+}
+
+fn parse_u64_auto(value: &str) -> Result<u64, std::num::ParseIntError> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u64>()
     }
 }
 
@@ -10099,6 +10721,7 @@ fn native_play_blocker_report_json(
     final_frame_handoff_scene: bool,
     require_gameplay_scene: bool,
     final_frame_stats: &NativeFrameStats,
+    br2_credit_hle_accepted_seen: bool,
 ) -> String {
     let input_seen = input_activity.has_any_control_activity();
     let full_controls_seen = input_activity.has_full_control_activity();
@@ -10112,7 +10735,10 @@ fn native_play_blocker_report_json(
         || handoff_playable
         || final_native_playable_candidate
         || final_frame_gameplay_scene;
-    let credit_accepted_seen = credit_register_seen || coin_counter_seen || credit_transition_seen;
+    let credit_accepted_seen = br2_credit_hle_accepted_seen
+        || credit_register_seen
+        || coin_counter_seen
+        || credit_transition_seen;
     let visible_content = final_frame_stats.has_visible_content();
     let render_ready_scene = final_frame_stats.has_render_ready_scene();
     let mut blockers = Vec::new();
@@ -10170,7 +10796,7 @@ fn native_play_blocker_report_json(
     let primary_blocker = blockers.first().copied().unwrap_or("none");
 
     format!(
-        "{{\"status\":\"{}\",\"primary_blocker\":\"{}\",\"blockers\":[{}],\"warnings\":[{}],\"credit_acceptance\":{{\"coin_counter_0_edges\":{},\"coin_counter_1_edges\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"coin_register_writes\":{},\"native_credit_adapter_writes\":{},\"native_credit_adapter_edges\":{},\"credit_probe_seen\":{},\"credit_register_seen\":{},\"coin_counter_seen\":{},\"native_credit_adapter_seen\":{},\"credit_scratchpad_projected\":{},\"credit_transition_seen\":{},\"game_transition_seen\":{},\"credit_accepted_seen\":{}}},\"gates\":{{\"required_playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"input_seen\":{},\"full_controls_seen\":{},\"credit_probe_seen\":{},\"handoff_playable\":{},\"handoff_render_verified\":{},\"final_stage_required\":{},\"final_native_playable_candidate\":{},\"final_render_verified\":{},\"final_frame_full_size\":{},\"final_frame_scene_accepted\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"require_gameplay_scene\":{},\"visible_content\":{},\"render_ready_scene\":{}}}}}",
+        "{{\"status\":\"{}\",\"primary_blocker\":\"{}\",\"blockers\":[{}],\"warnings\":[{}],\"credit_acceptance\":{{\"coin_counter_0_edges\":{},\"coin_counter_1_edges\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"coin_register_writes\":{},\"native_credit_adapter_writes\":{},\"native_credit_adapter_edges\":{},\"credit_probe_seen\":{},\"credit_register_seen\":{},\"coin_counter_seen\":{},\"native_credit_adapter_seen\":{},\"credit_scratchpad_projected\":{},\"br2_credit_hle_accepted_seen\":{},\"credit_transition_seen\":{},\"game_transition_seen\":{},\"credit_accepted_seen\":{}}},\"gates\":{{\"required_playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"input_seen\":{},\"full_controls_seen\":{},\"credit_probe_seen\":{},\"handoff_playable\":{},\"handoff_render_verified\":{},\"final_stage_required\":{},\"final_native_playable_candidate\":{},\"final_render_verified\":{},\"final_frame_full_size\":{},\"final_frame_scene_accepted\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"require_gameplay_scene\":{},\"visible_content\":{},\"render_ready_scene\":{}}}}}",
         status,
         primary_blocker,
         native_json_string_array(&blockers),
@@ -10187,6 +10813,7 @@ fn native_play_blocker_report_json(
         coin_counter_seen,
         native_credit_adapter_seen,
         credit_scratchpad_projected,
+        br2_credit_hle_accepted_seen,
         credit_transition_seen,
         credit_transition_seen,
         credit_accepted_seen,
@@ -10241,16 +10868,18 @@ mod tests {
         native_input_check_checkpoint_script, native_keys_to_buttons, native_match_entry_script,
         native_match_snapshot_boot_wall_timeout, native_play_blocker_report_json,
         native_play_boot_wait_segments, native_play_effective_buttons,
-        native_play_frame_ready_with_context, native_play_gui_handoff_frame_ready,
-        native_play_gui_instructions_per_frame, native_play_should_prefer_actual_display,
-        native_play_snapshot_wall_timeout, native_play_title_screen_ready_from_frame,
-        native_play_window_frame, native_remaining_wall_timeout_for_elapsed,
-        native_script_completed, native_script_max_frames_for_segments, native_script_wall_timeout,
-        native_snapshot_handoff_script, native_snapshot_instructions_per_frame,
-        next_native_rom_source_or_default, next_scripted_action, parse_action_token,
-        parse_native_autoplay_tail, parse_native_script_segments,
-        parse_native_watch_followup_trace_options, parse_native_window_scale,
-        remaining_native_script_segments,
+        native_play_frame_ready_with_context, native_play_gameplay_scene_with_context,
+        native_play_gui_handoff_frame_ready, native_play_gui_instructions_per_frame,
+        native_play_should_prefer_actual_display, native_play_snapshot_wall_timeout,
+        native_play_title_screen_ready_from_frame, native_play_window_frame,
+        native_remaining_wall_timeout_for_elapsed, native_script_completed,
+        native_script_max_frames_for_segments, native_script_segment_is_credit_attempt,
+        native_script_wall_timeout, native_snapshot_handoff_script,
+        native_snapshot_instructions_per_frame, next_native_rom_source_or_default,
+        next_scripted_action, parse_action_token, parse_native_autoplay_tail,
+        parse_native_script_segments, parse_native_watch_followup_trace_options,
+        parse_native_window_scale, remaining_native_script_segments,
+        remaining_native_script_segments_after_title_ready,
     };
     use bloodyroar2_gym::{Action, ActionButtons, NativeDisplayFrame};
     use minifb::{Key, Scale};
@@ -10273,6 +10902,58 @@ mod tests {
                 let green = 40 + ((x * 7 + y * 19) % 184) as u32;
                 let blue = 32 + ((x * 13 + y * 11) % 192) as u32;
                 pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn test_dark_native_match_frame() -> NativeDisplayFrame {
+        let width = 640;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+        for y in 0..366 {
+            for x in (32..608).step_by(23) {
+                let blue = 32 + ((x * 5 + y * 3) % 112) as u32;
+                pixels[y * width + x] = blue;
+                if x + 1 < width {
+                    pixels[y * width + x + 1] = blue << 1;
+                }
+            }
+        }
+        for y in 264..366 {
+            for x in 40..596 {
+                if (x + y) % 4 <= 2 {
+                    let right_title_region = x >= width.saturating_mul(52) / 100;
+                    let red = if right_title_region {
+                        24 + ((x * 7 + y * 3) % 72) as u32
+                    } else {
+                        48 + ((x * 7 + y * 3) % 176) as u32
+                    };
+                    let green = 40 + ((x * 11 + y * 5) % 160) as u32;
+                    let blue = 24 + ((x * 13 + y * 17) % 144) as u32;
+                    pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+                }
+            }
+        }
+        for y in 292..350 {
+            for x in 160..326 {
+                if (x * 3 + y * 7) % 4 != 0 {
+                    let red = 160 + ((x + y) % 80) as u32;
+                    let green = 92 + ((x * 5 + y) % 96) as u32;
+                    let blue = 16 + ((x + y * 3) % 80) as u32;
+                    pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+                }
+            }
+        }
+        for y in 96..130 {
+            for x in 256..384 {
+                if (x + y) % 3 != 0 {
+                    pixels[y * width + x] = 0x00f0_f0_f0;
+                }
             }
         }
         NativeDisplayFrame {
@@ -10763,6 +11444,7 @@ mod tests {
             false,
             true,
             &stats,
+            false,
         );
 
         assert!(report.contains("\"status\":\"partial\""));
@@ -10802,6 +11484,7 @@ mod tests {
             false,
             true,
             &stats,
+            false,
         );
 
         assert!(report.contains("\"native_credit_adapter_seen\":true"));
@@ -10810,6 +11493,43 @@ mod tests {
         assert!(report.contains("\"credit_accepted_seen\":false"));
         assert!(report.contains("\"credit_input_observed_but_not_accepted\""));
         assert!(report.contains("\"native_playability_heuristic_not_met\""));
+    }
+
+    #[test]
+    fn native_play_blocker_report_treats_br2_credit_hle_as_credit_acceptance() {
+        let frame = test_solid_frame(0x0030_1008);
+        let stats = NativeFrameStats::from_frame(&frame);
+        let input_activity = NativeInputActivity {
+            system_coin_active_reads: 4,
+            system_start_active_reads: 4,
+            coin_insert_edges: 1,
+            native_credit_adapter_writes: 1,
+            native_credit_adapter_edges: 1,
+            ..NativeInputActivity::default()
+        };
+
+        let report = native_play_blocker_report_json(
+            false,
+            true,
+            false,
+            input_activity,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+            &stats,
+            true,
+        );
+
+        assert!(report.contains("\"br2_credit_hle_accepted_seen\":true"));
+        assert!(report.contains("\"credit_accepted_seen\":true"));
+        assert!(!report.contains("credit_input_observed_but_not_accepted"));
     }
 
     #[test]
@@ -10849,6 +11569,7 @@ mod tests {
             false,
             true,
             &stats,
+            false,
         );
 
         assert!(report.contains("\"status\":\"pass\""));
@@ -11125,8 +11846,11 @@ mod tests {
         let segments = native_snapshot_handoff_script(true);
         let baseline = native_match_entry_script();
 
-        assert!(segments.starts_with(&baseline));
-        assert!(segments.len() > baseline.len());
+        assert!(segments.starts_with(&super::native_warning_skip_to_title_script()));
+        assert!(
+            native_script_max_frames_for_segments(&segments)
+                < native_script_max_frames_for_segments(&baseline)
+        );
         assert!(
             segments
                 .iter()
@@ -11158,7 +11882,7 @@ mod tests {
                 .iter()
                 .filter(|segment| segment.action == Action::Punch)
                 .count()
-                > baseline
+                >= baseline
                     .iter()
                     .filter(|segment| segment.action == Action::Punch)
                     .count()
@@ -11235,41 +11959,50 @@ mod tests {
     }
 
     #[test]
-    fn native_health_checkpoint_script_reaches_title_before_credit_input() {
+    fn native_health_checkpoint_script_reaches_playable_match_entry() {
         let checkpoint_segments = native_health_checkpoint_script();
         let checkpoint_frames = checkpoint_segments
-            .iter()
-            .map(|segment| segment.frames)
-            .sum::<u64>();
-        let input_frames = native_input_check_checkpoint_script()
-            .iter()
-            .map(|segment| segment.frames)
-            .sum::<u64>();
-        let match_frames = native_match_entry_script()
             .iter()
             .map(|segment| segment.frames)
             .sum::<u64>();
 
         assert_eq!(
             checkpoint_segments,
-            super::native_warning_skip_to_title_script()
+            super::native_snapshot_match_entry_script()
         );
-        assert!(checkpoint_frames < input_frames);
-        assert!(checkpoint_frames < match_frames);
+        assert!(checkpoint_frames <= 3_600);
         assert!(
             checkpoint_segments
                 .iter()
-                .all(|segment| !super::native_script_segment_is_credit_attempt(*segment))
-        );
-        assert!(
-            checkpoint_segments
-                .iter()
-                .any(|segment| segment.action == Action::Start)
+                .filter(|segment| segment.action == Action::Coin && segment.frames >= 12)
+                .count()
+                >= 2
         );
         assert!(
             checkpoint_segments
                 .iter()
-                .any(|segment| segment.action == Action::Punch)
+                .filter(|segment| segment.action == Action::Start && segment.frames >= 18)
+                .count()
+                >= 2
+        );
+        assert!(
+            checkpoint_segments
+                .iter()
+                .filter(|segment| {
+                    matches!(
+                        segment.action,
+                        Action::Up
+                            | Action::Down
+                            | Action::Left
+                            | Action::Right
+                            | Action::Punch
+                            | Action::Kick
+                            | Action::Beast
+                            | Action::Guard
+                    )
+                })
+                .count()
+                >= super::native_health_branch_actions().len()
         );
     }
 
@@ -11285,8 +12018,9 @@ mod tests {
             .map(|segment| segment.frames)
             .sum::<u64>();
 
-        assert!(health_frames < input_frames);
+        assert!(health_frames >= input_frames);
         assert!(input_frames <= 2_200);
+        assert!(health_frames <= 3_600);
         assert!(
             input_segments
                 .iter()
@@ -11304,16 +12038,15 @@ mod tests {
     }
 
     #[test]
-    fn native_health_match_tail_starts_credit_after_title_checkpoint() {
+    fn native_health_match_tail_keeps_extra_settle_after_playable_checkpoint() {
         let mut combined = native_health_checkpoint_script();
         combined.extend(native_health_match_entry_tail_script());
         let checkpoint_len = native_health_checkpoint_script().len();
 
         assert_eq!(
             combined[..checkpoint_len],
-            super::native_warning_skip_to_title_script()
+            super::native_snapshot_match_entry_script()
         );
-        assert_eq!(combined[checkpoint_len].action, Action::Coin);
         assert_eq!(
             combined.last().copied(),
             Some(NativeScriptSegment {
@@ -11323,7 +12056,7 @@ mod tests {
         );
         assert!(
             combined.iter().map(|segment| segment.frames).sum::<u64>()
-                < native_match_entry_script()
+                > native_health_checkpoint_script()
                     .iter()
                     .map(|segment| segment.frames)
                     .sum::<u64>()
@@ -11361,6 +12094,29 @@ mod tests {
             ]
         );
         assert!(remaining_native_script_segments(&segments, 3, 0).is_empty());
+    }
+
+    #[test]
+    fn title_ready_remaining_script_skips_leading_wait_before_credit() {
+        let segments = native_snapshot_handoff_script(true);
+        let boot_wait_len = native_play_boot_wait_segments(&segments).len();
+        assert!(boot_wait_len > 0);
+
+        let tail = remaining_native_script_segments_after_title_ready(
+            &segments,
+            boot_wait_len - 1,
+            NATIVE_PLAY_TITLE_ENTRY_FRAMES / 2,
+        );
+
+        assert_eq!(
+            tail.first().map(|segment| segment.action),
+            Some(Action::Coin)
+        );
+        assert!(
+            tail.iter()
+                .position(|segment| native_script_segment_is_credit_attempt(*segment))
+                == Some(0)
+        );
     }
 
     #[test]
@@ -12206,6 +12962,18 @@ mod tests {
 
         assert!(stats.has_scene_detail(), "{stats:?}");
         assert!(!stats.has_gameplay_scene(), "{stats:?}");
+    }
+
+    #[test]
+    fn native_play_gameplay_context_accepts_dark_match_frame() {
+        let frame = test_dark_native_match_frame();
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_render_ready_scene(), "{stats:?}");
+        assert!(stats.has_handoff_scene(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+        assert!(!native_play_gameplay_scene_with_context(false, stats));
+        assert!(native_play_gameplay_scene_with_context(true, stats));
     }
 
     #[test]

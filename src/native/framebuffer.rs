@@ -790,7 +790,7 @@ impl NativeFrameBuffer {
         v: u8,
         allow_palette_fallback: bool,
     ) -> TextureSample {
-        let (page_x, page_y) = texture_page_origin(texture_page);
+        let (page_x, page_y) = texture_page_origin_for_sample(texture_page, clut, u, v);
         self.sample_texture_sample_from_origin(
             raw_pixels,
             texture_page,
@@ -871,7 +871,7 @@ impl NativeFrameBuffer {
         texture_page: u16,
         clut: u16,
     ) -> Option<Vec<u16>> {
-        let texture_bounds = texture_page_raw_bounds(texture_page);
+        let texture_bounds = texture_page_raw_bounds_for_clut(texture_page, clut);
         let palette_bounds = texture_palette_raw_bounds(texture_page, clut);
         if bounds_overlap(dest_bounds, texture_bounds)
             || palette_bounds.is_some_and(|bounds| bounds_overlap(dest_bounds, bounds))
@@ -971,7 +971,7 @@ impl NativeFrameBuffer {
         }
 
         let mut images = Vec::new();
-        for candidate in texture_origin_candidates(texture_page) {
+        for candidate in texture_origin_candidates_for_clut(texture_page, clut) {
             for raw_width in raw_widths.iter().copied() {
                 let label = format!("{}-raw{}", candidate.label, raw_width);
                 images.push(TextureCandidateImage {
@@ -1054,7 +1054,7 @@ impl NativeFrameBuffer {
         let clut_x = ((clut & 0x3f) as i32) * 16;
         let clut_y = clut_y(clut) as i32;
 
-        let texture_candidates = texture_origin_candidates(texture_page);
+        let texture_candidates = texture_origin_candidates_for_clut(texture_page, clut);
 
         let texture_candidates_json = texture_candidates
             .iter()
@@ -2278,12 +2278,16 @@ fn clut_y(clut: u16) -> u16 {
     (clut >> 6) & 0x03ff
 }
 
+pub fn texture_page_color_mode_for_diagnostics(texture_page: u16) -> u16 {
+    texture_page_color_mode(texture_page)
+}
+
 pub fn texture_page_origin_for_diagnostics(texture_page: u16) -> (i32, i32) {
     texture_page_origin(texture_page)
 }
 
-pub fn texture_page_color_mode_for_diagnostics(texture_page: u16) -> u16 {
-    texture_page_color_mode(texture_page)
+pub fn texture_page_origin_for_clut_for_diagnostics(texture_page: u16, clut: u16) -> (i32, i32) {
+    texture_page_origin_for_clut(texture_page, clut)
 }
 
 pub fn clut_origin_for_diagnostics(clut: u16) -> (i32, i32) {
@@ -2332,6 +2336,18 @@ fn texture_origin_candidates(texture_page: u16) -> Vec<OriginCandidate> {
     );
     push_unique_origin(&mut candidates, "resolved_y0", page_x, 0);
     push_unique_origin(&mut candidates, "resolved_y256", page_x, 256);
+    candidates
+}
+
+fn texture_origin_candidates_for_clut(texture_page: u16, clut: u16) -> Vec<OriginCandidate> {
+    let (page_x, page_y) = texture_page_origin_for_clut(texture_page, clut);
+    let mut candidates = Vec::new();
+    push_unique_origin(&mut candidates, "resolved", page_x, page_y);
+    push_unique_origin(&mut candidates, "resolved_minus_64", page_x - 64, page_y);
+    push_unique_origin(&mut candidates, "resolved_plus_64", page_x + 64, page_y);
+    for candidate in texture_origin_candidates(texture_page) {
+        push_unique_origin(&mut candidates, candidate.label, candidate.x, candidate.y);
+    }
     candidates
 }
 
@@ -2424,6 +2440,24 @@ fn indexed_palette_sample_from(
         sample.color = color;
         sample.palette_fallback = true;
         sample.clut_nonzero = color != 0;
+        return sample;
+    }
+
+    if entries == 256
+        && let Some(fallback) =
+            fallback_linear_256_palette_sample(raw_pixels, texture_page, clut, index)
+        && should_use_linear_256_palette_sample(
+            texture_page,
+            clut,
+            allow_palette_fallback,
+            requested_stats.nonzero_entries,
+            fallback.nonzero_entries,
+            color,
+        )
+    {
+        sample.color = fallback.color;
+        sample.palette_fallback = true;
+        sample.clut_nonzero = fallback.color != 0;
         return sample;
     }
 
@@ -2664,6 +2698,65 @@ fn fallback_tiled_256_palette_raw_pixel_from(
     })
 }
 
+fn fallback_linear_256_palette_sample(
+    raw_pixels: &[u16],
+    _texture_page: u16,
+    clut: u16,
+    index: i32,
+) -> Option<LinearPaletteSample> {
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    let clut_y = clut_y(clut) as i32;
+    let candidates = [
+        clut_y & !0x1f,
+        clut_y & !0x0f,
+        clut_y.saturating_sub(16),
+        clut_y.saturating_add(16),
+    ];
+
+    let mut best = None;
+    for y in candidates {
+        if y == clut_y {
+            continue;
+        }
+        let Some(stats) = palette_region_stats(raw_pixels, clut_x, y, 256) else {
+            continue;
+        };
+        if stats.nonzero_entries < 128 || stats.unique_entries < 32 {
+            continue;
+        }
+        let candidate = LinearPaletteCandidate {
+            x: clut_x,
+            y,
+            nonzero_entries: stats.nonzero_entries,
+            unique_entries: stats.unique_entries,
+        };
+        best = prefer_linear_256_palette_candidate(best, candidate);
+    }
+
+    best.map(|candidate| LinearPaletteSample {
+        color: raw_pixel_from(raw_pixels, candidate.x + index, candidate.y),
+        nonzero_entries: candidate.nonzero_entries,
+        unique_entries: candidate.unique_entries,
+    })
+}
+
+fn prefer_linear_256_palette_candidate(
+    best: Option<LinearPaletteCandidate>,
+    candidate: LinearPaletteCandidate,
+) -> Option<LinearPaletteCandidate> {
+    let Some(best) = best else {
+        return Some(candidate);
+    };
+
+    if candidate.nonzero_entries > best.nonzero_entries {
+        return Some(candidate);
+    }
+    if candidate.nonzero_entries == best.nonzero_entries && candidate.y < best.y {
+        return Some(candidate);
+    }
+    Some(best)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TiledPaletteSample {
     color: u16,
@@ -2872,6 +2965,31 @@ fn should_prefer_tiled_256_palette(
     (requested_color == 0 || sparse_requested) && much_richer_tile
 }
 
+fn should_use_linear_256_palette_sample(
+    texture_page: u16,
+    clut: u16,
+    allow_palette_fallback: bool,
+    requested_nonzero_entries: usize,
+    linear_nonzero_entries: usize,
+    requested_color: u16,
+) -> bool {
+    if texture_page_color_mode(texture_page) != 1 || linear_nonzero_entries < 128 {
+        return false;
+    }
+
+    let clut_y = clut_y(clut);
+    if !(480..512).contains(&clut_y) {
+        return false;
+    }
+
+    allow_palette_fallback
+        && should_prefer_tiled_256_palette(
+            requested_nonzero_entries,
+            linear_nonzero_entries,
+            requested_color,
+        )
+}
+
 fn should_use_tiled_256_palette_sample(
     texture_page: u16,
     clut: u16,
@@ -3010,8 +3128,8 @@ fn fallback_palette_min_nonzero_entries(entries: usize) -> usize {
     }
 }
 
-fn texture_page_raw_bounds(texture_page: u16) -> (i32, i32, i32, i32) {
-    let (page_x, page_y) = texture_page_origin(texture_page);
+fn texture_page_raw_bounds_for_clut(texture_page: u16, clut: u16) -> (i32, i32, i32, i32) {
+    let (page_x, page_y) = texture_page_origin_for_clut(texture_page, clut);
     let raw_width = texture_page_raw_width(texture_page) as i32;
     (page_x, page_y, page_x + raw_width - 1, page_y + 256 - 1)
 }
@@ -3074,6 +3192,30 @@ fn texture_page_origin(texture_page: u16) -> (i32, i32) {
     )
 }
 
+fn texture_page_origin_for_clut(texture_page: u16, clut: u16) -> (i32, i32) {
+    let (page_x, page_y) = texture_page_origin(texture_page);
+    if texture_page_uses_br2_stage_y256_alias(texture_page, clut) {
+        return (page_x - 64, PSX_VRAM_HEIGHT as i32 / 2);
+    }
+    (page_x, page_y)
+}
+
+fn texture_page_origin_for_sample(texture_page: u16, clut: u16, _u: u8, _v: u8) -> (i32, i32) {
+    texture_page_origin_for_clut(texture_page, clut)
+}
+
+fn texture_page_uses_br2_stage_y256_alias(texture_page: u16, clut: u16) -> bool {
+    if native_disable_br2_stage_y256_alias() {
+        return false;
+    }
+
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    texture_page_color_mode(texture_page) == 0
+        && texture_page == 0x000c
+        && clut_x == 384
+        && clut_y(clut) == 500
+}
+
 fn low_bank_y0_alias_page_x(texture_page: u16, preserve_odd_x: bool) -> i32 {
     let page_bits = if preserve_odd_x {
         texture_page & 0x0f
@@ -3128,6 +3270,14 @@ fn native_force_4bpp_y0_alias() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("BLOODYROAR2_NATIVE_FORCE_4BPP_Y0_ALIAS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_disable_br2_stage_y256_alias() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_DISABLE_BR2_STAGE_Y256_ALIAS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
 }
@@ -3536,6 +3686,122 @@ mod tests {
         );
 
         assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_br2_stage_y256_alias_for_playfield_page() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x000c;
+        let clut = 0x7d18;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        assert_eq!((page_x, page_y), (768, 0));
+        assert_eq!((clut_x, clut_y), (384, 500));
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        framebuffer.set_raw_pixel(page_x - 64, PSX_VRAM_HEIGHT as i32 / 2, 0x0002);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 2, clut_y, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_br2_stage_high_u_on_y256_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x000c;
+        let clut = 0x7d18;
+        let (page_x, _page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        framebuffer.set_raw_pixel(page_x - 48, PSX_VRAM_HEIGHT as i32 / 2, 0x0001);
+        framebuffer.set_raw_pixel(page_x - 48, 0, 0x0002);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 2, clut_y, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 64, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_textured_draw_snapshots_br2_stage_alias_self_overlap() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x000c;
+        let clut = 0x7d18;
+        let (page_x, _page_y) = texture_page_origin(texture_page);
+        let alias_y = PSX_VRAM_HEIGHT as i32 / 2;
+        let alias_x = page_x - 64;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        framebuffer.set_raw_pixel(alias_x, alias_y, 0x2221);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 2, clut_y, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point {
+                x: alias_x,
+                y: alias_y,
+            },
+            (4, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(alias_x, alias_y), 0x00ff_0000);
+        assert_eq!(framebuffer.pixel(alias_x + 1, alias_y), 0x0000_ff00);
+        assert_eq!(framebuffer.pixel(alias_x + 2, alias_y), 0x0000_ff00);
+        assert_eq!(framebuffer.pixel(alias_x + 3, alias_y), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_adjacent_4bpp_page_y0() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x000e;
+        let clut = 0x7c1f;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        assert_eq!((page_x, page_y), (896, 0));
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x0001);
+        framebuffer.set_raw_pixel(page_x, PSX_VRAM_HEIGHT as i32 / 2, 0x0002);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 2, clut_y, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
     }
 
     #[test]
@@ -4296,6 +4562,97 @@ mod tests {
             framebuffer.set_raw_pixel(alias_x + index, clut_y, 0x03e0);
         }
         framebuffer.set_raw_pixel(alias_x + 0x2a, clut_y, 0x001f);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_recovers_br2_low_bank_character_linear_256_clut_alias_when_allowed()
+     {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0088;
+        let clut = 0x7d40;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let alias_y = clut_y & !0x1f;
+        let options = TextureDrawOptions::opaque_raw();
+
+        assert_eq!((page_x, page_y), (512, 0));
+        assert_eq!((clut_x, clut_y, alias_y), (0, 501, 480));
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            framebuffer.set_raw_pixel(clut_x + index, alias_y, 0x0400 + index as u16);
+        }
+        framebuffer.set_raw_pixel(clut_x + 0x2a, alias_y, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_blocks_br2_low_bank_character_linear_256_clut_alias_when_disabled()
+     {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0088;
+        let clut = 0x7d40;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let alias_y = (((clut >> 6) & 0x03ff) as i32) & !0x1f;
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.allow_palette_fallback = false;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            framebuffer.set_raw_pixel(clut_x + index, alias_y, 0x0400 + index as u16);
+        }
+        framebuffer.set_raw_pixel(clut_x + 0x2a, alias_y, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_keeps_non_br2_linear_256_clut_alias_blocked() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0299;
+        let clut = 0x7d40;
+        let (page_x, page_y) = texture_page_origin(texture_page);
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let alias_y = (((clut >> 6) & 0x03ff) as i32) & !0x1f;
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.allow_palette_fallback = false;
+
+        framebuffer.set_raw_pixel(page_x, page_y, 0x002a);
+        for index in 1..256 {
+            framebuffer.set_raw_pixel(clut_x + index, alias_y, 0x03e0);
+        }
         framebuffer.draw_textured_rect(
             Point { x: 8, y: 8 },
             (1, 1),
