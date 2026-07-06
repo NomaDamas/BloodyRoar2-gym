@@ -100,10 +100,11 @@ Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
 outside the repo.
 
 `native-play` and `native-manual` use the cached ROM directory and open a macOS
-keyboard window. `native-play` skips the warning-wait segment, then layers the
-built-in coin/start/select match-entry script while manual keys remain active.
-Use `native-manual` for a cold-boot window with no entry script. Use
-`native-autoplay` when you intentionally want the bounded pre-window
+keyboard window. `native-play` fast-forwards the built-in coin/start/select
+match-entry script before opening the window, so the visible session starts at
+the manual play handoff instead of waiting through warning/title/selection
+automation. Use `native-manual` for a cold-boot window with no entry script.
+Use `native-autoplay` when you intentionally want the bounded pre-window
 fast-forward and custom entry-assist diagnostics.
 `native-window-snapshot` writes the exact 640x480 GUI frame without opening a
 window, which is useful when checking whether the visible window is cropped,
@@ -129,7 +130,7 @@ Window controls:
 - `E`, `I`, or `G`: guard.
 - `C`: coin.
 - `V`: service credit.
-- `Enter` or `P`: start.
+- `Enter`: coin+start for one-key title entry. `P`: start only.
 - `Esc`: quit.
 
 For automated smoke tests, pass an optional frame limit:

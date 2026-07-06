@@ -340,7 +340,6 @@ const BR2_CREDIT_STATE_BASE: u32 = 0x803b_fa00;
 const BR2_CREDIT_FREEPLAY_FLAG_OFFSET: u32 = 0x00;
 const BR2_CREDIT_PLAYER_MODE_OFFSET: u32 = 0x01;
 const BR2_CREDIT_REQUIRED_P1_OFFSET: u32 = 0x08;
-const BR2_CREDIT_REQUIRED_P2_OFFSET: u32 = 0x09;
 const BR2_CREDIT_SHARED_SLOT_OFFSET: u32 = 0x18;
 const BR2_CREDIT_CHECK_ENTRY_SIGNATURE: [(u32, u32); 10] = [
     (0x8030_8770, 0x27bd_ffe8), // addiu sp, sp, -0x18
@@ -5020,20 +5019,19 @@ impl Cpu {
 
         let player = self.regs[4].min(1);
         let freeplay = bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_FREEPLAY_FLAG_OFFSET) != 0;
-        let required_offset = if player == 0 {
-            BR2_CREDIT_REQUIRED_P1_OFFSET
-        } else {
-            BR2_CREDIT_REQUIRED_P2_OFFSET
-        };
-        let required = bus.read_u8(BR2_CREDIT_STATE_BASE + required_offset);
+        // This entry loads a2 from credit_state[8] before jumping to the shared
+        // checker. Player mode can split the credit slot, but the price compared
+        // by this call remains the P1/shared requirement.
+        let required = bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET);
+        let effective_required = required.max(1);
         let credit_slot = br2_credit_slot_address(player, bus);
         let credit_before = bus.read_u8(credit_slot);
         let mut pending_coin_edges = 0;
 
-        if !freeplay {
+        if !freeplay && required > 0 {
             pending_coin_edges = bus.consume_br2_native_credit_hle_coin_edges();
             if pending_coin_edges > 0 {
-                let coin_value = u64::from(required.max(1));
+                let coin_value = u64::from(effective_required);
                 let inserted_value = pending_coin_edges.saturating_mul(coin_value).min(0xff) as u8;
                 let current = bus.read_u8(credit_slot);
                 bus.write_u8(credit_slot, current.saturating_add(inserted_value));
@@ -5042,10 +5040,12 @@ impl Cpu {
 
         let result = if freeplay {
             0
+        } else if required == 0 {
+            0
         } else {
             let current = bus.read_u8(credit_slot);
-            if current >= required {
-                let remaining = current.saturating_sub(required);
+            if current >= effective_required {
+                let remaining = current.saturating_sub(effective_required);
                 bus.write_u8(credit_slot, remaining);
                 u32::from(remaining)
             } else {
@@ -8068,7 +8068,7 @@ mod tests {
     fn hle_br2_credit_check_consumes_pending_coin_edge() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_credit_check(&mut bus);
-        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 0);
         bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 1);
         bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET, 0);
         bus.set_input(ActionButtons {
@@ -8101,7 +8101,7 @@ mod tests {
     fn hle_br2_credit_check_preserves_no_credit_rejection() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_credit_check(&mut bus);
-        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 0);
         bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 1);
 
         let return_pc = 0x802f_7770;
@@ -8116,6 +8116,106 @@ mod tests {
         assert_eq!(report.start_pc, BR2_CREDIT_CHECK_ENTRY);
         assert_eq!(cpu.pc, return_pc);
         assert_eq!(cpu.regs[2], u32::MAX);
+    }
+
+    #[test]
+    fn hle_br2_credit_check_player_one_uses_shared_price() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_credit_check(&mut bus);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 0x09, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET + 2, 1);
+
+        let return_pc = 0x802f_7770;
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_CREDIT_CHECK_ENTRY;
+        cpu.next_pc = BR2_CREDIT_CHECK_ENTRY + 4;
+        cpu.regs[4] = 1;
+        cpu.regs[31] = return_pc;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_CREDIT_CHECK_ENTRY);
+        assert_eq!(cpu.pc, return_pc);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET + 2),
+            0
+        );
+    }
+
+    #[test]
+    fn hle_br2_credit_check_required_zero_accepts_without_coin_credit() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_credit_check(&mut bus);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET, 0);
+
+        let return_pc = 0x802f_7770;
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_CREDIT_CHECK_ENTRY;
+        cpu.next_pc = BR2_CREDIT_CHECK_ENTRY + 4;
+        cpu.regs[4] = 0;
+        cpu.regs[31] = return_pc;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_CREDIT_CHECK_ENTRY);
+        assert_eq!(cpu.pc, return_pc);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            0
+        );
+    }
+
+    #[test]
+    fn hle_br2_credit_check_required_zero_accepts_pending_coin_without_debit_or_edge_consumption() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_credit_check(&mut bus);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + 1, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET, 0);
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        bus.set_input(ActionButtons::default());
+
+        let return_pc = 0x802f_7770;
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_CREDIT_CHECK_ENTRY;
+        cpu.next_pc = BR2_CREDIT_CHECK_ENTRY + 4;
+        cpu.regs[4] = 0;
+        cpu.regs[31] = return_pc;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_CREDIT_CHECK_ENTRY);
+        assert_eq!(cpu.pc, return_pc);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            0
+        );
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 1);
+
+        cpu.pc = BR2_CREDIT_CHECK_ENTRY;
+        cpu.next_pc = BR2_CREDIT_CHECK_ENTRY + 4;
+        cpu.regs[4] = 1;
+        cpu.regs[31] = return_pc;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, BR2_CREDIT_CHECK_ENTRY);
+        assert_eq!(cpu.pc, return_pc);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            0
+        );
     }
 
     fn install_br2_post_vs_vertex_record_loop(bus: &mut Bus) {

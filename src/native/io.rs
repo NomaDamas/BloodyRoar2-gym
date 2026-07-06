@@ -3476,6 +3476,8 @@ impl Gpu {
             output.width,
             output.height,
         );
+        let live_single_field_scene =
+            self.high_vertical_active_field_live_scene(output, color_stats);
         output.source == DISPLAY_SOURCE_ACTIVE_FIELD
             && !output.field_composed
             && !output.cached
@@ -3488,7 +3490,8 @@ impl Gpu {
                     output.width,
                     output.height,
                     color_stats,
-                ))
+                )
+                || live_single_field_scene)
             && !self.field_half_is_caption_or_font_texture_page_artifact(
                 output.window,
                 output.width,
@@ -3768,6 +3771,16 @@ impl Gpu {
         let color_stats = self.display_window_color_stats(active, width, field_height, true);
         let atlas_like =
             self.field_half_is_probable_texture_atlas_artifact(active, width, field_height);
+        let active_output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: active,
+        };
+        let live_single_field_scene =
+            self.high_vertical_active_field_live_scene(active_output, color_stats);
         if !screen_observation_worth_saving(active.stats)
             || self.display_window_has_glyph_texture_grid(active, width, field_height)
             || self.display_window_has_glyph_texture_grid_with_psx_depth(
@@ -3781,7 +3794,8 @@ impl Gpu {
                     width,
                     field_height,
                     color_stats,
-                ))
+                )
+                && !live_single_field_scene)
             || self.field_half_is_caption_or_font_texture_page_artifact(
                 active,
                 width,
@@ -3798,14 +3812,7 @@ impl Gpu {
             return None;
         }
 
-        Some(DisplayOutputWindow {
-            source: DISPLAY_SOURCE_ACTIVE_FIELD,
-            field_composed: false,
-            cached: false,
-            width,
-            height: field_height,
-            window: active,
-        })
+        Some(active_output)
     }
 
     fn visible_single_field_output_from_high_vertical_current_display(
@@ -3854,6 +3861,16 @@ impl Gpu {
         let color_stats = self.display_window_color_stats(candidate, width, field_height, true);
         let atlas_like =
             self.field_half_is_probable_texture_atlas_artifact(candidate, width, field_height);
+        let active_output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: candidate,
+        };
+        let live_single_field_scene =
+            self.high_vertical_active_field_live_scene(active_output, color_stats);
         if !screen_observation_worth_saving(candidate.stats)
             || self.display_window_has_glyph_texture_grid(candidate, width, field_height)
             || self.display_window_has_glyph_texture_grid_with_psx_depth(
@@ -3867,7 +3884,8 @@ impl Gpu {
                     width,
                     field_height,
                     color_stats,
-                ))
+                )
+                && !live_single_field_scene)
             || self.display_candidate_has_dominant_unpresented_texture_upload(
                 candidate,
                 width,
@@ -3877,14 +3895,7 @@ impl Gpu {
             return None;
         }
 
-        Some(DisplayOutputWindow {
-            source: DISPLAY_SOURCE_ACTIVE_FIELD,
-            field_composed: false,
-            cached: false,
-            width,
-            height: field_height,
-            window: candidate,
-        })
+        Some(active_output)
     }
 
     fn presented_field_output_from_high_vertical_current_display(
@@ -4103,6 +4114,21 @@ impl Gpu {
             return true;
         }
 
+        let (upload_overlap, upload_overlap_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(window, width, height);
+        if self.field_half_has_high_vertical_texture_page_fragment_without_upload(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            psx_color_stats,
+            upload_overlap.max(0) as u64,
+            upload_overlap_rects,
+            max_upload_overlap.max(0) as u64,
+        ) {
+            return true;
+        }
+
         if self.image_upload_rects.is_empty() {
             return false;
         }
@@ -4117,8 +4143,6 @@ impl Gpu {
             return true;
         }
 
-        let (upload_overlap, upload_overlap_rects, max_upload_overlap) =
-            self.texture_upload_overlap_summary(window, width, height);
         if upload_overlap <= 0 && upload_overlap_rects == 0 && max_upload_overlap <= 0 {
             return false;
         }
@@ -4390,6 +4414,22 @@ impl Gpu {
             && color_stats.bottom_dark_samples.saturating_mul(100)
                 >= color_stats.bottom_band_samples.saturating_mul(85);
         let low_luma = average_luma(window.stats) <= 24;
+        let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let (upload_overlap, upload_overlap_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(window, width, height);
+
+        if self.field_half_has_high_vertical_texture_page_fragment_without_upload(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            color_stats,
+            upload_overlap.max(0) as u64,
+            upload_overlap_rects,
+            max_upload_overlap.max(0) as u64,
+        ) {
+            return true;
+        }
 
         dominant_bucket >= 700 && dark_lower_band && low_luma
     }
@@ -4462,6 +4502,17 @@ impl Gpu {
             raw_periodic,
             psx_periodic,
         );
+        let texture_page_fragment_without_upload = self
+            .field_half_has_high_vertical_texture_page_fragment_without_upload(
+                window,
+                width,
+                height,
+                raw_color_stats,
+                psx_color_stats,
+                upload_overlap_u64,
+                upload_overlap_rects,
+                max_upload_overlap_u64,
+            );
         let caption_texture_page_artifact = self.field_half_is_caption_texture_page_artifact(
             window,
             width,
@@ -4486,7 +4537,7 @@ impl Gpu {
             self.field_half_is_probable_texture_atlas_artifact(window, width, height);
 
         format!(
-            "{{\"window\":{},\"width\":{},\"height\":{},\"high_vertical_texture_page_field\":{},\"likely_texture_page_candidate\":{},\"has_3d_draw_signal\":{},\"raw_caption_like\":{},\"psx_caption_like\":{},\"raw_periodic\":{},\"psx_periodic\":{},\"upload_overlap\":{},\"upload_overlap_rects\":{},\"max_upload_overlap\":{},\"upload_signal\":{},\"upload_touches_field\":{},\"has_playfield_density\":{},\"is_detailed\":{},\"low_bucket_fragmented\":{},\"strict_low_bucket\":{},\"raw_dominant_bucket_per_mille\":{},\"psx_dominant_bucket_per_mille\":{},\"dominant_backdrop\":{},\"dark_lower_band\":{},\"dominant_backdrop_fragments\":{},\"periodic_backdrop_fragments\":{},\"caption_texture_page_artifact\":{},\"font_texture_page_artifact\":{},\"blocks_playability\":{},\"probable_texture_atlas\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{},\"dominant_unpresented_texture_upload\":{},\"raw_color\":{},\"psx_color\":{}}}",
+            "{{\"window\":{},\"width\":{},\"height\":{},\"high_vertical_texture_page_field\":{},\"likely_texture_page_candidate\":{},\"has_3d_draw_signal\":{},\"raw_caption_like\":{},\"psx_caption_like\":{},\"raw_periodic\":{},\"psx_periodic\":{},\"upload_overlap\":{},\"upload_overlap_rects\":{},\"max_upload_overlap\":{},\"upload_signal\":{},\"upload_touches_field\":{},\"has_playfield_density\":{},\"is_detailed\":{},\"low_bucket_fragmented\":{},\"strict_low_bucket\":{},\"raw_dominant_bucket_per_mille\":{},\"psx_dominant_bucket_per_mille\":{},\"dominant_backdrop\":{},\"dark_lower_band\":{},\"dominant_backdrop_fragments\":{},\"periodic_backdrop_fragments\":{},\"texture_page_fragment_without_upload\":{},\"caption_texture_page_artifact\":{},\"font_texture_page_artifact\":{},\"blocks_playability\":{},\"probable_texture_atlas\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{},\"dominant_unpresented_texture_upload\":{},\"raw_color\":{},\"psx_color\":{}}}",
             framebuffer_window_json(window),
             width,
             height,
@@ -4512,6 +4563,7 @@ impl Gpu {
             dark_lower_band,
             dominant_backdrop_fragments,
             periodic_backdrop_fragments,
+            texture_page_fragment_without_upload,
             caption_texture_page_artifact,
             font_texture_page_artifact,
             blocks_playability,
@@ -4590,6 +4642,130 @@ impl Gpu {
         has_upload_signal
             && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
             && self.has_native_play_3d_draw_signal()
+    }
+
+    fn high_vertical_field_has_live_stage_energy(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+    ) -> bool {
+        let pixel_count = window.stats.pixel_count.max(1);
+        let bright_stage_signal =
+            window.stats.bright_pixels.saturating_mul(100) >= pixel_count.saturating_mul(12);
+        let high_detail_stage_signal =
+            window.stats.detail_edges >= full_scene_detail_cutoff(window.stats).saturating_mul(4);
+        let live_color_signal = raw_color_stats.has_scene_color_diversity()
+            || psx_color_stats.has_scene_color_diversity();
+        let rich_bucket_signal =
+            raw_color_stats.bucket_count >= 48 || psx_color_stats.bucket_count >= 48;
+        let dominant_bucket = self
+            .display_window_dominant_bucket_per_mille(window, width, height, false)
+            .max(self.display_window_dominant_bucket_per_mille(window, width, height, true));
+
+        bright_stage_signal
+            && high_detail_stage_signal
+            && live_color_signal
+            && rich_bucket_signal
+            && dominant_bucket <= 650
+            && self.has_strong_native_3d_textured_playfield_activity()
+            && self.textured_draw_stats.color_changes >= 262_144
+            && self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
+            && !self.display_candidate_has_scene_upload_overlap(window)
+            && self.high_vertical_field_has_sparse_counterpart(window, width, height)
+            && !self.display_window_has_glyph_texture_grid(window, width, height)
+            && !self.display_window_has_glyph_texture_grid_with_psx_depth(window, width, height)
+            && !self.display_window_has_primitive_workspace_artifact(window, width, height)
+            && !self
+                .display_window_has_high_vertical_static_title_screen(window, width, height, true)
+            && !self.display_window_has_atlas_caption_ghosting(
+                window,
+                width,
+                height,
+                true,
+                psx_color_stats,
+            )
+    }
+
+    fn field_half_has_high_vertical_texture_page_fragment_without_upload(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        raw_color_stats: DisplayColorStats,
+        psx_color_stats: DisplayColorStats,
+        upload_overlap: u64,
+        upload_overlap_rects: usize,
+        max_upload_overlap: u64,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || width > display_width
+            || height.saturating_mul(2) != display_height
+            || display_height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !is_likely_texture_page_candidate(window.x, window.y, width, height)
+            || !self.has_native_play_3d_draw_signal()
+            || !self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
+            || self.display_candidate_has_scene_upload_overlap(window)
+            || self.display_window_has_glyph_texture_grid(window, width, height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(window, width, height)
+            || self.display_window_has_primitive_workspace_artifact(window, width, height)
+        {
+            return false;
+        }
+
+        if upload_overlap > 0 || upload_overlap_rects > 0 || max_upload_overlap > 0 {
+            return false;
+        }
+
+        let pixel_count = window.stats.pixel_count.max(1);
+        let nonzero = window.stats.nonzero_pixels;
+        let nonzero_in_fragment_range = nonzero.saturating_mul(100)
+            >= pixel_count.saturating_mul(35)
+            && nonzero.saturating_mul(100) <= pixel_count.saturating_mul(70);
+        let dark_lower_band = (raw_color_stats.bottom_band_samples > 0
+            && raw_color_stats.bottom_dark_samples.saturating_mul(100)
+                >= raw_color_stats.bottom_band_samples.saturating_mul(85))
+            || (psx_color_stats.bottom_band_samples > 0
+                && psx_color_stats.bottom_dark_samples.saturating_mul(100)
+                    >= psx_color_stats.bottom_band_samples.saturating_mul(85));
+        let dominant_bucket = self
+            .display_window_dominant_bucket_per_mille(window, width, height, false)
+            >= 450
+            || self.display_window_dominant_bucket_per_mille(window, width, height, true) >= 450;
+        let low_luma = average_luma(window.stats) <= 48;
+        let dominant_dark_backdrop_fragment =
+            nonzero_in_fragment_range && dark_lower_band && dominant_bucket && low_luma;
+
+        if dominant_dark_backdrop_fragment
+            && self.high_vertical_field_has_live_stage_energy(
+                window,
+                width,
+                height,
+                raw_color_stats,
+                psx_color_stats,
+            )
+        {
+            return false;
+        }
+
+        let rich_live_field = has_native_full_scene_detail(window.stats)
+            && (raw_color_stats.bucket_count >= 48 || psx_color_stats.bucket_count >= 48)
+            && (raw_color_stats.has_scene_color_diversity()
+                || psx_color_stats.has_scene_color_diversity())
+            && self.has_strong_native_3d_textured_playfield_activity()
+            && self.textured_draw_stats.color_changes >= 262_144
+            && self.high_vertical_field_has_sparse_counterpart(window, width, height);
+        if rich_live_field && !dominant_dark_backdrop_fragment {
+            return false;
+        }
+
+        dominant_dark_backdrop_fragment
+            && !raw_color_stats.has_intro_caption_band()
+            && !psx_color_stats.has_intro_caption_band()
     }
 
     fn presented_frame_has_high_vertical_mixed_artifact(
@@ -7763,7 +7939,15 @@ impl Gpu {
         let mut options = self.texture_draw_options(words[0], self.texture_page);
         let clut = clut(uv);
         let bounds = rect_bounds(point, width, height);
-        if should_allow_zn_low_bank_screen_rect_palette_fallback(
+        if should_disable_zn_low_bank_4bpp_screen_rect_palette_fallback(
+            words[0],
+            self.texture_page,
+            clut,
+            bounds,
+        ) && !self.has_native_play_3d_draw_signal()
+        {
+            options.allow_palette_fallback = false;
+        } else if should_allow_zn_low_bank_screen_rect_palette_fallback(
             words[0],
             self.texture_page,
             clut,
@@ -10929,6 +11113,20 @@ impl Gpu {
         }
 
         let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let (upload_overlap, upload_overlap_rects, max_upload_overlap) =
+            self.texture_upload_overlap_summary(window, width, height);
+        if self.field_half_has_high_vertical_texture_page_fragment_without_upload(
+            window,
+            width,
+            height,
+            raw_color_stats,
+            color_stats,
+            upload_overlap.max(0) as u64,
+            upload_overlap_rects,
+            max_upload_overlap.max(0) as u64,
+        ) {
+            return false;
+        }
         let probable_field_atlas =
             self.field_half_is_probable_texture_atlas_artifact(window, width, height);
         let strong_stage_letterbox = color_stats.bottom_band_samples > 0
@@ -11539,6 +11737,9 @@ impl Gpu {
         }
 
         let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        if self.field_half_texture_artifact_blocks_playability(window, width, height, color_stats) {
+            return false;
+        }
         if self.field_half_is_caption_or_font_texture_page_artifact(
             window,
             width,
@@ -14030,6 +14231,28 @@ fn should_allow_zn_low_bank_screen_rect_palette_fallback(
     is_zn_screen_quadrant_rect(bounds, width, height)
 }
 
+fn should_disable_zn_low_bank_4bpp_screen_rect_palette_fallback(
+    command_word: u32,
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) -> bool {
+    let command = (command_word >> 24) as u8;
+    let texture_mode = (texture_page >> 7) & 0x03;
+    if !matches!(command, 0x64..=0x67) || texture_mode != 0 {
+        return false;
+    }
+
+    let clut_row = clut_row(clut);
+    if !(480..512).contains(&clut_row) {
+        return false;
+    }
+
+    let width = bounds.right.saturating_sub(bounds.left).saturating_add(1);
+    let height = bounds.bottom.saturating_sub(bounds.top).saturating_add(1);
+    is_zn_screen_quadrant_rect(bounds, width, height)
+}
+
 fn should_skip_noisy_4bpp_title_draw(texture_page: u16, clut: u16, bounds: DrawBounds) -> bool {
     let texture_mode = (texture_page >> 7) & 0x03;
     if texture_mode != 0 {
@@ -16272,6 +16495,33 @@ mod tests {
 
         let ordinary_sprite = super::texture_draw_options(0x6480_8080, 0x000f);
         assert!(ordinary_sprite.allow_palette_fallback);
+
+        assert!(
+            super::should_disable_zn_low_bank_4bpp_screen_rect_palette_fallback(
+                0x6480_8080,
+                0x000c,
+                0x7cc0,
+                super::DrawBounds {
+                    left: 256,
+                    top: 240,
+                    right: 511,
+                    bottom: 479,
+                },
+            )
+        );
+        assert!(
+            !super::should_disable_zn_low_bank_4bpp_screen_rect_palette_fallback(
+                0x6480_8080,
+                0x000c,
+                0x7cc0,
+                super::DrawBounds {
+                    left: 10,
+                    top: 10,
+                    right: 20,
+                    bottom: 20,
+                },
+            )
+        );
     }
 
     #[test]
@@ -16652,6 +16902,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn fill_dark_live_stage_field(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        let active_height = height * 3 / 4;
+        for y in 0..active_height {
+            for x in 0..width {
+                let hash = (x * 17 + y * 31 + (x * y) / 13) % 100;
+                if hash >= 72 {
+                    continue;
+                }
+
+                let red = ((x * 11 + y * 7) % 192) as u32;
+                let green = ((x * 5 + y * 19) % 176) as u32;
+                let blue = ((x * 23 + y * 3) % 224) as u32;
+                let color = match (x / 13 + y / 9 + hash) % 5 {
+                    0 => ((64 + red) << 16) | ((green / 2) << 8) | (blue / 3),
+                    1 => ((red / 3) << 16) | ((72 + green) << 8) | (blue / 2),
+                    2 => ((red / 2) << 16) | ((green / 3) << 8) | (48 + blue),
+                    3 => ((32 + red / 2) << 16) | ((48 + green / 2) << 8) | (64 + blue / 2),
+                    _ => ((24 + red / 4) << 16) | ((24 + green / 4) << 8) | (40 + blue / 4),
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+
+        let hud_y = y_offset + height * 58 / 100;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            x_offset.saturating_add(width * 8 / 100) as i32,
+            hud_y as i32,
+            (width * 34 / 100) as i32,
+            (height / 16).max(3) as i32,
+            0x00e8_e8_e8,
+        );
+        io.gpu.framebuffer.fill_rect_unclipped(
+            x_offset.saturating_add(width * 76 / 100) as i32,
+            hud_y as i32,
+            (width * 18 / 100) as i32,
+            (height / 14).max(3) as i32,
+            0x00d8_d8_d8,
+        );
     }
 
     fn fill_high_vertical_static_title_scene(
@@ -23920,6 +24222,93 @@ mod tests {
     }
 
     #[test]
+    fn gpu_high_vertical_dark_live_match_field_not_rejected_as_texture_fragment_without_upload() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, display_height as i32, 0);
+        fill_dark_live_stage_field(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (_top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(bottom, width, field_height, true);
+        let active_output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: bottom,
+        };
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(bottom, width, field_height);
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let bottom_frame =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+
+        assert!(
+            diagnostics.contains("\"dominant_backdrop\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"dark_lower_band\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"texture_page_fragment_without_upload\":false"),
+            "{diagnostics}"
+        );
+        assert!(
+            !io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .high_vertical_active_field_live_scene(active_output, color_stats),
+            "{playability}"
+        );
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, bottom_frame);
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!(gui_frame, line_doubled_rgb_frame(&bottom_frame, width));
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
     fn native_playability_accepts_sparse_high_vertical_active_field_live_scene() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
@@ -24217,6 +24606,194 @@ mod tests {
         assert!(
             !io.gpu.should_use_high_vertical_full_output(full),
             "{playability}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_high_vertical_active_field_texture_fragment_without_upload_overlap() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, display_height as i32, 0);
+        let palette = [
+            0x0018_2030,
+            0x0020_3050,
+            0x0030_2048,
+            0x0040_3020,
+            0x0060_4028,
+            0x0080_6038,
+            0x0028_8050,
+            0x0048_6088,
+            0x00a0_8020,
+            0x00c0_a030,
+            0x0020_70b0,
+            0x00b0_4030,
+        ];
+        for y in 0..field_height * 3 / 4 {
+            for x in 0..width {
+                if (x / 11 + y / 7 + (x * y) / 4096) % 9 < 4 {
+                    continue;
+                }
+                let color = palette[(x / 13 + y / 9 + (x * y) / 2048) % palette.len()];
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x as i32,
+                    field_height.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (_top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let (upload_overlap, upload_rects, max_upload_overlap) = io
+            .gpu
+            .texture_upload_overlap_summary(bottom, width, field_height);
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(bottom, width, field_height);
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(upload_overlap, 0, "{diagnostics}");
+        assert_eq!(upload_rects, 0, "{diagnostics}");
+        assert_eq!(max_upload_overlap, 0, "{diagnostics}");
+        assert!(
+            diagnostics.contains("\"texture_page_fragment_without_upload\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{diagnostics}"
+        );
+        assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(!io.gpu.native_playable_candidate(), "{playability}");
+    }
+
+    #[test]
+    fn gpu_rejects_rich_dominant_high_vertical_active_field_texture_fragment_without_upload_overlap()
+     {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, display_height as i32, 0);
+        let palette = [
+            0x00e8_4020,
+            0x0020_c860,
+            0x0040_60f0,
+            0x00d0_c040,
+            0x0040_d0d0,
+            0x00d0_40d0,
+            0x00f0_8080,
+            0x0080_f080,
+            0x0080_80f0,
+            0x00f0_f080,
+            0x0080_f0f0,
+            0x00f0_80f0,
+            0x00a0_4020,
+            0x0020_a040,
+            0x0040_20a0,
+            0x00d8_d8_d8,
+        ];
+        for y in 0..field_height * 7 / 12 {
+            for x in 0..width {
+                let color = if (x + y * 3) % 10 == 0 {
+                    palette[(x / 7 + y / 5 + (x * y) / 4096) % palette.len()]
+                } else {
+                    0x0010_1424
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x as i32,
+                    field_height.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io.gpu.current_display_window(),
+        };
+        let (_top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(bottom, width, field_height, true);
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(bottom, width, field_height);
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            diagnostics.contains("\"texture_page_fragment_without_upload\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"dominant_backdrop\":true"),
+            "{diagnostics}"
+        );
+        assert!(
+            !io.gpu.high_vertical_rich_live_single_field_scene(
+                bottom,
+                width,
+                field_height,
+                color_stats
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{diagnostics}"
         );
         assert_ne!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
         assert!(!io.gpu.native_playable_candidate(), "{playability}");
@@ -26431,6 +27008,76 @@ mod tests {
 
         assert_eq!(io.gpu.gp0_pending_words(), 0);
         assert_ne!(io.gpu.framebuffer.pixel(0, 240), 0);
+        assert!(io.gpu.textured_draw_stats.clut_blank_samples > 0);
+        assert!(io.gpu.textured_draw_stats.palette_fallback_samples > 0);
+    }
+
+    #[test]
+    fn gpu_gp0_4bpp_screen_rect_does_not_recover_blank_clut_alias() {
+        let mut io = Io::default();
+        let texture_page = 0x000c_u32;
+        let clut = 0x7cc0_u32;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        io.gpu.framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        for index in 1..16 {
+            io.gpu
+                .framebuffer
+                .set_raw_pixel(clut_x + index, clut_y - 16, 0x03e0);
+        }
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(clut_x + 1, clut_y - 16, 0x001f);
+
+        io.write_u32(GPU_GP0, 0xe100_000c);
+        io.write_u32(GPU_GP0, 0x6480_8080);
+        io.write_u32(GPU_GP0, 0x00f0_0100);
+        io.write_u32(GPU_GP0, clut << 16);
+        io.write_u32(GPU_GP0, 0x00f0_0100);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_eq!(io.gpu.framebuffer.pixel(256, 240), 0);
+        assert!(io.gpu.textured_draw_stats.clut_blank_samples > 0);
+        assert_eq!(io.gpu.textured_draw_stats.palette_fallback_samples, 0);
+    }
+
+    #[test]
+    fn gpu_gp0_4bpp_screen_rect_recovers_blank_clut_alias_during_live_3d_scene() {
+        let mut io = Io::default();
+        let texture_page = 0x000c_u32;
+        let clut = 0x7cc0_u32;
+        let page_x = ((texture_page & 0x0f) as i32) * 64;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS,
+            color_changes: 16,
+            ..TexturedDrawStats::default()
+        };
+        assert!(io.gpu.has_native_play_3d_draw_signal());
+
+        io.gpu.framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+        for index in 1..16 {
+            io.gpu
+                .framebuffer
+                .set_raw_pixel(clut_x + index, clut_y - 16, 0x03e0);
+        }
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(clut_x + 1, clut_y - 16, 0x001f);
+
+        io.write_u32(GPU_GP0, 0xe100_000c);
+        io.write_u32(GPU_GP0, 0x6480_8080);
+        io.write_u32(GPU_GP0, 0x00f0_0100);
+        io.write_u32(GPU_GP0, clut << 16);
+        io.write_u32(GPU_GP0, 0x00f0_0100);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_ne!(io.gpu.framebuffer.pixel(256, 240), 0);
         assert!(io.gpu.textured_draw_stats.clut_blank_samples > 0);
         assert!(io.gpu.textured_draw_stats.palette_fallback_samples > 0);
     }

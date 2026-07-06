@@ -234,9 +234,10 @@ native emulator starts reuse that cache until the source archive changes or
 that cache is removed. Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to
 store the runtime cache outside the repository.
 
-`native-play` skips the warning-wait segment, opens the native macOS keyboard
-window, then layers the built-in coin/start/select match-entry script while
-manual keys remain active. `native-manual` opens a cold-boot keyboard window
+`native-play` fast-forwards the built-in coin/start/select match-entry script
+before opening the native macOS keyboard window, then starts with manual keys
+active. This avoids presenting warning/title/selection automation as if it were
+an interactive play screen. `native-manual` opens a cold-boot keyboard window
 with no entry script. Use `native-autoplay` when you need bounded pre-window
 fast-forward, entry-assist, or scripted smoke diagnostics. `native-autoplay`
 bounded-fast-forwards the built-in match-entry script first, continues any
@@ -258,7 +259,7 @@ Controls:
 - `E`, `I`, or `G`: guard.
 - `C`: coin.
 - `V`: service credit.
-- `Enter` or `P`: start.
+- `Enter`: coin+start for one-key title entry. `P`: start only.
 - `Esc`: quit.
 
 For non-interactive smoke validation, pass a frame limit:

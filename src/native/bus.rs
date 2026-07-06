@@ -83,6 +83,12 @@ const BR2_INPUT_SCRATCHPAD_EDGE_WORD: u32 = 0x1f80_0068;
 const BR2_INPUT_SCRATCHPAD_EDGE_MIRROR_WORD: u32 = 0x1f80_0074;
 const BR2_INPUT_SCRATCHPAD_EDGE_WRITE_PC_PHYSICAL: u32 = 0x002c_ff94;
 const BR2_INPUT_SCRATCHPAD_EDGE_MIRROR_WRITE_PC_PHYSICAL: u32 = 0x002c_ff98;
+const BR2_CREDIT_STATE_BASE: u32 = 0x803b_fa00;
+const BR2_CREDIT_FREEPLAY_FLAG_OFFSET: u32 = 0x00;
+const BR2_CREDIT_PLAYER_MODE_OFFSET: u32 = 0x01;
+const BR2_CREDIT_REQUIRED_P1_OFFSET: u32 = 0x08;
+const BR2_CREDIT_REQUIRED_P2_OFFSET: u32 = 0x09;
+const BR2_CREDIT_SHARED_SLOT_OFFSET: u32 = 0x18;
 const BR2_NATIVE_CREDIT_INPUT_BIT: u32 = 0x0000_0008;
 const BR2_NATIVE_CREDIT_INPUT_BIT_ENV: &str = "BLOODYROAR2_NATIVE_CREDIT_INPUT_BIT";
 const BR2_NATIVE_CREDIT_PROJECTION_ENV: &str = "BLOODYROAR2_NATIVE_CREDIT_PROJECTION";
@@ -3845,6 +3851,7 @@ impl Bus {
     pub fn set_input(&mut self, buttons: ActionButtons) {
         self.io.set_input(buttons);
         self.zn_board.set_input(buttons);
+        self.inject_br2_native_credit_from_coin_edges();
     }
 
     pub fn input_activity(&self) -> NativeInputActivity {
@@ -3871,6 +3878,69 @@ impl Bus {
         let pending = edges.saturating_sub(self.br2_native_credit_hle_consumed_coin_edges);
         self.br2_native_credit_hle_consumed_coin_edges = edges;
         pending
+    }
+
+    fn inject_br2_native_credit_from_coin_edges(&mut self) {
+        let edges = self.zn_board.coin_insert_edges;
+        let pending = edges.saturating_sub(self.br2_native_credit_hle_consumed_coin_edges);
+        if pending == 0 || !self.br2_native_credit_state_is_ready() {
+            return;
+        }
+
+        let player = 0;
+        let freeplay = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_FREEPLAY_FLAG_OFFSET) != 0;
+        let required = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET);
+        let effective_required = required.max(1);
+        let credit_slot = self.br2_credit_slot_address(player);
+        let credit_before = self.read_u8(credit_slot);
+        let inserted = pending
+            .saturating_mul(u64::from(effective_required))
+            .min(0xff) as u8;
+        let credit_after = if freeplay {
+            credit_before
+        } else {
+            credit_before.saturating_add(inserted)
+        };
+        if !freeplay {
+            self.write_u8(credit_slot, credit_after);
+        }
+        self.br2_native_credit_hle_consumed_coin_edges = edges;
+        self.br2_native_credit_hle.record(Br2NativeCreditHleCheck {
+            player,
+            freeplay,
+            required,
+            credit_slot,
+            credit_before,
+            credit_after,
+            pending_coin_edges: pending,
+            result: u32::from(credit_after),
+        });
+    }
+
+    fn br2_native_credit_state_is_ready(&self) -> bool {
+        let freeplay = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_FREEPLAY_FLAG_OFFSET) != 0;
+        let required_p1 = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET);
+        let required_p2 = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P2_OFFSET);
+        let player_mode = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_PLAYER_MODE_OFFSET);
+        if required_p2 > 9 || player_mode > 2 {
+            return false;
+        }
+
+        let br2_input_adapter_seen = self.zn_board.native_credit_adapter_writes > 0
+            || self.zn_board.native_credit_adapter_edges > 0;
+        freeplay
+            || (1..=9).contains(&required_p1)
+            || (required_p1 == 0
+                && (self.br2_native_credit_hle_accepted_seen() || br2_input_adapter_seen))
+    }
+
+    fn br2_credit_slot_address(&self, player: u32) -> u32 {
+        let player_mode = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_PLAYER_MODE_OFFSET);
+        if player_mode == 1 {
+            BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET + player.min(1).saturating_mul(2)
+        } else {
+            BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET
+        }
     }
 
     pub fn record_br2_native_credit_hle_check(&mut self, check: Br2NativeCreditHleCheck) {
@@ -8174,13 +8244,15 @@ fn looks_like_gp0_command_opcode(opcode: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BR2_BOOT_WORD_COPY_LOOP_PHYSICAL, BR2_CODE_PATCH_SNAPSHOT_LEN, BR2_DRAW_SYNC_FLAG_VIRTUAL,
-        BR2_RUNTIME_CODE_SNAPSHOT_START,
+        BR2_BOOT_WORD_COPY_LOOP_PHYSICAL, BR2_CODE_PATCH_SNAPSHOT_LEN,
+        BR2_CREDIT_PLAYER_MODE_OFFSET, BR2_CREDIT_REQUIRED_P1_OFFSET,
+        BR2_CREDIT_REQUIRED_P2_OFFSET, BR2_CREDIT_SHARED_SLOT_OFFSET, BR2_CREDIT_STATE_BASE,
+        BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_RUNTIME_CODE_SNAPSHOT_START,
         BR2_UNLINKED_PRIMITIVE_REPLAY_FULL_VALIDATION_COOLDOWN_VBLANKS,
         BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS,
         BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS,
         BR2_UNLINKED_PRIMITIVE_REPLAY_PACKET_LIMIT, BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW,
-        Bus, DMA_ACTIVITY_RECENT_LIMIT, DMA_GPU_COMPLETION_DELAY_CYCLES,
+        Br2NativeCreditHleCheck, Bus, DMA_ACTIVITY_RECENT_LIMIT, DMA_GPU_COMPLETION_DELAY_CYCLES,
         DMA_MDEC_COMPLETION_DELAY_CYCLES, DMA_STEP_DECREMENT, GPU_LINKED_LIST_NODE_LIMIT,
         GPU_VBLANK_PRESENTATION_CAPTURE_INTERVAL, GpuLinkedListDmaRunStats, NativeBoardAssets,
         NativeInputActivity, PRIMITIVE_RAM_RECENT_LIMIT, UnlinkedPrimitiveReplayDiagnostics,
@@ -8600,6 +8672,128 @@ mod tests {
         assert!(board_json.contains("\"legacy_zinc_input_compat\":false"));
         assert!(board_json.contains("\"legacy_system_coin_latch_edges\":1"));
         assert!(board_json.contains("\"legacy_system_start_latch_edges\":1"));
+    }
+
+    #[test]
+    fn bus_injects_br2_credit_slot_from_coin_edge_once() {
+        let mut bus = Bus::with_board_assets(
+            Vec::new(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            NativeBoardAssets::default(),
+        );
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_PLAYER_MODE_OFFSET, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P2_OFFSET, 1);
+
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            1
+        );
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert!(bus.br2_native_credit_hle_accepted_seen());
+    }
+
+    #[test]
+    fn bus_injects_br2_credit_after_required_zero_hle_confirms_state() {
+        let mut bus = Bus::with_board_assets(
+            Vec::new(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            NativeBoardAssets::default(),
+        );
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_PLAYER_MODE_OFFSET, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P2_OFFSET, 0);
+
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        bus.set_input(ActionButtons::default());
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            0,
+            "required=0 alone is still treated as uninitialized"
+        );
+
+        bus.record_br2_native_credit_hle_check(Br2NativeCreditHleCheck {
+            player: 0,
+            freeplay: false,
+            required: 0,
+            credit_slot: BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET,
+            credit_before: 0,
+            credit_after: 0,
+            pending_coin_edges: 0,
+            result: 0,
+        });
+        bus.set_input(ActionButtons::default());
+
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            1
+        );
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert!(bus.br2_native_credit_hle_accepted_seen());
+    }
+
+    #[test]
+    fn bus_injects_br2_credit_after_required_zero_adapter_confirms_input_loop() {
+        let mut bus = Bus::with_board_assets(
+            Vec::new(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            NativeBoardAssets::default(),
+        );
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_PLAYER_MODE_OFFSET, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 0);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P2_OFFSET, 0);
+        bus.zn_board.native_credit_adapter_writes = 1;
+
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        bus.set_input(ActionButtons::default());
+
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            1
+        );
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert!(bus.br2_native_credit_hle_accepted_seen());
+    }
+
+    #[test]
+    fn bus_does_not_inject_br2_credit_before_price_state_is_initialized() {
+        let mut bus = Bus::with_board_assets(
+            Vec::new(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            NativeBoardAssets::default(),
+        );
+
+        bus.set_input(ActionButtons {
+            coin: true,
+            ..ActionButtons::default()
+        });
+        bus.set_input(ActionButtons::default());
+
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            0
+        );
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 1);
+        assert!(!bus.br2_native_credit_hle_accepted_seen());
     }
 
     #[test]
