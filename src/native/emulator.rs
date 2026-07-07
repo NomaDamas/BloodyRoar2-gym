@@ -468,6 +468,15 @@ impl NativeEmulator {
         }
     }
 
+    pub fn raw_actual_display_frame(&self) -> NativeDisplayFrame {
+        let (width, height, pixels) = self.bus.io.gpu.raw_actual_display_rgb_frame();
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     pub fn actual_display_png(&self) -> Vec<u8> {
         self.bus.io.gpu.actual_display_png()
     }

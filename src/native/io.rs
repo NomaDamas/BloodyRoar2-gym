@@ -3478,6 +3478,15 @@ impl Gpu {
         );
         let live_single_field_scene =
             self.high_vertical_active_field_live_scene(output, color_stats);
+        let static_counterpart_recovery =
+            self.high_vertical_active_field_replaces_static_counterpart(output, color_stats);
+        let caption_or_font_artifact = self.field_half_is_caption_or_font_texture_page_artifact(
+            output.window,
+            output.width,
+            output.height,
+            self.display_window_color_stats(output.window, output.width, output.height, false),
+            color_stats,
+        );
         output.source == DISPLAY_SOURCE_ACTIVE_FIELD
             && !output.field_composed
             && !output.cached
@@ -3491,14 +3500,9 @@ impl Gpu {
                     output.height,
                     color_stats,
                 )
-                || live_single_field_scene)
-            && !self.field_half_is_caption_or_font_texture_page_artifact(
-                output.window,
-                output.width,
-                output.height,
-                self.display_window_color_stats(output.window, output.width, output.height, false),
-                color_stats,
-            )
+                || live_single_field_scene
+                || static_counterpart_recovery)
+            && (!caption_or_font_artifact || static_counterpart_recovery)
             && (!resolved.promoted
                 || !self.should_present_resolved_display(resolved)
                 || self.display_window_is_texture_atlas(resolved.window))
@@ -3663,6 +3667,27 @@ impl Gpu {
         }
 
         let safe = if top_is_artifact { bottom } else { top };
+        let rejected = if top_is_artifact { top } else { bottom };
+        let recovered = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width: output.width,
+            height: field_height,
+            window: rejected,
+        };
+        let recovered_color =
+            self.display_window_color_stats(recovered.window, output.width, field_height, true);
+        if self.high_vertical_static_field_is_stale_warning_or_title(
+            safe,
+            output.width,
+            field_height,
+        ) && self
+            .high_vertical_active_field_replaces_static_counterpart(recovered, recovered_color)
+        {
+            return Some(recovered);
+        }
+
         if !screen_observation_worth_saving(safe.stats)
             || !self.safe_field_output_matches_display_flow(safe)
             || self.field_half_is_probable_texture_atlas_artifact(safe, output.width, field_height)
@@ -3678,6 +3703,189 @@ impl Gpu {
             height: field_height,
             window: safe,
         })
+    }
+
+    fn high_vertical_active_field_replaces_static_counterpart(
+        &self,
+        output: DisplayOutputWindow,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if output.source != DISPLAY_SOURCE_ACTIVE_FIELD
+            || output.field_composed
+            || output.cached
+            || !self.high_vertical_interlace_enabled()
+            || output.width != display_width
+            || output.height == 0
+            || output.height.saturating_mul(2) != display_height
+            || display_height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !self.has_strong_native_3d_textured_playfield_activity()
+            || !screen_observation_worth_saving(output.window.stats)
+            || !is_detailed_observation(output.window.stats)
+            || !has_native_playfield_density(output.window.stats)
+            || self.low_palette_noise_candidate(output.window.stats, color_stats)
+            || !self.display_candidate_has_live_draw_overlap_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            )
+            || self.display_candidate_has_scene_upload_overlap(output.window)
+            || self.display_window_has_glyph_texture_grid(
+                output.window,
+                output.width,
+                output.height,
+            )
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                output.window,
+                output.width,
+                output.height,
+            )
+            || self.display_window_has_primitive_workspace_artifact(
+                output.window,
+                output.width,
+                output.height,
+            )
+            || self.display_window_has_high_vertical_static_title_screen(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            )
+        {
+            return false;
+        }
+
+        let Some(counterpart) =
+            self.high_vertical_counterpart_field(output.window, output.width, output.height)
+        else {
+            return false;
+        };
+        if !self.high_vertical_static_field_is_stale_warning_or_title(
+            counterpart,
+            output.width,
+            output.height,
+        ) {
+            return false;
+        }
+
+        let output_score = screen_observation_score(output.window.stats);
+        let counterpart_score = screen_observation_score(counterpart.stats);
+        let stronger_score = output_score > counterpart_score.saturating_add(counterpart_score / 5);
+        let stronger_detail =
+            output.window.stats.detail_edges > counterpart.stats.detail_edges.saturating_mul(3) / 2;
+        let has_color_signal = color_stats.has_scene_color_diversity()
+            || color_stats.has_low_bucket_scene_range_signal()
+            || color_stats.bucket_count >= 12;
+        let raw_color_stats =
+            self.display_window_color_stats(output.window, output.width, output.height, false);
+        let live_stage_energy = self.high_vertical_field_has_live_stage_energy(
+            output.window,
+            output.width,
+            output.height,
+            raw_color_stats,
+            color_stats,
+        );
+
+        has_color_signal && (stronger_score || stronger_detail || live_stage_energy)
+    }
+
+    fn high_vertical_counterpart_field(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> Option<FrameBufferWindow> {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width != display_width
+            || height == 0
+            || height.saturating_mul(2) != display_height
+            || display_height < DEFAULT_DISPLAY_HEIGHT * 2
+        {
+            return None;
+        }
+
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if window.x != display_x {
+            return None;
+        }
+
+        let base_y = if window.y == display_y {
+            display_y.checked_add(height)?
+        } else if window.y == display_y.saturating_add(height) {
+            display_y
+        } else {
+            return None;
+        };
+        if base_y.saturating_add(height) > PSX_VRAM_HEIGHT {
+            return None;
+        }
+
+        Some(FrameBufferWindow {
+            x: display_x,
+            y: base_y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                display_x,
+                base_y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
+        })
+    }
+
+    fn high_vertical_static_field_is_stale_warning_or_title(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width != display_width
+            || height == 0
+            || height.saturating_mul(2) != display_height
+            || display_height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !screen_observation_worth_saving(window.stats)
+            || !is_detailed_observation(window.stats)
+        {
+            return false;
+        }
+
+        if self.display_window_has_high_vertical_static_title_screen(window, width, height, true)
+            || self.display_window_has_title_logo_overlay_artifact(window, width, height, true)
+        {
+            return true;
+        }
+
+        let raw_color = self.display_window_color_stats(window, width, height, false);
+        let psx_color = self.display_window_color_stats(window, width, height, true);
+        let dominant_bucket = self
+            .display_window_dominant_bucket_per_mille(window, width, height, false)
+            .max(self.display_window_dominant_bucket_per_mille(window, width, height, true));
+        let low_color_warning = raw_color.bucket_count <= 40 || psx_color.bucket_count <= 40;
+        let no_scene_color =
+            !raw_color.has_scene_color_diversity() && !psx_color.has_scene_color_diversity();
+        let low_playfield_brightness = !raw_color.has_low_bucket_playfield_brightness()
+            && !psx_color.has_low_bucket_playfield_brightness();
+        let dark_lower_band = (raw_color.bottom_band_samples > 0
+            && raw_color.bottom_dark_samples.saturating_mul(100)
+                >= raw_color.bottom_band_samples.saturating_mul(65))
+            || (psx_color.bottom_band_samples > 0
+                && psx_color.bottom_dark_samples.saturating_mul(100)
+                    >= psx_color.bottom_band_samples.saturating_mul(65));
+        let pixel_count = window.stats.pixel_count.max(1);
+        let sparse_warning_density = window.stats.nonzero_pixels.saturating_mul(100)
+            <= pixel_count.saturating_mul(55)
+            && window.stats.bright_pixels.saturating_mul(100) >= pixel_count.saturating_mul(4)
+            && window.stats.detail_edges >= full_scene_detail_cutoff(window.stats);
+
+        low_color_warning
+            && no_scene_color
+            && low_playfield_brightness
+            && dark_lower_band
+            && dominant_bucket >= 520
+            && sparse_warning_density
     }
 
     fn safe_field_output_matches_display_flow(&self, window: FrameBufferWindow) -> bool {
@@ -4418,6 +4626,29 @@ impl Gpu {
         let (upload_overlap, upload_overlap_rects, max_upload_overlap) =
             self.texture_upload_overlap_summary(window, width, height);
         if self.field_half_is_probable_texture_atlas_artifact(window, width, height) {
+            let live_stage_energy = self.high_vertical_field_has_live_stage_energy(
+                window,
+                width,
+                height,
+                raw_color_stats,
+                color_stats,
+            );
+            if live_stage_energy
+                && dark_lower_band
+                && color_stats.has_scene_color_diversity()
+                && !self.field_half_is_caption_or_font_texture_page_artifact(
+                    window,
+                    width,
+                    height,
+                    raw_color_stats,
+                    color_stats,
+                )
+                && !self.display_window_has_high_vertical_static_title_screen(
+                    window, width, height, true,
+                )
+            {
+                return false;
+            }
             return true;
         }
 
@@ -4677,7 +4908,7 @@ impl Gpu {
             && self.textured_draw_stats.color_changes >= 262_144
             && self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
             && !self.display_candidate_has_scene_upload_overlap(window)
-            && self.high_vertical_field_has_sparse_counterpart(window, width, height)
+            && self.high_vertical_field_has_recoverable_counterpart(window, width, height)
             && !self.display_window_has_glyph_texture_grid(window, width, height)
             && !self.display_window_has_glyph_texture_grid_with_psx_depth(window, width, height)
             && !self.display_window_has_primitive_workspace_artifact(window, width, height)
@@ -4690,6 +4921,26 @@ impl Gpu {
                 true,
                 psx_color_stats,
             )
+    }
+
+    fn high_vertical_field_has_recoverable_counterpart(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if self.high_vertical_field_has_sparse_counterpart(window, width, height) {
+            return true;
+        }
+
+        self.high_vertical_counterpart_field(window, width, height)
+            .is_some_and(|counterpart| {
+                self.high_vertical_static_field_is_stale_warning_or_title(
+                    counterpart,
+                    width,
+                    height,
+                )
+            })
     }
 
     fn field_half_has_high_vertical_texture_page_fragment_without_upload(
@@ -7327,6 +7578,9 @@ impl Gpu {
                     self.invalid_fill_rect_commands += 1;
                     return;
                 }
+                let options = self.flat_draw_options(words[0]);
+                let bounds = rect_bounds(Point { x, y }, width, height);
+                let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
                 self.fill_rect_commands += 1;
                 self.framebuffer.fill_rect_with_options(
                     x,
@@ -7334,12 +7588,13 @@ impl Gpu {
                     width,
                     height,
                     color(words[0]),
-                    self.flat_draw_options(words[0]),
+                    options,
                 );
+                self.restore_drawing_clip_if(adjusted_clip);
                 self.push_recent_draw_command(GpuDrawTrace::flat(
                     "fill_rect",
                     color(words[0]),
-                    rect_bounds(Point { x, y }, width, height),
+                    bounds,
                     words,
                     &[Point { x, y }],
                     source_ref,
@@ -7352,19 +7607,17 @@ impl Gpu {
             }
             0x68..=0x6f if words.len() >= 2 => {
                 let (x, y) = xy(words[1]);
+                let options = self.flat_draw_options(words[0]);
+                let bounds = rect_bounds(Point { x, y }, 1, 1);
+                let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
                 self.fill_rect_commands += 1;
-                self.framebuffer.fill_rect_with_options(
-                    x,
-                    y,
-                    1,
-                    1,
-                    color(words[0]),
-                    self.flat_draw_options(words[0]),
-                );
+                self.framebuffer
+                    .fill_rect_with_options(x, y, 1, 1, color(words[0]), options);
+                self.restore_drawing_clip_if(adjusted_clip);
                 self.push_recent_draw_command(GpuDrawTrace::flat(
                     "fill_rect_1x1",
                     color(words[0]),
-                    rect_bounds(Point { x, y }, 1, 1),
+                    bounds,
                     words,
                     &[Point { x, y }],
                     source_ref,
@@ -7372,19 +7625,17 @@ impl Gpu {
             }
             0x70..=0x73 if words.len() >= 2 => {
                 let (x, y) = xy(words[1]);
+                let options = self.flat_draw_options(words[0]);
+                let bounds = rect_bounds(Point { x, y }, 8, 8);
+                let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
                 self.fill_rect_commands += 1;
-                self.framebuffer.fill_rect_with_options(
-                    x,
-                    y,
-                    8,
-                    8,
-                    color(words[0]),
-                    self.flat_draw_options(words[0]),
-                );
+                self.framebuffer
+                    .fill_rect_with_options(x, y, 8, 8, color(words[0]), options);
+                self.restore_drawing_clip_if(adjusted_clip);
                 self.push_recent_draw_command(GpuDrawTrace::flat(
                     "fill_rect_8x8",
                     color(words[0]),
-                    rect_bounds(Point { x, y }, 8, 8),
+                    bounds,
                     words,
                     &[Point { x, y }],
                     source_ref,
@@ -7395,19 +7646,17 @@ impl Gpu {
             }
             0x78..=0x7b if words.len() >= 2 => {
                 let (x, y) = xy(words[1]);
+                let options = self.flat_draw_options(words[0]);
+                let bounds = rect_bounds(Point { x, y }, 16, 16);
+                let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
                 self.fill_rect_commands += 1;
-                self.framebuffer.fill_rect_with_options(
-                    x,
-                    y,
-                    16,
-                    16,
-                    color(words[0]),
-                    self.flat_draw_options(words[0]),
-                );
+                self.framebuffer
+                    .fill_rect_with_options(x, y, 16, 16, color(words[0]), options);
+                self.restore_drawing_clip_if(adjusted_clip);
                 self.push_recent_draw_command(GpuDrawTrace::flat(
                     "fill_rect_16x16",
                     color(words[0]),
-                    rect_bounds(Point { x, y }, 16, 16),
+                    bounds,
                     words,
                     &[Point { x, y }],
                     source_ref,
@@ -7526,6 +7775,8 @@ impl Gpu {
         let a = self.offset_point(point(a));
         let b = self.offset_point(point(b));
         let c = self.offset_point(point(c));
+        let bounds = points_bounds(&[a, b, c]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
         self.framebuffer.draw_triangle_with_options(
             a,
             b,
@@ -7533,10 +7784,11 @@ impl Gpu {
             color,
             self.flat_draw_options(words[0]),
         );
+        self.restore_drawing_clip_if(adjusted_clip);
         self.push_recent_draw_command(GpuDrawTrace::flat(
             "flat_triangle",
             color,
-            points_bounds(&[a, b, c]),
+            bounds,
             words,
             &[a, b, c],
             source,
@@ -7558,6 +7810,8 @@ impl Gpu {
         let b = self.offset_point(point(b));
         let c = self.offset_point(point(c));
         let d = self.offset_point(point(d));
+        let bounds = points_bounds(&[a, b, c, d]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
         self.framebuffer.draw_triangle_with_options(
             a,
             b,
@@ -7572,10 +7826,11 @@ impl Gpu {
             color,
             self.flat_draw_options(words[0]),
         );
+        self.restore_drawing_clip_if(adjusted_clip);
         self.push_recent_draw_command(GpuDrawTrace::flat(
             "flat_quad",
             color,
-            points_bounds(&[a, b, c, d]),
+            bounds,
             words,
             &[a, b, c, d],
             source,
@@ -7593,6 +7848,8 @@ impl Gpu {
         let a = self.offset_point(point(a));
         let b = self.offset_point(point(b));
         let c = self.offset_point(point(c));
+        let bounds = points_bounds(&[a, b, c]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
         self.framebuffer.draw_shaded_triangle_with_options(
             a,
             b,
@@ -7604,10 +7861,11 @@ impl Gpu {
             ],
             self.flat_draw_options(words[0]),
         );
+        self.restore_drawing_clip_if(adjusted_clip);
         self.push_recent_draw_command(GpuDrawTrace::flat(
             "shaded_triangle",
             color(words[0]),
-            points_bounds(&[a, b, c]),
+            bounds,
             words,
             &[a, b, c],
             source,
@@ -7630,6 +7888,8 @@ impl Gpu {
         let b_color = command_color(b_color);
         let c_color = command_color(c_color);
         let d_color = command_color(d_color);
+        let bounds = points_bounds(&[a, b, c, d]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
         self.framebuffer.draw_shaded_triangle_with_options(
             a,
             b,
@@ -7644,10 +7904,11 @@ impl Gpu {
             [b_color, c_color, d_color],
             self.flat_draw_options(words[0]),
         );
+        self.restore_drawing_clip_if(adjusted_clip);
         self.push_recent_draw_command(GpuDrawTrace::flat(
             "shaded_quad",
             color(words[0]),
-            points_bounds(&[a, b, c, d]),
+            bounds,
             words,
             &[a, b, c, d],
             source,
@@ -7665,12 +7926,15 @@ impl Gpu {
         self.flat_line_commands += 1;
         let a = self.offset_point(point(a));
         let b = self.offset_point(point(b));
+        let bounds = points_bounds(&[a, b]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, false);
         self.framebuffer
             .draw_line_with_options(a, b, color, self.flat_draw_options(words[0]));
+        self.restore_drawing_clip_if(adjusted_clip);
         self.push_recent_draw_command(GpuDrawTrace::flat(
             "flat_line",
             color,
-            points_bounds(&[a, b]),
+            bounds,
             words,
             &[a, b],
             source,
@@ -7692,6 +7956,8 @@ impl Gpu {
         let a = self.textured_point(a, a_uv);
         let b = self.textured_point(b, b_uv);
         let c = self.textured_point(c, c_uv);
+        let bounds = points_bounds(&[a.point, b.point, c.point]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, true);
         let stats = self.framebuffer.draw_shaded_textured_triangle(
             a,
             b,
@@ -7706,12 +7972,13 @@ impl Gpu {
             options,
             self.texture_window,
         );
+        self.restore_drawing_clip_if(adjusted_clip);
         self.add_textured_draw_stats(stats);
         self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
             "shaded_textured_triangle",
             texture_page,
             clut,
-            points_bounds(&[a.point, b.point, c.point]),
+            bounds,
             stats,
             words,
             &[a, b, c],
@@ -7736,6 +8003,8 @@ impl Gpu {
         let a = self.textured_point(a, a_uv);
         let b = self.textured_point(b, b_uv);
         let c = self.textured_point(c, c_uv);
+        let bounds = points_bounds(&[a.point, b.point, c.point]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, true);
         let stats = self.framebuffer.draw_textured_triangle(
             a,
             b,
@@ -7745,12 +8014,13 @@ impl Gpu {
             options,
             self.texture_window,
         );
+        self.restore_drawing_clip_if(adjusted_clip);
         self.add_textured_draw_stats(stats);
         self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
             "textured_triangle",
             texture_page,
             clut,
-            points_bounds(&[a.point, b.point, c.point]),
+            bounds,
             stats,
             words,
             &[a, b, c],
@@ -7786,6 +8056,7 @@ impl Gpu {
         let b_color = command_color(b_color);
         let c_color = command_color(c_color);
         let d_color = command_color(d_color);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, true);
         let (first, second) = if native_use_alternate_quad_split() {
             (
                 self.framebuffer.draw_shaded_textured_triangle(
@@ -7833,6 +8104,7 @@ impl Gpu {
                 ),
             )
         };
+        self.restore_drawing_clip_if(adjusted_clip);
         self.add_textured_draw_stats(first);
         self.add_textured_draw_stats(second);
         self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
@@ -7866,6 +8138,7 @@ impl Gpu {
         let c = self.textured_point(c, c_uv);
         let d = self.textured_point(d, d_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, true);
         let (first, second) = if should_skip_noisy_4bpp_title_draw(texture_page, clut, bounds) {
             (TexturedDrawStats::default(), TexturedDrawStats::default())
         } else if native_use_alternate_quad_split() {
@@ -7911,6 +8184,7 @@ impl Gpu {
                 ),
             )
         };
+        self.restore_drawing_clip_if(adjusted_clip);
         self.add_textured_draw_stats(first);
         self.add_textured_draw_stats(second);
         self.push_recent_draw_command(GpuDrawTrace::textured_with_options(
@@ -7958,6 +8232,7 @@ impl Gpu {
         ) {
             options.allow_palette_fallback = true;
         }
+        let adjusted_clip = self.apply_drawing_clip_for_bounds(bounds, true);
         let stats = if should_skip_noisy_4bpp_title_draw(self.texture_page, clut, bounds) {
             TexturedDrawStats::default()
         } else {
@@ -7971,6 +8246,7 @@ impl Gpu {
                 self.texture_window,
             )
         };
+        self.restore_drawing_clip_if(adjusted_clip);
         self.add_textured_draw_stats(stats);
         let textured_point = TexturedPoint {
             point,
@@ -8075,6 +8351,87 @@ impl Gpu {
             self.drawing_area_top_left,
             self.drawing_area_bottom_right,
         ));
+    }
+
+    fn apply_drawing_clip_for_bounds(&mut self, bounds: DrawBounds, textured: bool) -> bool {
+        let Some(current_clip) =
+            drawing_area_clip(self.drawing_area_top_left, self.drawing_area_bottom_right)
+        else {
+            return false;
+        };
+        let Some(field_local_clip) =
+            self.high_vertical_field_local_drawing_clip_for_bounds(bounds, current_clip, textured)
+        else {
+            return false;
+        };
+        if field_local_clip == current_clip {
+            return false;
+        }
+
+        self.framebuffer.set_clip(Some(field_local_clip));
+        true
+    }
+
+    fn restore_drawing_clip_if(&mut self, adjusted: bool) {
+        if adjusted {
+            self.update_drawing_clip();
+        }
+    }
+
+    fn high_vertical_field_local_drawing_clip_for_bounds(
+        &self,
+        bounds: DrawBounds,
+        current_clip: ClipRect,
+        textured: bool,
+    ) -> Option<ClipRect> {
+        let (_, display_height) = self.display_dimensions();
+        if !textured
+            || !self.high_vertical_field_local_clip_runtime_ready()
+            || !self.high_vertical_interlace_enabled()
+            || display_height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !display_height.is_multiple_of(2)
+        {
+            return None;
+        }
+
+        let field_height = i32::try_from(display_height / 2).ok()?;
+        if field_height <= 0 || field_height > PSX_VRAM_HEIGHT as i32 {
+            return None;
+        }
+        let clip_height = current_clip.bottom.saturating_sub(current_clip.top) + 1;
+        if clip_height <= 0 || clip_height > field_height {
+            return None;
+        }
+        if draw_bounds_intersects_clip(bounds, current_clip) {
+            return None;
+        }
+
+        let shifted = if current_clip.top >= field_height
+            && current_clip.bottom < field_height.saturating_mul(2)
+        {
+            ClipRect::new(
+                current_clip.left,
+                current_clip.top - field_height,
+                current_clip.right,
+                current_clip.bottom - field_height,
+            )?
+        } else if current_clip.bottom < field_height {
+            ClipRect::new(
+                current_clip.left,
+                current_clip.top + field_height,
+                current_clip.right,
+                current_clip.bottom + field_height,
+            )?
+        } else {
+            return None;
+        };
+
+        draw_bounds_intersects_clip(bounds, shifted).then_some(shifted)
+    }
+
+    fn high_vertical_field_local_clip_runtime_ready(&self) -> bool {
+        self.has_strong_native_3d_textured_playfield_activity()
+            || self.has_strong_streamed_scene_rect_activity()
     }
 
     fn pixel_write_options(&self) -> PixelWriteOptions {
@@ -11105,7 +11462,7 @@ impl Gpu {
             || self.display_window_has_glyph_texture_grid_with_psx_depth(window, width, height)
             || self.display_window_has_primitive_workspace_artifact(window, width, height)
             || self.display_candidate_has_dominant_unpresented_texture_upload(window, width, height)
-            || !self.high_vertical_field_has_sparse_counterpart(window, width, height)
+            || !self.high_vertical_field_has_recoverable_counterpart(window, width, height)
         {
             return false;
         }
@@ -11132,7 +11489,14 @@ impl Gpu {
         }
         let probable_field_atlas =
             self.field_half_is_probable_texture_atlas_artifact(window, width, height);
-        if probable_field_atlas {
+        if probable_field_atlas
+            && self.field_half_texture_artifact_blocks_playability(
+                window,
+                width,
+                height,
+                color_stats,
+            )
+        {
             return false;
         }
         let strong_stage_letterbox = color_stats.bottom_band_samples > 0
@@ -11602,7 +11966,26 @@ impl Gpu {
 
         let probable_field_atlas =
             self.field_half_is_probable_texture_atlas_artifact(window, width, height);
-        if probable_field_atlas {
+        let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let artifact_blocks =
+            self.field_half_texture_artifact_blocks_playability(window, width, height, color_stats);
+        let recovered_live_atlas_field = probable_field_atlas
+            && !artifact_blocks
+            && self.high_vertical_field_has_live_stage_energy(
+                window,
+                width,
+                height,
+                raw_color_stats,
+                color_stats,
+            )
+            && color_stats.has_scene_color_diversity()
+            && color_stats.bottom_band_samples > 0
+            && color_stats.bottom_dark_samples.saturating_mul(100)
+                >= color_stats.bottom_band_samples.saturating_mul(85)
+            && color_stats.bottom_caption_samples.saturating_mul(100)
+                <= color_stats.bottom_band_samples.saturating_mul(10)
+            && !color_stats.has_intro_caption_band();
+        if probable_field_atlas && !recovered_live_atlas_field {
             return false;
         }
         let strong_stage_letterbox = color_stats.bottom_band_samples > 0
@@ -11720,7 +12103,7 @@ impl Gpu {
             || self.presentation_captures == 0
             || !self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
             || self.display_candidate_has_scene_upload_overlap(window)
-            || !self.high_vertical_field_has_sparse_counterpart(window, width, height)
+            || !self.high_vertical_field_has_recoverable_counterpart(window, width, height)
             || self.display_window_has_glyph_texture_grid(window, width, height)
             || self.display_window_has_glyph_texture_grid_with_psx_depth(window, width, height)
             || self.display_window_has_primitive_workspace_artifact(window, width, height)
@@ -14141,6 +14524,13 @@ fn drawing_area_clip(top_left: u32, bottom_right: u32) -> Option<ClipRect> {
     ClipRect::new(left, top, right, bottom)
 }
 
+fn draw_bounds_intersects_clip(bounds: DrawBounds, clip: ClipRect) -> bool {
+    bounds.left <= clip.right
+        && bounds.right >= clip.left
+        && bounds.top <= clip.bottom
+        && bounds.bottom >= clip.top
+}
+
 fn point(value: u32) -> Point {
     let (x, y) = xy(value);
     Point { x, y }
@@ -16394,14 +16784,15 @@ mod tests {
         GpuDrawTrace, IO_REGISTER_MAP, IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io, IoAccess,
         IoDevice, MDEC_COMMAND, MDEC_STATUS, SIO_CONTROL, SIO_DATA, SIO_STATUS_IRQ_REQUEST,
         SPU_REGION_START, STALE_PRESENTATION_CAPTURE_GRACE, VRAM_HEIGHT, VRAM_WIDTH,
-        has_native_full_scene_detail, has_native_playfield_density, io_register, io_register_range,
-        is_detailed_observation, is_io_register_address, is_likely_texture_page_candidate,
-        is_sparse_display, minimum_live_draw_overlap_area_for_dimensions,
-        presented_frame_has_live_scene, resolved_display_candidate_has_scene_signal,
-        screen_observation_score, screen_observation_worth_saving,
+        drawing_area_clip, has_native_full_scene_detail, has_native_playfield_density, io_register,
+        io_register_range, is_detailed_observation, is_io_register_address,
+        is_likely_texture_page_candidate, is_sparse_display,
+        minimum_live_draw_overlap_area_for_dimensions, presented_frame_has_live_scene,
+        resolved_display_candidate_has_scene_signal, screen_observation_score,
+        screen_observation_worth_saving,
     };
     use crate::native::framebuffer::{
-        FrameBufferStats, FrameBufferWindow, Point, TexturedDrawStats,
+        ClipRect, FrameBufferStats, FrameBufferWindow, Point, TexturedDrawStats,
     };
 
     fn line_doubled_rgb_frame(field: &[u32], width: usize) -> Vec<u32> {
@@ -24456,6 +24847,175 @@ mod tests {
     }
 
     #[test]
+    fn native_playability_accepts_active_live_stage_over_stale_title_counterpart() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_high_vertical_static_title_scene(&mut io, 0, 0, width, field_height);
+        for y in 0..field_height {
+            for x in 0..width {
+                let live_band = y < field_height * 4 / 5;
+                let active_pixel =
+                    live_band && ((x / 8) * 17 + (y / 6) * 31 + (x / 32) * (y / 24)) % 100 < 76;
+                let color = if !active_pixel {
+                    0
+                } else if ((x / 16) + (y / 12) * 3) % 7 == 0 {
+                    let red = 40 + (((x / 4) * 5 + (y / 3) * 3) % 160) as u32;
+                    let green = 56 + (((x / 4) * 11 + (y / 3) * 7) % 144) as u32;
+                    let blue = 88 + (((x / 4) * 19 + (y / 3) * 13) % 144) as u32;
+                    (red << 16) | (green << 8) | blue
+                } else {
+                    0x0010_2038
+                };
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x as i32,
+                    field_height.saturating_add(y) as i32,
+                    1,
+                    1,
+                    color,
+                );
+            }
+        }
+
+        for y in field_height + 18..field_height + 82 {
+            for x in 18..112 {
+                if (x + y) % 5 != 0 {
+                    let color = if (x + y * 3) % 7 == 0 {
+                        0x00f8_f8ff
+                    } else {
+                        0x0048_70f0
+                    };
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
+                }
+            }
+        }
+
+        let title_x = width * 52 / 100;
+        let title_y = field_height + field_height * 48 / 100;
+        let title_width = width * 47 / 100;
+        let title_height = field_height * 24 / 100;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            title_x as i32,
+            title_y as i32,
+            title_width as i32,
+            title_height as i32,
+            0,
+        );
+        for y in title_y..title_y + title_height {
+            for x in title_x..title_x + title_width {
+                let local_x = x - title_x;
+                let local_y = y - title_y;
+                let color = if local_y % 13 < 7 && local_x < title_width * 2 / 3 {
+                    0x00d8_1818
+                } else if (local_x + local_y * 3) % 17 < 4 {
+                    0x00f0_f0f0
+                } else {
+                    continue;
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
+            }
+        }
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let top = FrameBufferWindow {
+            x: 0,
+            y: 0,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                0,
+                width,
+                field_height,
+                io.gpu.display_24bit_enabled(),
+            ),
+        };
+        let bottom = FrameBufferWindow {
+            x: 0,
+            y: field_height,
+            stats: io.gpu.framebuffer.psx_display_stats_with_depth(
+                0,
+                field_height,
+                width,
+                field_height,
+                io.gpu.display_24bit_enabled(),
+            ),
+        };
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(bottom, width, field_height, true);
+        let active_output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: bottom,
+        };
+
+        assert!(
+            io.gpu
+                .high_vertical_static_field_is_stale_warning_or_title(top, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .high_vertical_field_has_recoverable_counterpart(bottom, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu
+                .field_half_is_probable_texture_atlas_artifact(bottom, width, field_height),
+            "{playability}"
+        );
+        assert!(
+            !io.gpu.field_half_texture_artifact_blocks_playability(
+                bottom,
+                width,
+                field_height,
+                color_stats,
+            ),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .high_vertical_active_field_replaces_static_counterpart(
+                    active_output,
+                    color_stats,
+                ),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .high_vertical_active_field_live_scene(active_output, color_stats),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .should_use_active_field_output(active_output, io.gpu.display_resolve()),
+            "{playability}"
+        );
+        if output.source == DISPLAY_SOURCE_ACTIVE_FIELD {
+            assert_eq!(output.window.y, field_height, "{playability}");
+        }
+    }
+
+    #[test]
     fn native_playability_rejects_sparse_high_vertical_active_field_title_screen() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
@@ -27052,6 +27612,77 @@ mod tests {
 
         assert_eq!(io.gpu.gp0_pending_words(), 0);
         assert!(io.gpu.framebuffer_stats().nonzero_pixels > 16);
+    }
+
+    #[test]
+    fn gpu_high_vertical_field_local_clip_allows_active_top_field_draws() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        assert_eq!(
+            io.gpu.display_dimensions(),
+            (512, DEFAULT_DISPLAY_HEIGHT * 2)
+        );
+
+        io.write_u32(GPU_GP0, 0xe303_c000);
+        io.write_u32(GPU_GP0, 0xe407_7dff);
+        mark_gpu_as_having_live_textured_playfield(
+            &mut io,
+            DEFAULT_DISPLAY_WIDTH * 2,
+            DEFAULT_DISPLAY_HEIGHT * 2,
+        );
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_draw_stats.written_pixels =
+            DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16;
+        io.gpu.textured_draw_stats.color_changes = 16_384;
+        io.gpu.presentation_captures = 32;
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0001_0010);
+        io.write_u32(GPU_GP0, 0x001f_0000);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+        io.write_u32(GPU_GP0, 0x001f_001f);
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_0040);
+        io.write_u32(GPU_GP0, 0x0008_0002);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+
+        io.write_u32(GPU_GP0, 0x2c80_8080);
+        io.write_u32(GPU_GP0, 0x0078_005d);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0078_0060);
+        io.write_u32(GPU_GP0, 0x0001_0000);
+        io.write_u32(GPU_GP0, 0x0080_005d);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+        io.write_u32(GPU_GP0, 0x0080_0060);
+        io.write_u32(GPU_GP0, 0x0000_0000);
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        assert_ne!(io.gpu.framebuffer.raw_pixel(93, 120) & 0x7fff, 0);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(93, 240) & 0x7fff, 0);
+        assert_eq!(
+            drawing_area_clip(
+                io.gpu.drawing_area_top_left,
+                io.gpu.drawing_area_bottom_right
+            ),
+            ClipRect::new(0, 240, 511, 479)
+        );
+        let last = io.gpu.recent_draw_commands.last().expect("recent draw");
+        assert!(last.stats.sampled_pixels > 0, "{}", last.json());
+        assert!(last.stats.written_pixels > 0, "{}", last.json());
     }
 
     #[test]
