@@ -100,13 +100,13 @@ Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
 outside the repo.
 
 `native-play` and `native-manual` use the cached ROM directory and open a macOS
-keyboard window. `native-play` fast-forwards the built-in coin/start/select
-match-entry script before opening the window, so the visible session starts at
-the manual play handoff instead of waiting through warning/title/selection
-automation. Use `native-manual` for a cold-boot window with no entry script.
-Use `native-autoplay` when you intentionally want the bounded pre-window
-fast-forward and custom entry-assist diagnostics.
-`native-window-snapshot` writes the exact 640x480 GUI frame without opening a
+keyboard window. `native-play` fast-forwards the built-in
+warning/title/coin/start/select/match-entry assist before opening the window, so
+the visible session starts near the manual play handoff instead of at warning or
+intro screens. Use `native-manual` for a cold-boot window with no entry script.
+Use `native-autoplay` when you intentionally want a visible scripted assist or
+custom entry-assist diagnostics.
+`native-window-snapshot` writes the exact 512x480 GUI frame without opening a
 window, which is useful when checking whether the visible window is cropped,
 doubled, or black. `native-autoplay` also accepts an explicit script tail for
 smoke and control-sweep validation.
@@ -142,6 +142,10 @@ cargo run -- native-manual 120000 2 700
 cargo run -- native-window-snapshot 40505333 tmp/native-validation/manual-window.png
 cargo run -- native-play-snapshot assets/BloodRoar2-combined.zip 120000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
 ```
+
+In `native-play assets/BloodRoar2-combined.zip 120000 1`, the final `1` is the
+window scale, not a frame limit. Use a fourth argument for bounded smoke runs,
+for example `native-play assets/BloodRoar2-combined.zip 120000 1 600`.
 
 `native-play-snapshot` exits non-zero unless the final rendered window frame
 meets the stricter gameplay-scene criteria. Warning screens, black letterboxed
@@ -229,7 +233,7 @@ command before claiming emulator parity.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend.
 `native-scripted-step` applies a sequence of Gym actions to the native core and
-writes the same 640x480 GUI frame that `native-play` presents, with raw/window
+writes the same 512x480 GUI frame that `native-play` presents, with raw/window
 frame stats in JSON for repeatable boot/input debugging. `native-input-check`
 verifies that the game reads mapped coin/start/fighter controls,
 `native-health-check` fails on remaining full-scene rendering or branch-stability
@@ -259,7 +263,7 @@ Endpoints:
 
 Action space:
 
-- Type: `Discrete(19)`
+- Type: `Discrete(20)`
 - Values: see `cargo run -- action-space`
 
 Observation space:

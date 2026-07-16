@@ -22,6 +22,7 @@ impl NativeBackend {
     ) -> Result<Self, BackendError> {
         let rom_path = rom_path.into();
         let mut emulator = NativeEmulator::from_rom_zip(rom_path.clone())?;
+        emulator.rom_compatibility().validate_native_runtime()?;
         configure_native_backend_emulator(&mut emulator);
         Ok(Self {
             emulator,
@@ -47,6 +48,9 @@ impl NativeBackend {
 impl Backend for NativeBackend {
     fn reset(&mut self) -> Result<Observation, BackendError> {
         self.emulator = NativeEmulator::from_rom_zip(self.rom_path.clone())?;
+        self.emulator
+            .rom_compatibility()
+            .validate_native_runtime()?;
         configure_native_backend_emulator(&mut self.emulator);
         self.frame = 0;
         Ok(self.observe())

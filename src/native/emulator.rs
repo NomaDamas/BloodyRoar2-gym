@@ -14,7 +14,7 @@ use crate::native::romset::{NativeRomCacheReport, NativeRomCompatibilityReport, 
 const NATIVE_AT28C16_MODE_ENV: &str = "BLOODYROAR2_NATIVE_AT28C16_MODE";
 const NATIVE_COIN_MAPPING_ENV: &str = "BLOODYROAR2_NATIVE_COIN_MAPPING";
 const NATIVE_LEGACY_ZINC_INPUT_ENV: &str = "BLOODYROAR2_NATIVE_LEGACY_ZINC_INPUT";
-const NATIVE_WINDOW_FRAME_WIDTH: usize = 640;
+const NATIVE_WINDOW_FRAME_WIDTH: usize = 512;
 const NATIVE_WINDOW_FRAME_HEIGHT: usize = 480;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,8 +54,12 @@ impl NativeEmulator {
         let boot_rom = romset.load_boot_rom()?;
         let banked_roms = romset.load_banked_roms()?;
         let board_assets = apply_runtime_board_asset_overrides(romset.load_board_assets());
+        let mut cpu = Cpu::default();
+        cpu.set_br2_corrupt_runtime_recovery_hles(
+            rom_compatibility.has_known_bad_dump("flash1.024_bad_dump_4866dce3"),
+        );
         Ok(Self {
-            cpu: Cpu::default(),
+            cpu,
             bus: Bus::with_board_assets(boot_rom, banked_roms, 4 * 1024 * 1024, board_assets),
             rom_compatibility,
             last_outcome: StepOutcome::Continue,
@@ -122,6 +126,14 @@ impl NativeEmulator {
         self.bus.set_unlinked_primitive_replay_interval(interval);
     }
 
+    pub fn set_unlinked_primitive_replay_enabled(&mut self, enabled: bool) {
+        self.bus.set_unlinked_primitive_replay_enabled(enabled);
+    }
+
+    pub fn unlinked_primitive_replay_enabled(&self) -> bool {
+        self.bus.unlinked_primitive_replay_enabled()
+    }
+
     pub fn set_coin_input_mapping_name(&mut self, value: &str) -> bool {
         self.bus.set_coin_input_mapping_name(value)
     }
@@ -153,12 +165,13 @@ impl NativeEmulator {
     fn auto_coin_input_mapping_name(&self) -> Option<&'static str> {
         if self
             .rom_compatibility
-            .has_known_variant("zinc_jp_bundle_flash_variant")
-            || self
-                .rom_compatibility
-                .has_known_variant("zinc_cfg_eeprom_variant")
+            .has_known_variant("zinc_cfg_eeprom_variant")
         {
-            Some("legacy-zinc")
+            // ZiNc ROM/config provenance does not change the ZN JAMMA wiring.
+            // Bloody Roar 2 uses SYSTEM bit 0 for Start 1 and bit 4 for Coin 1;
+            // the legacy compatibility mapping also asserts the P2 lines and
+            // can make the game evaluate a simultaneous two-player start.
+            Some("mame")
         } else {
             None
         }
@@ -176,8 +189,14 @@ impl NativeEmulator {
         config: NativeTraceConfig,
     ) -> NativeTrace {
         self.bus.set_access_trace_limit(recent_limit.max(32));
-        self.bus
-            .set_access_trace_watch_ranges(config.watch_ranges.clone());
+        let mut watch_armed = config
+            .watch_after_vblank
+            .is_none_or(|threshold| self.bus.vblank_count() >= threshold);
+        self.bus.set_access_trace_watch_ranges(if watch_armed {
+            config.watch_ranges.clone()
+        } else {
+            Vec::new()
+        });
         self.bus.set_access_trace_watch_only(config.watch_only);
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
@@ -187,6 +206,8 @@ impl NativeEmulator {
         let start_steps = self.executed_steps;
 
         for _ in 0..count {
+            self.arm_trace_watch_if_ready(&config, &mut watch_armed);
+            let packed_helper_accepted_before = self.cpu.br2_packed_vertex_helper_accepted_count();
             let report = self.step_instruction();
             *pc_counts.entry(report.start_pc).or_insert(0) += 1;
             if let StepOutcome::Unsupported(instruction) = report.outcome {
@@ -211,7 +232,11 @@ impl NativeEmulator {
                 .is_some_and(|limit| report.cycles_elapsed >= limit);
             let reached_stop_excode = config
                 .stop_excode
-                .is_some_and(|excode| self.cpu.cause_excode() == excode);
+                .is_some_and(|excode| self.cpu.cause_excode() == excode)
+                || config.stop_excodes.contains(&self.cpu.cause_excode());
+            let reached_packed_helper_accept = config.stop_br2_packed_helper_accept
+                && self.cpu.br2_packed_vertex_helper_accepted_count()
+                    > packed_helper_accepted_before;
 
             if recent_limit > 0 {
                 recent_steps.push(report);
@@ -224,6 +249,7 @@ impl NativeEmulator {
                 || reached_stop
                 || reached_slow_step
                 || reached_stop_excode
+                || reached_packed_helper_accept
             {
                 break;
             }
@@ -236,6 +262,7 @@ impl NativeEmulator {
             unsupported,
             recent_steps,
             hot_limit,
+            watch_write_count: self.bus.access_trace_watch_write_count(),
             bus_access_trace_json: self.bus.access_trace_json(),
             state_json: self.json(),
         })
@@ -249,8 +276,14 @@ impl NativeEmulator {
         config: NativeTraceConfig,
     ) -> (NativeTrace, bool) {
         self.bus.set_access_trace_limit(recent_limit.max(32));
-        self.bus
-            .set_access_trace_watch_ranges(config.watch_ranges.clone());
+        let mut watch_armed = config
+            .watch_after_vblank
+            .is_none_or(|threshold| self.bus.vblank_count() >= threshold);
+        self.bus.set_access_trace_watch_ranges(if watch_armed {
+            config.watch_ranges.clone()
+        } else {
+            Vec::new()
+        });
         self.bus.set_access_trace_watch_only(config.watch_only);
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
@@ -265,6 +298,8 @@ impl NativeEmulator {
             && self.bus.vblank_count() == start_vblank
             && self.last_outcome == StepOutcome::Continue
         {
+            self.arm_trace_watch_if_ready(&config, &mut watch_armed);
+            let packed_helper_accepted_before = self.cpu.br2_packed_vertex_helper_accepted_count();
             let report = self.step_instruction();
             *pc_counts.entry(report.start_pc).or_insert(0) += 1;
             if let StepOutcome::Unsupported(instruction) = report.outcome {
@@ -289,7 +324,11 @@ impl NativeEmulator {
                 .is_some_and(|limit| report.cycles_elapsed >= limit);
             let reached_stop_excode = config
                 .stop_excode
-                .is_some_and(|excode| self.cpu.cause_excode() == excode);
+                .is_some_and(|excode| self.cpu.cause_excode() == excode)
+                || config.stop_excodes.contains(&self.cpu.cause_excode());
+            let reached_packed_helper_accept = config.stop_br2_packed_helper_accept
+                && self.cpu.br2_packed_vertex_helper_accepted_count()
+                    > packed_helper_accepted_before;
 
             if recent_limit > 0 {
                 recent_steps.push(report);
@@ -302,6 +341,7 @@ impl NativeEmulator {
                 || reached_stop
                 || reached_slow_step
                 || reached_stop_excode
+                || reached_packed_helper_accept
             {
                 break;
             }
@@ -316,6 +356,7 @@ impl NativeEmulator {
                 unsupported,
                 recent_steps,
                 hot_limit,
+                watch_write_count: self.bus.access_trace_watch_write_count(),
                 bus_access_trace_json: self.bus.access_trace_json(),
                 state_json: self.json(),
             }),
@@ -332,8 +373,14 @@ impl NativeEmulator {
         config: NativeTraceConfig,
     ) -> NativeTrace {
         self.bus.set_access_trace_limit(recent_limit.max(32));
-        self.bus
-            .set_access_trace_watch_ranges(config.watch_ranges.clone());
+        let mut watch_armed = config
+            .watch_after_vblank
+            .is_none_or(|threshold| self.bus.vblank_count() >= threshold);
+        self.bus.set_access_trace_watch_ranges(if watch_armed {
+            config.watch_ranges.clone()
+        } else {
+            Vec::new()
+        });
         self.bus.set_access_trace_watch_only(config.watch_only);
         let mut pc_counts = BTreeMap::new();
         let mut unsupported = BTreeMap::new();
@@ -350,6 +397,9 @@ impl NativeEmulator {
             self.set_input(*buttons);
             for _ in 0..*frames {
                 for _ in 0..instructions_per_frame {
+                    self.arm_trace_watch_if_ready(&config, &mut watch_armed);
+                    let packed_helper_accepted_before =
+                        self.cpu.br2_packed_vertex_helper_accepted_count();
                     let report = self.step_instruction();
                     *pc_counts.entry(report.start_pc).or_insert(0) += 1;
                     if let StepOutcome::Unsupported(instruction) = report.outcome {
@@ -377,7 +427,11 @@ impl NativeEmulator {
                         .is_some_and(|limit| report.cycles_elapsed >= limit);
                     let reached_stop_excode = config
                         .stop_excode
-                        .is_some_and(|excode| self.cpu.cause_excode() == excode);
+                        .is_some_and(|excode| self.cpu.cause_excode() == excode)
+                        || config.stop_excodes.contains(&self.cpu.cause_excode());
+                    let reached_packed_helper_accept = config.stop_br2_packed_helper_accept
+                        && self.cpu.br2_packed_vertex_helper_accepted_count()
+                            > packed_helper_accepted_before;
 
                     if recent_limit > 0 {
                         recent_steps.push(report);
@@ -390,6 +444,7 @@ impl NativeEmulator {
                         || reached_stop
                         || reached_slow_step
                         || reached_stop_excode
+                        || reached_packed_helper_accept
                     {
                         break 'script;
                     }
@@ -404,9 +459,24 @@ impl NativeEmulator {
             unsupported,
             recent_steps,
             hot_limit,
+            watch_write_count: self.bus.access_trace_watch_write_count(),
             bus_access_trace_json: self.bus.access_trace_json(),
             state_json: self.json(),
         })
+    }
+
+    fn arm_trace_watch_if_ready(&mut self, config: &NativeTraceConfig, watch_armed: &mut bool) {
+        if *watch_armed
+            || !config
+                .watch_after_vblank
+                .is_some_and(|threshold| self.bus.vblank_count() >= threshold)
+        {
+            return;
+        }
+
+        self.bus
+            .set_access_trace_watch_ranges(config.watch_ranges.clone());
+        *watch_armed = true;
     }
 
     pub fn set_input(&mut self, buttons: ActionButtons) {
@@ -431,6 +501,15 @@ impl NativeEmulator {
 
     pub fn screenshot_png(&self) -> Vec<u8> {
         self.bus.io.gpu.screenshot_png()
+    }
+
+    pub fn observation_frame(&self) -> NativeDisplayFrame {
+        let (width, height, pixels) = self.bus.io.gpu.screenshot_rgb_frame();
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
     }
 
     pub fn display_png(&self) -> Vec<u8> {
@@ -516,12 +595,20 @@ impl NativeEmulator {
         self.bus.input_activity().json()
     }
 
+    pub fn gpu_diagnostic_json(&self) -> String {
+        self.bus.io_compact_json()
+    }
+
     pub fn input_activity(&self) -> NativeInputActivity {
         self.bus.input_activity()
     }
 
     pub fn br2_native_credit_hle_accepted_seen(&self) -> bool {
         self.bus.br2_native_credit_hle_accepted_seen()
+    }
+
+    pub fn br2_native_credit_hle_json(&self) -> String {
+        self.bus.br2_native_credit_hle_json()
     }
 
     pub fn ram_snapshot(&self) -> Vec<u8> {
@@ -548,16 +635,28 @@ impl NativeEmulator {
         let gpu_playable_candidate = self.gpu_native_playable_candidate();
         let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
         let gte_gameplay_signal = self.native_3d_gameplay_signal();
+        self.native_playable_candidate_with_render_context(
+            gpu_playable_candidate,
+            gpu_rendered_scene_candidate,
+            gte_gameplay_signal,
+        )
+    }
+
+    pub fn native_playable_candidate_with_render_context(
+        &self,
+        gpu_playable_candidate: bool,
+        gpu_rendered_scene_candidate: bool,
+        gte_gameplay_signal: bool,
+    ) -> bool {
         let display_frame_guard = self
             .native_display_frame_supports_playable_candidate_with_context(
                 gpu_playable_candidate,
                 gpu_rendered_scene_candidate,
                 gte_gameplay_signal,
             );
-        display_frame_guard
-            && (gpu_playable_candidate
-                || (gpu_rendered_scene_candidate && gte_gameplay_signal)
-                || gte_gameplay_signal)
+        let native_3d_gameplay_candidate =
+            display_frame_guard && gpu_rendered_scene_candidate && gte_gameplay_signal;
+        display_frame_guard && (gpu_playable_candidate || native_3d_gameplay_candidate)
     }
 
     pub fn gpu_native_playable_candidate(&self) -> bool {
@@ -573,8 +672,24 @@ impl NativeEmulator {
     }
 
     pub fn actual_display_supports_playable_candidate(&self) -> bool {
-        let render_context_allows_periodic = self.gpu_native_playable_candidate()
-            || (self.gpu_native_rendered_scene_candidate() && self.native_3d_gameplay_signal());
+        let gpu_playable_candidate = self.gpu_native_playable_candidate();
+        let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
+        let gte_gameplay_signal = self.native_3d_gameplay_signal();
+        self.actual_display_supports_playable_candidate_with_render_context(
+            gpu_playable_candidate,
+            gpu_rendered_scene_candidate,
+            gte_gameplay_signal,
+        )
+    }
+
+    pub fn actual_display_supports_playable_candidate_with_render_context(
+        &self,
+        gpu_playable_candidate: bool,
+        gpu_rendered_scene_candidate: bool,
+        gte_gameplay_signal: bool,
+    ) -> bool {
+        let render_context_allows_periodic =
+            gpu_playable_candidate || (gpu_rendered_scene_candidate && gte_gameplay_signal);
         native_display_frame_or_window_supports_playable_candidate_with_render_context(
             &self.actual_display_frame(),
             render_context_allows_periodic,
@@ -739,12 +854,13 @@ impl NativeEmulator {
     pub fn json(&self) -> String {
         let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
             self.cpu.gte_json(),
             self.bus.io_json(),
             self.bus.zn_board_json(),
             self.bus.native_sync_json(),
+            self.bus.write_watch_json(),
             self.native_playability_json(),
             native_platform_json(),
             self.rom_compatibility.summary_json(),
@@ -764,12 +880,13 @@ impl NativeEmulator {
     pub fn diagnostic_json(&self) -> String {
         let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
             self.cpu.gte_json(),
             self.bus.io_compact_json(),
             self.bus.zn_board_json(),
             self.bus.native_sync_json(),
+            self.bus.write_watch_json(),
             self.native_playability_json(),
             native_platform_json(),
             self.rom_compatibility.summary_json(),
@@ -968,7 +1085,7 @@ impl NativeEmulator {
         };
 
         format!(
-            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"r10\":{},\"r10_hex\":\"0x{:08x}\",\"r15\":{},\"r15_hex\":\"0x{:08x}\"}},\"vblank_count\":{},\"gte\":{{\"projected_vertices\":{},\"gameplay_signal\":{}}},\"runtime\":{},\"input_activity\":{},\"playability\":{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"display_frame_guard\":{},\"stable_frame_guard\":{},\"actual_frame_guard\":{},\"display_frame_periodic_ghosting\":{}}},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\"}}",
+            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"r10\":{},\"r10_hex\":\"0x{:08x}\",\"r15\":{},\"r15_hex\":\"0x{:08x}\"}},\"vblank_count\":{},\"gte\":{{\"projected_vertices\":{},\"gameplay_signal\":{},\"command_counts\":[{}]}},\"runtime\":{},\"input_activity\":{},\"playability\":{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"display_frame_guard\":{},\"stable_frame_guard\":{},\"actual_frame_guard\":{},\"display_frame_periodic_ghosting\":{}}},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\"}}",
             self.cpu.pc,
             self.cpu.pc,
             self.cpu.next_pc,
@@ -982,6 +1099,7 @@ impl NativeEmulator {
             self.vblank_count(),
             self.cpu.gte_projected_vertices(),
             gte_gameplay_signal,
+            self.cpu.gte_command_counts_summary_json(),
             self.bus.input_compact_probe_json(),
             self.bus.input_activity().json(),
             playable_candidate,
@@ -1402,6 +1520,9 @@ fn native_window_should_deinterlace_frame(frame: &NativeDisplayFrame) -> bool {
     if frame.height < NATIVE_WINDOW_FRAME_HEIGHT {
         return false;
     }
+    if native_display_frame_has_caption_stalled_select_ui_artifact(frame) {
+        return false;
+    }
 
     let field_height = (frame.height / 2).max(1);
     let top = native_window_deinterlace_field_profile(frame, 0, field_height);
@@ -1431,10 +1552,49 @@ fn native_window_should_deinterlace_frame(frame: &NativeDisplayFrame) -> bool {
         && weaker_profile.color_changes >= frame.width as u64
         && weaker_profile.color_changes.saturating_mul(4)
             <= stronger_profile.color_changes.max(frame.width as u64);
+    let asymmetric_stacked_field = native_window_has_asymmetric_stacked_fields(
+        frame,
+        weaker_profile,
+        stronger_profile,
+        field_pixels,
+    );
 
-    (weak_blank_field || weak_residual_artifact)
-        && weaker_profile.nonzero.saturating_mul(8) <= stronger_profile.nonzero.max(1)
-        && weaker.saturating_mul(8) <= stronger.max(1)
+    asymmetric_stacked_field
+        || ((weak_blank_field || weak_residual_artifact)
+            && weaker_profile.nonzero.saturating_mul(8) <= stronger_profile.nonzero.max(1)
+            && weaker.saturating_mul(8) <= stronger.max(1))
+}
+
+fn native_window_has_asymmetric_stacked_fields(
+    frame: &NativeDisplayFrame,
+    weaker: NativeWindowFieldProfile,
+    stronger: NativeWindowFieldProfile,
+    field_pixels: u64,
+) -> bool {
+    weaker.nonzero.saturating_mul(100) >= field_pixels.saturating_mul(5)
+        && stronger.nonzero.saturating_mul(100) >= field_pixels.saturating_mul(18)
+        && weaker.nonzero.saturating_mul(20) <= stronger.nonzero.saturating_mul(9)
+        && weaker.color_changes.saturating_mul(4) <= stronger.color_changes.max(frame.width as u64)
+}
+
+pub fn native_window_prefers_stronger_stacked_field(frame: &NativeDisplayFrame) -> bool {
+    if !native_window_should_deinterlace_frame(frame) {
+        return false;
+    }
+
+    let field_height = (frame.height / 2).max(1);
+    let top = native_window_deinterlace_field_profile(frame, 0, field_height);
+    let bottom = native_window_deinterlace_field_profile(frame, field_height, field_height);
+    let (weaker, stronger) = if top.score() <= bottom.score() {
+        (top, bottom)
+    } else {
+        (bottom, top)
+    };
+    let field_pixels = frame.width.saturating_mul(field_height) as u64;
+    let field_offset = native_window_deinterlace_field_offset(frame);
+
+    native_window_has_asymmetric_stacked_fields(frame, weaker, stronger, field_pixels)
+        && !native_window_deinterlace_field_is_texture_atlas_artifact(frame, field_offset)
 }
 
 fn native_window_source_y(
@@ -1659,12 +1819,15 @@ pub struct NativeTraceConfig {
     pub stop_watch_access: bool,
     pub stop_watch_data: bool,
     pub stop_watch_write: bool,
+    pub stop_br2_packed_helper_accept: bool,
     pub stop_pc_skip: u64,
     pub stop_watch_write_skip: u64,
     pub stop_cycles_elapsed: Option<u64>,
     pub stop_excode: Option<u32>,
+    pub stop_excodes: Vec<u32>,
     pub watch_ranges: Vec<(u32, u32)>,
     pub watch_only: bool,
+    pub watch_after_vblank: Option<u64>,
 }
 
 impl NativeTraceConfig {
@@ -1713,6 +1876,7 @@ pub struct NativeTrace {
     hot_pcs: Vec<NativeTracePc>,
     unsupported_instructions: Vec<NativeTraceInstruction>,
     recent_steps: Vec<StepReport>,
+    watch_write_count: u64,
     bus_access_trace_json: String,
     state_json: String,
 }
@@ -1747,6 +1911,7 @@ impl NativeTrace {
             hot_pcs,
             unsupported_instructions,
             recent_steps: parts.recent_steps,
+            watch_write_count: parts.watch_write_count,
             bus_access_trace_json: parts.bus_access_trace_json,
             state_json: parts.state_json,
         }
@@ -1773,13 +1938,14 @@ impl NativeTrace {
             .join(",");
 
         format!(
-            "{{\"requested_steps\":{},\"executed_steps\":{},\"unique_pcs\":{},\"hot_pcs\":[{}],\"unsupported_instructions\":[{}],\"recent_steps\":[{}],\"bus_access_trace\":[{}],\"state\":{}}}",
+            "{{\"requested_steps\":{},\"executed_steps\":{},\"unique_pcs\":{},\"hot_pcs\":[{}],\"unsupported_instructions\":[{}],\"recent_steps\":[{}],\"watch_write_count\":{},\"bus_access_trace\":[{}],\"state\":{}}}",
             self.requested_steps,
             self.executed_steps,
             self.unique_pcs,
             hot_pcs,
             unsupported_instructions,
             recent_steps,
+            self.watch_write_count,
             self.bus_access_trace_json,
             self.state_json
         )
@@ -1819,6 +1985,10 @@ impl NativeTrace {
     pub fn bus_access_trace_json(&self) -> &str {
         &self.bus_access_trace_json
     }
+
+    pub fn watch_write_count(&self) -> u64 {
+        self.watch_write_count
+    }
 }
 
 #[derive(Debug)]
@@ -1829,6 +1999,7 @@ struct NativeTraceParts {
     unsupported: BTreeMap<u32, u64>,
     recent_steps: Vec<StepReport>,
     hot_limit: usize,
+    watch_write_count: u64,
     bus_access_trace_json: String,
     state_json: String,
 }
@@ -1916,16 +2087,170 @@ fn native_display_frame_supports_playable_candidate_with_render_context(
 ) -> bool {
     let contextual_live_stage =
         render_context_allows_periodic && native_display_frame_has_context_live_stage_hud(frame);
+    let contextual_full_live_scene =
+        render_context_allows_periodic && native_display_frame_has_context_full_live_scene(frame);
     let texture_page_blocks =
         native_display_frame_has_texture_page_fragment_artifact(frame) && !contextual_live_stage;
+    let caption_stall_blocks = native_display_frame_has_caption_stalled_select_ui_artifact(frame);
     let title_logo_blocks = native_display_frame_has_title_logo_overlay(frame)
-        && (!render_context_allows_periodic
-            || !native_display_frame_has_context_stage_letterbox(frame));
+        && !contextual_live_stage
+        && !contextual_full_live_scene;
+    let saturated_logo_blocks =
+        native_display_frame_has_saturated_logo_transition(frame) && !contextual_full_live_scene;
     native_display_frame_has_visible_detail(frame)
         && !texture_page_blocks
-        && !native_display_frame_has_saturated_logo_transition(frame)
+        && !caption_stall_blocks
+        && !saturated_logo_blocks
         && !title_logo_blocks
         && !native_display_frame_has_periodic_horizontal_ghosting(frame)
+}
+
+fn native_display_frame_has_caption_stalled_select_ui_artifact(frame: &NativeDisplayFrame) -> bool {
+    if frame.width < 512
+        || frame.height < 240
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        return false;
+    }
+
+    let mut unique_colors = Vec::new();
+    let mut color_buckets = [0usize; 4096];
+    let mut horizontal_changes = 0usize;
+    let mut nonzero_pixels = 0usize;
+    let mut black_pixels = 0usize;
+    let mut warm_pixels = 0usize;
+    let mut red_dominant_pixels = 0usize;
+    let row_content_cutoff = (frame.width / 20).max(1);
+    let mut first_occupied_row = None;
+    let mut last_occupied_row = None;
+    let warning_region_x_start = frame.width / 20;
+    let warning_region_x_end = frame.width.saturating_mul(48) / 100;
+    let warning_region_y_start = frame.height / 12;
+    let warning_region_y_end = frame.height.saturating_mul(38) / 100;
+    let warning_row_cutoff = (frame.width / 80).max(6);
+    let mut top_left_warning_text_rows = 0usize;
+    let bottom_band_start = frame.height.saturating_mul(4) / 5;
+    let mut bottom_caption_pixels = 0usize;
+    let mut bottom_dark_pixels = 0usize;
+
+    for y in 0..frame.height {
+        let row = y.saturating_mul(frame.width);
+        let mut row_nonzero_pixels = 0usize;
+        let mut row_warning_text_pixels = 0usize;
+        let mut previous = None;
+        for x in 0..frame.width {
+            let color = frame.pixels[row + x] & 0x00ff_ffff;
+            let red = (color >> 16) & 0xff;
+            let green = (color >> 8) & 0xff;
+            let blue = color & 0xff;
+            let max_channel = red.max(green).max(blue);
+            let min_channel = red.min(green).min(blue);
+            let luma =
+                (red.saturating_mul(30) + green.saturating_mul(59) + blue.saturating_mul(11)) / 100;
+
+            if color != 0 {
+                nonzero_pixels = nonzero_pixels.saturating_add(1);
+                row_nonzero_pixels = row_nonzero_pixels.saturating_add(1);
+            } else {
+                black_pixels = black_pixels.saturating_add(1);
+            }
+            if red > 128 && red > green.saturating_add(32) && red > blue.saturating_add(32) {
+                warm_pixels = warm_pixels.saturating_add(1);
+            }
+            if red > green.saturating_add(32) && red > blue.saturating_add(32) {
+                red_dominant_pixels = red_dominant_pixels.saturating_add(1);
+            }
+            if previous.is_some_and(|previous| previous != color) {
+                horizontal_changes = horizontal_changes.saturating_add(1);
+            }
+            previous = Some(color);
+
+            if x >= warning_region_x_start
+                && x < warning_region_x_end
+                && y >= warning_region_y_start
+                && y < warning_region_y_end
+                && luma >= 142
+                && max_channel.saturating_sub(min_channel) <= 112
+            {
+                row_warning_text_pixels = row_warning_text_pixels.saturating_add(1);
+            }
+            if y >= bottom_band_start {
+                if luma < 40 {
+                    bottom_dark_pixels = bottom_dark_pixels.saturating_add(1);
+                } else if luma > 156 && max_channel.saturating_sub(min_channel) <= 96 {
+                    bottom_caption_pixels = bottom_caption_pixels.saturating_add(1);
+                }
+            }
+            if unique_colors.len() < 257 && !unique_colors.contains(&color) {
+                unique_colors.push(color);
+            }
+            let bucket = (((red >> 4) as usize) << 8)
+                | (((green >> 4) as usize) << 4)
+                | ((blue >> 4) as usize);
+            color_buckets[bucket] = color_buckets[bucket].saturating_add(1);
+        }
+
+        if row_nonzero_pixels >= row_content_cutoff {
+            first_occupied_row.get_or_insert(y);
+            last_occupied_row = Some(y);
+        }
+        if y >= warning_region_y_start
+            && y < warning_region_y_end
+            && row_warning_text_pixels >= warning_row_cutoff
+        {
+            top_left_warning_text_rows = top_left_warning_text_rows.saturating_add(1);
+        }
+    }
+
+    let total_pixels = frame.width.saturating_mul(frame.height);
+    let bottom_band_pixels = frame.width.saturating_mul((frame.height / 5).max(1));
+    let occupied_row_span = first_occupied_row
+        .zip(last_occupied_row)
+        .map_or(0usize, |(first, last)| {
+            last.saturating_sub(first).saturating_add(1)
+        });
+    let dominant_color_bucket_pixels = color_buckets.into_iter().max().unwrap_or(0);
+    let has_visible_content =
+        nonzero_pixels.saturating_mul(100) >= total_pixels && unique_colors.len() >= 2;
+    let has_scene_detail = has_visible_content
+        && unique_colors.len() >= 64
+        && horizontal_changes.saturating_mul(30) >= total_pixels;
+    let has_bottom_caption_band = bottom_caption_pixels.saturating_mul(1_000)
+        >= total_pixels.saturating_mul(3)
+        && bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(5);
+    let has_intro_caption_band = has_bottom_caption_band && {
+        let dark_subtitle_band = bottom_dark_pixels.saturating_mul(100)
+            >= bottom_band_pixels.saturating_mul(30)
+            && bottom_caption_pixels.saturating_mul(100) <= bottom_band_pixels.saturating_mul(35);
+        let bright_caption_panel = bottom_caption_pixels.saturating_mul(100)
+            >= bottom_band_pixels.saturating_mul(70)
+            && bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(4);
+        dark_subtitle_band || bright_caption_panel
+    };
+
+    bottom_band_pixels > 0
+        && has_scene_detail
+        && has_bottom_caption_band
+        && has_intro_caption_band
+        && unique_colors.len() >= 192
+        && unique_colors.len() <= 320
+        && nonzero_pixels.saturating_mul(100) >= total_pixels.saturating_mul(55)
+        && nonzero_pixels.saturating_mul(100) <= total_pixels.saturating_mul(66)
+        && black_pixels.saturating_mul(100) >= total_pixels.saturating_mul(34)
+        && black_pixels.saturating_mul(100) <= total_pixels.saturating_mul(45)
+        && red_dominant_pixels.saturating_mul(100) >= total_pixels.saturating_mul(12)
+        && red_dominant_pixels.saturating_mul(100) <= total_pixels.saturating_mul(22)
+        && warm_pixels.saturating_mul(100) <= total_pixels.saturating_mul(8)
+        && dominant_color_bucket_pixels.saturating_mul(100) >= total_pixels.saturating_mul(40)
+        && dominant_color_bucket_pixels.saturating_mul(100) <= total_pixels.saturating_mul(50)
+        && horizontal_changes.saturating_mul(100) >= total_pixels.saturating_mul(32)
+        && horizontal_changes.saturating_mul(100) <= total_pixels.saturating_mul(46)
+        && occupied_row_span.saturating_mul(100) >= frame.height.saturating_mul(95)
+        && bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(80)
+        && bottom_dark_pixels.saturating_mul(100) <= bottom_band_pixels.saturating_mul(95)
+        && bottom_caption_pixels.saturating_mul(1_000) >= total_pixels.saturating_mul(4)
+        && bottom_caption_pixels.saturating_mul(1_000) <= total_pixels.saturating_mul(10)
+        && top_left_warning_text_rows <= (frame.height / 32).max(8)
 }
 
 fn native_display_frame_has_texture_page_fragment_artifact(frame: &NativeDisplayFrame) -> bool {
@@ -2083,6 +2408,80 @@ fn native_display_frame_has_context_stage_letterbox(frame: &NativeDisplayFrame) 
 fn native_display_frame_has_context_live_stage_hud(frame: &NativeDisplayFrame) -> bool {
     native_display_frame_has_context_stage_letterbox(frame)
         && native_display_frame_has_title_logo_overlay(frame)
+}
+
+fn native_display_frame_has_context_full_live_scene(frame: &NativeDisplayFrame) -> bool {
+    if frame.width < 512
+        || frame.height < 480
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        return false;
+    }
+
+    let row_content_cutoff = (frame.width / 20).max(1);
+    let mut unique_colors = Vec::new();
+    let mut color_buckets = [0usize; 4096];
+    let mut nonzero = 0usize;
+    let mut black = 0usize;
+    let mut horizontal_changes = 0usize;
+    let mut occupied_rows = 0usize;
+    let mut first_occupied_row = None;
+    let mut last_occupied_row = None;
+
+    for y in 0..frame.height {
+        let row = y.saturating_mul(frame.width);
+        let mut row_nonzero = 0usize;
+        let mut previous = None;
+        for x in 0..frame.width {
+            let color = frame.pixels[row + x] & 0x00ff_ffff;
+            let red = (color >> 16) & 0xff;
+            let green = (color >> 8) & 0xff;
+            let blue = color & 0xff;
+            if color != 0 {
+                nonzero = nonzero.saturating_add(1);
+                row_nonzero = row_nonzero.saturating_add(1);
+            } else {
+                black = black.saturating_add(1);
+            }
+            if previous.is_some_and(|previous| previous != color) {
+                horizontal_changes = horizontal_changes.saturating_add(1);
+            }
+            previous = Some(color);
+            if unique_colors.len() < 65 && !unique_colors.contains(&color) {
+                unique_colors.push(color);
+            }
+            let bucket = (((red >> 4) as usize) << 8)
+                | (((green >> 4) as usize) << 4)
+                | ((blue >> 4) as usize);
+            color_buckets[bucket] = color_buckets[bucket].saturating_add(1);
+        }
+        if row_nonzero >= row_content_cutoff {
+            occupied_rows = occupied_rows.saturating_add(1);
+            first_occupied_row.get_or_insert(y);
+            last_occupied_row = Some(y);
+        }
+    }
+
+    let total = frame.width.saturating_mul(frame.height);
+    let occupied_row_span = first_occupied_row
+        .zip(last_occupied_row)
+        .map_or(0, |(first, last)| {
+            last.saturating_sub(first).saturating_add(1)
+        });
+    let dominant = color_buckets.into_iter().max().unwrap_or(0);
+
+    total > 0
+        && unique_colors.len() >= 24
+        && nonzero.saturating_mul(100) >= total.saturating_mul(35)
+        && black.saturating_mul(100) <= total.saturating_mul(45)
+        && horizontal_changes.saturating_mul(30) >= total
+        && occupied_rows.saturating_mul(100) >= frame.height.saturating_mul(55)
+        && occupied_row_span.saturating_mul(100) >= frame.height.saturating_mul(60)
+        && dominant.saturating_mul(100) <= total.saturating_mul(60)
+        && native_display_frame_has_title_logo_overlay(frame)
+        && !native_display_frame_has_texture_page_fragment_artifact(frame)
+        && !native_display_frame_has_sparse_title_logo_artifact(frame)
+        && !native_display_frame_has_periodic_horizontal_ghosting(frame)
 }
 
 fn native_display_frame_or_window_supports_playable_candidate_with_render_context(
@@ -2398,7 +2797,8 @@ fn native_display_frame_has_periodic_horizontal_ghosting(frame: &NativeDisplayFr
 mod tests {
     use super::{
         Bus, Cpu, NativeDisplayFrame, NativeEmulator, StepOutcome, apply_at28c16_mode_override,
-        native_at28c16_mode_is_blank, native_display_frame_has_context_stage_letterbox,
+        native_at28c16_mode_is_blank, native_display_frame_has_context_full_live_scene,
+        native_display_frame_has_context_stage_letterbox,
         native_display_frame_has_periodic_horizontal_ghosting,
         native_display_frame_has_saturated_logo_transition,
         native_display_frame_has_texture_page_fragment_artifact,
@@ -2465,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_coin_input_mapping_uses_legacy_zinc_for_zinc_rom_variants() {
+    fn auto_coin_input_mapping_ignores_known_bad_program_dump_without_zinc_cfg() {
         let mut report = NativeRomCompatibilityReport::missing_all_required_assets();
         report.mismatched_assets.push(NativeRomAssetMismatch {
             name: "flash1.024".to_string(),
@@ -2477,7 +2877,23 @@ mod tests {
         });
         let emulator = test_emulator_with_rom_compatibility(report);
 
-        assert_eq!(emulator.auto_coin_input_mapping_name(), Some("legacy-zinc"));
+        assert_eq!(emulator.auto_coin_input_mapping_name(), None);
+    }
+
+    #[test]
+    fn auto_coin_input_mapping_keeps_mame_jamma_wiring_for_zinc_cfg() {
+        let mut report = NativeRomCompatibilityReport::missing_all_required_assets();
+        report.mismatched_assets.push(NativeRomAssetMismatch {
+            name: "at28c16_world".to_string(),
+            role: "settings_eeprom",
+            expected_size: 128,
+            actual_size: 2048,
+            expected_crc32: Some(0x01b4_2397),
+            actual_crc32: 0x4c5f_ea47,
+        });
+        let emulator = test_emulator_with_rom_compatibility(report);
+
+        assert_eq!(emulator.auto_coin_input_mapping_name(), Some("mame"));
     }
 
     #[test]
@@ -2636,7 +3052,7 @@ mod tests {
         let (_, first_y, _, last_y) = nonzero_bounds(&window).expect("logo should remain visible");
         let occupied_height = last_y.saturating_sub(first_y).saturating_add(1);
 
-        assert_eq!(window.width, 640);
+        assert_eq!(window.width, 512);
         assert_eq!(window.height, 480);
         assert!(
             occupied_height <= 120,
@@ -2715,7 +3131,7 @@ mod tests {
             nonzero_bounds(&window).expect("active atlas field should remain visible");
         let occupied_height = last_y.saturating_sub(first_y).saturating_add(1);
 
-        assert_eq!(window.width, 640);
+        assert_eq!(window.width, 512);
         assert_eq!(window.height, 480);
         assert!(
             first_y >= 220,
@@ -2781,7 +3197,7 @@ mod tests {
             nonzero_bounds(&window).expect("live scene should remain visible");
         let occupied_height = last_y.saturating_sub(first_y).saturating_add(1);
 
-        assert_eq!((window.width, window.height), (640, 480));
+        assert_eq!((window.width, window.height), (512, 480));
         assert!(
             first_y <= 16,
             "deinterlaced live scene should start near the top instead of y={first_y}"
@@ -2790,8 +3206,63 @@ mod tests {
             occupied_height >= 360,
             "deinterlaced live scene should use most of the output height, got {occupied_height}px"
         );
-        assert_ne!(window.pixels[320 + 40 * 640], 0);
-        assert_ne!(window.pixels[320 + 420 * 640], 0);
+        assert_ne!(window.pixels[256 + 40 * 512], 0);
+        assert_ne!(window.pixels[256 + 420 * 512], 0);
+    }
+
+    #[test]
+    fn native_window_deinterlaces_stronger_field_when_both_stacked_fields_are_visible() {
+        let width = 512usize;
+        let height = 480usize;
+        let field_height = height / 2;
+        let mut pixels = vec![0; width * height];
+
+        // Model a stale, partially populated top field.
+        for y in 54..126 {
+            for x in 112..368 {
+                pixels[y * width + x] = 0x00f0_1010;
+            }
+        }
+
+        // Model the current field with substantially denser scene detail.
+        for local_y in 8..232 {
+            for x in 18..246 {
+                let red = 24 + ((x * 3 + local_y * 5) % 96) as u32;
+                let green = 48 + ((x * 7 + local_y * 11) % 176) as u32;
+                let blue = 32 + ((x * 13 + local_y * 17) % 192) as u32;
+                pixels[(field_height + local_y) * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+
+        let frame = NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        };
+
+        assert!(super::native_window_should_deinterlace_frame(&frame));
+        assert!(super::native_window_prefers_stronger_stacked_field(&frame));
+        assert_eq!(
+            super::native_window_deinterlace_field_offset(&frame),
+            field_height
+        );
+        assert!(
+            !super::native_window_deinterlace_field_is_texture_atlas_artifact(&frame, field_height)
+        );
+
+        let window = super::native_window_frame_from_display(&frame);
+        let (_, first_y, _, last_y) =
+            nonzero_bounds(&window).expect("stronger current field should remain visible");
+        assert_eq!((window.width, window.height), (512, 480));
+        assert!(first_y <= 20);
+        assert!(last_y >= 455);
+        assert!(
+            window
+                .pixels
+                .iter()
+                .all(|pixel| *pixel & 0x00ff_ffff != 0x00f0_1010),
+            "stale top-field pixels must not leak into the window frame"
+        );
     }
 
     fn nonzero_bounds(frame: &NativeDisplayFrame) -> Option<(usize, usize, usize, usize)> {
@@ -2813,6 +3284,55 @@ mod tests {
         }
 
         (min_x != usize::MAX).then_some((min_x, min_y, max_x, max_y))
+    }
+
+    fn test_caption_stalled_select_artifact_frame() -> NativeDisplayFrame {
+        let width = 512usize;
+        let height = 480usize;
+        let bottom_start = height * 4 / 5;
+        let mut pixels = vec![0; width * height];
+
+        for y in 0..bottom_start {
+            for x in 0..width {
+                let slot = x % 7;
+                if slot < 2 {
+                    continue;
+                }
+                let seed = (x / 7 + y * 11 + if slot < 5 { 0 } else { 97 }) as u32;
+                pixels[y * width + x] = if seed % 3 == 0 {
+                    let red = 72 + (seed % 48);
+                    let low = 12 + (seed % 20);
+                    (red << 16) | (low << 8) | low
+                } else if seed % 3 == 1 {
+                    let green = 72 + (seed % 96);
+                    let blue = 24 + (seed % 80);
+                    (16 << 16) | (green << 8) | blue
+                } else {
+                    let red = 20 + (seed % 56);
+                    let green = 36 + (seed % 72);
+                    let blue = 88 + (seed % 96);
+                    (red << 16) | (green << 8) | blue
+                };
+            }
+        }
+
+        for y in bottom_start..height {
+            let local_y = y - bottom_start;
+            for x in 0..width {
+                let index = y * width + x;
+                if x < 16 || (local_y < 64 && x == 26) {
+                    pixels[index] = 0x00d0_d0d0;
+                } else if (16..26).contains(&x) {
+                    pixels[index] = 0x0040_4040;
+                }
+            }
+        }
+
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
     }
 
     #[test]
@@ -2838,6 +3358,24 @@ mod tests {
         assert!(native_display_frame_has_periodic_horizontal_ghosting(
             &frame
         ));
+        assert!(
+            !native_display_frame_supports_playable_candidate_with_render_context(&frame, false)
+        );
+        assert!(
+            !native_display_frame_supports_playable_candidate_with_render_context(&frame, true)
+        );
+    }
+
+    #[test]
+    fn native_playable_candidate_rejects_caption_stalled_select_guard() {
+        let frame = test_caption_stalled_select_artifact_frame();
+
+        assert!(native_display_frame_has_visible_detail(&frame));
+        assert!(super::native_display_frame_has_caption_stalled_select_ui_artifact(&frame));
+        assert!(
+            !super::native_window_should_deinterlace_frame(&frame),
+            "full-height select UI must not collapse to one field"
+        );
         assert!(
             !native_display_frame_supports_playable_candidate_with_render_context(&frame, false)
         );
@@ -2950,6 +3488,59 @@ mod tests {
         assert!(native_display_frame_has_texture_page_fragment_artifact(
             &frame
         ));
+        assert!(
+            !native_display_frame_supports_playable_candidate_with_render_context(&frame, false)
+        );
+        assert!(native_display_frame_supports_playable_candidate_with_render_context(&frame, true));
+    }
+
+    #[test]
+    fn native_playable_candidate_allows_full_live_scene_title_overlay_false_positive() {
+        let width = 512usize;
+        let height = 480usize;
+        let mut pixels = vec![0; width * height];
+
+        for y in 0..height {
+            for x in 0..width {
+                let color = if (194..226).contains(&y) {
+                    0
+                } else {
+                    let red = 40 + ((x * 11 + y * 3 + (x * y) / 257) % 176) as u32;
+                    let green = 32 + ((x * 7 + y * 13 + (x * y) / 509) % 168) as u32;
+                    let blue = 24 + ((x * 17 + y * 5 + (x * y) / 383) % 160) as u32;
+                    (red << 16) | (green << 8) | blue
+                };
+                pixels[y * width + x] = color;
+            }
+        }
+
+        let title_x = width * 52 / 100;
+        let title_y = height * 48 / 100;
+        let title_width = width * 47 / 100;
+        let title_height = height * 36 / 100;
+        for y in title_y..title_y + title_height {
+            for x in title_x..title_x + title_width {
+                let local_x = x - title_x;
+                let local_y = y - title_y;
+                pixels[y * width + x] = if local_y % 18 < 10 && local_x < title_width * 2 / 3 {
+                    0x00d8_1818
+                } else if (local_x + local_y * 3) % 23 < 5 {
+                    0x00f0_f0f0
+                } else {
+                    0
+                };
+            }
+        }
+
+        let frame = NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        };
+
+        assert!(native_display_frame_has_visible_detail(&frame));
+        assert!(native_display_frame_has_title_logo_overlay(&frame));
+        assert!(native_display_frame_has_context_full_live_scene(&frame));
         assert!(
             !native_display_frame_supports_playable_candidate_with_render_context(&frame, false)
         );

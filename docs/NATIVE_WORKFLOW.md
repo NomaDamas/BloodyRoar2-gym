@@ -108,9 +108,25 @@ cargo run -- native-rom-summary assets/roms/bldyror2.zip
 ```
 
 `compatible:false` means the asset set does not exactly match the MAME
-manifest. The native runtime may still identify a known local ZiNc-style
-variant through `known_variants`, but do not patch, download, or commit
+manifest. `known_variants` reports supported non-program asset variants.
+`known_bad_dumps` reports program images that differ from the current archival
+manifest. In particular, `flash1.024` CRC `4866dce3` is the historical image
+shipped with the Windows ZiNc bundle. The native runtime accepts it through an
+explicit ZiNc compatibility path while still reporting its provenance. The
+current archival image is CRC `03465a69`. Do not patch, download, or commit
 proprietary ROM data in this repository.
+
+If the legally obtained good `flash1.024` is available as a separate file,
+place it beside the existing archive and rebuild the cache without repacking
+the ZIP:
+
+```sh
+cp /legal/path/flash1.024 assets/roms/flash1.024
+cargo run --release -- native-cache-prepare assets/roms
+```
+
+The cache loader prefers an exact manifest-matching sidecar over a same-named
+bad entry inside the legacy ZIP.
 
 ## 4. Deterministic Native Stepping
 
@@ -145,7 +161,7 @@ Exercise one native backend environment step from the CLI:
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 ```
 
-Run a deterministic input script and write the same 640x480 GUI frame that
+Run a deterministic input script and write the same 512x480 GUI frame that
 `native-play` presents:
 
 ```sh
@@ -234,16 +250,17 @@ native emulator starts reuse that cache until the source archive changes or
 that cache is removed. Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to
 store the runtime cache outside the repository.
 
-`native-play` fast-forwards the built-in coin/start/select match-entry script
-before opening the native macOS keyboard window, then starts with manual keys
-active. This avoids presenting warning/title/selection automation as if it were
-an interactive play screen. `native-manual` opens a cold-boot keyboard window
-with no entry script. Use `native-autoplay` when you need bounded pre-window
-fast-forward, entry-assist, or scripted smoke diagnostics. `native-autoplay`
-bounded-fast-forwards the built-in match-entry script first, continues any
-remaining scripted input in the visible window, then returns control to the
-keyboard. The bounded phase uses a full vblank-sized instruction budget so it
-does not mistake partial warning, transition, or stale frames for progress.
+`native-play` fast-forwards the built-in
+warning/title/coin/start/select/match-entry assist before opening the native
+macOS keyboard window, so the visible session starts near the manual play
+handoff instead of at warning or intro screens. `native-manual` opens a cold-boot
+keyboard window with no entry script. Use `native-autoplay` when you need a
+visible scripted assist, bounded pre-window fast-forward diagnostics, or custom
+scripted smoke runs. `native-autoplay` bounded-fast-forwards the supplied entry
+script first, continues any remaining scripted input in the visible window until
+manual takeover, then returns control to the keyboard. The bounded phase uses a
+full vblank-sized instruction budget so it does not mistake partial warning,
+transition, or stale frames for progress.
 
 Input defaults to the MAME `znt2p` map for Bloody Roar 2. A ZiNc
 `cfg/bldyror2.cfg` file is treated as an EEPROM fallback, but native input
@@ -269,6 +286,10 @@ cargo run --release -- native-autoplay assets/roms 500000 fit 1000
 cargo run --release -- native-play assets/roms 500000 fit 1000
 cargo run --release -- native-play-snapshot assets/roms 500000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
 ```
+
+The third `native-play` argument is the window scale. For example,
+`native-play assets/BloodRoar2-combined.zip 120000 1` uses scale `1` and has no
+frame limit; add a fourth argument such as `600` for bounded smoke validation.
 
 `native-play-snapshot` is intentionally stricter than the quick GUI path: it
 fails unless the final window frame satisfies gameplay-scene heuristics. A

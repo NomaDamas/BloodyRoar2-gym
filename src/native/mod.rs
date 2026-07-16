@@ -11,6 +11,7 @@ pub use backend::NativeBackend;
 pub use bus::NativeInputActivity;
 pub use emulator::{
     NativeDisplayFrame, NativeEmulator, NativeTraceConfig, native_window_frame_from_display,
+    native_window_prefers_stronger_stacked_field,
 };
 pub use framebuffer::png_from_rgb888_pixels;
 pub use io::{NativeGpuDisplayCandidate, NativeGpuDrawCapturePredicate};

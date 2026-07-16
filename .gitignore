@@ -44,5 +44,8 @@ bios/
 isos/
 samples/
 captures/
+cfg/
+nvram/
+snap/
 *.sav
 *.state

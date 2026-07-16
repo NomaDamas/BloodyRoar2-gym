@@ -25,6 +25,7 @@ name = "bloodyroar2-gym"
 version = "0.1.0"
 dependencies = [
  "minifb",
+ "serde_json",
 ]
 
 [[package]]

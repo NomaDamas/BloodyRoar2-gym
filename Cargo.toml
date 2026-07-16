@@ -7,3 +7,4 @@ description = "Rust RL/LLM control harness for legally supplied Bloody Roar 2-co
 
 [dependencies]
 minifb = "0.28.0"
+serde_json = "1.0"
