@@ -260,7 +260,10 @@ scripted smoke runs. `native-autoplay` bounded-fast-forwards the supplied entry
 script first, continues any remaining scripted input in the visible window until
 manual takeover, then returns control to the keyboard. The bounded phase uses a
 full vblank-sized instruction budget so it does not mistake partial warning,
-transition, or stale frames for progress.
+transition, or stale frames for progress. `native-play` scales the pre-window
+wall timeout from that frame budget; set
+`BR2_NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS` to override it on unusually
+slow systems.
 
 Input defaults to the MAME `znt2p` map for Bloody Roar 2. A ZiNc
 `cfg/bldyror2.cfg` file is treated as an EEPROM fallback, but native input

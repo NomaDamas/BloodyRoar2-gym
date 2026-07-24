@@ -1317,6 +1317,7 @@ pub struct Gpu {
     recent_gp0_commands: Vec<Gp0CommandTrace>,
     recent_gp1_commands: Vec<Gp1CommandTrace>,
     recent_transfer_commands: Vec<GpuTransferTrace>,
+    transfer_sequence: u64,
     image_upload_rects: Vec<DrawBounds>,
     recent_draw_commands: Vec<GpuDrawTrace>,
     display_area_history: Vec<DisplayAreaTrace>,
@@ -1401,6 +1402,7 @@ impl Default for Gpu {
             recent_gp0_commands: Vec::new(),
             recent_gp1_commands: Vec::new(),
             recent_transfer_commands: Vec::new(),
+            transfer_sequence: 0,
             image_upload_rects: Vec::new(),
             recent_draw_commands: Vec::new(),
             display_area_history: Vec::new(),
@@ -3510,6 +3512,9 @@ impl Gpu {
     fn transfer_trace_signature(traces: &[GpuTransferTrace]) -> u64 {
         let mut hash = Self::visibility_signature_seed(traces.len());
         for trace in traces {
+            Self::visibility_mix_u64(&mut hash, trace.sequence);
+            Self::visibility_mix_u64(&mut hash, trace.command_order);
+            Self::visibility_mix_u64(&mut hash, trace.vblank);
             Self::visibility_mix_str(&mut hash, trace.kind);
             Self::visibility_mix_i32(&mut hash, trace.source_x.unwrap_or(i32::MIN));
             Self::visibility_mix_i32(&mut hash, trace.source_y.unwrap_or(i32::MIN));
@@ -11547,7 +11552,11 @@ impl Gpu {
             .join(",")
     }
 
-    fn push_recent_transfer_command(&mut self, trace: GpuTransferTrace) {
+    fn push_recent_transfer_command(&mut self, mut trace: GpuTransferTrace) {
+        self.transfer_sequence = self.transfer_sequence.saturating_add(1);
+        trace.sequence = self.transfer_sequence;
+        trace.command_order = self.commands_seen;
+        trace.vblank = self.presentation_captures;
         self.recent_transfer_commands.push(trace);
         if self.recent_transfer_commands.len() > GPU_RECENT_TRANSFER_LIMIT {
             self.recent_transfer_commands.remove(0);
@@ -11576,6 +11585,8 @@ impl Gpu {
     fn push_recent_draw_command(&mut self, mut trace: GpuDrawTrace) {
         self.draw_sequence = self.draw_sequence.saturating_add(1);
         trace.sequence = self.draw_sequence;
+        trace.command_order = self.commands_seen;
+        trace.presentation_vblank = self.presentation_captures;
         trace.drawing_area_top_left = self.drawing_area_top_left;
         trace.drawing_area_bottom_right = self.drawing_area_bottom_right;
         trace.drawing_offset = self.drawing_offset;
@@ -11653,9 +11664,10 @@ impl Gpu {
                     .texture_candidate_images(texture_page, clut)
             })
             .unwrap_or_default();
+        let transfer_provenance_json = self.draw_transfer_provenance_json(trace);
         self.draw_captures.push(NativeGpuDrawCapture {
             sequence: trace.sequence,
-            trace_json: trace.json(),
+            trace_json: trace.json_with_transfer_provenance(&transfer_provenance_json),
             display_x,
             display_y,
             display_width,
@@ -11684,6 +11696,63 @@ impl Gpu {
             texture_diagnostics_json,
             texture_candidate_images,
         });
+    }
+
+    fn draw_transfer_provenance_json(&self, trace: &GpuDrawTrace) -> String {
+        let texture_raw_bounds = texture_raw_bounds_for_trace(trace);
+        let clut_bounds = clut_bounds_for_trace(trace);
+        let latest_texture_raw_transfer = texture_raw_bounds.and_then(|bounds| {
+            self.latest_transfer_dest_overlap(bounds, trace.command_order)
+                .map(|transfer| (bounds, transfer))
+        });
+        let latest_clut_transfer = clut_bounds.and_then(|bounds| {
+            self.latest_transfer_dest_overlap(bounds, trace.command_order)
+                .map(|transfer| (bounds, transfer))
+        });
+        let texture_transfer_before_draw = latest_texture_raw_transfer.map(|(_, transfer)| {
+            transfer.command_order <= trace.command_order
+                && transfer.vblank <= trace.presentation_vblank
+        });
+        let clut_transfer_before_draw = latest_clut_transfer.map(|(_, transfer)| {
+            transfer.command_order <= trace.command_order
+                && transfer.vblank <= trace.presentation_vblank
+        });
+        let generation_valid = texture_raw_bounds
+            .is_none_or(|_| texture_transfer_before_draw.is_some_and(|before_draw| before_draw))
+            && clut_bounds
+                .is_none_or(|_| clut_transfer_before_draw.is_some_and(|before_draw| before_draw));
+
+        format!(
+            "{{\"draw_command_order\":{},\"draw_presentation_vblank\":{},\"recent_transfer_count\":{},\"texture_raw_bounds\":{},\"clut_bounds\":{},\"texture_transfer_before_draw\":{},\"clut_transfer_before_draw\":{},\"generation_valid\":{},\"latest_texture_raw_transfer\":{},\"latest_clut_transfer\":{}}}",
+            trace.command_order,
+            trace.presentation_vblank,
+            self.recent_transfer_commands.len(),
+            optional_draw_bounds_json(texture_raw_bounds),
+            optional_draw_bounds_json(clut_bounds),
+            optional_bool_json(texture_transfer_before_draw),
+            optional_bool_json(clut_transfer_before_draw),
+            generation_valid,
+            latest_texture_raw_transfer.map_or_else(
+                || "null".to_string(),
+                |(bounds, transfer)| transfer.overlap_summary_json(bounds),
+            ),
+            latest_clut_transfer.map_or_else(
+                || "null".to_string(),
+                |(bounds, transfer)| transfer.overlap_summary_json(bounds),
+            )
+        )
+    }
+
+    fn latest_transfer_dest_overlap(
+        &self,
+        bounds: DrawBounds,
+        draw_command_order: u64,
+    ) -> Option<&GpuTransferTrace> {
+        self.recent_transfer_commands.iter().rev().find(|transfer| {
+            transfer.valid
+                && transfer.command_order <= draw_command_order
+                && transfer.dest_overlap_area(bounds) > 0
+        })
     }
 
     fn push_top_draw_command(&mut self, trace: GpuDrawTrace) {
@@ -18407,6 +18476,8 @@ impl DisplayColorStats {
 #[derive(Clone, Debug)]
 struct GpuDrawTrace {
     sequence: u64,
+    command_order: u64,
+    presentation_vblank: u64,
     kind: &'static str,
     drawing_area_top_left: u32,
     drawing_area_bottom_right: u32,
@@ -18469,6 +18540,8 @@ impl GpuDrawTrace {
     ) -> Self {
         Self {
             sequence: 0,
+            command_order: 0,
+            presentation_vblank: 0,
             kind,
             drawing_area_top_left: 0,
             drawing_area_bottom_right: 0,
@@ -18503,6 +18576,8 @@ impl GpuDrawTrace {
     ) -> Self {
         Self {
             sequence: 0,
+            command_order: 0,
+            presentation_vblank: 0,
             kind,
             drawing_area_top_left: 0,
             drawing_area_bottom_right: 0,
@@ -18592,8 +18667,10 @@ impl GpuDrawTrace {
             drawing_area_clip(self.drawing_area_top_left, self.drawing_area_bottom_right);
         let (drawing_offset_x, drawing_offset_y) = drawing_offset_xy(self.drawing_offset);
         format!(
-            "{{\"sequence\":{},\"kind\":\"{}\",\"source\":{},\"drawing_area_top_left\":{},\"drawing_area_top_left_hex\":\"0x{:05x}\",\"drawing_area_bottom_right\":{},\"drawing_area_bottom_right_hex\":\"0x{:05x}\",\"drawing_clip\":{},\"drawing_offset\":{},\"drawing_offset_hex\":\"0x{:06x}\",\"drawing_offset_x\":{},\"drawing_offset_y\":{},\"texture_page\":{},\"texture_page_hex\":{},\"texture_page_mode\":{},\"texture_origin\":{},\"clut\":{},\"clut_hex\":{},\"clut_origin\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"points\":[{}],\"uvs\":[{}],\"texture_window\":{},\"texture_options\":{},\"words\":[{}],\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"texture_nonzero_samples\":{},\"zero_texel_samples\":{},\"clut_nonzero_samples\":{},\"clut_blank_samples\":{},\"palette_fallback_samples\":{},\"nonzero_texel_transparent_samples\":{},\"first_color\":{},\"first_color_hex\":\"0x{:04x}\",\"last_color\":{},\"last_color_hex\":\"0x{:04x}\",\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
+            "{{\"sequence\":{},\"command_order\":{},\"presentation_vblank\":{},\"kind\":\"{}\",\"source\":{},\"drawing_area_top_left\":{},\"drawing_area_top_left_hex\":\"0x{:05x}\",\"drawing_area_bottom_right\":{},\"drawing_area_bottom_right_hex\":\"0x{:05x}\",\"drawing_clip\":{},\"drawing_offset\":{},\"drawing_offset_hex\":\"0x{:06x}\",\"drawing_offset_x\":{},\"drawing_offset_y\":{},\"texture_page\":{},\"texture_page_hex\":{},\"texture_page_mode\":{},\"texture_origin\":{},\"clut\":{},\"clut_hex\":{},\"clut_origin\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"points\":[{}],\"uvs\":[{}],\"texture_window\":{},\"texture_options\":{},\"words\":[{}],\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"texture_nonzero_samples\":{},\"zero_texel_samples\":{},\"clut_nonzero_samples\":{},\"clut_blank_samples\":{},\"palette_fallback_samples\":{},\"nonzero_texel_transparent_samples\":{},\"first_color\":{},\"first_color_hex\":\"0x{:04x}\",\"last_color\":{},\"last_color_hex\":\"0x{:04x}\",\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
             self.sequence,
+            self.command_order,
+            self.presentation_vblank,
             self.kind,
             optional_gpu_source_json(self.source.as_ref()),
             self.drawing_area_top_left,
@@ -18643,13 +18720,26 @@ impl GpuDrawTrace {
         )
     }
 
+    fn json_with_transfer_provenance(&self, transfer_provenance_json: &str) -> String {
+        let mut json = self.json();
+        if json.ends_with('}') {
+            json.pop();
+            json.push_str(",\"vram_transfer_provenance\":");
+            json.push_str(transfer_provenance_json);
+            json.push('}');
+        }
+        json
+    }
+
     fn compact_json(&self) -> String {
         let drawing_clip =
             drawing_area_clip(self.drawing_area_top_left, self.drawing_area_bottom_right);
         let (drawing_offset_x, drawing_offset_y) = drawing_offset_xy(self.drawing_offset);
         format!(
-            "{{\"sequence\":{},\"kind\":\"{}\",\"source\":{},\"drawing_area_top_left\":{},\"drawing_area_top_left_hex\":\"0x{:05x}\",\"drawing_area_bottom_right\":{},\"drawing_area_bottom_right_hex\":\"0x{:05x}\",\"drawing_clip\":{},\"drawing_offset\":{},\"drawing_offset_hex\":\"0x{:06x}\",\"drawing_offset_x\":{},\"drawing_offset_y\":{},\"texture_page\":{},\"texture_page_hex\":{},\"texture_page_mode\":{},\"texture_origin\":{},\"clut\":{},\"clut_hex\":{},\"clut_origin\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"points\":[{}],\"uvs\":[{}],\"texture_window\":{},\"texture_options\":{},\"words\":[{}],\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"texture_nonzero_samples\":{},\"zero_texel_samples\":{},\"clut_nonzero_samples\":{},\"clut_blank_samples\":{},\"palette_fallback_samples\":{},\"nonzero_texel_transparent_samples\":{},\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
+            "{{\"sequence\":{},\"command_order\":{},\"presentation_vblank\":{},\"kind\":\"{}\",\"source\":{},\"drawing_area_top_left\":{},\"drawing_area_top_left_hex\":\"0x{:05x}\",\"drawing_area_bottom_right\":{},\"drawing_area_bottom_right_hex\":\"0x{:05x}\",\"drawing_clip\":{},\"drawing_offset\":{},\"drawing_offset_hex\":\"0x{:06x}\",\"drawing_offset_x\":{},\"drawing_offset_y\":{},\"texture_page\":{},\"texture_page_hex\":{},\"texture_page_mode\":{},\"texture_origin\":{},\"clut\":{},\"clut_hex\":{},\"clut_origin\":{},\"color\":{},\"color_hex\":{},\"bounds\":{},\"area\":{},\"score\":{},\"points\":[{}],\"uvs\":[{}],\"texture_window\":{},\"texture_options\":{},\"words\":[{}],\"sampled_pixels\":{},\"drawn_pixels\":{},\"written_pixels\":{},\"clipped_pixels\":{},\"transparent_pixels\":{},\"texture_nonzero_samples\":{},\"zero_texel_samples\":{},\"clut_nonzero_samples\":{},\"clut_blank_samples\":{},\"palette_fallback_samples\":{},\"nonzero_texel_transparent_samples\":{},\"color_hash\":{},\"color_hash_hex\":\"0x{:08x}\",\"color_changes\":{}}}",
             self.sequence,
+            self.command_order,
+            self.presentation_vblank,
             self.kind,
             optional_gpu_source_json(self.source.as_ref()),
             self.drawing_area_top_left,
@@ -18841,6 +18931,9 @@ impl Gp1CommandTrace {
 
 #[derive(Clone, Debug)]
 struct GpuTransferTrace {
+    sequence: u64,
+    command_order: u64,
+    vblank: u64,
     kind: &'static str,
     source_x: Option<i32>,
     source_y: Option<i32>,
@@ -18911,6 +19004,9 @@ impl GpuTransferTrace {
         source: Option<&GpuCommandSource>,
     ) -> Self {
         Self {
+            sequence: 0,
+            command_order: 0,
+            vblank: 0,
             kind: "image_upload",
             source_x: None,
             source_y: None,
@@ -18944,6 +19040,9 @@ impl GpuTransferTrace {
         source: Option<&GpuCommandSource>,
     ) -> Self {
         Self {
+            sequence: 0,
+            command_order: 0,
+            vblank: 0,
             kind: "vram_copy",
             source_x: Some(source_x),
             source_y: Some(source_y),
@@ -18964,8 +19063,13 @@ impl GpuTransferTrace {
 
     fn json(&self) -> String {
         format!(
-            "{{\"kind\":\"{}\",\"source_x\":{},\"source_y\":{},\"dest_x\":{},\"dest_y\":{},\"width\":{},\"height\":{},\"data_words\":{},\"valid\":{},\"source_before\":{},\"dest_before\":{},\"dest_after\":{},\"payload\":{},\"command_words\":[{}],\"command_source\":{}}}",
+            "{{\"sequence\":{},\"command_order\":{},\"vblank\":{},\"kind\":\"{}\",\"source_rect\":{},\"dest_rect\":{},\"source_x\":{},\"source_y\":{},\"dest_x\":{},\"dest_y\":{},\"width\":{},\"height\":{},\"data_words\":{},\"valid\":{},\"source_before\":{},\"dest_before\":{},\"dest_after\":{},\"payload\":{},\"command_words\":[{}],\"command_source\":{}}}",
+            self.sequence,
+            self.command_order,
+            self.vblank,
             self.kind,
+            self.source_rect_json(),
+            self.dest_rect_json(),
             optional_i32_json(self.source_x),
             optional_i32_json(self.source_y),
             self.dest_x,
@@ -18984,6 +19088,55 @@ impl GpuTransferTrace {
                 .map_or_else(|| "null".to_string(), GpuTransferPayloadStats::json),
             words_json(&self.command_words),
             optional_gpu_source_json(self.source.as_ref())
+        )
+    }
+
+    fn dest_bounds(&self) -> DrawBounds {
+        rect_bounds(
+            Point {
+                x: self.dest_x,
+                y: self.dest_y,
+            },
+            self.width,
+            self.height,
+        )
+    }
+
+    fn source_bounds(&self) -> Option<DrawBounds> {
+        self.source_x
+            .zip(self.source_y)
+            .map(|(x, y)| rect_bounds(Point { x, y }, self.width, self.height))
+    }
+
+    fn dest_overlap_area(&self, bounds: DrawBounds) -> i64 {
+        transfer_overlap_area(self.dest_bounds(), bounds)
+    }
+
+    fn source_overlap_area(&self, bounds: DrawBounds) -> i64 {
+        self.source_bounds()
+            .map_or(0, |source| transfer_overlap_area(source, bounds))
+    }
+
+    fn dest_rect_json(&self) -> String {
+        transfer_rect_json(self.dest_x, self.dest_y, self.width, self.height)
+    }
+
+    fn source_rect_json(&self) -> String {
+        self.source_x.zip(self.source_y).map_or_else(
+            || "null".to_string(),
+            |(x, y)| transfer_rect_json(x, y, self.width, self.height),
+        )
+    }
+
+    fn overlap_summary_json(&self, bounds: DrawBounds) -> String {
+        let dest_overlap_area = self.dest_overlap_area(bounds);
+        let source_overlap_area = self.source_overlap_area(bounds);
+        format!(
+            "{{\"bounds\":{},\"dest_overlap_area\":{},\"source_overlap_area\":{},\"transfer\":{}}}",
+            bounds.json(),
+            dest_overlap_area,
+            source_overlap_area,
+            self.json()
         )
     }
 }
@@ -19023,6 +19176,111 @@ fn gpu_transfer_region_stats(
     }
     stats.unique_colors = unique.len();
     stats
+}
+
+fn texture_raw_bounds_for_trace(trace: &GpuDrawTrace) -> Option<DrawBounds> {
+    let texture_page = trace.texture_page?;
+    let (origin_x, origin_y) = trace.clut.map_or_else(
+        || texture_page_origin_for_diagnostics(texture_page),
+        |clut| texture_page_origin_for_clut_for_diagnostics(texture_page, clut),
+    );
+    let Some((min_u, min_v, max_u, max_v)) = texture_uv_bounds_for_trace(trace) else {
+        return Some(rect_bounds(
+            Point {
+                x: origin_x,
+                y: origin_y,
+            },
+            texture_raw_width_for_diagnostics(texture_page),
+            256,
+        ));
+    };
+    let mode = texture_page_color_mode_for_diagnostics(texture_page);
+    let left = origin_x.saturating_add(texture_u_to_raw_word(mode, min_u));
+    let right = origin_x.saturating_add(texture_u_to_raw_word(mode, max_u));
+    Some(DrawBounds {
+        left,
+        top: origin_y.saturating_add(i32::from(min_v)),
+        right,
+        bottom: origin_y.saturating_add(i32::from(max_v)),
+    })
+}
+
+fn texture_uv_bounds_for_trace(trace: &GpuDrawTrace) -> Option<(u8, u8, u8, u8)> {
+    let first = *trace.uvs.first()?;
+    if trace.kind == "textured_rect" {
+        let width = trace.bounds.right.saturating_sub(trace.bounds.left).max(0) as u16;
+        let height = trace.bounds.bottom.saturating_sub(trace.bounds.top).max(0) as u16;
+        return Some((
+            first.u,
+            first.v,
+            first.u.saturating_add(width.min(u16::from(u8::MAX)) as u8),
+            first.v.saturating_add(height.min(u16::from(u8::MAX)) as u8),
+        ));
+    }
+
+    let mut min_u = first.u;
+    let mut min_v = first.v;
+    let mut max_u = first.u;
+    let mut max_v = first.v;
+    for uv in &trace.uvs {
+        min_u = min_u.min(uv.u);
+        min_v = min_v.min(uv.v);
+        max_u = max_u.max(uv.u);
+        max_v = max_v.max(uv.v);
+    }
+    Some((min_u, min_v, max_u, max_v))
+}
+
+fn clut_bounds_for_trace(trace: &GpuDrawTrace) -> Option<DrawBounds> {
+    let texture_page = trace.texture_page?;
+    let clut = trace.clut?;
+    let entries = texture_palette_entries_for_diagnostics(texture_page)?;
+    let (x, y) = clut_origin_for_diagnostics(clut);
+    Some(rect_bounds(Point { x, y }, entries, 1))
+}
+
+fn texture_raw_width_for_diagnostics(texture_page: u16) -> i32 {
+    match texture_page_color_mode_for_diagnostics(texture_page) {
+        0 => 64,
+        1 => 128,
+        _ => 256,
+    }
+}
+
+fn texture_palette_entries_for_diagnostics(texture_page: u16) -> Option<i32> {
+    match texture_page_color_mode_for_diagnostics(texture_page) {
+        0 => Some(16),
+        1 => Some(256),
+        _ => None,
+    }
+}
+
+fn texture_u_to_raw_word(mode: u16, u: u8) -> i32 {
+    match mode {
+        0 => i32::from(u) / 4,
+        1 => i32::from(u) / 2,
+        _ => i32::from(u),
+    }
+}
+
+fn transfer_overlap_area(transfer_bounds: DrawBounds, target_bounds: DrawBounds) -> i64 {
+    if transfer_bounds.left > transfer_bounds.right || transfer_bounds.top > transfer_bounds.bottom
+    {
+        return 0;
+    }
+    transfer_bounds.intersection_area(target_bounds)
+}
+
+fn transfer_rect_json(x: i32, y: i32, width: i32, height: i32) -> String {
+    let bounds = rect_bounds(Point { x, y }, width, height);
+    format!(
+        "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"bounds\":{}}}",
+        x,
+        y,
+        width,
+        height,
+        bounds.json()
+    )
 }
 
 fn gpu_transfer_payload_stats(words: &[u32]) -> GpuTransferPayloadStats {
@@ -19469,6 +19727,7 @@ fn texture_draw_options(command_word: u32, texture_page: u16) -> TextureDrawOpti
         texture_flip_x: allow_sprite_flip && texture_page & 0x1000 != 0,
         texture_flip_y: allow_sprite_flip && texture_page & 0x2000 != 0,
         allow_palette_fallback,
+        allow_texture_descriptor_alias: true,
     }
 }
 
@@ -19767,6 +20026,10 @@ fn optional_i32_json(value: Option<i32>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
+fn optional_bool_json(value: Option<bool>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
 fn optional_clip_rect_json(value: Option<ClipRect>) -> String {
     value.map_or_else(
         || "null".to_string(),
@@ -19781,6 +20044,10 @@ fn optional_clip_rect_json(value: Option<ClipRect>) -> String {
 
 fn optional_i64_json(value: Option<i64>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn optional_draw_bounds_json(value: Option<DrawBounds>) -> String {
+    value.map_or_else(|| "null".to_string(), DrawBounds::json)
 }
 
 fn optional_u64_json(value: Option<u64>) -> String {
@@ -19850,7 +20117,7 @@ fn optional_texture_options_json(value: Option<TextureDrawOptions>) -> String {
         || "null".to_string(),
         |value| {
             format!(
-                "{{\"primitive_color\":{},\"primitive_color_hex\":\"0x{:06x}\",\"raw_texture\":{},\"semi_transparent\":{},\"semi_transparency_mode\":{},\"set_mask_bit\":{},\"check_mask_bit\":{},\"texture_flip_x\":{},\"texture_flip_y\":{},\"allow_palette_fallback\":{}}}",
+                "{{\"primitive_color\":{},\"primitive_color_hex\":\"0x{:06x}\",\"raw_texture\":{},\"semi_transparent\":{},\"semi_transparency_mode\":{},\"set_mask_bit\":{},\"check_mask_bit\":{},\"texture_flip_x\":{},\"texture_flip_y\":{},\"allow_palette_fallback\":{},\"allow_texture_descriptor_alias\":{}}}",
                 value.primitive_color,
                 value.primitive_color,
                 value.raw_texture,
@@ -19860,7 +20127,8 @@ fn optional_texture_options_json(value: Option<TextureDrawOptions>) -> String {
                 value.check_mask_bit,
                 value.texture_flip_x,
                 value.texture_flip_y,
-                value.allow_palette_fallback
+                value.allow_palette_fallback,
+                value.allow_texture_descriptor_alias
             )
         },
     )
@@ -36349,12 +36617,21 @@ mod tests {
         io.write_u32(GPU_GP0, 0x000e_000e);
 
         let top_left = io.gpu.framebuffer.pixel(10, 10);
-        let top_right = io.gpu.framebuffer.pixel(14, 10);
-        let bottom_left = io.gpu.framebuffer.pixel(10, 14);
+        let top_right = io.gpu.framebuffer.pixel(13, 11);
+        let bottom_left = io.gpu.framebuffer.pixel(11, 13);
 
-        assert!((top_left & 0x00ff_0000) > (top_left & 0x0000_ff00));
-        assert!((top_right & 0x0000_ff00) > (top_right & 0x00ff_0000));
-        assert!((bottom_left & 0x0000_00ff) > (bottom_left & 0x00ff_0000));
+        assert!(
+            (top_left & 0x00ff_0000) > (top_left & 0x0000_ff00),
+            "top_left={top_left:#08x}"
+        );
+        assert!(
+            (top_right & 0x0000_ff00) > (top_right & 0x00ff_0000),
+            "top_right={top_right:#08x}"
+        );
+        assert!(
+            (bottom_left & 0x0000_00ff) > (bottom_left & 0x00ff_0000),
+            "bottom_left={bottom_left:#08x}"
+        );
     }
 
     #[test]
@@ -36713,7 +36990,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_gp0_low_ram_stage_draw_uses_br2_stage_palette_alias() {
+    fn gpu_gp0_low_ram_stage_draw_keeps_br2_stage_palette_alias() {
         let io = render_br2_model_descriptor_from_linked_list_source(0x0003_9df4, false);
 
         assert_eq!(io.gpu.gp0_pending_words(), 0);
@@ -37096,22 +37373,31 @@ mod tests {
         io.write_u32(GPU_GP0, 0x000a_000a);
         io.write_u32(GPU_GP0, 0x0000_0000);
         io.write_u32(GPU_GP0, 0x0000_ff00);
-        io.write_u32(GPU_GP0, 0x000a_000c);
+        io.write_u32(GPU_GP0, 0x000a_000e);
         io.write_u32(GPU_GP0, texture_page_uv | 0x0001);
         io.write_u32(GPU_GP0, 0x00ff_0000);
-        io.write_u32(GPU_GP0, 0x000c_000a);
+        io.write_u32(GPU_GP0, 0x000e_000a);
         io.write_u32(GPU_GP0, 0x0000_0100);
         io.write_u32(GPU_GP0, 0x00ff_ffff);
-        io.write_u32(GPU_GP0, 0x000c_000c);
+        io.write_u32(GPU_GP0, 0x000e_000e);
         io.write_u32(GPU_GP0, 0x0000_0101);
 
         let top_left = io.gpu.framebuffer.pixel(10, 10);
-        let top_right = io.gpu.framebuffer.pixel(12, 10);
-        let bottom_left = io.gpu.framebuffer.pixel(10, 12);
+        let top_right = io.gpu.framebuffer.pixel(13, 11);
+        let bottom_left = io.gpu.framebuffer.pixel(11, 13);
 
-        assert!((top_left & 0x00ff_0000) > (top_left & 0x0000_ff00));
-        assert!((top_right & 0x0000_ff00) > (top_right & 0x00ff_0000));
-        assert!((bottom_left & 0x0000_00ff) > (bottom_left & 0x00ff_0000));
+        assert!(
+            (top_left & 0x00ff_0000) > (top_left & 0x0000_ff00),
+            "top_left={top_left:#08x}"
+        );
+        assert!(
+            (top_right & 0x0000_ff00) > (top_right & 0x00ff_0000),
+            "top_right={top_right:#08x}"
+        );
+        assert!(
+            (bottom_left & 0x0000_00ff) > (bottom_left & 0x00ff_0000),
+            "bottom_left={bottom_left:#08x}"
+        );
     }
 
     #[test]
@@ -37354,6 +37640,196 @@ mod tests {
         assert_eq!(io.gpu.vram_copy_commands, 1);
         assert_eq!(io.gpu.gp0_read, 0);
         assert_eq!(io.gpu.framebuffer_stats().nonzero_pixels, 4);
+    }
+
+    #[test]
+    fn gpu_transfer_trace_json_includes_sequence_rect_vblank_and_source() {
+        let mut io = Io::default();
+        io.gpu.presentation_captures = 7;
+
+        io.gpu.write_gp0_with_source(
+            0xa000_0000,
+            GpuCommandSource::dma_block(0x1000, Some(0x2000)),
+        );
+        io.write_u32(GPU_GP0, 0x0008_0004);
+        io.write_u32(GPU_GP0, 0x0001_0002);
+        io.write_u32(GPU_GP0, 0x03e0_001f);
+
+        let upload_json = io.gpu.recent_transfer_commands_json();
+        assert!(upload_json.contains("\"sequence\":1"), "{upload_json}");
+        assert!(upload_json.contains("\"command_order\":4"), "{upload_json}");
+        assert!(upload_json.contains("\"vblank\":7"), "{upload_json}");
+        assert!(
+            upload_json.contains("\"dest_rect\":{\"x\":4,\"y\":8,\"width\":2,\"height\":1"),
+            "{upload_json}"
+        );
+        assert!(
+            upload_json.contains("\"command_source\":{\"kind\":\"dma_block\""),
+            "{upload_json}"
+        );
+
+        io.gpu
+            .write_gp0_with_source(0x8000_0000, GpuCommandSource::dma_linked_list(0x3000, None));
+        io.write_u32(GPU_GP0, 0x0008_0004);
+        io.write_u32(GPU_GP0, 0x0010_000c);
+        io.write_u32(GPU_GP0, 0x0001_0002);
+
+        let copy_json = io.gpu.recent_transfer_commands_json();
+        assert!(copy_json.contains("\"sequence\":2"), "{copy_json}");
+        assert!(
+            copy_json.contains("\"source_rect\":{\"x\":4,\"y\":8,\"width\":2,\"height\":1"),
+            "{copy_json}"
+        );
+        assert!(
+            copy_json.contains("\"dest_rect\":{\"x\":12,\"y\":16,\"width\":2,\"height\":1"),
+            "{copy_json}"
+        );
+        assert!(
+            copy_json.contains("\"command_source\":{\"kind\":\"dma_linked_list\""),
+            "{copy_json}"
+        );
+    }
+
+    #[test]
+    fn gpu_draw_capture_json_summarizes_latest_vram_transfer_overlap() {
+        let mut io = Io::default();
+        io.gpu.presentation_captures = 9;
+
+        io.gpu.write_gp0_with_source(
+            0xa000_0000,
+            GpuCommandSource::dma_block(0x1110, Some(0x2220)),
+        );
+        io.write_u32(GPU_GP0, 0x0008_0000);
+        io.write_u32(GPU_GP0, 0x0002_0001);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+
+        io.gpu.write_gp0_with_source(
+            0xa000_0000,
+            GpuCommandSource::dma_block(0x1120, Some(0x2230)),
+        );
+        io.write_u32(GPU_GP0, 0x0001_0000);
+        io.write_u32(GPU_GP0, 0x0001_0010);
+        for _ in 0..8 {
+            io.write_u32(GPU_GP0, 0x03e0_001f);
+        }
+
+        io.gpu
+            .set_draw_capture_predicates(vec![NativeGpuDrawCapturePredicate {
+                kind: Some("textured_rect".to_string()),
+                texture_page: Some(0x0000),
+                clut: Some(0x0040),
+                ..NativeGpuDrawCapturePredicate::default()
+            }]);
+        io.write_u32(GPU_GP0, 0xe100_0000);
+        io.write_u32(GPU_GP0, 0x6400_0000);
+        io.write_u32(GPU_GP0, 0x0010_0010);
+        io.write_u32(GPU_GP0, 0x0040_0800);
+        io.write_u32(GPU_GP0, 0x0002_0004);
+
+        assert_eq!(io.gpu.draw_captures().len(), 1);
+        let capture = &io.gpu.draw_captures()[0];
+        let capture_json = capture.json(
+            "display.png",
+            "actual.png",
+            "raw-actual.png",
+            "gui.png",
+            "bounds.png",
+            None,
+            None,
+            None,
+            None,
+            "",
+        );
+
+        assert!(
+            capture_json.contains("\"vram_transfer_provenance\""),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json.contains("\"texture_transfer_before_draw\":true"),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json.contains("\"clut_transfer_before_draw\":true"),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json.contains("\"generation_valid\":true"),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json
+                .contains("\"texture_raw_bounds\":{\"left\":0,\"top\":8,\"right\":0,\"bottom\":9}"),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json
+                .contains("\"clut_bounds\":{\"left\":0,\"top\":1,\"right\":15,\"bottom\":1}"),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json.contains(
+                "\"latest_texture_raw_transfer\":{\"bounds\":{\"left\":0,\"top\":8,\"right\":0,\"bottom\":9},\"dest_overlap_area\":2"
+            ),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json.contains("\"latest_clut_transfer\":{\"bounds\":{\"left\":0,\"top\":1,\"right\":15,\"bottom\":1},\"dest_overlap_area\":16"),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json.contains("\"dest_rect\":{\"x\":0,\"y\":8,\"width\":1,\"height\":2"),
+            "{capture_json}"
+        );
+        assert!(
+            capture_json.contains("\"dest_rect\":{\"x\":0,\"y\":1,\"width\":16,\"height\":1"),
+            "{capture_json}"
+        );
+    }
+
+    #[test]
+    fn gpu_draw_transfer_provenance_ignores_uploads_after_draw() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP0, 0xe100_0000);
+        io.write_u32(GPU_GP0, 0x6400_0000);
+        io.write_u32(GPU_GP0, 0x0010_0010);
+        io.write_u32(GPU_GP0, 0x0040_0800);
+        io.write_u32(GPU_GP0, 0x0002_0004);
+
+        let draw = io
+            .gpu
+            .recent_draw_commands
+            .last()
+            .cloned()
+            .expect("textured draw should be traced");
+        assert!(draw.command_order > 0);
+
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0008_0000);
+        io.write_u32(GPU_GP0, 0x0002_0001);
+        io.write_u32(GPU_GP0, 0x1111_1111);
+
+        let upload = io
+            .gpu
+            .recent_transfer_commands
+            .last()
+            .expect("upload should be traced");
+        assert!(upload.command_order > draw.command_order);
+
+        let provenance = io.gpu.draw_transfer_provenance_json(&draw);
+        assert!(
+            provenance.contains("\"texture_transfer_before_draw\":null"),
+            "{provenance}"
+        );
+        assert!(
+            provenance.contains("\"latest_texture_raw_transfer\":null"),
+            "{provenance}"
+        );
+        assert!(
+            provenance.contains("\"generation_valid\":false"),
+            "{provenance}"
+        );
     }
 
     #[test]

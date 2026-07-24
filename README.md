@@ -103,7 +103,10 @@ outside the repo.
 keyboard window. `native-play` fast-forwards the built-in
 warning/title/coin/start/select/match-entry assist before opening the window, so
 the visible session starts near the manual play handoff instead of at warning or
-intro screens. Use `native-manual` for a cold-boot window with no entry script.
+intro screens. Its pre-window timeout scales with the scripted frame budget;
+set `BR2_NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS` only when an unusually slow
+machine needs an explicit override. Use `native-manual` for a cold-boot window
+with no entry script.
 Use `native-autoplay` when you intentionally want a visible scripted assist or
 custom entry-assist diagnostics.
 `native-window-snapshot` writes the exact 512x480 GUI frame without opening a
