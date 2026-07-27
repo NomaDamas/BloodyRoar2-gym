@@ -86,6 +86,7 @@ cargo run -- native-play
 cargo run -- native-input-check
 cargo run -- native-health-check
 cargo run -- native-autoplay
+cargo run --release -- native-startup-probe assets/roms 120000 optimized
 ```
 
 ZIP inputs are not extracted by hand on every run. Native runtime startup
@@ -107,6 +108,10 @@ intro screens. Its pre-window timeout scales with the scripted frame budget;
 set `BR2_NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS` only when an unusually slow
 machine needs an explicit override. Use `native-manual` for a cold-boot window
 with no entry script.
+`native-startup-probe` executes the exact pre-window path without opening a GUI.
+Use `optimized` for the production path and `tracked` for the legacy
+diagnostic-capture path; its JSON reports startup timing and the final
+render/playability gates.
 Use `native-autoplay` when you intentionally want a visible scripted assist or
 custom entry-assist diagnostics.
 `native-window-snapshot` writes the normalized native display frame without
