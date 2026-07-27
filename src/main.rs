@@ -683,14 +683,8 @@ fn run() -> Result<(), String> {
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             let scale = parse_native_window_scale(args.next())?;
-            let max_frames = args
-                .next()
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| "max_frames must be a positive integer".to_string())
-                })
-                .transpose()?;
+            let (max_frames, gui_test_input_segments) =
+                parse_native_play_tail(args.collect::<Vec<_>>())?;
             run_native_play(
                 rom,
                 instructions_per_frame.max(1),
@@ -700,6 +694,7 @@ fn run() -> Result<(), String> {
                 true,
                 true,
                 false,
+                gui_test_input_segments,
             )
         }
         "native-manual" => {
@@ -727,6 +722,7 @@ fn run() -> Result<(), String> {
                 false,
                 false,
                 false,
+                Vec::new(),
             )
         }
         "native-autoplay" => {
@@ -747,6 +743,7 @@ fn run() -> Result<(), String> {
                 true,
                 false,
                 true,
+                Vec::new(),
             )
         }
         "native-input-check" => {
@@ -3588,6 +3585,7 @@ fn run_native_play(
     fast_forward_script: bool,
     stop_script_at_first_playable: bool,
     pre_window_boot_wait: bool,
+    gui_test_input_segments: Vec<NativeScriptSegment>,
 ) -> Result<(), String> {
     let (mut emulator, cache_report) =
         NativeEmulator::from_rom_zip_with_cache_report(rom).map_err(|error| error.to_string())?;
@@ -3615,6 +3613,8 @@ fn run_native_play(
     let mut manual_takeover_observed = false;
     let mut observed_physical_buttons = ActionButtons::default();
     let mut physical_input_activity = NativeInputActivity::default();
+    let mut observed_test_input_buttons = ActionButtons::default();
+    let mut test_input_activity = NativeInputActivity::default();
     let mut pending_manual_takeover_buttons: Option<ActionButtons> = None;
     let mut last_effective_buttons = ActionButtons::default();
     let initial_native_playable_candidate = emulator.native_playable_candidate();
@@ -3853,13 +3853,19 @@ fn run_native_play(
     let mut input_latch = NativeInputLatch::default();
     let mut physical_input_latch = NativeInputLatch::default();
     let mut input_trace = NativeGuiInputTrace::from_env(emulator.input_activity());
-    let mut test_input_script = NativeGuiTestInputScript::from_env()?;
+    let mut test_input_script =
+        NativeGuiTestInputScript::from_segments_or_env(&gui_test_input_segments)?;
     let test_input_enabled = test_input_script.is_enabled();
     let mut test_input_observed = false;
     if test_input_script.is_enabled() {
+        let source = if gui_test_input_segments.is_empty() {
+            NATIVE_PLAY_GUI_TEST_INPUT_SCRIPT_ENV
+        } else {
+            "--gui-test-input"
+        };
         eprintln!(
-            "native GUI test input sidecar enabled: env={} frames={}",
-            NATIVE_PLAY_GUI_TEST_INPUT_SCRIPT_ENV,
+            "native GUI test input sidecar enabled: source={} frames={}",
+            source,
             test_input_script.len()
         );
     }
@@ -3974,6 +3980,9 @@ fn run_native_play(
             merge_action_buttons(observed_physical_buttons, step.physical_buttons);
         physical_input_activity =
             physical_input_activity.saturating_added(step.physical_input_activity);
+        observed_test_input_buttons =
+            merge_action_buttons(observed_test_input_buttons, step.test_input_buttons);
+        test_input_activity = test_input_activity.saturating_added(step.test_input_activity);
         test_input_observed |= step.test_input_override;
         let cancel_for_manual_takeover = manual_takeover || pending_takeover_buttons.is_some();
         let mut effective_step_buttons = step.buttons;
@@ -4293,6 +4302,15 @@ fn run_native_play(
     let physical_any_input_guest_verified = physical_input_activity.has_any_control_activity();
     let physical_play_input_guest_verified = physical_input_activity.has_play_control_activity();
     let physical_full_input_guest_verified = physical_input_activity.has_full_control_activity();
+    let test_any_input_observed = action_buttons_any(observed_test_input_buttons);
+    let test_direction_input_observed =
+        action_buttons_have_direction_coverage(observed_test_input_buttons);
+    let test_play_input_observed =
+        action_buttons_have_play_control_coverage(observed_test_input_buttons);
+    let test_full_input_observed = test_direction_input_observed && test_play_input_observed;
+    let test_any_input_guest_verified = test_input_activity.has_any_control_activity();
+    let test_play_input_guest_verified = test_input_activity.has_play_control_activity();
+    let test_full_input_guest_verified = test_input_activity.has_full_control_activity();
     let native_playable_observed_or_final = observed_native_playable_candidate
         || (final_native_playable_candidate && final_frame_render_verified);
     let native_play_any_input_verified = native_playable_observed_or_final
@@ -4304,6 +4322,9 @@ fn run_native_play(
     let native_play_full_input_verified = native_playable_observed_or_final
         && physical_full_input_observed
         && physical_full_input_guest_verified;
+    let native_play_test_input_verified = native_playable_observed_or_final
+        && test_full_input_observed
+        && test_full_input_guest_verified;
     let render_ready =
         (observed_render_ready || final_frame_render_verified) && final_frame_render_ready;
     let gameplay_ready = native_playable_observed_or_final
@@ -4328,7 +4349,7 @@ fn run_native_play(
     let first_render_ready_frame = optional_u64_json(first_render_ready_frame);
     let last_render_ready_frame = optional_u64_json(last_render_ready_frame);
     println!(
-        "{{\"rendered_frames\":{},\"gui_rendered_frames\":{},\"manual_override_frames\":{},\"manual_input_observed\":{},\"manual_takeover_observed\":{},\"physical_input_buttons\":{},\"physical_input_activity\":{},\"physical_any_input_observed\":{},\"physical_direction_input_observed\":{},\"physical_play_input_observed\":{},\"physical_full_input_observed\":{},\"physical_any_input_guest_verified\":{},\"physical_play_input_guest_verified\":{},\"physical_full_input_guest_verified\":{},\"test_input_enabled\":{},\"test_input_observed\":{},\"last_effective_buttons\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_fast_forwarded\":{},\"autoplay_stop_at_first_playable\":{},\"boot_fast_forwarded\":{},\"boot_fast_forwarded_frames\":{},\"boot_fast_forward_stop_reason\":\"{}\",\"autoplay_fast_forward_max_frames\":{},\"autoplay_fast_forward_instructions_per_frame\":{},\"gui_instructions_per_frame\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_missed_vblank_frames\":{},\"autoplay_segments\":[{}],\"initial_raw_frame\":{},\"initial_window_frame\":{},\"final_raw_frame\":{},\"final_window_size\":{{\"width\":{},\"height\":{}}},\"input_activity\":{},\"render_ready\":{},\"observed_render_ready\":{},\"first_render_ready_frame\":{},\"last_render_ready_frame\":{},\"gameplay_ready\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"any_input_controls_active\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_any_input_verified\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_visible_content\":{},\"final_frame_scene_detail\":{},\"final_frame_render_ready\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
+        "{{\"rendered_frames\":{},\"gui_rendered_frames\":{},\"manual_override_frames\":{},\"manual_input_observed\":{},\"manual_takeover_observed\":{},\"physical_input_buttons\":{},\"physical_input_activity\":{},\"physical_any_input_observed\":{},\"physical_direction_input_observed\":{},\"physical_play_input_observed\":{},\"physical_full_input_observed\":{},\"physical_any_input_guest_verified\":{},\"physical_play_input_guest_verified\":{},\"physical_full_input_guest_verified\":{},\"test_input_enabled\":{},\"test_input_observed\":{},\"test_input_buttons\":{},\"test_input_activity\":{},\"test_any_input_observed\":{},\"test_direction_input_observed\":{},\"test_play_input_observed\":{},\"test_full_input_observed\":{},\"test_any_input_guest_verified\":{},\"test_play_input_guest_verified\":{},\"test_full_input_guest_verified\":{},\"native_play_test_input_verified\":{},\"last_effective_buttons\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_fast_forwarded\":{},\"autoplay_stop_at_first_playable\":{},\"boot_fast_forwarded\":{},\"boot_fast_forwarded_frames\":{},\"boot_fast_forward_stop_reason\":\"{}\",\"autoplay_fast_forward_max_frames\":{},\"autoplay_fast_forward_instructions_per_frame\":{},\"gui_instructions_per_frame\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_missed_vblank_frames\":{},\"autoplay_segments\":[{}],\"initial_raw_frame\":{},\"initial_window_frame\":{},\"final_raw_frame\":{},\"final_window_size\":{{\"width\":{},\"height\":{}}},\"input_activity\":{},\"render_ready\":{},\"observed_render_ready\":{},\"first_render_ready_frame\":{},\"last_render_ready_frame\":{},\"gameplay_ready\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"any_input_controls_active\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_any_input_verified\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_visible_content\":{},\"final_frame_scene_detail\":{},\"final_frame_render_ready\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
         rendered_frames,
         gui_rendered_frames,
         manual_override_frames,
@@ -4345,6 +4366,16 @@ fn run_native_play(
         physical_full_input_guest_verified,
         test_input_enabled,
         test_input_observed,
+        observed_test_input_buttons.json(),
+        test_input_activity.json(),
+        test_any_input_observed,
+        test_direction_input_observed,
+        test_play_input_observed,
+        test_full_input_observed,
+        test_any_input_guest_verified,
+        test_play_input_guest_verified,
+        test_full_input_guest_verified,
+        native_play_test_input_verified,
         last_effective_buttons.json(),
         emulator.executed_steps(),
         autoplay_enabled,
@@ -8673,6 +8704,8 @@ struct NativePlayWindowStep {
     latched_buttons: ActionButtons,
     physical_buttons: ActionButtons,
     physical_input_activity: NativeInputActivity,
+    test_input_buttons: ActionButtons,
+    test_input_activity: NativeInputActivity,
     buttons: ActionButtons,
     manual_override: bool,
     raw_manual_override: bool,
@@ -8722,6 +8755,8 @@ fn step_native_play_window_frame_checked(
     let mut latched_buttons = ActionButtons::default();
     let mut physical_buttons = ActionButtons::default();
     let mut physical_input_activity = NativeInputActivity::default();
+    let mut test_input_buttons = ActionButtons::default();
+    let mut test_input_activity = NativeInputActivity::default();
     let mut buttons = ActionButtons::default();
     while remaining > 0
         && emulator.vblank_count() == start_vblank
@@ -8764,6 +8799,7 @@ fn step_native_play_window_frame_checked(
         raw_buttons = merge_action_buttons(raw_buttons, resolved.raw_buttons);
         latched_buttons = merge_action_buttons(latched_buttons, resolved.latched_buttons);
         physical_buttons = merge_action_buttons(physical_buttons, resolved.physical_buttons);
+        test_input_buttons = merge_action_buttons(test_input_buttons, input_sample.test_sidecar);
         raw_manual_override |= resolved.raw_manual_override;
         manual_override |= resolved.manual_override;
         test_input_override |= resolved.test_input_override;
@@ -8777,6 +8813,11 @@ fn step_native_play_window_frame_checked(
         if action_buttons_any(resolved.physical_buttons) {
             physical_input_activity = physical_input_activity.saturating_added(
                 native_input_activity_for_buttons(activity_delta, resolved.physical_buttons),
+            );
+        }
+        if action_buttons_any(input_sample.test_sidecar) {
+            test_input_activity = test_input_activity.saturating_added(
+                native_input_activity_for_buttons(activity_delta, input_sample.test_sidecar),
             );
         }
         input_trace.record(
@@ -8797,6 +8838,8 @@ fn step_native_play_window_frame_checked(
         latched_buttons,
         physical_buttons,
         physical_input_activity,
+        test_input_buttons,
+        test_input_activity,
         buttons,
         manual_override,
         raw_manual_override,
@@ -13536,6 +13579,14 @@ impl NativeGuiTestInputScript {
         Ok(Self::from_segments(&segments))
     }
 
+    fn from_segments_or_env(segments: &[NativeScriptSegment]) -> Result<Self, String> {
+        if segments.is_empty() {
+            Self::from_env()
+        } else {
+            Ok(Self::from_segments(segments))
+        }
+    }
+
     fn from_segments(segments: &[NativeScriptSegment]) -> Self {
         let mut frames = Vec::new();
         for segment in segments {
@@ -14533,7 +14584,7 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-frame-stats-png <project_png>\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-compact <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step <rom_zip_or_dir> <action_index> [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play fast-forwards the built-in warning/title/coin/start/select/match-entry assist before opening the macOS window, so the visible session starts near manual play handoff; any physical key immediately cancels any remaining assist: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, V service, Enter coin+start, P start, Esc quit. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 512x480 GUI frame without opening a window; native-frame-stats-png prints Rust classifier stats for project-generated PNGs. native-autoplay keeps the visible or custom scripted-assist path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-frame-stats-png <project_png>\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [--gui-test-input action:frames...]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-compact <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step <rom_zip_or_dir> <action_index> [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play fast-forwards the built-in warning/title/coin/start/select/match-entry assist before opening the macOS window, so the visible session starts near manual play handoff; any physical key immediately cancels any remaining assist: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, V service, Enter coin+start, P start, Esc quit. Pass --gui-test-input only for bounded GUI QA; its actions traverse the same GUI latch and guest input registers without being counted as physical input. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 512x480 GUI frame without opening a window; native-frame-stats-png prints Rust classifier stats for project-generated PNGs. native-autoplay keeps the visible or custom scripted-assist path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
     println!(
         "  native-scripted-fast-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
@@ -15145,6 +15196,40 @@ fn parse_native_autoplay_tail(
         parse_native_script_segments(segment_values)?
     };
     Ok((max_frames, segments))
+}
+
+fn parse_native_play_tail(
+    values: Vec<String>,
+) -> Result<(Option<u64>, Vec<NativeScriptSegment>), String> {
+    if values.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+
+    let mut values = values.into_iter();
+    let first = values.next().expect("non-empty values");
+    let (max_frames, option) = if first == "--gui-test-input" {
+        (None, first)
+    } else {
+        let max_frames = first
+            .parse::<u64>()
+            .map_err(|_| "max_frames must be a positive integer".to_string())?;
+        if max_frames == 0 {
+            return Err("max_frames must be greater than zero".to_string());
+        }
+        let Some(option) = values.next() else {
+            return Ok((Some(max_frames), Vec::new()));
+        };
+        (Some(max_frames), option)
+    };
+
+    if option != "--gui-test-input" {
+        return Err(format!("unknown native-play option: {option}"));
+    }
+    let segment_values = values.collect::<Vec<_>>();
+    if segment_values.is_empty() {
+        return Err("--gui-test-input requires at least one <action:frames> segment".to_string());
+    }
+    Ok((max_frames, parse_native_script_segments(segment_values)?))
 }
 
 fn parse_native_script_trace_segments(
@@ -19236,7 +19321,7 @@ mod tests {
         native_window_button_sample_with_test_sidecar, next_native_rom_source_or_default,
         next_scripted_action, parse_action_token, parse_native_autoplay_tail,
         parse_native_credit_state_probe_options, parse_native_gui_test_input_script,
-        parse_native_script_segments, parse_native_trace_options,
+        parse_native_play_tail, parse_native_script_segments, parse_native_trace_options,
         parse_native_watch_followup_trace_options, parse_native_window_scale,
         remaining_native_script_segments, remaining_native_script_segments_after_title_ready,
     };
@@ -27803,6 +27888,63 @@ mod tests {
         assert_eq!(script.current_buttons(), Action::RightPunch.buttons());
         script.advance_frame();
         assert_eq!(script.current_buttons(), ActionButtons::default());
+    }
+
+    #[test]
+    fn native_play_tail_parses_bounded_gui_test_input() {
+        let (max_frames, segments) = parse_native_play_tail(vec![
+            "120".to_string(),
+            "--gui-test-input".to_string(),
+            "left:6".to_string(),
+            "noop:2".to_string(),
+            "punch:6".to_string(),
+        ])
+        .expect("native-play GUI QA tail parses");
+
+        assert_eq!(max_frames, Some(120));
+        assert_eq!(
+            segments,
+            vec![
+                NativeScriptSegment {
+                    action: Action::Left,
+                    frames: 6,
+                },
+                NativeScriptSegment {
+                    action: Action::Noop,
+                    frames: 2,
+                },
+                NativeScriptSegment {
+                    action: Action::Punch,
+                    frames: 6,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_play_tail_allows_gui_test_input_without_frame_limit() {
+        let (max_frames, segments) = parse_native_play_tail(vec![
+            "--gui-test-input".to_string(),
+            "right+punch:4".to_string(),
+        ])
+        .expect("native-play GUI QA tail parses without a frame limit");
+
+        assert_eq!(max_frames, None);
+        assert_eq!(
+            segments,
+            vec![NativeScriptSegment {
+                action: Action::RightPunch,
+                frames: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn native_play_tail_rejects_empty_gui_test_input() {
+        assert_eq!(
+            parse_native_play_tail(vec!["--gui-test-input".to_string()]),
+            Err("--gui-test-input requires at least one <action:frames> segment".to_string())
+        );
     }
 
     #[test]

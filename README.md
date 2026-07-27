@@ -146,11 +146,17 @@ cargo run -- native-autoplay 120000 fit 1000
 cargo run -- native-manual 120000 2 700
 cargo run -- native-window-snapshot 40505333 tmp/native-validation/manual-window.png
 cargo run -- native-play-snapshot assets/BloodRoar2-combined.zip 120000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
+cargo run --release -- native-play assets/roms 120000 1 150 \
+  --gui-test-input coin:6 start:6 up:6 down:6 left:6 right:6 \
+  punch:6 kick:6 beast:6 guard:6 noop:25
 ```
 
 In `native-play assets/BloodRoar2-combined.zip 120000 1`, the final `1` is the
 window scale, not a frame limit. Use a fourth argument for bounded smoke runs,
 for example `native-play assets/BloodRoar2-combined.zip 120000 1 600`.
+`--gui-test-input` is an opt-in QA path that traverses the same GUI input latch
+and guest registers while keeping its result separate from physical-keyboard
+verification. The final JSON reports `native_play_test_input_verified`.
 
 `native-play-snapshot` exits non-zero unless the final rendered window frame
 meets the stricter gameplay-scene criteria. Warning screens, black letterboxed
