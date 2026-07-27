@@ -42,6 +42,10 @@ impl<B: Backend> BloodyRoar2Env<B> {
         Ok(observation)
     }
 
+    pub fn set_observation_screenshot(&mut self, enabled: bool) {
+        self.backend.set_observation_screenshot(enabled);
+    }
+
     pub fn step(&mut self, action: Action, frames: u32) -> Result<StepResult, BackendError> {
         let previous = match self.last_observation.clone() {
             Some(observation) => observation,

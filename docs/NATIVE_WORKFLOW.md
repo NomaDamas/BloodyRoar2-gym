@@ -161,8 +161,8 @@ Exercise one native backend environment step from the CLI:
 cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
 ```
 
-Run a deterministic input script and write the same 512x480 GUI frame that
-`native-play` presents:
+Run a deterministic input script and write a normalized 512x480 diagnostic
+frame:
 
 ```sh
 cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
@@ -177,10 +177,13 @@ The JSON includes both `raw_frame` and `window_frame` statistics. Use
 path; use `native-scripted-dump` when raw display, observation, and VRAM images
 are all needed for GPU debugging.
 
+For the exact 640x480 aspect-corrected buffer presented by `native-play`, use
+`native-play-snapshot`.
+
 Serve the native backend over the Gym-style HTTP API:
 
 ```sh
-cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
+cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 500000
 ```
 
 Probe the API from another shell:
@@ -190,7 +193,13 @@ curl -sS http://127.0.0.1:8765/action_space
 curl -sS http://127.0.0.1:8765/observation_space
 curl -sS -X POST http://127.0.0.1:8765/reset
 curl -sS -X POST http://127.0.0.1:8765/step -d '{"action":5,"frames":1}'
+curl -sS -X POST http://127.0.0.1:8765/step \
+  -d '{"action":5,"frames":1,"screenshot":true}'
 ```
+
+`screenshot` defaults to `false` for compact RL/LLM responses. Native steps
+advance the requested number of emulated vblanks and report an error rather
+than silently returning a partial frame count.
 
 The Python standard-library client can target the same server:
 

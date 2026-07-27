@@ -27,14 +27,19 @@ const NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES: u64 = 9_000;
 const NATIVE_PLAY_SCRIPT_INSTRUCTIONS_PER_FRAME: u64 = 500_000;
 const NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME: u64 = 240_000;
 const NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE: u64 = 5_000;
+const NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES: u64 = 1;
 const NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE_ENV: &str = "BR2_NATIVE_GUI_POLL_INSTRUCTION_SLICE";
 const NATIVE_PLAY_GUI_CAPTURE_DIR_ENV: &str = "BR2_NATIVE_GUI_CAPTURE_DIR";
 const NATIVE_PLAY_GUI_CAPTURE_INTERVAL_ENV: &str = "BR2_NATIVE_GUI_CAPTURE_INTERVAL";
 const NATIVE_PLAY_GUI_INPUT_TRACE_ENV: &str = "BR2_NATIVE_TRACE_GUI_INPUT";
 const NATIVE_PLAY_GUI_INPUT_TRACE_COMPAT_ENV: &str = "BR2_NATIVE_PLAY_GUI_INPUT_TRACE";
 const NATIVE_PLAY_GUI_TEST_INPUT_SCRIPT_ENV: &str = "BR2_NATIVE_GUI_TEST_INPUT_SCRIPT";
+const NATIVE_PLAY_GUI_DISPLAY_REFRESH_FRAMES_ENV: &str = "BR2_NATIVE_GUI_DISPLAY_REFRESH_FRAMES";
+const NATIVE_PLAY_GUI_OTC_RECOVERY_INTERVAL_ENV: &str = "BR2_NATIVE_GUI_OTC_RECOVERY_INTERVAL";
 const NATIVE_PLAY_GUI_CAPTURE_INTERVAL_FRAMES: u64 = 30;
 const NATIVE_PLAY_GUI_DISPLAY_REFRESH_FRAMES: u64 = 1;
+const NATIVE_PLAY_GUI_OTC_RECOVERY_INTERVAL: u64 = 4;
+const NATIVE_PLAY_GUI_PRESENTED_CAPTURE_HEARTBEAT_FRAMES: u64 = 60;
 const NATIVE_PLAY_GUI_PLAYABILITY_REFRESH_FRAMES: u64 = 15;
 const NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES: u64 = 30;
 const NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_INTERVAL: u64 = 5;
@@ -45,7 +50,9 @@ const NATIVE_SCRIPT_VBLANK_POLL_INSTRUCTION_SLICE: u64 = 5_000;
 const NATIVE_WARNING_SKIP_INITIAL_FRAMES: u64 = 30;
 const NATIVE_WARNING_SKIP_PULSE_FRAMES: u64 = 12;
 const NATIVE_WARNING_SKIP_GAP_FRAMES: u64 = 24;
+#[cfg(test)]
 const NATIVE_WARNING_SKIP_RETRY_CYCLES: usize = 0;
+#[cfg(test)]
 const NATIVE_WARNING_SKIP_RETRY_GAP_FRAMES: u64 = 18;
 const NATIVE_PLAY_TITLE_ENTRY_FRAMES: u64 = 528;
 const NATIVE_PLAY_TITLE_READY_EXTRA_WAIT_FRAMES: u64 = 900;
@@ -53,6 +60,7 @@ const NATIVE_TITLE_RUNTIME_MIN_P1_POLLS: u64 = 1_150;
 const NATIVE_PLAY_HANDOFF_SETTLE_FRAMES: u64 = 120;
 const NATIVE_PLAY_HANDOFF_CHECK_STRIDE_FRAMES: u64 = 6;
 const NATIVE_PLAY_HANDOFF_RENDER_CHECK_STRIDE_FRAMES: u64 = 60;
+const NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES: u64 = 240;
 const NATIVE_PLAY_PRE_WINDOW_BOOT_WAIT_WALL_TIMEOUT_SECS: u64 = 60;
 const NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS_ENV: &str =
     "BR2_NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS";
@@ -217,7 +225,7 @@ fn run() -> Result<(), String> {
             let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .unwrap_or_else(|| "10000".to_string())
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
             bloodyroar2_gym::server::serve_native(&address, rom, instructions_per_frame)
@@ -523,6 +531,7 @@ fn run() -> Result<(), String> {
             let mut draw_capture_range = None;
             let mut draw_capture_predicates = Vec::new();
             let mut draw_capture_predicates_from_boot = false;
+            let mut draw_capture_predicates_after_tail = false;
             let mut memory_dump = None;
             let mut tail_values = Vec::new();
             let mut tail_args = args.peekable();
@@ -580,6 +589,9 @@ fn run() -> Result<(), String> {
                     "--draw-capture-predicate-from-boot" => {
                         draw_capture_predicates_from_boot = true;
                     }
+                    "--draw-capture-predicate-after-tail" => {
+                        draw_capture_predicates_after_tail = true;
+                    }
                     "--memory-dump" => {
                         let raw_address = tail_args.next().ok_or_else(|| {
                             "--memory-dump requires <address> <bytes> <output.bin>".to_string()
@@ -622,6 +634,7 @@ fn run() -> Result<(), String> {
                 draw_capture_range,
                 draw_capture_predicates,
                 draw_capture_predicates_from_boot,
+                draw_capture_predicates_after_tail,
                 memory_dump,
             )
         }
@@ -3565,6 +3578,7 @@ fn run() -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_native_play(
     rom: PathBuf,
     instructions_per_frame: u64,
@@ -3725,14 +3739,15 @@ fn run_native_play(
         }
     }
     let gui_title_gate_enabled = autoplay_enabled && !fast_forward_script && pre_window_boot_wait;
+    let initial_fast_window_frame =
+        native_play_present_native_resolution_actual_frame(&emulator.fast_gameplay_display_frame());
     let mut gui_title_ready_for_tail = !gui_title_gate_enabled
-        || native_play_emulator_title_screen_input_ready(&emulator)
-        || native_title_runtime_input_ready(
-            emulator.input_activity(),
-            &native_play_unsanitized_window_frame_for_emulator(&emulator),
-        )
-        || native_play_emulator_handoff_ready(&emulator);
+        || native_play_emulator_title_screen_input_ready_fast(&emulator)
+        || native_title_runtime_input_ready(emulator.input_activity(), &initial_fast_window_frame)
+        || native_play_lightweight_emulator_handoff_ready(&emulator);
     let gui_instructions_per_frame = native_play_gui_instructions_per_frame(instructions_per_frame);
+    let gui_display_refresh_frames = native_play_gui_display_refresh_frames();
+    emulator.set_native_otc_dma_recovery_interval(native_play_gui_otc_recovery_interval());
     emulator.set_vblank_presentation_capture_interval(Some(NATIVE_SCRIPT_VBLANK_CAPTURE_INTERVAL));
     emulator.set_unlinked_primitive_replay_enabled(false);
     emulator.set_unlinked_primitive_replay_interval(None);
@@ -3792,6 +3807,11 @@ fn run_native_play(
         &initial_current,
     );
     let mut current_visible_window_frame = initial_frame.clone();
+    let mut current_visible_stats = NativeFrameStats::from_frame(&initial_frame);
+    let mut current_presented_frame = native_play_aspect_corrected_gui_frame(&initial_frame);
+    let mut last_gui_presented_at = Instant::now();
+    let mut last_gui_presented_frame = rendered_frames;
+    let mut pending_display_refresh = false;
     let mut last_safe_window_frame = initial_seed_safe
         .or_else(|| native_play_presentable_frame(&initial_frame).then_some(initial_frame.clone()));
     let title = if autoplay_enabled && fast_forward_script {
@@ -3806,8 +3826,8 @@ fn run_native_play(
     native_play_prepare_foreground_application();
     let mut window = Window::new(
         title,
-        initial_frame.width,
-        initial_frame.height,
+        current_presented_frame.width,
+        current_presented_frame.height,
         WindowOptions {
             resize: true,
             scale,
@@ -3845,9 +3865,9 @@ fn run_native_play(
     }
     window
         .update_with_buffer(
-            &initial_frame.pixels,
-            initial_frame.width,
-            initial_frame.height,
+            &current_presented_frame.pixels,
+            current_presented_frame.width,
+            current_presented_frame.height,
         )
         .map_err(|error| format!("failed to update native play window: {error:?}"))?;
     // AppKit cannot reliably promote the native window until minifb has
@@ -3860,7 +3880,7 @@ fn run_native_play(
             capture_dir,
             "initial",
             gui_rendered_frames,
-            &initial_frame,
+            &current_presented_frame,
             ActionButtons::default(),
             &emulator,
         )?;
@@ -3917,16 +3937,17 @@ fn run_native_play(
         if step.window_closed_or_escape {
             break;
         }
-        if step.vblank_advanced {
-            emulator.capture_vblank_presented_frame();
-            if script_tail_waiting_for_title {
-                gui_title_ready_for_tail = native_play_emulator_title_screen_input_ready(&emulator)
+        if step.vblank_advanced && script_tail_waiting_for_title {
+            let fast_window_frame = native_play_present_native_resolution_actual_frame(
+                &emulator.fast_gameplay_display_frame(),
+            );
+            gui_title_ready_for_tail =
+                native_play_emulator_title_screen_input_ready_fast(&emulator)
                     || native_title_runtime_input_ready(
                         emulator.input_activity(),
-                        &native_play_unsanitized_window_frame_for_emulator(&emulator),
+                        &fast_window_frame,
                     )
-                    || native_play_emulator_handoff_ready(&emulator);
-            }
+                    || native_play_lightweight_emulator_handoff_ready(&emulator);
         }
         let manual_takeover = native_play_manual_takeover(
             step.manual_override,
@@ -3974,6 +3995,7 @@ fn run_native_play(
             }
         }
         let buttons_changed = effective_step_buttons != last_effective_buttons;
+        pending_display_refresh |= buttons_changed;
         if scripted_segment_action.is_some()
             && !cancel_for_manual_takeover
             && !script_tail_waiting_for_title
@@ -3991,20 +4013,28 @@ fn run_native_play(
                 script_segment_frame = 0;
             }
         }
-        let refresh_gui_playability = gui_rendered_frames == 0
-            || buttons_changed
-            || gui_rendered_frames % NATIVE_PLAY_GUI_PLAYABILITY_REFRESH_FRAMES == 0;
-        if refresh_gui_playability {
-            gui_native_playable_candidate = emulator.native_playable_candidate();
-            gui_gpu_native_playable_candidate = emulator.gpu_native_playable_candidate();
-            gui_gpu_rendered_scene_candidate = emulator.gpu_native_rendered_scene_candidate();
+        let refresh_gui_playability = step.vblank_advanced
+            && (gui_rendered_frames == 0
+                || buttons_changed
+                || gui_rendered_frames.is_multiple_of(NATIVE_PLAY_GUI_PLAYABILITY_REFRESH_FRAMES));
+        if refresh_gui_playability && !gui_native_playable_candidate {
             gui_native_3d_gameplay_signal = emulator.native_3d_gameplay_signal();
-            gui_gpu_gameplay_context = native_play_cached_gpu_gameplay_context(
-                gui_native_playable_candidate,
-                gui_gpu_native_playable_candidate,
-                gui_gpu_rendered_scene_candidate,
-                gui_native_3d_gameplay_signal,
-            );
+            if gui_native_3d_gameplay_signal {
+                gui_gpu_native_playable_candidate = emulator.gpu_native_playable_candidate();
+                gui_gpu_rendered_scene_candidate = emulator.gpu_native_rendered_scene_candidate();
+                gui_native_playable_candidate = emulator
+                    .native_playable_candidate_with_render_context(
+                        gui_gpu_native_playable_candidate,
+                        gui_gpu_rendered_scene_candidate,
+                        gui_native_3d_gameplay_signal,
+                    );
+                gui_gpu_gameplay_context = native_play_cached_gpu_gameplay_context(
+                    gui_native_playable_candidate,
+                    gui_gpu_native_playable_candidate,
+                    gui_gpu_rendered_scene_candidate,
+                    gui_native_3d_gameplay_signal,
+                );
+            }
             window.set_title(&native_play_runtime_title(
                 autoplay_enabled,
                 scripted_action.is_some() && !cancel_for_manual_takeover,
@@ -4018,64 +4048,80 @@ fn run_native_play(
             ));
         }
         last_effective_buttons = effective_step_buttons;
-        let current_visible_stats = NativeFrameStats::from_frame(&current_visible_window_frame);
-        let refresh_display = gui_rendered_frames == 0
-            || !current_visible_stats.has_visible_content()
-            || buttons_changed
-            || gui_rendered_frames % NATIVE_PLAY_GUI_DISPLAY_REFRESH_FRAMES == 0;
+        let refresh_display = native_play_gui_should_refresh_display(
+            step.vblank_advanced,
+            gui_rendered_frames,
+            current_visible_stats.has_visible_content(),
+            pending_display_refresh,
+            gui_display_refresh_frames,
+        );
+        if native_play_gui_should_capture_presented_frame(
+            step.vblank_advanced,
+            gui_rendered_frames,
+            current_visible_stats.has_visible_content(),
+            buttons_changed,
+            script_tail_waiting_for_title,
+        ) {
+            emulator.capture_vblank_presented_frame();
+        }
         if refresh_display {
-            let display_frames = native_play_gui_display_frames_with_context(
-                &emulator,
-                gui_native_playable_candidate,
-                gui_gpu_gameplay_context,
-            );
-            let candidate_frame = native_play_window_frame_with_context(
-                &display_frames.selected,
-                gui_native_playable_candidate,
-                gui_gpu_gameplay_context,
-            );
-            let candidate_stats = NativeFrameStats::from_frame(&candidate_frame);
-            let actual_frame =
-                native_play_present_native_resolution_actual_frame(&display_frames.actual);
-            let actual_stats = NativeFrameStats::from_frame(&actual_frame);
             let gui_actual_supports_playable = gui_native_playable_candidate
                 && (gui_gpu_native_playable_candidate
                     || gui_gpu_rendered_scene_candidate
                     || gui_native_3d_gameplay_signal);
-            if native_play_native_resolution_actual_should_replace_window_candidate(
+            let fast_actual_frame = native_play_present_native_resolution_actual_frame(
+                &emulator.fast_gameplay_display_frame(),
+            );
+            let fast_actual_stats = NativeFrameStats::from_frame(&fast_actual_frame);
+            let fast_actual_accepted = native_play_fast_gui_frame_stats_are_safe(
                 gui_native_playable_candidate,
                 gui_gpu_gameplay_context,
-                gui_actual_supports_playable,
-                actual_stats,
-                candidate_stats,
-            ) {
-                current_visible_window_frame = actual_frame;
-            } else {
-                let fast_actual_frame =
-                    gui_native_playable_candidate && gui_gpu_native_playable_candidate;
-                if fast_actual_frame {
-                    if native_play_gpu_verified_window_stats_with_context(
+                fast_actual_stats,
+            ) || (gui_native_playable_candidate
+                && gui_gpu_native_playable_candidate
+                && native_play_gpu_verified_window_stats_with_context(
+                    gui_native_playable_candidate,
+                    gui_gpu_gameplay_context,
+                    fast_actual_stats,
+                )
+                && !native_play_frame_has_blocking_render_artifact(fast_actual_stats));
+            if fast_actual_accepted {
+                current_visible_window_frame = fast_actual_frame;
+                current_visible_stats = fast_actual_stats;
+            }
+            if !fast_actual_accepted {
+                let display_frames = native_play_gui_display_frames_with_context(
+                    &emulator,
+                    gui_native_playable_candidate,
+                    gui_gpu_gameplay_context,
+                );
+                let candidate_frame = native_play_window_frame_with_context(
+                    &display_frames.selected,
+                    gui_native_playable_candidate,
+                    gui_gpu_gameplay_context,
+                );
+                let candidate_stats = NativeFrameStats::from_frame(&candidate_frame);
+                let actual_frame =
+                    native_play_present_native_resolution_actual_frame(&display_frames.actual);
+                let actual_stats = NativeFrameStats::from_frame(&actual_frame);
+                let actual_should_replace =
+                    native_play_native_resolution_actual_should_replace_window_candidate(
                         gui_native_playable_candidate,
                         gui_gpu_gameplay_context,
+                        gui_actual_supports_playable,
                         actual_stats,
-                    ) && !native_play_frame_has_blocking_render_artifact(actual_stats)
-                    {
-                        current_visible_window_frame = actual_frame;
-                    } else {
-                        current_visible_window_frame =
-                            native_play_select_visible_window_frame_for_gui(
-                                candidate_frame,
-                                candidate_stats,
-                                actual_frame,
-                                actual_stats,
-                                gui_native_playable_candidate,
-                                gui_gpu_gameplay_context,
-                                gui_native_3d_gameplay_signal,
-                                gui_actual_supports_playable,
-                                &last_safe_window_frame,
-                                &current_visible_window_frame,
-                            );
-                    }
+                        candidate_stats,
+                    ) || (gui_native_playable_candidate
+                        && gui_gpu_native_playable_candidate
+                        && native_play_gpu_verified_window_stats_with_context(
+                            gui_native_playable_candidate,
+                            gui_gpu_gameplay_context,
+                            actual_stats,
+                        )
+                        && !native_play_frame_has_blocking_render_artifact(actual_stats));
+                if actual_should_replace {
+                    current_visible_window_frame = actual_frame;
+                    current_visible_stats = actual_stats;
                 } else {
                     current_visible_window_frame = native_play_select_visible_window_frame_for_gui(
                         candidate_frame,
@@ -4089,17 +4135,18 @@ fn run_native_play(
                         &last_safe_window_frame,
                         &current_visible_window_frame,
                     );
+                    current_visible_stats =
+                        NativeFrameStats::from_frame(&current_visible_window_frame);
                 }
             }
         }
-        let frame = current_visible_window_frame.clone();
-        let frame_render_ready = native_play_render_ready_frame(&frame);
-        let frame_stats = NativeFrameStats::from_frame(&frame);
+        let frame_render_ready = native_play_render_ready_frame_stats(current_visible_stats);
+        let frame_stats = current_visible_stats;
         let gui_actual_supports_playable = gui_native_playable_candidate
             && (gui_gpu_native_playable_candidate
                 || gui_gpu_rendered_scene_candidate
                 || gui_native_3d_gameplay_signal);
-        let frame_presentable = native_play_presentable_frame(&frame)
+        let frame_presentable = native_play_presentable_frame_stats(frame_stats)
             || native_play_safe_render_ready_fallback_frame_stats(frame_stats)
             || native_play_native_resolution_stage_frame_stats_with_context(
                 gui_native_playable_candidate,
@@ -4107,14 +4154,43 @@ fn run_native_play(
                 gui_actual_supports_playable,
                 frame_stats,
             );
-        window.set_target_fps(NATIVE_PLAY_WINDOW_TARGET_FPS);
-        window
-            .update_with_buffer(&frame.pixels, frame.width, frame.height)
-            .map_err(|error| format!("failed to update native play window: {error:?}"))?;
-        window.set_target_fps(0);
-        rendered_frames += 1;
-        gui_rendered_frames += 1;
+        if refresh_display {
+            native_play_update_aspect_corrected_gui_frame(
+                &current_visible_window_frame,
+                &mut current_presented_frame,
+            );
+            let present_elapsed_frames = native_play_gui_present_elapsed_frames(
+                last_gui_presented_frame,
+                gui_rendered_frames,
+                step.vblank_advanced,
+            );
+            let pacing_delay = native_play_gui_pacing_delay(
+                last_gui_presented_at,
+                Instant::now(),
+                native_play_gui_present_interval(present_elapsed_frames),
+                pending_display_refresh,
+            );
+            if !pacing_delay.is_zero() {
+                std::thread::sleep(pacing_delay);
+            }
+            window
+                .update_with_buffer(
+                    &current_presented_frame.pixels,
+                    current_presented_frame.width,
+                    current_presented_frame.height,
+                )
+                .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+            last_gui_presented_at = Instant::now();
+            last_gui_presented_frame =
+                native_play_gui_present_frame(gui_rendered_frames, step.vblank_advanced);
+            pending_display_refresh = false;
+        }
+        if step.vblank_advanced {
+            rendered_frames += 1;
+            gui_rendered_frames += 1;
+        }
         if let Some(capture_dir) = gui_capture_dir.as_deref()
+            && refresh_display
             && (buttons_changed
                 || gui_rendered_frames == 1
                 || gui_rendered_frames.is_multiple_of(gui_capture_interval))
@@ -4123,22 +4199,26 @@ fn run_native_play(
                 capture_dir,
                 "presented",
                 gui_rendered_frames,
-                &frame,
+                &current_presented_frame,
                 effective_step_buttons,
                 &emulator,
             )?;
         }
-        if frame_presentable {
-            last_safe_window_frame = Some(frame.clone());
+        if refresh_display && frame_presentable {
+            last_safe_window_frame = Some(current_visible_window_frame.clone());
         }
-        test_input_script.advance_frame();
+        if step.vblank_advanced {
+            test_input_script.advance_frame();
+        }
         if frame_render_ready {
             observed_render_ready = true;
             first_render_ready_frame.get_or_insert(rendered_frames);
             last_render_ready_frame = Some(rendered_frames);
         }
-        let handoff_frame_ready =
-            native_play_frame_ready_with_context(gui_native_playable_candidate, &frame);
+        let handoff_frame_ready = native_play_frame_ready_stats_with_context(
+            gui_native_playable_candidate,
+            current_visible_stats,
+        );
         if gui_native_playable_candidate && handoff_frame_ready {
             observed_native_playable_candidate = true;
             first_native_playable_frame.get_or_insert(rendered_frames);
@@ -4147,8 +4227,8 @@ fn run_native_play(
     }
 
     let final_native_playable_candidate = emulator.native_playable_candidate();
-    let final_raw_frame = current_visible_window_frame.clone();
-    let final_frame = current_visible_window_frame;
+    let final_raw_frame = current_visible_window_frame;
+    let final_frame = current_presented_frame;
     if let Some(capture_dir) = gui_capture_dir.as_deref() {
         write_native_play_gui_capture(
             capture_dir,
@@ -4506,7 +4586,7 @@ fn write_native_play_gui_capture(
     write_output_file(
         &json_path,
         format!(
-            "{{\"label\":\"{}\",\"gui_frame\":{},\"checksum\":{},\"buttons\":{},\"native_playable_candidate\":{},\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"frame\":{},\"stable_frame\":{},\"actual_frame\":{},\"raw_actual_frame\":{},\"observation_frame\":{},\"input_activity\":{},\"native_sync\":{}}}",
+            "{{\"label\":\"{}\",\"gui_frame\":{},\"checksum\":{},\"buttons\":{},\"native_playable_candidate\":{},\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"frame\":{},\"stable_frame\":{},\"actual_frame\":{},\"raw_actual_frame\":{},\"observation_frame\":{},\"input_activity\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{}}}",
             escape_json(label),
             gui_frame,
             native_frame_checksum(frame),
@@ -4520,6 +4600,7 @@ fn write_native_play_gui_capture(
             NativeFrameStats::from_frame(&raw_actual_frame).json(),
             NativeFrameStats::from_frame(&observation_frame).json(),
             emulator.input_activity_json(),
+            emulator.recovery_raster_cache_stats_json(),
             emulator.native_sync_compact_json()
         ),
     )
@@ -4534,6 +4615,12 @@ fn run_native_play_match_entry_fast_forward_progress(
     let started_at = Instant::now();
     let wall_timeout = native_play_fast_forward_wall_timeout(script_frame_budget);
     let boot_wait_segments = native_play_boot_wait_segments(segments);
+    // The boot/title wait is never presented. Keep CPU and input polling live,
+    // but defer expensive recovered software raster work until render settle.
+    emulator.set_native_otc_dma_recovery_suppressed(true);
+    emulator.set_vblank_presentation_capture_interval(None);
+    emulator.set_unlinked_primitive_replay_enabled(false);
+    emulator.set_unlinked_primitive_replay_interval(None);
     let boot_progress =
         if let Some(boot_wall_timeout) = native_remaining_wall_timeout(started_at, wall_timeout) {
             run_native_title_ready_boot_wait_with_timeout(
@@ -4546,12 +4633,6 @@ fn run_native_play_match_entry_fast_forward_progress(
         } else {
             NativeScriptProgress::skipped("skipped_native_play_boot_timeout")
         };
-
-    // Recovery replay is useful for reconstructing the sparse title screen, but
-    // replaying detached primitive streams after title handoff can overwrite
-    // live character/stage geometry with stale packet contents.
-    emulator.set_unlinked_primitive_replay_enabled(false);
-    emulator.set_unlinked_primitive_replay_interval(None);
 
     let tail_segments = remaining_native_script_segments_after_title_ready(
         segments,
@@ -4579,7 +4660,11 @@ fn run_native_play_match_entry_fast_forward_progress(
             emulator,
             instructions_per_frame,
             &tail_segments,
-            NativeScriptStopMode::PlayableCandidate,
+            // The lightweight playable signal also occurs during BR2's attract
+            // fight. Run the bounded entry tail to completion so the GUI opens
+            // after the injected credit/start/selection sequence, not on the
+            // first demo frame that happens to contain 3D geometry.
+            NativeScriptStopMode::None,
             Some(native_script_max_frames_for_segments(&tail_segments)),
             Some(tail_wall_timeout),
             false,
@@ -4592,10 +4677,12 @@ fn run_native_play_match_entry_fast_forward_progress(
         tail_progress.summary.stop_reason,
         "wall_timeout" | "skipped_native_play_boot_timeout" | "skipped_native_play_tail_timeout"
     ) {
+        emulator.set_native_otc_dma_recovery_suppressed(false);
         NativeScriptProgress::skipped("skipped_native_play_render_timeout")
     } else if let Some(render_wall_timeout) =
         native_remaining_wall_timeout(started_at, wall_timeout)
     {
+        emulator.set_native_otc_dma_recovery_suppressed(false);
         run_native_script_observed_with_stop_and_timeout_policy(
             emulator,
             instructions_per_frame,
@@ -4609,6 +4696,7 @@ fn run_native_play_match_entry_fast_forward_progress(
             false,
         )
     } else {
+        emulator.set_native_otc_dma_recovery_suppressed(false);
         NativeScriptProgress::skipped("skipped_native_play_render_timeout")
     };
 
@@ -4762,6 +4850,11 @@ fn native_title_runtime_poll_ready(activity: NativeInputActivity) -> bool {
         && activity.native_credit_adapter_writes > 0
 }
 
+fn native_title_render_probe_ready(activity: NativeInputActivity) -> bool {
+    activity.p1_input_reads >= NATIVE_TITLE_RUNTIME_MIN_P1_POLLS / 2
+        && activity.system_input_reads >= NATIVE_TITLE_RUNTIME_MIN_P1_POLLS
+}
+
 fn run_native_match_tail_timeline(
     rom: PathBuf,
     instructions_per_frame: u64,
@@ -4853,17 +4946,17 @@ fn run_native_match_tail_timeline(
         total_frames = total_frames.saturating_add(segment_progress.summary.total_frames);
         missed_vblank_frames =
             missed_vblank_frames.saturating_add(segment_progress.summary.missed_vblank_frames);
-        if emulator.is_terminal() || segment_progress.summary.missed_vblank_frames > 0 {
-            if let Some(checkpoint) = terminal_trace_checkpoint {
-                eprintln!(
-                    "BR2 match-tail stall trace: {}",
-                    native_match_tail_first_stall_trace_json(
-                        checkpoint,
-                        fast_forward_instructions_per_frame,
-                        *segment,
-                    )
-                );
-            }
+        if (emulator.is_terminal() || segment_progress.summary.missed_vblank_frames > 0)
+            && let Some(checkpoint) = terminal_trace_checkpoint
+        {
+            eprintln!(
+                "BR2 match-tail stall trace: {}",
+                native_match_tail_first_stall_trace_json(
+                    checkpoint,
+                    fast_forward_instructions_per_frame,
+                    *segment,
+                )
+            );
         }
 
         let snapshot_prefix = suffixed_path(
@@ -5107,9 +5200,14 @@ fn run_native_play_snapshot(
     draw_capture_range: Option<(u64, u64)>,
     draw_capture_predicates: Vec<NativeGpuDrawCapturePredicate>,
     draw_capture_predicates_from_boot: bool,
+    draw_capture_predicates_after_tail: bool,
     memory_dump: Option<(u32, usize, PathBuf)>,
 ) -> Result<(), String> {
     let mut emulator = native_emulator_from_rom_source(rom)?;
+    // Match the interactive GUI's recovery cadence. Rebuilding the recovered
+    // OTC scene every vblank makes headless visual QA substantially slower
+    // than the windowed runtime and does not improve the presented frame.
+    emulator.set_native_otc_dma_recovery_interval(native_play_gui_otc_recovery_interval());
     emulator
         .rom_compatibility()
         .validate_native_runtime()
@@ -5213,7 +5311,10 @@ fn run_native_play_snapshot(
     );
     let handoff_playable =
         boot_summary.observed_native_playable_candidate && handoff_render_verified;
-    if !draw_capture_predicates_from_boot && !draw_capture_predicates.is_empty() {
+    if !draw_capture_predicates_from_boot
+        && !draw_capture_predicates_after_tail
+        && !draw_capture_predicates.is_empty()
+    {
         emulator.set_draw_capture_predicates(draw_capture_predicates.clone());
     }
 
@@ -5265,6 +5366,9 @@ fn run_native_play_snapshot(
         )
         .json()
     };
+    if draw_capture_predicates_after_tail && !draw_capture_predicates.is_empty() {
+        emulator.set_draw_capture_predicates(draw_capture_predicates.clone());
+    }
     let render_settle_run_json = if final_stage_required {
         if let Some(render_wall_timeout) =
             native_remaining_wall_timeout(snapshot_started_at, snapshot_wall_timeout)
@@ -5356,7 +5460,7 @@ fn run_native_play_snapshot(
             snapshot_safe_stats,
             snapshot_current_stats,
         );
-    let final_window_frame = if final_window_candidate_display_diagnostic {
+    let selected_window_frame = if final_window_candidate_display_diagnostic {
         final_window_candidate.clone()
     } else {
         native_play_select_visible_window_frame(
@@ -5367,19 +5471,21 @@ fn run_native_play_snapshot(
             &snapshot_current_window_frame,
         )
     };
-    let window_output = suffixed_path(output_prefix, "window.png");
-    write_native_display_frame_png(&final_window_frame, &window_output)?;
-    let final_frame_stats = NativeFrameStats::from_frame(&final_window_frame);
+    let selected_window_stats = NativeFrameStats::from_frame(&selected_window_frame);
     let final_window_selection_json = native_play_snapshot_final_window_selection_json(
         &final_window_candidate,
         final_window_candidate_stats,
         final_window_candidate_cached_safe,
         final_window_candidate_display_diagnostic,
-        &final_window_frame,
-        final_frame_stats,
+        &selected_window_frame,
+        selected_window_stats,
         &snapshot_safe_window_frame,
         &snapshot_current_window_frame,
     );
+    let final_window_frame = native_play_aspect_corrected_gui_frame(&selected_window_frame);
+    let window_output = suffixed_path(output_prefix, "window.png");
+    write_native_display_frame_png(&final_window_frame, &window_output)?;
+    let final_frame_stats = NativeFrameStats::from_frame(&final_window_frame);
     let final_native_playable_candidate = native_play_snapshot_final_playability_candidate(
         require_gameplay_scene,
         final_snapshot_gameplay_context.native_playable_candidate,
@@ -5515,7 +5621,7 @@ fn run_native_play_snapshot(
         write_output_file(state_output, final_state_json.as_bytes())?;
     }
     let summary_json = format!(
-        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_credit_hle\":{},\"br2_runtime_progress\":{},\"credit_debug_words\":[{}],\"boot\":{{\"run\":{},\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"native_sync\":{},\"display_diagnosis\":{},\"executed_steps\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_credit_hle\":{},\"br2_runtime_progress\":{},\"credit_debug_words\":[{}],\"boot\":{{\"run\":{},\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"display_diagnosis\":{},\"executed_steps\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         escape_json(&summary_output.display().to_string()),
         state_output_json,
@@ -5573,6 +5679,7 @@ fn run_native_play_snapshot(
         final_playable,
         input_activity.json(),
         security_state_json,
+        emulator.recovery_raster_cache_stats_json(),
         native_sync_json,
         emulator.display_diagnosis_json(),
         emulator.executed_steps()
@@ -5580,7 +5687,7 @@ fn run_native_play_snapshot(
     write_output_file(&summary_output, summary_json.as_bytes())?;
 
     println!(
-        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_runtime_progress\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"native_sync\":{},\"executed_steps\":{},\"state\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_runtime_progress\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"executed_steps\":{},\"state\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         escape_json(&summary_output.display().to_string()),
         state_output_json,
@@ -5641,6 +5748,7 @@ fn run_native_play_snapshot(
         final_playable,
         input_activity.json(),
         security_state_json,
+        emulator.recovery_raster_cache_stats_json(),
         native_sync_json,
         emulator.executed_steps(),
         final_state_json
@@ -5678,20 +5786,23 @@ fn native_play_snapshot_lightweight_selected_window_frame(
     last_safe: &Option<NativeDisplayFrame>,
     current: &NativeDisplayFrame,
 ) -> NativeDisplayFrame {
+    // Gameplay keeps a native-resolution field-composed frame cached in the
+    // GPU. Prefer it before the general display resolver, whose artifact
+    // checks may scan the same 512x480 image many times.
+    let fast_actual =
+        native_play_present_native_resolution_actual_frame(&emulator.fast_gameplay_display_frame());
+    let fast_actual_stats = NativeFrameStats::from_frame(&fast_actual);
+    if native_play_snapshot_native_actual_frame_is_safe(fast_actual_stats)
+        || native_play_snapshot_cached_frame_is_safe(fast_actual_stats)
+    {
+        return fast_actual;
+    }
+
     let raw_actual = emulator.raw_actual_display_frame();
     let actual = emulator.actual_display_frame();
-    let observation =
-        native_play_present_native_resolution_actual_frame(&emulator.observation_frame());
-    let observation_stats = NativeFrameStats::from_frame(&observation);
     let actual_candidate =
         native_play_sanitize_window_frame(native_play_window_frame_without_deinterlace(&actual));
     let actual_candidate_stats = NativeFrameStats::from_frame(&actual_candidate);
-    if native_play_character_select_observation_should_replace_incomplete_window(
-        observation_stats,
-        actual_candidate_stats,
-    ) {
-        return observation;
-    }
 
     let actual_stats = NativeFrameStats::from_frame(&actual);
     if native_play_selected_active_field_should_replace_raw_high_vertical_frame(
@@ -5743,6 +5854,19 @@ fn native_play_snapshot_lightweight_selected_window_frame(
         candidate_stats,
     ) {
         return actual_candidate;
+    }
+
+    // Observation resolution performs several full-frame artifact and color
+    // scans. Only pay that cost when the direct GPU outputs are incomplete,
+    // which is the character-select fallback it is intended to repair.
+    let observation =
+        native_play_present_native_resolution_actual_frame(&emulator.observation_frame());
+    let observation_stats = NativeFrameStats::from_frame(&observation);
+    if native_play_character_select_observation_should_replace_incomplete_window(
+        observation_stats,
+        actual_candidate_stats,
+    ) {
+        return observation;
     }
 
     // `display_frame()` can perform expensive candidate resolution. Defer it
@@ -5968,6 +6092,7 @@ fn native_play_snapshot_display_diagnostic_should_bypass_visible_filter(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_play_snapshot_final_window_selection_json(
     candidate: &NativeDisplayFrame,
     candidate_stats: NativeFrameStats,
@@ -6302,6 +6427,7 @@ fn native_play_snapshot_title_fallback_frame_stats(stats: NativeFrameStats) -> b
             || stats.right_title_bright_pixels.saturating_mul(1_000) >= stats.total_pixels)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_native_snapshot_script_preserving_safe_frame(
     emulator: &mut NativeEmulator,
     instructions_per_frame: u64,
@@ -7316,11 +7442,11 @@ fn native_script_first_credit_position_after_progress(
 ) -> (usize, u64) {
     let mut index = segment_index;
     let mut frame = segment_frame;
-    if let Some(segment) = segments.get(index) {
-        if frame >= segment.frames {
-            index = index.saturating_add(1);
-            frame = 0;
-        }
+    if let Some(segment) = segments.get(index)
+        && frame >= segment.frames
+    {
+        index = index.saturating_add(1);
+        frame = 0;
     }
 
     while let Some(segment) = segments.get(index) {
@@ -7367,6 +7493,7 @@ fn native_script_tail_progress_to_original_position(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_script_fast_forward_resume_position(
     segments: &[NativeScriptSegment],
     boot_progress: NativeScriptProgress,
@@ -7580,6 +7707,13 @@ fn native_play_window_frame_with_context(
     native_playable_candidate: bool,
     gpu_gameplay_context: bool,
 ) -> NativeDisplayFrame {
+    if frame.width == NATIVE_PLAY_SCALED_WINDOW_WIDTH
+        && frame.height == NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        && frame.pixels.len() >= frame.width.saturating_mul(frame.height)
+    {
+        return native_play_sanitize_window_frame(frame.clone());
+    }
+
     let window = native_play_sanitize_window_frame(native_play_window_frame(frame));
     let raw_stats = NativeFrameStats::from_frame(frame);
     let raw_without_deinterlace =
@@ -7786,7 +7920,7 @@ fn native_play_clear_sparse_warning_overlay(frame: &mut NativeDisplayFrame) {
     }
 
     let x_start = frame.width / 20;
-    let x_end = frame.width.saturating_mul(95) / 100;
+    let x_end = frame.width.saturating_mul(48) / 100;
     let y_start = frame.height / 12;
     let y_end = frame.height.saturating_mul(38) / 100;
     for y in y_start..y_end.min(frame.height) {
@@ -7859,11 +7993,71 @@ fn native_play_window_frame_without_deinterlace(frame: &NativeDisplayFrame) -> N
 fn native_play_present_native_resolution_actual_frame(
     frame: &NativeDisplayFrame,
 ) -> NativeDisplayFrame {
-    if frame.width == NATIVE_PLAY_WINDOW_WIDTH && frame.height == NATIVE_PLAY_MIN_WINDOW_HEIGHT {
+    if matches!(
+        frame.width,
+        NATIVE_PLAY_WINDOW_WIDTH | NATIVE_PLAY_SCALED_WINDOW_WIDTH
+    ) && frame.height == NATIVE_PLAY_MIN_WINDOW_HEIGHT
+    {
         return frame.clone();
     }
 
     native_play_window_frame_without_deinterlace(frame)
+}
+
+fn native_play_aspect_corrected_gui_frame(frame: &NativeDisplayFrame) -> NativeDisplayFrame {
+    let mut output = NativeDisplayFrame {
+        width: 0,
+        height: 0,
+        pixels: Vec::new(),
+    };
+    native_play_update_aspect_corrected_gui_frame(frame, &mut output);
+    output
+}
+
+fn native_play_update_aspect_corrected_gui_frame(
+    frame: &NativeDisplayFrame,
+    output: &mut NativeDisplayFrame,
+) {
+    if frame.width == 0
+        || frame.height == 0
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        output.width = NATIVE_PLAY_SCALED_WINDOW_WIDTH;
+        output.height = NATIVE_PLAY_MIN_WINDOW_HEIGHT;
+        output.pixels.resize(
+            NATIVE_PLAY_SCALED_WINDOW_WIDTH.saturating_mul(NATIVE_PLAY_MIN_WINDOW_HEIGHT),
+            0,
+        );
+        output.pixels.fill(0);
+        return;
+    }
+
+    let target_width = NATIVE_PLAY_SCALED_WINDOW_WIDTH;
+    let target_height = NATIVE_PLAY_MIN_WINDOW_HEIGHT;
+    output.width = target_width;
+    output.height = target_height;
+    output
+        .pixels
+        .resize(target_width.saturating_mul(target_height), 0);
+    if frame.width == target_width && frame.height == target_height {
+        let source_len = frame.width.saturating_mul(frame.height);
+        output.pixels[..source_len].copy_from_slice(&frame.pixels[..source_len]);
+        return;
+    }
+
+    for y in 0..target_height {
+        let source_y = y.saturating_mul(frame.height) / target_height;
+        let source_row = source_y.saturating_mul(frame.width);
+        let target_row = y.saturating_mul(target_width);
+        for x in 0..target_width {
+            let source_x = x
+                .saturating_mul(frame.width)
+                .checked_div(target_width)
+                .unwrap_or_default()
+                .min(frame.width.saturating_sub(1));
+            output.pixels[target_row + x] = frame.pixels[source_row + source_x];
+        }
+    }
 }
 
 fn native_play_should_preserve_raw_frame_over_deinterlace(
@@ -7981,6 +8175,30 @@ struct NativePlayGuiDisplayFrames {
     actual: NativeDisplayFrame,
 }
 
+fn native_play_fast_gui_frame_stats_are_safe(
+    native_playable_candidate: bool,
+    gpu_gameplay_context: bool,
+    stats: NativeFrameStats,
+) -> bool {
+    if stats.width < NATIVE_PLAY_MIN_WINDOW_WIDTH
+        || stats.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        || !stats.has_visible_content()
+        || native_play_frame_has_blocking_render_artifact(stats)
+        || stats.has_blocking_display_artifact()
+    {
+        return false;
+    }
+
+    stats.has_presentable_scene()
+        || native_play_title_stats_input_ready(stats)
+        || native_play_safe_render_ready_fallback_frame_stats(stats)
+        || native_play_gpu_verified_window_stats_with_context(
+            native_playable_candidate,
+            gpu_gameplay_context,
+            stats,
+        )
+}
+
 fn native_play_gui_display_frames_with_context(
     emulator: &NativeEmulator,
     native_playable_candidate: bool,
@@ -7989,7 +8207,6 @@ fn native_play_gui_display_frames_with_context(
     let stable = emulator.display_frame();
     let actual = emulator.actual_display_frame();
     let raw_actual = emulator.raw_actual_display_frame();
-    let observation = emulator.observation_frame();
     let stable_window = native_play_window_frame_with_context(
         &stable,
         native_playable_candidate,
@@ -8002,20 +8219,38 @@ fn native_play_gui_display_frames_with_context(
     );
     let actual_stats = NativeFrameStats::from_frame(&actual_window);
     let stable_stats = NativeFrameStats::from_frame(&stable_window);
-    let observation_window = native_play_window_frame_with_context(
-        &observation,
-        native_playable_candidate,
-        gpu_gameplay_context,
-    );
-    let observation_stats = NativeFrameStats::from_frame(&observation_window);
+    let incomplete_character_select_candidate = |stats: NativeFrameStats| {
+        stats.width >= NATIVE_PLAY_WINDOW_WIDTH
+            && stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
+            && stats.has_visible_content()
+            && stats.has_scene_detail()
+            && !stats.has_bottom_caption_band()
+            && !stats.has_intro_caption_band()
+            && !stats.has_context_live_stage_hud()
+    };
+    let observation = if incomplete_character_select_candidate(actual_stats)
+        && incomplete_character_select_candidate(stable_stats)
+    {
+        let observation = emulator.observation_frame();
+        let observation_window = native_play_window_frame_with_context(
+            &observation,
+            native_playable_candidate,
+            gpu_gameplay_context,
+        );
+        let observation_stats = NativeFrameStats::from_frame(&observation_window);
+        (native_play_character_select_observation_should_replace_incomplete_window(
+            observation_stats,
+            actual_stats,
+        ) && native_play_character_select_observation_should_replace_incomplete_window(
+            observation_stats,
+            stable_stats,
+        ))
+        .then_some(observation)
+    } else {
+        None
+    };
 
-    let selected = if native_play_character_select_observation_should_replace_incomplete_window(
-        observation_stats,
-        actual_stats,
-    ) && native_play_character_select_observation_should_replace_incomplete_window(
-        observation_stats,
-        stable_stats,
-    ) {
+    let selected = if let Some(observation) = observation {
         observation
     } else if native_play_gpu_context_actual_should_replace_stale_title(
         native_playable_candidate,
@@ -8444,6 +8679,26 @@ struct NativePlayWindowStep {
     test_input_override: bool,
 }
 
+fn native_play_gui_idle_fast_path_allowed(
+    scripted_action: Option<Action>,
+    input_latch: &NativeInputLatch,
+    physical_input_latch: &NativeInputLatch,
+    input_trace: &NativeGuiInputTrace,
+    test_input_script: &NativeGuiTestInputScript,
+    defer_edge_key_sample: bool,
+    input_sample: NativeWindowButtonSample,
+) -> bool {
+    scripted_action.is_none()
+        && input_latch.is_empty()
+        && physical_input_latch.is_empty()
+        && !input_trace.is_enabled()
+        && !test_input_script.is_enabled()
+        && !defer_edge_key_sample
+        && !action_buttons_any(input_sample.merged)
+        && !action_buttons_any(input_sample.test_sidecar)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn step_native_play_window_frame_checked(
     emulator: &mut NativeEmulator,
     instructions_per_frame: u64,
@@ -8483,6 +8738,22 @@ fn step_native_play_window_frame_checked(
             raw_window_active,
             test_input_script.current_buttons(),
         );
+        if native_play_gui_idle_fast_path_allowed(
+            scripted_action,
+            input_latch,
+            physical_input_latch,
+            input_trace,
+            test_input_script,
+            defer_edge_key_sample,
+            input_sample,
+        ) {
+            emulator.set_input(ActionButtons::default());
+            let slice =
+                native_play_gui_idle_fast_path_instruction_slice(remaining, poll_instruction_slice);
+            emulator.step_instructions_until_vblank_untracked(slice);
+            remaining = remaining.saturating_sub(slice);
+            continue;
+        }
         let resolved = native_play_resolve_input_poll(
             input_latch,
             physical_input_latch,
@@ -8500,7 +8771,7 @@ fn step_native_play_window_frame_checked(
         let activity_before = emulator.input_activity();
         emulator.set_input(buttons);
         let slice = remaining.min(poll_instruction_slice);
-        emulator.step_instructions(slice);
+        emulator.step_instructions_until_vblank_untracked(slice);
         let activity_after = emulator.input_activity();
         let activity_delta = activity_after.saturating_subtracted(activity_before);
         if action_buttons_any(resolved.physical_buttons) {
@@ -10619,7 +10890,7 @@ fn run_native_credit_timeline_probe(
             let delta = activity.saturating_subtracted(previous_activity);
             let total_delta = activity.saturating_subtracted(checkpoint_activity);
             let sample_due = total_frames == 1
-                || total_frames % sample_stride == 0
+                || total_frames.is_multiple_of(sample_stride)
                 || segment.action != Action::Noop
                 || native_credit_timeline_delta_important(delta);
             if sample_due {
@@ -11012,7 +11283,7 @@ fn native_play_snapshot_should_run_tail(
     handoff_satisfies_required_stage: bool,
     boot_summary: NativeScriptRunSummary,
 ) -> bool {
-    if !complete_script || !(has_explicit_tail_segments || !handoff_satisfies_required_stage) {
+    if !complete_script || (!has_explicit_tail_segments && handoff_satisfies_required_stage) {
         return false;
     }
 
@@ -13484,6 +13755,21 @@ impl NativeGuiInputTrace {
         }
     }
 
+    #[cfg(test)]
+    fn disabled(activity_baseline: NativeInputActivity) -> Self {
+        Self {
+            enabled: false,
+            last_sample: NativeWindowButtonSample::default(),
+            last_latched: ActionButtons::default(),
+            last_effective: ActionButtons::default(),
+            activity_baseline,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     fn should_emit(
         &self,
         sample: NativeWindowButtonSample,
@@ -13541,6 +13827,13 @@ struct NativeInputLatch {
 impl NativeInputLatch {
     fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    fn is_empty(&self) -> bool {
+        !action_buttons_any(self.direction_buttons)
+            && !action_buttons_any(self.edge_buttons)
+            && self.direction_polls_remaining == 0
+            && self.edge_polls_remaining == 0
     }
 
     fn buttons(&mut self, current: ActionButtons) -> ActionButtons {
@@ -13627,6 +13920,7 @@ fn action_buttons_have_play_control_coverage(buttons: ActionButtons) -> bool {
     buttons.punch && buttons.kick && buttons.beast && buttons.guard && buttons.coin && buttons.start
 }
 
+#[allow(clippy::obfuscated_if_else)]
 fn native_input_activity_for_buttons(
     activity: NativeInputActivity,
     buttons: ActionButtons,
@@ -13777,6 +14071,7 @@ fn native_play_manual_takeover(
     manual_override && scripted_action.is_some() && manual_takeover_enabled
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_play_runtime_title(
     autoplay_enabled: bool,
     scripted_action_active: bool,
@@ -14008,9 +14303,11 @@ fn native_window_button_sample(
         pressed,
     );
     let quartz_fallback_active = native_macos_window_is_key_or_main(window);
-    let platform = quartz_fallback_active
-        .then(|| native_macos_window_buttons(window))
-        .unwrap_or_default();
+    let platform = if quartz_fallback_active {
+        native_macos_window_buttons(window)
+    } else {
+        ActionButtons::default()
+    };
     native_macos_window_button_sample_from_sources_with_quartz_gate(
         window_active,
         quartz_fallback_active,
@@ -14236,7 +14533,6 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 
 fn print_help() {
     println!(
-        "{}",
         "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-frame-stats-png <project_png>\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-compact <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step <rom_zip_or_dir> <action_index> [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play fast-forwards the built-in warning/title/coin/start/select/match-entry assist before opening the macOS window, so the visible session starts near manual play handoff; any physical key immediately cancels any remaining assist: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, V service, Enter coin+start, P start, Esc quit. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 512x480 GUI frame without opening a window; native-frame-stats-png prints Rust classifier stats for project-generated PNGs. native-autoplay keeps the visible or custom scripted-assist path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
     println!(
@@ -14565,27 +14861,6 @@ fn native_warning_skip_to_title_script() -> Vec<NativeScriptSegment> {
             frames: NATIVE_WARNING_SKIP_GAP_FRAMES,
         },
     ];
-
-    for _ in 0..NATIVE_WARNING_SKIP_RETRY_CYCLES {
-        segments.extend([
-            NativeScriptSegment {
-                action: Action::Start,
-                frames: NATIVE_WARNING_SKIP_PULSE_FRAMES,
-            },
-            NativeScriptSegment {
-                action: Action::Noop,
-                frames: NATIVE_WARNING_SKIP_RETRY_GAP_FRAMES,
-            },
-            NativeScriptSegment {
-                action: Action::Punch,
-                frames: NATIVE_WARNING_SKIP_PULSE_FRAMES,
-            },
-            NativeScriptSegment {
-                action: Action::Noop,
-                frames: NATIVE_WARNING_SKIP_RETRY_GAP_FRAMES,
-            },
-        ]);
-    }
 
     segments.push(NativeScriptSegment {
         action: Action::Noop,
@@ -16142,6 +16417,13 @@ fn run_native_script_observed_with_stop_and_timeout_policy_observed(
 
             total_frames += 1;
             segment_frame += 1;
+            if stop_mode == NativeScriptStopMode::TitleScreen
+                && native_title_runtime_poll_ready(emulator.input_activity())
+            {
+                stop_reason = "title_screen_ready";
+                stopped = true;
+                break 'script;
+            }
             if let Some(observer) = frame_observer.as_deref_mut() {
                 let observer_ready = observer(
                     emulator,
@@ -16468,9 +16750,19 @@ fn native_script_stop_observation_ready(
 ) -> bool {
     match stop_mode {
         NativeScriptStopMode::TitleScreen => {
+            let activity = emulator.input_activity();
+            if native_title_runtime_poll_ready(activity) {
+                return true;
+            }
+            // Full display resolution runs several VRAM-sized artifact scans.
+            // Before BR2 has begun polling the title controls, none of those
+            // scans can produce a usable handoff and they dominate cold boot.
+            if !native_title_render_probe_ready(activity) {
+                return false;
+            }
             native_play_emulator_title_screen_input_ready_fast(emulator)
                 || native_title_runtime_input_ready(
-                    emulator.input_activity(),
+                    activity,
                     &native_play_unsanitized_window_frame_for_emulator(emulator),
                 )
         }
@@ -16563,7 +16855,7 @@ fn native_script_should_sample_stop_observation(
     match stop_mode {
         NativeScriptStopMode::TitleScreen => {
             total_frames == 1
-                || total_frames.is_multiple_of(NATIVE_PLAY_HANDOFF_RENDER_CHECK_STRIDE_FRAMES)
+                || total_frames.is_multiple_of(NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES)
         }
         NativeScriptStopMode::HandoffFrame => {
             total_frames == 1
@@ -16599,6 +16891,11 @@ fn native_script_title_wait_ready_to_advance(
     total_frames: u64,
     stop_mode: NativeScriptStopMode,
 ) -> bool {
+    // TitleScreen already evaluates the same readiness condition in the stop
+    // observation path. Avoid rendering and classifying the frame twice.
+    if stop_mode == NativeScriptStopMode::TitleScreen {
+        return false;
+    }
     if !native_script_can_early_advance_title_wait(segment, segment_frame, stop_mode)
         || !total_frames.is_multiple_of(NATIVE_PLAY_HANDOFF_RENDER_CHECK_STRIDE_FRAMES)
     {
@@ -16693,11 +16990,19 @@ fn native_play_gui_handoff_frame_ready(frame: &NativeDisplayFrame) -> bool {
 }
 
 fn native_play_render_ready_frame(frame: &NativeDisplayFrame) -> bool {
-    NativeFrameStats::from_frame(frame).has_render_ready_scene()
+    native_play_render_ready_frame_stats(NativeFrameStats::from_frame(frame))
+}
+
+fn native_play_render_ready_frame_stats(stats: NativeFrameStats) -> bool {
+    stats.has_render_ready_scene()
 }
 
 fn native_play_presentable_frame(frame: &NativeDisplayFrame) -> bool {
-    NativeFrameStats::from_frame(frame).has_presentable_scene()
+    native_play_presentable_frame_stats(NativeFrameStats::from_frame(frame))
+}
+
+fn native_play_presentable_frame_stats(stats: NativeFrameStats) -> bool {
+    stats.has_presentable_scene()
 }
 
 fn native_play_visible_window_frame(
@@ -16705,10 +17010,10 @@ fn native_play_visible_window_frame(
     last_safe: &Option<NativeDisplayFrame>,
 ) -> NativeDisplayFrame {
     let stats = NativeFrameStats::from_frame(&candidate);
-    if let Some(last_safe) = last_safe {
-        if native_play_frame_has_blocking_render_artifact(stats) || !stats.has_visible_content() {
-            return native_play_present_native_resolution_actual_frame(last_safe);
-        }
+    if let Some(last_safe) = last_safe
+        && (native_play_frame_has_blocking_render_artifact(stats) || !stats.has_visible_content())
+    {
+        return native_play_present_native_resolution_actual_frame(last_safe);
     }
 
     native_play_present_native_resolution_actual_frame(&candidate)
@@ -16915,6 +17220,7 @@ fn native_play_vertical_color_bars_artifact(stats: NativeFrameStats) -> bool {
         && stats.horizontal_color_changes <= stats.width.saturating_mul(8)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_play_select_visible_window_frame_for_gui(
     candidate: NativeDisplayFrame,
     candidate_stats: NativeFrameStats,
@@ -17795,8 +18101,8 @@ fn native_play_gpu_verified_sparse_stage_window_stats(
 
 fn native_play_sparse_stage_window_has_hard_artifact(stats: NativeFrameStats) -> bool {
     let title_warning_false_positive = native_play_sparse_stage_title_warning_false_positive(stats);
-    (stats.has_title_screen_frame() && !title_warning_false_positive)
-        || (stats.has_warning_text_overlay() && !title_warning_false_positive)
+    ((stats.has_title_screen_frame() || stats.has_warning_text_overlay())
+        && !title_warning_false_positive)
         || stats.has_corrupt_title_texture_fragment()
         || stats.has_repeating_tile_grid_artifact()
         || stats.has_stage_texture_replay_fragment_artifact()
@@ -18030,7 +18336,16 @@ fn native_play_frame_ready_with_context(
     native_playable_candidate: bool,
     frame: &NativeDisplayFrame,
 ) -> bool {
-    let stats = NativeFrameStats::from_frame(frame);
+    native_play_frame_ready_stats_with_context(
+        native_playable_candidate,
+        NativeFrameStats::from_frame(frame),
+    )
+}
+
+fn native_play_frame_ready_stats_with_context(
+    native_playable_candidate: bool,
+    stats: NativeFrameStats,
+) -> bool {
     if native_play_frame_has_blocking_render_artifact(stats) {
         return false;
     }
@@ -18464,10 +18779,99 @@ fn native_play_gui_instructions_per_frame(requested: u64) -> u64 {
     if requested == 0 {
         NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME
     } else {
-        requested
-            .max(1)
-            .min(NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME)
+        requested.clamp(1, NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME)
     }
+}
+
+fn native_play_gui_display_refresh_frames() -> u64 {
+    env::var(NATIVE_PLAY_GUI_DISPLAY_REFRESH_FRAMES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(NATIVE_PLAY_GUI_DISPLAY_REFRESH_FRAMES)
+}
+
+fn native_play_gui_otc_recovery_interval() -> u64 {
+    env::var(NATIVE_PLAY_GUI_OTC_RECOVERY_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(NATIVE_PLAY_GUI_OTC_RECOVERY_INTERVAL)
+}
+
+fn native_play_gui_present_interval(display_refresh_frames: u64) -> Duration {
+    Duration::from_secs_f64(
+        display_refresh_frames.max(1) as f64 / NATIVE_PLAY_WINDOW_TARGET_FPS as f64,
+    )
+}
+
+fn native_play_gui_present_frame(rendered_frames: u64, vblank_advanced: bool) -> u64 {
+    rendered_frames.saturating_add(if vblank_advanced { 1 } else { 0 })
+}
+
+fn native_play_gui_present_elapsed_frames(
+    last_presented_frame: u64,
+    rendered_frames: u64,
+    vblank_advanced: bool,
+) -> u64 {
+    native_play_gui_present_frame(rendered_frames, vblank_advanced)
+        .saturating_sub(last_presented_frame)
+        .max(1)
+}
+
+fn native_play_gui_pacing_delay(
+    last_presented_at: Instant,
+    now: Instant,
+    present_interval: Duration,
+    input_refresh_pending: bool,
+) -> Duration {
+    if input_refresh_pending {
+        return Duration::ZERO;
+    }
+    present_interval.saturating_sub(now.saturating_duration_since(last_presented_at))
+}
+
+fn native_play_gui_should_capture_presented_frame(
+    vblank_advanced: bool,
+    rendered_frames: u64,
+    has_visible_content: bool,
+    buttons_changed: bool,
+    script_tail_waiting_for_title: bool,
+) -> bool {
+    vblank_advanced
+        && (rendered_frames == 0
+            || !has_visible_content
+            || buttons_changed
+            || rendered_frames.is_multiple_of(NATIVE_PLAY_GUI_PRESENTED_CAPTURE_HEARTBEAT_FRAMES)
+            || (script_tail_waiting_for_title
+                && rendered_frames.is_multiple_of(NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES)))
+}
+
+fn native_play_gui_should_refresh_display(
+    vblank_advanced: bool,
+    rendered_frames: u64,
+    has_visible_content: bool,
+    buttons_changed: bool,
+    display_refresh_frames: u64,
+) -> bool {
+    buttons_changed
+        || (vblank_advanced
+            && (rendered_frames == 0
+                || !has_visible_content
+                || rendered_frames.is_multiple_of(display_refresh_frames.max(1))))
+}
+
+fn native_play_gui_idle_fast_path_instruction_slice(
+    remaining: u64,
+    poll_instruction_slice: u64,
+) -> u64 {
+    if remaining == 0 {
+        return 0;
+    }
+    let max_idle_slice = poll_instruction_slice
+        .max(1)
+        .saturating_mul(NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES);
+    remaining.min(max_idle_slice).max(1)
 }
 
 fn native_play_gui_poll_instruction_slice() -> u64 {
@@ -18547,8 +18951,7 @@ fn native_play_snapshot_wall_timeout(max_frames: u64) -> Duration {
 
     let frame_budget_secs = max_frames
         .div_ceil(10)
-        .max(1)
-        .min(NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_CAP_SECS);
+        .clamp(1, NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_CAP_SECS);
     Duration::from_secs(NATIVE_PLAY_SNAPSHOT_TAIL_WALL_TIMEOUT_SECS.max(frame_budget_secs))
 }
 
@@ -18561,10 +18964,10 @@ fn native_play_fast_forward_wall_timeout(max_frames: u64) -> Duration {
         return Duration::from_secs(timeout_secs);
     }
 
-    let frame_budget_secs = max_frames
-        .div_ceil(10)
-        .max(NATIVE_PLAY_SNAPSHOT_TAIL_WALL_TIMEOUT_SECS)
-        .min(NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_CAP_SECS);
+    let frame_budget_secs = max_frames.div_ceil(10).clamp(
+        NATIVE_PLAY_SNAPSHOT_TAIL_WALL_TIMEOUT_SECS,
+        NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_CAP_SECS,
+    );
     Duration::from_secs(frame_budget_secs)
 }
 
@@ -18577,10 +18980,10 @@ fn native_gap_probe_wall_timeout(max_frames: u64) -> Duration {
         return Duration::from_secs(timeout_secs);
     }
 
-    let frame_budget_secs = max_frames
-        .div_ceil(7)
-        .max(NATIVE_PLAY_SNAPSHOT_TAIL_WALL_TIMEOUT_SECS)
-        .min(NATIVE_GAP_PROBE_WALL_TIMEOUT_CAP_SECS);
+    let frame_budget_secs = max_frames.div_ceil(7).clamp(
+        NATIVE_PLAY_SNAPSHOT_TAIL_WALL_TIMEOUT_SECS,
+        NATIVE_GAP_PROBE_WALL_TIMEOUT_CAP_SECS,
+    );
     Duration::from_secs(frame_budget_secs)
 }
 
@@ -18767,39 +19170,50 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
-        NATIVE_PLAY_MIN_WINDOW_HEIGHT, NATIVE_PLAY_MIN_WINDOW_WIDTH,
-        NATIVE_PLAY_TEST_FIXTURE_WIDTH, NATIVE_PLAY_TITLE_ENTRY_FRAMES, NATIVE_PLAY_WINDOW_WIDTH,
-        NativeFrameStats, NativeGuiInputTrace, NativeGuiTestInputScript, NativeInputActivity,
-        NativeInputLatch, NativeScriptProgress, NativeScriptRunSummary, NativeScriptSegment,
-        NativeScriptStopMode, NativeWindowButtonSample, default_native_play_script,
-        native_action_activity_observed, native_control_sweep_script, native_credit_adapter_ready,
-        native_credit_gap_reason, native_credit_probe_ready, native_credit_ready,
-        native_credit_register_ready, native_credit_system_port_ready,
-        native_credit_transition_verified, native_fast_forward_instructions_per_frame,
-        native_frame_checksum, native_gap_observed_frame_score, native_gap_probe_wall_timeout,
+        NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES,
+        NATIVE_PLAY_GUI_PRESENTED_CAPTURE_HEARTBEAT_FRAMES, NATIVE_PLAY_MIN_WINDOW_HEIGHT,
+        NATIVE_PLAY_MIN_WINDOW_WIDTH, NATIVE_PLAY_TEST_FIXTURE_WIDTH,
+        NATIVE_PLAY_TITLE_ENTRY_FRAMES, NATIVE_PLAY_WINDOW_WIDTH,
+        NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES, NativeFrameStats, NativeGuiInputTrace,
+        NativeGuiTestInputScript, NativeInputActivity, NativeInputLatch, NativeScriptProgress,
+        NativeScriptRunSummary, NativeScriptSegment, NativeScriptStopMode,
+        NativeWindowButtonSample, default_native_play_script, native_action_activity_observed,
+        native_control_sweep_script, native_credit_adapter_ready, native_credit_gap_reason,
+        native_credit_probe_ready, native_credit_ready, native_credit_register_ready,
+        native_credit_system_port_ready, native_credit_transition_verified,
+        native_fast_forward_instructions_per_frame, native_frame_checksum,
+        native_gap_observed_frame_score, native_gap_probe_wall_timeout,
         native_health_checkpoint_script, native_health_match_entry_tail_script,
         native_health_stage_wall_timeout_with_reserve_for_elapsed,
         native_input_branch_visual_response, native_input_check_checkpoint_script,
         native_input_check_gameplay_frame_ready, native_input_check_gameplay_wait_script,
         native_keys_down_to_buttons, native_keys_to_buttons,
         native_macos_window_button_sample_from_sources, native_match_entry_script,
-        native_match_snapshot_boot_wall_timeout, native_play_blocker_report_json,
-        native_play_boot_visible_frame, native_play_boot_wait_segments,
-        native_play_candidate_should_replace_stale_title, native_play_effective_buttons,
-        native_play_fast_forward_wall_timeout, native_play_frame_ready_with_context,
+        native_match_snapshot_boot_wall_timeout, native_play_aspect_corrected_gui_frame,
+        native_play_blocker_report_json, native_play_boot_visible_frame,
+        native_play_boot_wait_segments, native_play_candidate_should_replace_stale_title,
+        native_play_effective_buttons, native_play_fast_forward_wall_timeout,
+        native_play_frame_ready_stats_with_context, native_play_frame_ready_with_context,
         native_play_gameplay_scene_with_context,
         native_play_gpu_context_candidate_should_replace_sparse_stale_fallback,
         native_play_gpu_context_scene_detail, native_play_gpu_verified_active_stage_window_stats,
         native_play_gpu_verified_actual_window_frame_with_context,
         native_play_gpu_verified_dark_stage_window_stats, native_play_gpu_verified_frame_stats,
         native_play_gpu_verified_frame_stats_with_context,
-        native_play_gpu_verified_sparse_stage_window_stats, native_play_gui_handoff_frame_ready,
-        native_play_gui_instructions_per_frame, native_play_manual_takeover,
+        native_play_gpu_verified_sparse_stage_window_stats, native_play_gui_display_refresh_frames,
+        native_play_gui_handoff_frame_ready, native_play_gui_idle_fast_path_allowed,
+        native_play_gui_idle_fast_path_instruction_slice, native_play_gui_instructions_per_frame,
+        native_play_gui_otc_recovery_interval, native_play_gui_pacing_delay,
+        native_play_gui_present_elapsed_frames, native_play_gui_present_frame,
+        native_play_gui_present_interval, native_play_gui_should_capture_presented_frame,
+        native_play_gui_should_refresh_display, native_play_manual_takeover,
         native_play_native_resolution_actual_should_replace_window_candidate,
         native_play_native_resolution_stage_frame_stats_with_context,
-        native_play_present_native_resolution_actual_frame,
-        native_play_reinject_pending_takeover_buttons,
+        native_play_present_native_resolution_actual_frame, native_play_presentable_frame_stats,
+        native_play_reinject_pending_takeover_buttons, native_play_render_ready_frame_stats,
         native_play_repair_context_live_stage_window_frame, native_play_resolve_input_poll,
         native_play_runtime_verified_actual_window_stats, native_play_sanitize_window_frame,
         native_play_script_manual_takeover_enabled,
@@ -18812,12 +19226,13 @@ mod tests {
         native_play_title_gate_pending_takeover_buttons_transition,
         native_play_title_gate_pending_takeover_transition,
         native_play_title_screen_input_ready_from_frame, native_play_title_screen_ready_from_frame,
-        native_play_window_frame, native_play_window_frame_with_context,
-        native_remaining_wall_timeout_for_elapsed, native_script_completed,
-        native_script_first_credit_position_after_progress, native_script_max_frames_for_segments,
-        native_script_segment_is_credit_attempt, native_script_tail_progress_to_original_position,
-        native_script_wall_timeout, native_snapshot_handoff_script,
-        native_snapshot_instructions_per_frame, native_title_runtime_input_ready,
+        native_play_update_aspect_corrected_gui_frame, native_play_window_frame,
+        native_play_window_frame_with_context, native_remaining_wall_timeout_for_elapsed,
+        native_script_completed, native_script_first_credit_position_after_progress,
+        native_script_max_frames_for_segments, native_script_segment_is_credit_attempt,
+        native_script_tail_progress_to_original_position, native_script_wall_timeout,
+        native_snapshot_handoff_script, native_snapshot_instructions_per_frame,
+        native_title_render_probe_ready, native_title_runtime_input_ready,
         native_window_button_sample_with_test_sidecar, next_native_rom_source_or_default,
         next_scripted_action, parse_action_token, parse_native_autoplay_tail,
         parse_native_credit_state_probe_options, parse_native_gui_test_input_script,
@@ -18835,6 +19250,298 @@ mod tests {
             height: 480,
             pixels: vec![color; 640 * 480],
         }
+    }
+
+    #[test]
+    fn native_play_gui_frame_corrects_512_by_480_to_four_by_three() {
+        let width = 512;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                pixels[y * width + x] = x as u32;
+            }
+        }
+
+        let presented = native_play_aspect_corrected_gui_frame(&NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        });
+
+        assert_eq!((presented.width, presented.height), (640, 480));
+        for x in 0..presented.width {
+            assert_eq!(presented.pixels[x], (x * width / presented.width) as u32);
+        }
+    }
+
+    #[test]
+    fn native_play_gui_frame_expands_single_512_by_240_field_to_full_window() {
+        let width = 512;
+        let height = 240;
+        let mut pixels = vec![0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                pixels[y * width + x] = ((y as u32) << 16) | x as u32;
+            }
+        }
+
+        let presented = native_play_aspect_corrected_gui_frame(&NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        });
+
+        assert_eq!((presented.width, presented.height), (640, 480));
+        assert_eq!(presented.pixels[0], 0);
+        assert_eq!(presented.pixels[640], 0);
+        assert_eq!(presented.pixels[2 * 640], 1 << 16);
+        assert_eq!(presented.pixels[479 * 640], 239 << 16);
+    }
+
+    #[test]
+    fn native_play_gui_frame_collapses_512_by_960_field_pair_to_full_window() {
+        let width = 512;
+        let height = 960;
+        let mut pixels = vec![0; width * height];
+        for y in 0..height {
+            pixels[y * width] = y as u32;
+        }
+
+        let presented = native_play_aspect_corrected_gui_frame(&NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        });
+
+        assert_eq!((presented.width, presented.height), (640, 480));
+        assert_eq!(presented.pixels[0], 0);
+        assert_eq!(presented.pixels[640], 2);
+        assert_eq!(presented.pixels[479 * 640], 958);
+    }
+
+    #[test]
+    fn native_play_context_preserves_native_640x480_frame_without_resampling() {
+        let width = 640;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                pixels[y * width + x] = ((x as u32) << 8) ^ y as u32;
+            }
+        }
+        let source = NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        };
+
+        let window = native_play_window_frame_with_context(&source, true, true);
+        let presented = native_play_aspect_corrected_gui_frame(&window);
+
+        assert_eq!((window.width, window.height), (width, height));
+        assert_eq!(window.pixels, source.pixels);
+        assert_eq!(presented, source);
+    }
+
+    #[test]
+    fn native_play_gui_aspect_update_reuses_presented_buffer_allocation() {
+        let width = 512;
+        let height = 480;
+        let mut first_pixels = vec![0; width * height];
+        let mut second_pixels = vec![0; width * height];
+        first_pixels[0] = 0x0012_3456;
+        second_pixels[0] = 0x00ab_cdef;
+
+        let first = NativeDisplayFrame {
+            width,
+            height,
+            pixels: first_pixels,
+        };
+        let second = NativeDisplayFrame {
+            width,
+            height,
+            pixels: second_pixels,
+        };
+        let mut presented = NativeDisplayFrame {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+
+        native_play_update_aspect_corrected_gui_frame(&first, &mut presented);
+        let buffer = presented.pixels.as_ptr();
+        let capacity = presented.pixels.capacity();
+        assert_eq!((presented.width, presented.height), (640, 480));
+        assert_eq!(presented.pixels[0], 0x0012_3456);
+
+        native_play_update_aspect_corrected_gui_frame(&second, &mut presented);
+
+        assert_eq!((presented.width, presented.height), (640, 480));
+        assert_eq!(presented.pixels.as_ptr(), buffer);
+        assert_eq!(presented.pixels.capacity(), capacity);
+        assert_eq!(presented.pixels[0], 0x00ab_cdef);
+    }
+
+    #[test]
+    fn native_play_gui_stats_helpers_match_frame_based_classifiers() {
+        let frames = [
+            test_solid_frame(0),
+            test_gradient_playfield_frame(),
+            test_warning_text_overlay_over_playfield_frame(),
+            test_contextual_live_stage_field_frame(),
+            test_title_screen_frame(),
+        ];
+
+        for frame in frames {
+            let stats = NativeFrameStats::from_frame(&frame);
+            assert_eq!(
+                native_play_render_ready_frame_stats(stats),
+                super::native_play_render_ready_frame(&frame)
+            );
+            assert_eq!(
+                native_play_presentable_frame_stats(stats),
+                super::native_play_presentable_frame(&frame)
+            );
+            for native_playable_candidate in [false, true] {
+                assert_eq!(
+                    native_play_frame_ready_stats_with_context(native_playable_candidate, stats),
+                    native_play_frame_ready_with_context(native_playable_candidate, &frame)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_play_gui_refreshes_every_vblank_by_default() {
+        assert_eq!(native_play_gui_display_refresh_frames(), 1);
+    }
+
+    #[test]
+    fn native_play_gui_recovers_missing_otc_draws_every_four_vblanks_by_default() {
+        assert_eq!(native_play_gui_otc_recovery_interval(), 4);
+    }
+
+    #[test]
+    fn native_play_gui_refreshes_input_without_waiting_for_guest_vblank() {
+        assert!(native_play_gui_should_refresh_display(
+            false, 0, false, true, 2,
+        ));
+        assert!(!native_play_gui_should_refresh_display(
+            false, 0, false, false, 2,
+        ));
+        assert!(native_play_gui_should_refresh_display(
+            true, 0, true, false, 2,
+        ));
+        assert!(!native_play_gui_should_refresh_display(
+            true, 1, true, false, 2,
+        ));
+        assert!(native_play_gui_should_refresh_display(
+            true, 2, true, false, 2,
+        ));
+        assert!(native_play_gui_should_refresh_display(
+            true, 1, true, true, 2,
+        ));
+    }
+
+    #[test]
+    fn native_play_gui_captures_presented_frames_only_when_needed() {
+        assert!(!native_play_gui_should_capture_presented_frame(
+            false, 0, false, true, true,
+        ));
+        assert!(native_play_gui_should_capture_presented_frame(
+            true, 0, true, false, false,
+        ));
+        assert!(native_play_gui_should_capture_presented_frame(
+            true, 1, false, false, false,
+        ));
+        assert!(native_play_gui_should_capture_presented_frame(
+            true, 1, true, true, false,
+        ));
+        assert!(!native_play_gui_should_capture_presented_frame(
+            true, 2, true, false, false,
+        ));
+        assert!(native_play_gui_should_capture_presented_frame(
+            true,
+            NATIVE_PLAY_GUI_PRESENTED_CAPTURE_HEARTBEAT_FRAMES,
+            true,
+            false,
+            false,
+        ));
+        assert!(native_play_gui_should_capture_presented_frame(
+            true,
+            NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES,
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn native_play_gui_pacing_only_sleeps_for_remaining_budget() {
+        let started_at = Instant::now();
+        let interval = native_play_gui_present_interval(2);
+
+        assert_eq!(
+            native_play_gui_pacing_delay(
+                started_at,
+                started_at + Duration::from_millis(10),
+                interval,
+                false,
+            ),
+            interval - Duration::from_millis(10)
+        );
+        assert_eq!(
+            native_play_gui_pacing_delay(
+                started_at,
+                started_at + interval + Duration::from_millis(1),
+                interval,
+                false,
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            native_play_gui_pacing_delay(started_at, started_at, interval, true),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn native_play_gui_pacing_uses_actual_presented_vblank_gap() {
+        assert_eq!(native_play_gui_present_frame(0, true), 1);
+        assert_eq!(native_play_gui_present_elapsed_frames(0, 0, true), 1);
+        assert_eq!(native_play_gui_present_elapsed_frames(1, 2, true), 2);
+        assert_eq!(native_play_gui_present_elapsed_frames(7, 7, false), 1);
+
+        let single_vblank = native_play_gui_present_interval(1);
+        let periodic_vblank_pair = native_play_gui_present_interval(2);
+        let started_at = Instant::now();
+
+        assert!(single_vblank < periodic_vblank_pair);
+        assert_eq!(
+            native_play_gui_pacing_delay(started_at, started_at, single_vblank, false),
+            single_vblank
+        );
+    }
+
+    #[test]
+    fn native_play_gui_idle_fast_path_keeps_event_pump_bounded() {
+        let poll_slice = 5_000;
+        let bounded = poll_slice * NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES;
+
+        assert_eq!(
+            native_play_gui_idle_fast_path_instruction_slice(240_000, poll_slice),
+            bounded
+        );
+        assert_eq!(
+            native_play_gui_idle_fast_path_instruction_slice(bounded - 1, poll_slice),
+            bounded - 1
+        );
+        assert_eq!(
+            native_play_gui_idle_fast_path_instruction_slice(0, poll_slice),
+            0
+        );
+        assert_eq!(native_play_gui_idle_fast_path_instruction_slice(10, 0), 1);
     }
 
     fn test_gradient_playfield_frame() -> NativeDisplayFrame {
@@ -19883,7 +20590,7 @@ mod tests {
                 pixels[y * width + x] = if (x / 8 + y / 5) % 3 == 0 {
                     0x00e0_1810
                 } else {
-                    0x00d8_d8_d8
+                    0x00d8_d8d8
                 };
             }
         }
@@ -19915,7 +20622,7 @@ mod tests {
         for y in 355..410 {
             for x in 390..506 {
                 pixels[y * width + x] = if (x + y) % 17 == 0 {
-                    0x00f0_f0_f0
+                    0x00f0_f0f0
                 } else {
                     0x00d8_2010
                 };
@@ -19957,9 +20664,9 @@ mod tests {
         for y in 108..126 {
             for x in 268..506 {
                 if (x / 5 + y / 4) % 5 == 0 {
-                    pixels[y * width + x] = 0x00f0_f0_f0;
+                    pixels[y * width + x] = 0x00f0_f0f0;
                 } else if (x + y) % 11 == 0 {
-                    pixels[y * width + x] = 0x00ff_e8_c0;
+                    pixels[y * width + x] = 0x00ff_e8c0;
                 } else {
                     pixels[y * width + x] = 0x00d8_1810;
                 }
@@ -19986,9 +20693,9 @@ mod tests {
                 let palette_index = ((x / 10 + y / 10 + (x * y) / 8192) % 48) as u32;
                 let color = if tile_edge {
                     if (x / 10 + y / 10) % 2 == 0 {
-                        0x00e8_e8_dc
+                        0x00e8_e8dc
                     } else {
-                        0x00b8_c8_d0
+                        0x00b8_c8d0
                     }
                 } else {
                     let red = 96 + ((palette_index * 5) % 112);
@@ -20006,7 +20713,7 @@ mod tests {
         for y in 232..392 {
             for x in 356..604 {
                 if (x / 8 + y / 8) % 3 != 0 {
-                    pixels[y * width + x] = 0x00f0_f0_e8;
+                    pixels[y * width + x] = 0x00f0_f0e8;
                 }
             }
         }
@@ -20059,7 +20766,7 @@ mod tests {
         for y in 96..130 {
             for x in 256..384 {
                 if (x + y) % 3 != 0 {
-                    pixels[y * width + x] = 0x00f0_f0_f0;
+                    pixels[y * width + x] = 0x00f0_f0f0;
                 }
             }
         }
@@ -20075,7 +20782,7 @@ mod tests {
         let mut frame = test_dark_native_match_frame();
         for y in 392..416 {
             for x in (440..560).step_by(3) {
-                frame.pixels[y * width + x] = 0x00e8_e8_e8;
+                frame.pixels[y * width + x] = 0x00e8_e8e8;
             }
         }
         frame
@@ -20164,7 +20871,7 @@ mod tests {
         for y in 230..370 {
             for x in 486..624 {
                 if (x / 6 + y / 5) % 3 == 0 {
-                    pixels[y * width + x] = 0x00f0_f0_f0;
+                    pixels[y * width + x] = 0x00f0_f0f0;
                 } else if (x + y) % 3 != 0 {
                     pixels[y * width + x] = 0x00d8_2010;
                 }
@@ -20209,7 +20916,7 @@ mod tests {
         for y in 250..292 {
             for x in 486..624 {
                 if (x + y) % 2 == 0 {
-                    pixels[y * width + x] = 0x00f0_f0_f0;
+                    pixels[y * width + x] = 0x00f0_f0f0;
                 } else {
                     pixels[y * width + x] = 0x00d8_2010;
                 }
@@ -20255,7 +20962,7 @@ mod tests {
         for y in 344..386 {
             for x in 508..628 {
                 pixels[y * width + x] = if (x + y) % 3 == 0 {
-                    0x00f0_f0_f0
+                    0x00f0_f0f0
                 } else {
                     0x00c8_2010
                 };
@@ -20327,20 +21034,20 @@ mod tests {
 
         for y in (52..116).step_by(4) {
             for x in 48..304 {
-                pixels[y * width + x] = 0x00e8_e8_e8;
+                pixels[y * width + x] = 0x00e8_e8e8;
             }
         }
         for y in 245..265 {
             for x in 500..568 {
                 if (x + y) % 3 != 0 {
-                    pixels[y * width + x] = 0x00f0_f0_f0;
+                    pixels[y * width + x] = 0x00f0_f0f0;
                 }
             }
         }
         for y in 390..414 {
             for x in (96..516).step_by(8) {
-                pixels[y * width + x] = 0x00f8_f8_f8;
-                pixels[y * width + x + 1] = 0x00d8_d8_d8;
+                pixels[y * width + x] = 0x00f8_f8f8;
+                pixels[y * width + x + 1] = 0x00d8_d8d8;
             }
         }
 
@@ -20355,7 +21062,7 @@ mod tests {
         let width = 640;
         let height = 480;
         let mut pixels = vec![0; width * height];
-        let title_colors = [0x00ff_ffff, 0x00f0_f0_f0, 0x00d8_d8_d8, 0x00c8_c8_c8];
+        let title_colors = [0x00ff_ffff, 0x00f0_f0f0, 0x00d8_d8d8, 0x00c8_c8c8];
         for y in 245..269 {
             for x in 500..580 {
                 let index = ((x / 3) + (y / 2)) % title_colors.len();
@@ -20366,11 +21073,11 @@ mod tests {
             0x00ff_ffff,
             0x00f0_8010,
             0x0030_50ff,
-            0x00f8_f8_c0,
-            0x00d8_d8_d8,
+            0x00f8_f8c0,
+            0x00d8_d8d8,
             0x00ff_a040,
             0x0040_70ff,
-            0x00c0_c0_c0,
+            0x00c0_c0c0,
         ];
         for y in 300..330 {
             for x in 170..470 {
@@ -20404,9 +21111,9 @@ mod tests {
             for x in 500..580 {
                 let color = match (x / 3 + y / 2) % 4 {
                     0 => 0x00ff_ffff,
-                    1 => 0x00f0_f0_f0,
-                    2 => 0x00d8_d8_d8,
-                    _ => 0x00c8_c8_c8,
+                    1 => 0x00f0_f0f0,
+                    2 => 0x00d8_d8d8,
+                    _ => 0x00c8_c8c8,
                 };
                 pixels[y * width + x] = color;
             }
@@ -20425,13 +21132,13 @@ mod tests {
         let mut pixels = vec![0; width * height];
         for y in 245..269 {
             for x in 500..580 {
-                pixels[y * width + x] = 0x00f0_f0_f0;
+                pixels[y * width + x] = 0x00f0_f0f0;
             }
         }
         for y in 390..414 {
             for x in (80..560).step_by(3) {
                 pixels[y * width + x] = 0x00ff_ffff;
-                pixels[y * width + x + 1] = 0x00d8_d8_d8;
+                pixels[y * width + x + 1] = 0x00d8_d8d8;
             }
         }
         NativeDisplayFrame {
@@ -20811,7 +21518,10 @@ mod tests {
 
     #[test]
     fn native_play_window_sanitizes_sparse_title_warning_overlay() {
-        let warning_title = test_sparse_warning_text_over_title_frame();
+        let mut warning_title = test_sparse_warning_text_over_title_frame();
+        let preserved_x = warning_title.width.saturating_mul(80) / 100;
+        let preserved_y = warning_title.height / 4;
+        warning_title.pixels[preserved_y * warning_title.width + preserved_x] = 0x0012_3456;
         let sanitized = native_play_sanitize_window_frame(warning_title.clone());
         let before = NativeFrameStats::from_frame(&warning_title);
         let after = NativeFrameStats::from_frame(&sanitized);
@@ -20821,6 +21531,11 @@ mod tests {
         assert!(!after.has_sparse_warning_text_overlay(), "{after:?}");
         assert_eq!(after.top_left_warning_text_pixels, 0, "{after:?}");
         assert!(after.has_title_screen_frame(), "{after:?}");
+        assert_eq!(
+            sanitized.pixels[preserved_y * sanitized.width + preserved_x],
+            0x0012_3456,
+            "warning cleanup must not erase the title UI outside the detected warning region"
+        );
     }
 
     #[test]
@@ -22249,9 +22964,13 @@ mod tests {
                 super::NATIVE_PLAY_SNAPSHOT_MATCH_BOOT_WALL_TIMEOUT_SECS
             )
         );
+        let boot_timeout =
+            native_match_snapshot_boot_wall_timeout(std::time::Duration::from_secs(360));
         assert!(
-            super::NATIVE_PLAY_SNAPSHOT_MATCH_BOOT_WALL_TIMEOUT_SECS
-                < super::NATIVE_PLAY_SNAPSHOT_TAIL_WALL_TIMEOUT_SECS
+            boot_timeout
+                < std::time::Duration::from_secs(
+                    super::NATIVE_PLAY_SNAPSHOT_TAIL_WALL_TIMEOUT_SECS
+                )
         );
     }
 
@@ -22571,6 +23290,43 @@ mod tests {
         assert!(!native_title_runtime_input_ready(
             NativeInputActivity::default(),
             &frame
+        ));
+    }
+
+    #[test]
+    fn native_title_render_probe_waits_for_mature_input_polling() {
+        let immature = NativeInputActivity {
+            p1_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS / 2 - 1,
+            system_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS * 3,
+            ..NativeInputActivity::default()
+        };
+        let mature = NativeInputActivity {
+            p1_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS / 2,
+            system_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS,
+            ..NativeInputActivity::default()
+        };
+
+        assert!(!native_title_render_probe_ready(immature));
+        assert!(native_title_render_probe_ready(mature));
+    }
+
+    #[test]
+    fn native_title_screen_uses_sparse_full_frame_probes() {
+        assert!(super::native_script_should_sample_stop_observation(
+            1,
+            super::NativeScriptStopMode::TitleScreen
+        ));
+        assert!(!super::native_script_should_sample_stop_observation(
+            60,
+            super::NativeScriptStopMode::TitleScreen
+        ));
+        assert!(super::native_script_should_sample_stop_observation(
+            super::NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES,
+            super::NativeScriptStopMode::TitleScreen
+        ));
+        assert!(super::native_script_should_sample_stop_observation(
+            super::NATIVE_PLAY_HANDOFF_RENDER_CHECK_STRIDE_FRAMES,
+            super::NativeScriptStopMode::HandoffFrame
         ));
     }
 
@@ -23167,7 +23923,7 @@ mod tests {
                 if local_x < 150 && (local_x / 5 + local_y / 7) % 2 == 0 {
                     pixels[y * 512 + x] = 0x00d8_1010;
                 } else if local_x >= 154 && (local_y / 4) % 3 == 0 {
-                    pixels[y * 512 + x] = 0x00f0_f0_d8;
+                    pixels[y * 512 + x] = 0x00f0_f0d8;
                 }
             }
         }
@@ -23438,7 +24194,7 @@ mod tests {
             for x in 216..304 {
                 let color = match (x + y) % 5 {
                     0 => 0x00ff_d800,
-                    1 => 0x00f0_f0_f0,
+                    1 => 0x00f0_f0f0,
                     2 => 0x0000_80ff,
                     3 => 0x00ff_6818,
                     _ => 0x0080_80a0,
@@ -23453,7 +24209,7 @@ mod tests {
                 let color = if local_x < 132 && (local_x / 4 + local_y / 5) % 3 != 0 {
                     0x00d8_1010
                 } else if local_x >= 140 && (local_y / 3 + local_x / 11) % 2 == 0 {
-                    0x00f0_f0_d8
+                    0x00f0_f0d8
                 } else if (local_x + local_y) % 29 == 0 {
                     0x00ff_8030
                 } else {
@@ -23503,7 +24259,7 @@ mod tests {
         for y in 0..28 {
             for x in 248..320 {
                 fragment_pixels[y * 320 + x] = if (x + y) % 5 == 0 {
-                    0x00f0_f0_f0
+                    0x00f0_f0f0
                 } else {
                     0x00d8_1010
                 };
@@ -23558,7 +24314,7 @@ mod tests {
         for y in 0..30 {
             for x in 412..512 {
                 pixels[y * width + x] = if (x + y) % 4 == 0 {
-                    0x00f0_f0_f0
+                    0x00f0_f0f0
                 } else {
                     0x00d8_1010
                 };
@@ -23567,7 +24323,7 @@ mod tests {
         for y in 248..314 {
             for x in 282..508 {
                 let colors = [
-                    0x00f0_f0_f0,
+                    0x00f0_f0f0,
                     0x00d8_1810,
                     0x00ff_5030,
                     0x00b8_1808,
@@ -23591,8 +24347,8 @@ mod tests {
         }
         for y in 386..414 {
             for x in (96..406).step_by(5) {
-                pixels[y * width + x] = 0x00f0_f0_f0;
-                pixels[y * width + x + 1] = 0x00d8_d8_d8;
+                pixels[y * width + x] = 0x00f0_f0f0;
+                pixels[y * width + x + 1] = 0x00d8_d8d8;
             }
         }
         let raw = NativeDisplayFrame {
@@ -23627,7 +24383,7 @@ mod tests {
             for x in 216..304 {
                 let color = match (x + y) % 5 {
                     0 => 0x00ff_d800,
-                    1 => 0x00f0_f0_f0,
+                    1 => 0x00f0_f0f0,
                     2 => 0x0000_80ff,
                     3 => 0x00ff_6818,
                     _ => 0x0080_80a0,
@@ -23642,7 +24398,7 @@ mod tests {
                 if local_x < 136 && (local_x / 4 + local_y / 5) % 3 != 0 {
                     actual_pixels[y * 512 + x] = 0x00d8_1010;
                 } else if local_x >= 142 && (local_x / 5 + local_y / 3) % 2 == 0 {
-                    actual_pixels[y * 512 + x] = 0x00f0_f0_d8;
+                    actual_pixels[y * 512 + x] = 0x00f0_f0d8;
                 }
             }
         }
@@ -24244,7 +25000,7 @@ mod tests {
                     .wrapping_mul(1_103_515_245)
                     .wrapping_add((y as u32).wrapping_mul(12_345))
                     .rotate_left(((x ^ y) & 15) as u32);
-                let color = if hash % 8 == 0 {
+                let color = if hash.is_multiple_of(8) {
                     let red = 32 + ((hash >> 3) % 208);
                     let green = 24 + ((hash >> 11) % 200);
                     let blue = 32 + ((hash >> 19) % 192);
@@ -26893,6 +27649,124 @@ mod tests {
             ActionButtons::default(),
             ActionButtons::default(),
             NativeInputActivity::default(),
+        ));
+    }
+
+    #[test]
+    fn native_input_latch_reports_empty_only_after_pending_buttons_expire() {
+        let mut latch = NativeInputLatch::default();
+        assert!(latch.is_empty());
+
+        let start = ActionButtons {
+            start: true,
+            ..ActionButtons::default()
+        };
+        assert_eq!(latch.buttons(start), start);
+        assert!(!latch.is_empty());
+
+        latch.clear();
+        assert!(latch.is_empty());
+    }
+
+    #[test]
+    fn native_play_gui_idle_fast_path_allows_only_quiet_uninstrumented_frames() {
+        let mut input_latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let trace = NativeGuiInputTrace::disabled(NativeInputActivity::default());
+        let script = NativeGuiTestInputScript::default();
+        let sample = NativeWindowButtonSample::default();
+
+        assert!(native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &trace,
+            &script,
+            false,
+            sample,
+        ));
+
+        let enabled_trace = NativeGuiInputTrace::enabled(NativeInputActivity::default());
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &enabled_trace,
+            &script,
+            false,
+            sample,
+        ));
+
+        let scripted = NativeGuiTestInputScript::from_segments(&[NativeScriptSegment {
+            action: Action::Noop,
+            frames: 1,
+        }]);
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &trace,
+            &scripted,
+            false,
+            sample,
+        ));
+
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            Some(Action::Noop),
+            &input_latch,
+            &physical_latch,
+            &trace,
+            &script,
+            false,
+            sample,
+        ));
+
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &trace,
+            &script,
+            true,
+            sample,
+        ));
+
+        let pressed_sample = NativeWindowButtonSample {
+            minifb: Action::Left.buttons(),
+            merged: Action::Left.buttons(),
+            ..NativeWindowButtonSample::default()
+        };
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &trace,
+            &script,
+            false,
+            pressed_sample,
+        ));
+
+        input_latch.buttons(Action::Start.buttons());
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &trace,
+            &script,
+            false,
+            sample,
+        ));
+
+        input_latch.clear();
+        physical_latch.buttons(Action::Right.buttons());
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &trace,
+            &script,
+            false,
+            sample,
         ));
     }
 

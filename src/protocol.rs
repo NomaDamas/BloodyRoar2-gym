@@ -2,7 +2,7 @@ use crate::ACTION_SPACE;
 
 pub fn api_index_json() -> String {
     format!(
-        "{{\"name\":\"bloodyroar2-gym\",\"version\":\"{}\",\"endpoints\":[\"GET /\",\"GET /action_space\",\"GET /observation_space\",\"POST /reset\",\"POST /step\"],\"asset_policy\":\"No ROMs, BIOS files, or proprietary game binaries are included. Provide legally obtained assets at runtime.\"}}",
+        "{{\"name\":\"bloodyroar2-gym\",\"version\":\"{}\",\"endpoints\":[\"GET /\",\"GET /action_space\",\"GET /observation_space\",\"POST /reset\",\"POST /step\"],\"request_options\":{{\"screenshot\":\"optional boolean; defaults false\"}},\"asset_policy\":\"No ROMs, BIOS files, or proprietary game binaries are included. Provide legally obtained assets at runtime.\"}}",
         env!("CARGO_PKG_VERSION")
     )
 }

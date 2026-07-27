@@ -170,6 +170,7 @@ const BR2_MATRIX_MULTIPLY_ENTRY_PC: u32 = 0x8035_8270;
 const BR2_MATRIX_MULTIPLY_RESULT_PC: u32 = 0x8035_8370;
 const BR2_MATRIX_MULTIPLY_GLOBAL_POINTER: u32 = 0x8036_ca3c;
 const BR2_MATRIX_CALLBACK_CALL_PC: u32 = 0x8035_4a3c;
+const BR2_MATRIX_CALLBACK_CONTROL_BRANCH_PC: u32 = 0x8035_71c0;
 const BR2_MATRIX_MULTIPLY_NORMAL_SAMPLE_LIMIT: usize = 8;
 const BR2_MATRIX_MULTIPLY_SATURATED_SAMPLE_LIMIT: usize = 24;
 const BIOS_DELAY_LOOP_START: u32 = 0x1fc0_a9b8;
@@ -2482,6 +2483,9 @@ struct Br2MatrixMultiplySample {
     callback_target: u32,
     callback_object: u32,
     callback_data: u32,
+    callback_data_control: [u32; 3],
+    callback_branch_v0: u32,
+    callback_branch_control: u32,
     a0: u32,
     a1: u32,
     output: u32,
@@ -2496,13 +2500,18 @@ struct Br2MatrixMultiplySample {
 impl Br2MatrixMultiplySample {
     fn json(&self) -> String {
         format!(
-            "{{\"cycles\":{},\"vblank\":{},\"return_address_hex\":\"0x{:08x}\",\"callback_target_hex\":\"0x{:08x}\",\"callback_object_hex\":\"0x{:08x}\",\"callback_data_hex\":\"0x{:08x}\",\"a0_hex\":\"0x{:08x}\",\"a1_hex\":\"0x{:08x}\",\"output_hex\":\"0x{:08x}\",\"saved_hex\":[\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\"],\"global_matrix_pointer_hex\":\"0x{:08x}\",\"rotation\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"source\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"result\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"saturated\":{}}}",
+            "{{\"cycles\":{},\"vblank\":{},\"return_address_hex\":\"0x{:08x}\",\"callback_target_hex\":\"0x{:08x}\",\"callback_object_hex\":\"0x{:08x}\",\"callback_data_hex\":\"0x{:08x}\",\"callback_data_control_hex\":[\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\"],\"callback_branch_v0_hex\":\"0x{:08x}\",\"callback_branch_control_hex\":\"0x{:08x}\",\"a0_hex\":\"0x{:08x}\",\"a1_hex\":\"0x{:08x}\",\"output_hex\":\"0x{:08x}\",\"saved_hex\":[\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\"],\"global_matrix_pointer_hex\":\"0x{:08x}\",\"rotation\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"source\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"result\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"saturated\":{}}}",
             self.cycles,
             self.vblank,
             self.return_address,
             self.callback_target,
             self.callback_object,
             self.callback_data,
+            self.callback_data_control[0],
+            self.callback_data_control[1],
+            self.callback_data_control[2],
+            self.callback_branch_v0,
+            self.callback_branch_control,
             self.a0,
             self.a1,
             self.output,
@@ -2584,6 +2593,8 @@ pub struct Cpu {
     br2_matrix_callback_target: u32,
     br2_matrix_callback_object: u32,
     br2_matrix_callback_data: u32,
+    br2_matrix_callback_branch_v0: u32,
+    br2_matrix_callback_branch_control: u32,
     gte_control_write_pc: [u32; 32],
     pub hi: u32,
     pub lo: u32,
@@ -2821,6 +2832,8 @@ impl Default for Cpu {
             br2_matrix_callback_target: 0,
             br2_matrix_callback_object: 0,
             br2_matrix_callback_data: 0,
+            br2_matrix_callback_branch_v0: 0,
+            br2_matrix_callback_branch_control: 0,
             gte_control_write_pc: [0; 32],
             hi: 0,
             lo: 0,
@@ -2863,22 +2876,76 @@ impl Default for Cpu {
 }
 
 fn br2_native_hle_disabled(feature: &str) -> bool {
-    static DISABLED: OnceLock<Vec<String>> = OnceLock::new();
+    const ALL: u64 = 1 << 63;
+    const POST_VS: u64 = 1 << 62;
+    static DISABLED: OnceLock<u64> = OnceLock::new();
 
-    let disabled = DISABLED.get_or_init(|| {
+    fn feature_mask(feature: &str) -> u64 {
+        match feature {
+            "draw_sync_wait" => 1 << 0,
+            "status_pointer_scan" => 1 << 1,
+            "status_halfword_wait" => 1 << 2,
+            "frame_counter_wait" => 1 << 3,
+            "irq_poll_timeout" => 1 << 4,
+            "banked_halfword_copy" => 1 << 5,
+            "post_vs_table_group" => 1 << 6,
+            "post_vs_table_select_group" => 1 << 7,
+            "post_vs_null_link_scan" => 1 << 8,
+            "post_vs_stack_link_scan" => 1 << 9,
+            "post_vs_stack_packet_scan" => 1 << 10,
+            "post_vs_record_copy" => 1 << 11,
+            "post_vs_vertex_record" => 1 << 12,
+            "post_vs_strided_pointer_copy" => 1 << 13,
+            "post_vs_alt_strided_pointer_copy" => 1 << 14,
+            "post_vs_table_accum" => 1 << 15,
+            "credit_check" => 1 << 16,
+            "render_submit_gate" => 1 << 17,
+            "blank_bios_irq_handler" => 1 << 18,
+            "bios_irq_return" => 1 << 19,
+            "runtime_invalid_scene_callback" => 1 << 20,
+            "runtime_invalid_callback_halfword_load" => 1 << 21,
+            "runtime_invalid_callback_word_load" => 1 << 22,
+            "runtime_invalid_table_halfword_load" => 1 << 23,
+            "runtime_invalid_vertex_pack" => 1 << 24,
+            "runtime_invalid_callback_object" => 1 << 25,
+            "runtime_invalid_relation_callback" => 1 << 26,
+            "runtime_invalid_callback_dispatch" => 1 << 27,
+            "runtime_invalid_model_relation" => 1 << 28,
+            "runtime_invalid_packed_transform" => 1 << 29,
+            "runtime_invalid_indexed_packed_transform" => 1 << 30,
+            "runtime_invalid_link_splice" => 1 << 31,
+            "runtime_invalid_model_cleanup" => 1 << 32,
+            "runtime_invalid_vertex_transform_store" => 1 << 33,
+            "post_vs_packed_vertex_helper" => 1 << 34,
+            "runtime_invalid_model_child" => 1 << 35,
+            "runtime_invalid_allocator_link" => 1 << 36,
+            "runtime_invalid_status_table_halfword_store" => 1 << 37,
+            "runtime_invalid_list_insert" => 1 << 38,
+            "runtime_invalid_model_unlink" => 1 << 39,
+            "runtime_control_callback_cycle" => 1 << 40,
+            _ => 0,
+        }
+    }
+
+    let disabled = *DISABLED.get_or_init(|| {
         std::env::var("BR2_NATIVE_DISABLE_HLE")
             .unwrap_or_default()
             .split([',', ';', ':', ' '])
-            .map(|value| value.trim().to_ascii_lowercase())
+            .map(str::trim)
             .filter(|value| !value.is_empty())
-            .collect()
+            .fold(0, |mask, value| {
+                let value = value.to_ascii_lowercase();
+                mask | match value.as_str() {
+                    "all" => ALL,
+                    "post_vs" => POST_VS,
+                    feature => feature_mask(feature),
+                }
+            })
     });
-
-    disabled.iter().any(|value| {
-        value == "all"
-            || value == feature
-            || (value == "post_vs" && feature.starts_with("post_vs_"))
-    })
+    let mask = feature_mask(feature);
+    disabled & ALL != 0
+        || mask != 0 && disabled & mask != 0
+        || feature.starts_with("post_vs_") && disabled & POST_VS != 0
 }
 
 impl Cpu {
@@ -5295,7 +5362,6 @@ impl Cpu {
 
         let instruction = br2_post_vs_record_copy_loop_instruction(self.pc)?;
 
-        let loop_start_entry = self.pc == BR2_POST_VS_RECORD_COPY_LOOP_START;
         if self.next_pc != self.pc.wrapping_add(4)
             || self.delay_slot_branch_pc.is_some()
             || !br2_post_vs_record_copy_pending_load_matches(self.pc, self.pending_load)
@@ -5371,11 +5437,12 @@ impl Cpu {
             {
                 return None;
             }
-            if !loop_start_entry
-                && !source_noop
-                && !destination_noop
-                && br2_physical_byte_ranges_overlap(source, byte_count, destination, byte_count)
-            {
+            // Real packet writes are consumed between guest instructions by
+            // the render pipeline. Even a one-record direct copy preserves the
+            // final bytes but collapses those observation points, which
+            // deforms projected fighters. Keep HLE only for fully unmapped
+            // no-op ranges; execute every observable RAM record normally.
+            if !(source_noop && destination_noop) {
                 return None;
             }
         }
@@ -5386,21 +5453,111 @@ impl Cpu {
                 let source_address = source.wrapping_add(index.wrapping_mul(16));
                 let destination_address = destination.wrapping_add(index.wrapping_mul(16));
                 if !source_noop {
+                    bus.set_trace_context(
+                        0x8031_552c,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_552c,
+                        ),
+                    );
                     last_words[0] = bus.read_u32(source_address);
+                    bus.set_trace_context(
+                        0x8031_5530,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_5530,
+                        ),
+                    );
                     last_words[1] = bus.read_u32(source_address.wrapping_add(4));
+                    bus.set_trace_context(
+                        0x8031_5534,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_5534,
+                        ),
+                    );
                     last_words[2] = bus.read_u32(source_address.wrapping_add(8));
+                    bus.set_trace_context(
+                        0x8031_5538,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_5538,
+                        ),
+                    );
                     last_words[3] = bus.read_u32(source_address.wrapping_add(12));
                 }
                 if !destination_noop {
+                    bus.set_trace_context(
+                        0x8031_553c,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_553c,
+                        ),
+                    );
                     bus.write_u32(destination_address, last_words[0]);
+                    bus.set_trace_context(
+                        0x8031_5540,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_5540,
+                        ),
+                    );
                     bus.write_u32(destination_address.wrapping_add(4), last_words[1]);
+                    bus.set_trace_context(
+                        0x8031_5544,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_5544,
+                        ),
+                    );
                     bus.write_u32(destination_address.wrapping_add(8), last_words[2]);
+                    bus.set_trace_context(
+                        0x8031_5548,
+                        br2_hle_loop_trace_cycle(
+                            cycles_before,
+                            index,
+                            BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                            BR2_POST_VS_RECORD_COPY_LOOP_START,
+                            0x8031_5548,
+                        ),
+                    );
                     bus.write_u32(destination_address.wrapping_add(12), last_words[3]);
                 }
             }
         }
 
         let final_counter = counter.wrapping_add(iterations);
+        bus.set_trace_context(
+            0x8031_5564,
+            br2_hle_loop_trace_cycle(
+                cycles_before,
+                iterations.saturating_sub(1),
+                BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION,
+                BR2_POST_VS_RECORD_COPY_LOOP_START,
+                0x8031_5564,
+            ),
+        );
         bus.write_u32(counter_slot, final_counter);
         self.regs[2] = u32::from(final_counter < limit);
         self.regs[3] = source.wrapping_add(iterations.wrapping_mul(16));
@@ -5507,27 +5664,137 @@ impl Cpu {
         let mut last_v1 = self.regs[3];
         let mut last_a0 = self.regs[4];
 
-        for _ in 0..iterations {
+        for iteration in 0..iterations {
+            bus.set_trace_context(
+                0x8031_3548,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3548,
+                ),
+            );
             bus.write_u8(t0.wrapping_sub(0x2b), t5);
+            bus.set_trace_context(
+                0x8031_354c,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_354c,
+                ),
+            );
             bus.write_u8(t0.wrapping_sub(0x27), t4);
+            bus.set_trace_context(
+                0x8031_3550,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3550,
+                ),
+            );
             bus.write_u8(t0.wrapping_sub(0x0b), t5);
+            bus.set_trace_context(
+                0x8031_3554,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3554,
+                ),
+            );
             bus.write_u8(t0.wrapping_sub(0x07), t4);
 
             let mut v0 = bus.read_u32(t3);
+            bus.set_trace_context(
+                0x8031_3560,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3560,
+                ),
+            );
             bus.write_u32(t0.wrapping_sub(0x02), v0);
+            bus.set_trace_context(
+                0x8031_3564,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3564,
+                ),
+            );
             bus.write_u32(t0.wrapping_sub(0x22), v0);
 
             v0 = bus.read_u32(a1.wrapping_sub(0x0e));
+            bus.set_trace_context(
+                0x8031_3570,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3570,
+                ),
+            );
             bus.write_u32(t0.wrapping_add(0x06), v0);
+            bus.set_trace_context(
+                0x8031_3574,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3574,
+                ),
+            );
             bus.write_u32(t0.wrapping_sub(0x1a), v0);
 
             v0 = bus.read_u32(a1.wrapping_sub(0x0a));
+            bus.set_trace_context(
+                0x8031_3580,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3580,
+                ),
+            );
             bus.write_u32(t0.wrapping_add(0x0e), v0);
+            bus.set_trace_context(
+                0x8031_3584,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3584,
+                ),
+            );
             bus.write_u32(t0.wrapping_sub(0x12), v0);
 
             v0 = br2_signed_halfword_table_offset(bus.read_u16(a1.wrapping_sub(0x06)))
                 .wrapping_add(a3);
             v0 = bus.read_u32(v0);
+            bus.set_trace_context(
+                0x8031_35a0,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_35a0,
+                ),
+            );
             bus.write_u32(t0.wrapping_sub(0x32), v0);
 
             v0 = br2_signed_halfword_table_offset(bus.read_u16(a1.wrapping_sub(0x04)))
@@ -5535,6 +5802,16 @@ impl Cpu {
             v0 = bus.read_u32(v0);
             t3 = t3.wrapping_add(0x14);
             t1 = t1.wrapping_sub(1);
+            bus.set_trace_context(
+                0x8031_35bc,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_35bc,
+                ),
+            );
             bus.write_u32(t2, v0);
 
             v0 = br2_signed_halfword_table_offset(bus.read_u16(a1.wrapping_sub(0x02)))
@@ -5542,6 +5819,16 @@ impl Cpu {
             let mut v1 = u32::from(bus.read_u16(t0.wrapping_sub(0x20)));
             v0 = bus.read_u32(v0);
             t2 = t2.wrapping_add(0x50);
+            bus.set_trace_context(
+                0x8031_35d8,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_35d8,
+                ),
+            );
             bus.write_u32(t0.wrapping_sub(0x3a), v0);
 
             v0 = br2_signed_halfword_table_offset(bus.read_u16(a1)).wrapping_add(a2);
@@ -5550,17 +5837,67 @@ impl Cpu {
             last_a0 = v0;
             v0 = u32::from(bus.read_u16(t0.wrapping_sub(0x18)));
             a1 = a1.wrapping_add(0x14);
+            bus.set_trace_context(
+                0x8031_35f8,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_35f8,
+                ),
+            );
             bus.write_u16(t0.wrapping_sub(0x20), v1 as u16);
 
             v1 = u32::from(bus.read_u16(t0));
             v0 = v0.wrapping_add(t7);
+            bus.set_trace_context(
+                0x8031_3604,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3604,
+                ),
+            );
             bus.write_u16(t0.wrapping_sub(0x18), v0 as u16);
 
             let next_v0 = u32::from(bus.read_u16(t0.wrapping_add(0x08)));
             v1 = v1.wrapping_add(t6);
+            bus.set_trace_context(
+                0x8031_3610,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3610,
+                ),
+            );
             bus.write_u16(t0, v1 as u16);
+            bus.set_trace_context(
+                0x8031_3614,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_3614,
+                ),
+            );
             bus.write_u32(t0.wrapping_sub(0x36), last_a0);
             last_v0 = next_v0.wrapping_add(t7);
+            bus.set_trace_context(
+                0x8031_361c,
+                br2_hle_loop_trace_cycle(
+                    cycles_before,
+                    iteration,
+                    BR2_POST_VS_VERTEX_RECORD_CYCLES_PER_ITERATION,
+                    BR2_POST_VS_VERTEX_RECORD_LOOP_START,
+                    0x8031_361c,
+                ),
+            );
             bus.write_u16(t0.wrapping_add(0x08), last_v0 as u16);
             last_v1 = v1;
 
@@ -8400,16 +8737,16 @@ impl Cpu {
             diagnostics.last_destination_words = destination_words;
         }
 
-        if self.br2_runtime_recovery_hle_disabled("post_vs_packed_vertex_helper") {
-            return None;
-        }
-
         if self.pc != BR2_POST_VS_PACKED_VERTEX_HELPER_START
             || self.next_pc != self.pc.wrapping_add(4)
             || self.delay_slot_branch_pc.is_some()
             || self.pending_load.is_some()
             || self.regs[31] != BR2_POST_VS_PACKED_VERTEX_HELPER_RETURN
         {
+            return None;
+        }
+
+        if self.br2_runtime_recovery_hle_disabled("post_vs_packed_vertex_helper") {
             return None;
         }
 
@@ -9283,16 +9620,16 @@ impl Cpu {
             return false;
         }
 
-        let value = if br2_readable_byte_range(address, 4, bus) {
-            u32::from(bus.read_u8(address))
-                | (u32::from(bus.read_u8(address.wrapping_add(1))) << 8)
-                | (u32::from(bus.read_u8(address.wrapping_add(2))) << 16)
-                | (u32::from(bus.read_u8(address.wrapping_add(3))) << 24)
-        } else if br2_noop_read_byte_range(address, 4, bus) {
-            0
-        } else {
+        if br2_noop_read_byte_range(address, 4, bus) {
+            return true;
+        }
+        if !br2_readable_byte_range(address, 4, bus) {
             return false;
-        };
+        }
+        let value = u32::from(bus.read_u8(address))
+            | (u32::from(bus.read_u8(address.wrapping_add(1))) << 8)
+            | (u32::from(bus.read_u8(address.wrapping_add(2))) << 16)
+            | (u32::from(bus.read_u8(address.wrapping_add(3))) << 24);
         self.gte_data_write(rt(instruction), value);
         true
     }
@@ -10139,6 +10476,12 @@ impl Cpu {
             return;
         }
 
+        if self.pc == BR2_MATRIX_CALLBACK_CONTROL_BRANCH_PC {
+            self.br2_matrix_callback_branch_v0 = self.regs[2];
+            self.br2_matrix_callback_branch_control = bus.read_u32(self.regs[4].wrapping_add(0x20));
+            return;
+        }
+
         if self.pc == BR2_MATRIX_MULTIPLY_ENTRY_PC {
             let global_matrix_pointer = bus.read_u32(BR2_MATRIX_MULTIPLY_GLOBAL_POINTER);
             self.br2_matrix_multiply_pending = Some(Br2MatrixMultiplySample {
@@ -10148,13 +10491,20 @@ impl Cpu {
                 callback_target: self.br2_matrix_callback_target,
                 callback_object: self.br2_matrix_callback_object,
                 callback_data: self.br2_matrix_callback_data,
+                callback_data_control: [
+                    bus.read_u32(self.br2_matrix_callback_data.wrapping_add(0x20)),
+                    bus.read_u32(self.br2_matrix_callback_data.wrapping_add(0x24)),
+                    bus.read_u32(self.br2_matrix_callback_data.wrapping_add(0x28)),
+                ],
+                callback_branch_v0: self.br2_matrix_callback_branch_v0,
+                callback_branch_control: self.br2_matrix_callback_branch_control,
                 a0: self.regs[4],
                 a1: self.regs[5],
-                output: self.regs[3],
+                output: self.regs[4],
                 saved: [self.regs[16], self.regs[17], self.regs[18], self.regs[19]],
                 global_matrix_pointer,
                 rotation: br2_read_matrix(bus, global_matrix_pointer),
-                source: br2_read_matrix_columns(bus, self.regs[4], self.regs[5]),
+                source: br2_read_matrix(bus, self.regs[4]),
                 result: [[0; 3]; 3],
                 saturated: false,
             });
@@ -10334,8 +10684,8 @@ impl Cpu {
         let normal = self.gte_vector(vector_index);
         let light = self.gte_matrix(1);
 
-        for index in 0..3 {
-            let mac = self.gte_matrix_row_mac(index + 1, 0, light[index], normal);
+        for (index, row) in light.into_iter().enumerate() {
+            let mac = self.gte_matrix_row_mac(index + 1, 0, row, normal);
             self.set_gte_mac_ir(index + 1, mac, shift, lm);
         }
 
@@ -11760,6 +12110,7 @@ fn br2_post_vs_vertex_record_loop_signature_matches(bus: &Bus) -> bool {
         .all(|(address, expected)| bus.read_u32_executable_no_trace(address) == expected)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn br2_post_vs_vertex_record_ranges_fast_forwardable(
     a1: u32,
     a2: u32,
@@ -11833,6 +12184,18 @@ fn br2_post_vs_vertex_record_ranges_fast_forwardable(
 
 fn br2_signed_halfword_table_offset(value: u16) -> u32 {
     ((value as i16) as i32 as u32) << 3
+}
+
+fn br2_hle_loop_trace_cycle(
+    cycles_before: u64,
+    iteration: u32,
+    cycles_per_iteration: u64,
+    loop_start: u32,
+    instruction_pc: u32,
+) -> u64 {
+    cycles_before
+        .saturating_add(u64::from(iteration).saturating_mul(cycles_per_iteration))
+        .saturating_add(u64::from(instruction_pc.wrapping_sub(loop_start) / 4))
 }
 
 fn br2_post_vs_stack_packet_scan_current_instruction_matches(pc: u32, bus: &Bus) -> bool {
@@ -12445,26 +12808,6 @@ fn br2_read_matrix(bus: &Bus, address: u32) -> [[i16; 3]; 3] {
     ]
 }
 
-fn br2_read_matrix_columns(bus: &Bus, a0: u32, a1: u32) -> [[i16; 3]; 3] {
-    [
-        [
-            br2_read_i16(bus, a1),
-            br2_read_i16(bus, a0.wrapping_add(2)),
-            br2_read_i16(bus, a0.wrapping_add(4)),
-        ],
-        [
-            br2_read_i16(bus, a1.wrapping_add(6)),
-            br2_read_i16(bus, a0.wrapping_add(8)),
-            br2_read_i16(bus, a0.wrapping_add(10)),
-        ],
-        [
-            br2_read_i16(bus, a1.wrapping_add(12)),
-            br2_read_i16(bus, a0.wrapping_add(14)),
-            br2_read_i16(bus, a0.wrapping_add(16)),
-        ],
-    ]
-}
-
 fn br2_read_i16(bus: &Bus, address: u32) -> i16 {
     bus.read_u16(address) as i16
 }
@@ -12602,7 +12945,9 @@ fn gte_projection_factor(h: u16, z: u16) -> (i64, bool) {
 }
 
 fn gte_unr_table_entry(index: u32) -> u8 {
-    let reciprocal = ((0x4_0000 / (index + 0x100) + 1) / 2).saturating_sub(0x101);
+    let reciprocal = (0x4_0000 / (index + 0x100))
+        .div_ceil(2)
+        .saturating_sub(0x101);
     reciprocal.min(0xff) as u8
 }
 
@@ -17047,6 +17392,93 @@ mod tests {
     }
 
     #[test]
+    fn br2_post_vs_vertex_record_hle_matches_interpreter() {
+        let mut hle_bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_post_vs_vertex_record_loop(&mut hle_bus);
+
+        let a1 = 0x8000_1012;
+        let t0 = 0x8000_203e;
+        let t2 = 0x8000_2000;
+        let t3 = 0x8000_3000;
+        let a2 = 0x8000_4000;
+        let a3 = 0x8000_5000;
+        for iteration in 0..3u32 {
+            let record = a1 + iteration * 0x14;
+            let output = t0 + iteration * 0x50;
+            hle_bus.write_u32(t3 + iteration * 0x14, 0x1111_0000 | iteration);
+            hle_bus.write_u32(record - 0x0e, 0x2222_0000 | iteration);
+            hle_bus.write_u32(record - 0x0a, 0x3333_0000 | iteration);
+            for (offset, index) in [(-0x06i32, 1i16), (-0x04, 2), (-0x02, 3), (0, 4)] {
+                hle_bus.write_u16(record.wrapping_add(offset as u32), index as u16);
+            }
+            hle_bus.write_u16(output - 0x20, 10 + iteration as u16);
+            hle_bus.write_u16(output - 0x18, 20 + iteration as u16);
+            hle_bus.write_u16(output, 30 + iteration as u16);
+            hle_bus.write_u16(output + 0x08, 40 + iteration as u16);
+        }
+        for index in 1..=4u32 {
+            hle_bus.write_u32(a2 + index * 8, 0xaaaa_0000 | index);
+            hle_bus.write_u32(a3 + index * 8, 0xbbbb_0000 | index);
+        }
+
+        let mut hle_cpu = Cpu::default();
+        hle_cpu.pc = BR2_POST_VS_VERTEX_RECORD_LOOP_START;
+        hle_cpu.next_pc = BR2_POST_VS_VERTEX_RECORD_LOOP_START + 4;
+        hle_cpu.regs[2] = 0x0202_0202;
+        hle_cpu.regs[3] = 0x0303_0303;
+        hle_cpu.regs[4] = 0x0404_0404;
+        hle_cpu.regs[5] = a1;
+        hle_cpu.regs[6] = a2;
+        hle_cpu.regs[7] = a3;
+        hle_cpu.regs[8] = t0;
+        hle_cpu.regs[9] = 3;
+        hle_cpu.regs[10] = t2;
+        hle_cpu.regs[11] = t3;
+        hle_cpu.regs[12] = 0x24;
+        hle_cpu.regs[13] = 7;
+        hle_cpu.regs[14] = 2;
+        hle_cpu.regs[15] = 3;
+
+        let mut interpreter_bus = hle_bus.clone();
+        let mut interpreter_cpu = hle_cpu.clone();
+        // Keep the guest semantics but break the exact signature so this copy
+        // executes through the regular MIPS interpreter.
+        interpreter_bus.write_u32(0x8031_355c, 0x0000_0021);
+
+        let hle_report = hle_cpu.step_report(&mut hle_bus);
+        assert_eq!(hle_cpu.pc, BR2_POST_VS_VERTEX_RECORD_LOOP_EXIT);
+
+        let mut interpreter_cycles = 0;
+        for _ in 0..BR2_POST_VS_VERTEX_RECORD_LOOP_INSTRUCTIONS.len() * 3 {
+            let report = interpreter_cpu.step_report(&mut interpreter_bus);
+            interpreter_cycles += report.cycles_elapsed;
+            if interpreter_cpu.pc == BR2_POST_VS_VERTEX_RECORD_LOOP_EXIT {
+                break;
+            }
+        }
+        assert_eq!(interpreter_cpu.pc, BR2_POST_VS_VERTEX_RECORD_LOOP_EXIT);
+        assert_eq!(hle_report.cycles_elapsed, interpreter_cycles);
+        assert_eq!(hle_cpu.regs, interpreter_cpu.regs);
+
+        for offset in 0..0x120u32 {
+            let address = t0.wrapping_sub(0x40).wrapping_add(offset);
+            assert_eq!(
+                hle_bus.read_u8(address),
+                interpreter_bus.read_u8(address),
+                "vertex output differs at 0x{address:08x}"
+            );
+        }
+        for offset in 0..0xf0u32 {
+            let address = t2.wrapping_add(offset);
+            assert_eq!(
+                hle_bus.read_u8(address),
+                interpreter_bus.read_u8(address),
+                "vertex table output differs at 0x{address:08x}"
+            );
+        }
+    }
+
+    #[test]
     fn does_not_fast_forward_br2_post_vs_vertex_record_loop_with_unmapped_table() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_post_vs_vertex_record_loop(&mut bus);
@@ -17094,7 +17526,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_forwards_br2_post_vs_record_copy_loop_with_ram_records() {
+    fn br2_post_vs_record_copy_executes_ram_records_in_interpreter() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_post_vs_record_copy_loop(&mut bus);
         let source = 0x8001_0000;
@@ -17117,20 +17549,14 @@ mod tests {
         let report = cpu.step_report(&mut bus);
 
         assert_eq!(report.start_pc, BR2_POST_VS_RECORD_COPY_LOOP_START);
-        assert_eq!(
-            report.cycles_elapsed,
-            2 * BR2_POST_VS_RECORD_COPY_CYCLES_PER_ITERATION
-        );
-        assert_eq!(cpu.pc, BR2_POST_VS_RECORD_COPY_LOOP_EXIT);
-        assert_eq!(cpu.next_pc, BR2_POST_VS_RECORD_COPY_LOOP_EXIT + 4);
-        assert_eq!(cpu.regs[2], 0);
-        assert_eq!(cpu.regs[3], source + 0x20);
-        assert_eq!(cpu.regs[10], 5);
-        assert_eq!(cpu.regs[17], destination + 0x20);
-        assert_eq!(bus.read_u32(counter_slot), 5);
-        for index in 0..8u32 {
-            assert_eq!(bus.read_u32(destination + index * 4), 0x1000_0000 | index);
-        }
+        assert_eq!(report.cycles_elapsed, 2);
+        assert_eq!(cpu.pc, BR2_POST_VS_RECORD_COPY_LOOP_START + 4);
+        assert_eq!(cpu.next_pc, BR2_POST_VS_RECORD_COPY_LOOP_START + 8);
+        assert_eq!(cpu.pending_load, Some((10, 0x1000_0000)));
+        assert_eq!(cpu.regs[3], source);
+        assert_eq!(cpu.regs[17], destination);
+        assert_eq!(bus.read_u32(counter_slot), 3);
+        assert!((0..8u32).all(|index| bus.read_u32(destination + index * 4) == 0));
     }
 
     #[test]
@@ -20428,13 +20854,14 @@ mod tests {
             (0x12 << 26) | (0x04 << 21) | (8 << 16) | (2 << 11), // mtc2 t0, r2
             (0x3a << 26) | (2 << 16),                            // swc2 r2, 0(zero)
             (0x32 << 26) | (6 << 16),                            // lwc2 rgb, 0(zero)
+            0,                                                   // load delay slot
             (0x12 << 26) | (9 << 16) | (6 << 11),                // mfc2 t1, rgb
             (0x12 << 26) | (0x10 << 21) | 0x01,                  // rtps placeholder
         ]);
         let mut bus = Bus::new(rom, 2 * 1024 * 1024);
         let mut cpu = Cpu::default();
 
-        for _ in 0..7 {
+        for _ in 0..8 {
             assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
         }
 
@@ -20442,6 +20869,27 @@ mod tests {
         assert_eq!(cpu.cop2_data[6], 0x1234_5678);
         assert_eq!(cpu.regs[9], 0x1234_5678);
         assert_eq!(cpu.cop2_data[31], 0);
+    }
+
+    #[test]
+    fn lwc2_value_is_immediately_visible_to_gte_command() {
+        let rom = program(&[
+            i_type(0x09, 0, 8, 3),                               // addiu t0, zero, 3
+            i_type(0x2b, 0, 8, 0),                               // sw t0, 0(zero)
+            i_type(0x09, 0, 9, 2),                               // addiu t1, zero, 2
+            (0x12 << 26) | (0x04 << 21) | (9 << 16) | (9 << 11), // mtc2 t1, ir1
+            i_type(0x32, 0, 9, 0),                               // lwc2 ir1, 0(zero)
+            (0x12 << 26) | (0x10 << 21) | 0x28,                  // sqr
+        ]);
+        let mut bus = Bus::new(rom, 2 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+
+        for _ in 0..6 {
+            assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+        }
+
+        assert_eq!(cpu.cop2_data[25], 9);
+        assert_eq!(cpu.cop2_data[9], 9);
     }
 
     #[test]
@@ -21132,6 +21580,117 @@ mod tests {
         assert_eq!(cpu.cop2_data[10] as i16, 100);
         assert_eq!(cpu.cop2_data[11] as i16, 150);
         assert_eq!(cpu.cop2_data[31], 0);
+    }
+
+    #[test]
+    fn br2_matrix_callback_records_pending_load_as_callback_data() {
+        let bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_MATRIX_CALLBACK_CALL_PC;
+        cpu.regs[2] = 0x8035_71b0;
+        cpu.regs[4] = 0xdead_beef;
+        cpu.regs[5] = 0x8038_a808;
+        cpu.pending_load = Some((4, 0x8038_a824));
+
+        cpu.record_br2_matrix_multiply_boundary(&bus);
+
+        assert_eq!(cpu.br2_matrix_callback_target, 0x8035_71b0);
+        assert_eq!(cpu.br2_matrix_callback_object, 0x8038_a808);
+        assert_eq!(
+            cpu.br2_matrix_callback_data, 0x8038_a824,
+            "0x80354a38 loads a0 from object+0x10 immediately before the jalr"
+        );
+    }
+
+    #[test]
+    fn br2_matrix_callback_zero_control_takes_alternate_branch_after_load_delay() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (index, instruction) in [
+            0x3c03_1f80, // lui v1, 0x1f80
+            0x3463_03e0, // ori v1, v1, 0x03e0
+            0x8c82_0020, // lw v0, 0x20(a0)
+            0x0000_0000, // nop
+            0x1040_028c, // beq v0, zero, alternate path
+            0x0080_2821, // addu a1, a0, zero
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bus.write_u32(
+                0x8035_71b0_u32.wrapping_add((index as u32) * 4),
+                instruction,
+            );
+        }
+
+        let callback_data = 0x8038_a200_u32;
+        bus.write_u32(callback_data.wrapping_add(0x20), 0);
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x8035_71b0;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = 0x8035_71b0;
+        cpu.regs[4] = callback_data;
+
+        for _ in 0..6 {
+            assert_eq!(cpu.step(&mut bus), StepOutcome::Continue);
+        }
+
+        assert_eq!(cpu.pc, 0x8035_7bf4);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.br2_matrix_callback_branch_v0, 0);
+        assert_eq!(cpu.br2_matrix_callback_branch_control, 0);
+    }
+
+    #[test]
+    fn br2_matrix_multiply_diagnostic_tracks_in_place_a0_matrix() {
+        fn write_matrix(bus: &mut Bus, address: u32, matrix: [[i16; 3]; 3]) {
+            for (row_index, row) in matrix.iter().enumerate() {
+                for (column_index, value) in row.iter().enumerate() {
+                    let offset = ((row_index * 3 + column_index) * 2) as u32;
+                    bus.write_u16(address.wrapping_add(offset), *value as u16);
+                }
+            }
+        }
+
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let callback_object = 0x8038_a808;
+        let callback_data = 0x8038_a824;
+        let rotation = 0x8038_b000;
+        let source = [
+            [0x0100, 0x0200, 0x0300],
+            [0x0400, 0x0500, 0x0600],
+            [0x0700, 0x0800, 0x0900],
+        ];
+
+        bus.write_u32(super::BR2_MATRIX_MULTIPLY_GLOBAL_POINTER, rotation);
+        write_matrix(
+            &mut bus,
+            rotation,
+            [[0x1000, 0, 0], [0, 0x1000, 0], [0, 0, 0x1000]],
+        );
+        write_matrix(&mut bus, callback_data, source);
+        bus.write_u16(callback_object, 0xa808);
+        bus.write_u16(callback_object.wrapping_add(6), 0x8038);
+        bus.write_u16(callback_object.wrapping_add(12), 0xbeef);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_MATRIX_MULTIPLY_ENTRY_PC;
+        cpu.regs[3] = 0x1f80_03e0;
+        cpu.regs[4] = callback_data;
+        cpu.regs[5] = callback_data;
+        cpu.br2_matrix_callback_target = 0x8035_71b0;
+        cpu.br2_matrix_callback_object = callback_object;
+        cpu.br2_matrix_callback_data = callback_data;
+
+        cpu.record_br2_matrix_multiply_boundary(&bus);
+
+        let sample = cpu.br2_matrix_multiply_pending.as_ref().unwrap();
+        assert_eq!(sample.callback_object, callback_object);
+        assert_eq!(sample.callback_data, callback_data);
+        assert_eq!(sample.a0, callback_data);
+        assert_eq!(sample.a1, callback_data);
+        assert_eq!(sample.output, callback_data);
+        assert_ne!(sample.a1, sample.callback_object);
+        assert_eq!(sample.source, source);
     }
 
     #[test]
@@ -23336,6 +23895,7 @@ mod tests {
         assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
         assert_eq!(cpu.cp0[CP0_CAUSE], 0);
         assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(cpu.cop2_data[0], 0x4433_2211);
         assert_eq!(cpu.cop2_data[1], 0x6655);
         assert_eq!(cpu.pc, BR2_RUNTIME_UNALIGNED_GTE_LOAD_PC + 8);
         assert_eq!(cpu.next_pc, BR2_RUNTIME_UNALIGNED_GTE_LOAD_PC + 12);
@@ -23346,9 +23906,14 @@ mod tests {
         assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
         assert_eq!(cpu.cp0[CP0_CAUSE], 0);
         assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(cpu.cop2_data[1], 0x6655);
         assert_eq!(cpu.cop2_data[2], 0xccbb_aa99);
         assert_eq!(cpu.pc, BR2_RUNTIME_UNALIGNED_GTE_LOAD_PC + 12);
         assert_eq!(cpu.next_pc, BR2_RUNTIME_UNALIGNED_GTE_LOAD_PC + 16);
+
+        let delay = cpu.step_report(&mut bus);
+        assert_eq!(delay.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cop2_data[2], 0xccbb_aa99);
     }
 
     #[test]
@@ -23375,9 +23940,13 @@ mod tests {
         assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
         assert_eq!(cpu.cp0[CP0_CAUSE], 0);
         assert_eq!(cpu.cp0[CP0_EPC], 0);
-        assert_eq!(cpu.cop2_data[0], 0);
+        assert_eq!(cpu.cop2_data[0], 0xfeed_beef);
         assert_eq!(cpu.pc, BR2_RUNTIME_UNALIGNED_GTE_LOAD_PC + 4);
         assert_eq!(cpu.next_pc, BR2_RUNTIME_UNALIGNED_GTE_LOAD_PC + 8);
+
+        let delay = cpu.step_report(&mut bus);
+        assert_eq!(delay.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cop2_data[0], 0xfeed_beef);
     }
 
     #[test]

@@ -6,6 +6,7 @@ Backends implement:
 
 ```rust
 pub trait Backend {
+    fn set_observation_screenshot(&mut self, _enabled: bool) {}
     fn reset(&mut self) -> Result<Observation, BackendError>;
     fn step(&mut self, buttons: ActionButtons, frames: u32) -> Result<Observation, BackendError>;
 }
@@ -45,6 +46,6 @@ cargo run -- play assets/roms
 This launches the macOS emulator for human play. It intentionally stores ROM zip
 files under ignored local paths and never commits them.
 
-For RL-grade control, the next backend should connect MAME's debugger/Lua/input
-surfaces to the `Backend` trait so `step(action, frames)` performs deterministic
-frame advance instead of only launching the emulator window.
+The Rust-native backend is the RL-grade path: it maps actions directly into the
+emulated controller and advances `step(action, frames)` by emulated vblanks.
+MAME remains an optional external compatibility reference.

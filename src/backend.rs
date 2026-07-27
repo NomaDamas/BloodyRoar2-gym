@@ -56,6 +56,8 @@ impl Display for BackendError {
 impl Error for BackendError {}
 
 pub trait Backend {
+    fn set_observation_screenshot(&mut self, _enabled: bool) {}
+
     fn reset(&mut self) -> Result<Observation, BackendError>;
     fn step(&mut self, buttons: ActionButtons, frames: u32) -> Result<Observation, BackendError>;
 }

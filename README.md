@@ -109,10 +109,12 @@ machine needs an explicit override. Use `native-manual` for a cold-boot window
 with no entry script.
 Use `native-autoplay` when you intentionally want a visible scripted assist or
 custom entry-assist diagnostics.
-`native-window-snapshot` writes the exact 512x480 GUI frame without opening a
-window, which is useful when checking whether the visible window is cropped,
-doubled, or black. `native-autoplay` also accepts an explicit script tail for
-smoke and control-sweep validation.
+`native-window-snapshot` writes the normalized native display frame without
+opening a window. `native-play-snapshot` writes the exact 640x480
+aspect-corrected presentation used by the GUI, which is useful when checking
+whether the visible window is cropped, doubled, black, or horizontally
+distorted. `native-autoplay` also accepts an explicit script tail for smoke and
+control-sweep validation.
 `native-health-check` is stricter than the autoplay smoke path: it verifies the
 CPU core, mapped controls, rendered frame statistics, and per-action branch
 stability. It exits non-zero when the native renderer still has a full-scene
@@ -222,7 +224,7 @@ cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-scrip
 cargo run -- native-input-check 120000
 cargo run -- native-health-check 120000
 cargo run -- native-play 120000 fit
-cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 10000
+cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 500000
 ```
 
 The native path is intentionally separated from MAME and ZiNc compatibility
@@ -230,14 +232,16 @@ commands so emulator-core work can proceed without republishing proprietary
 Windows binaries or ROM data.
 The current native core runs on macOS, opens a local framebuffer window, reads
 the mapped controls, uploads visible texture data to VRAM, tracks presentation
-quality, and exposes CPU/IO/GPU state for iterative validation. Full native
-scene composition is still guarded by `native-health-check`; keep using that
-command before claiming emulator parity.
+quality, and exposes CPU/IO/GPU state for iterative validation.
+`native-health-check` and `native-play-snapshot --match-script` remain the
+release gates for full-scene composition, input coverage, and gameplay-scene
+rendering.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend.
 `native-scripted-step` applies a sequence of Gym actions to the native core and
-writes the same 512x480 GUI frame that `native-play` presents, with raw/window
-frame stats in JSON for repeatable boot/input debugging. `native-input-check`
+writes a normalized 512x480 diagnostic frame, with raw/window frame stats in
+JSON for repeatable boot/input debugging. `native-play-snapshot` additionally
+writes the exact 640x480 aspect-corrected GUI presentation. `native-input-check`
 verifies that the game reads mapped coin/start/fighter controls,
 `native-health-check` fails on remaining full-scene rendering or branch-stability
 gaps, and `native-play` opens the native macOS framebuffer window.
@@ -251,8 +255,17 @@ path.
 ```sh
 curl -sS http://127.0.0.1:8765/action_space
 curl -sS -X POST http://127.0.0.1:8765/reset
-curl -sS -X POST http://127.0.0.1:8765/step -d '{"action":5,"frames":4}'
+curl -sS -X POST http://127.0.0.1:8765/step \
+  -d '{"action":5,"frames":1}'
+curl -sS -X POST http://127.0.0.1:8765/step \
+  -d '{"action":5,"frames":1,"screenshot":true}'
 ```
+
+`screenshot` defaults to `false` on both `/reset` and `/step` to keep
+non-vision-agent responses small. Set it to `true` only when a base64 PNG is
+needed. Native `/step` advances the requested number of emulated vblanks; if
+the core cannot reach the next vblank within its safety budget, the request
+fails instead of returning a partial frame count.
 
 Endpoints:
 
@@ -287,9 +300,10 @@ Observation space:
    backend.
 4. Do not push proprietary dumps, archives, or extracted Windows bundles.
 
-## Next backend step
+## Backend status
 
-For deterministic RL, connect a MAME debugger/Lua/input bridge to the `Backend`
-trait so `step(action, frames)` drives the running emulator. The current `play`
-command launches the real macOS emulator for human play, while `serve` exposes
-the stable Gym-style API contract.
+`serve-native` connects the Rust-native emulator directly to the `Backend`
+trait, including deterministic vblank stepping, mapped controller input, HUD
+observations, and optional PNG observations. `serve` remains a ROM-free null
+backend for client development, while `play` is an optional MAME compatibility
+reference.

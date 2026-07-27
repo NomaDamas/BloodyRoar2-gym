@@ -1,6 +1,7 @@
 #![allow(clippy::collapsible_if, clippy::too_many_arguments)]
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::sync::OnceLock;
 
 use crate::action::ActionButtons;
@@ -108,6 +109,7 @@ const GPU_OVERLAP_DRAW_LIMIT: usize = 96;
 const GPU_DRAW_CAPTURE_LIMIT: usize = 64;
 const GPU_DISPLAY_AREA_HISTORY_LIMIT: usize = 32;
 const GPU_IMAGE_UPLOAD_RECT_LIMIT: usize = 128;
+const GPU_DISPLAY_COLOR_STATS_CACHE_LIMIT: usize = 8;
 const GP0_BEST_OBSERVATION_EAGER_COMMANDS: u64 = 64;
 const GP0_BEST_OBSERVATION_COMMAND_INTERVAL: u64 = 32_768;
 const GP0_BEST_OBSERVATION_DRAW_INTERVAL: u64 = 128;
@@ -142,6 +144,56 @@ const DISPLAY_SOURCE_HIGH_VERTICAL_DEINTERLACED: &str =
     "gp1_display_area_high_vertical_deinterlaced";
 const VRAM_X_MASK: u32 = 0x03ff;
 const VRAM_Y_MASK: u32 = 0x03ff;
+
+#[derive(Clone, Debug, Default)]
+struct GpuDrawTraceBuffer {
+    entries: VecDeque<GpuDrawTrace>,
+}
+
+impl GpuDrawTraceBuffer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, trace: GpuDrawTrace) {
+        self.entries.push_back(trace);
+    }
+
+    fn remove(&mut self, index: usize) -> Option<GpuDrawTrace> {
+        if index == 0 {
+            self.entries.pop_front()
+        } else {
+            self.entries.remove(index)
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &GpuDrawTrace> {
+        self.entries.iter()
+    }
+
+    #[cfg(test)]
+    fn last(&self) -> Option<&GpuDrawTrace> {
+        self.entries.back()
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl<'a> IntoIterator for &'a GpuDrawTraceBuffer {
+    type Item = &'a GpuDrawTrace;
+    type IntoIter = std::collections::vec_deque::Iter<'a, GpuDrawTrace>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
 
 pub const ACCESS_WIDTH_8: u8 = 1 << 0;
 pub const ACCESS_WIDTH_16: u8 = 1 << 1;
@@ -841,7 +893,7 @@ impl Io {
         let screenshot_window = self.gpu.screenshot_window();
         let (display_width, display_height) = self.gpu.display_dimensions();
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{},\"controller\":{}}}",
+            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_recovery_raster_cache\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{},\"controller\":{}}}",
             self.irq.status,
             self.irq.mask,
             self.gpu.commands_seen,
@@ -883,6 +935,7 @@ impl Io {
             self.gpu.textured_draw_stats.clipped_pixels,
             self.gpu.textured_draw_stats.transparent_pixels,
             self.gpu.textured_draw_stats.json(),
+            self.gpu.recovery_raster_cache_stats_json(),
             self.gpu.image_upload_commands,
             self.gpu.vram_copy_commands,
             self.gpu.largest_draw_command_compact_json(),
@@ -948,6 +1001,10 @@ impl Io {
 
     pub fn native_playability_compact_json(&self) -> String {
         self.gpu.native_playability_compact_json()
+    }
+
+    pub fn recovery_raster_cache_stats_json(&self) -> String {
+        self.gpu.recovery_raster_cache_stats_json()
     }
 
     pub fn native_playable_candidate(&self) -> bool {
@@ -1319,12 +1376,12 @@ pub struct Gpu {
     recent_transfer_commands: Vec<GpuTransferTrace>,
     transfer_sequence: u64,
     image_upload_rects: Vec<DrawBounds>,
-    recent_draw_commands: Vec<GpuDrawTrace>,
+    recent_draw_commands: GpuDrawTraceBuffer,
     display_area_history: Vec<DisplayAreaTrace>,
     largest_draw_command: Option<GpuDrawTrace>,
     top_draw_commands: Vec<GpuDrawTrace>,
-    focus_draw_commands: Vec<GpuDrawTrace>,
-    overlap_draw_commands: Vec<GpuDrawTrace>,
+    focus_draw_commands: GpuDrawTraceBuffer,
+    overlap_draw_commands: GpuDrawTraceBuffer,
     draw_sequence: u64,
     draw_capture_range: Option<(u64, u64)>,
     draw_capture_predicates: Vec<NativeGpuDrawCapturePredicate>,
@@ -1356,12 +1413,22 @@ pub struct Gpu {
     field_composed_display_width: usize,
     field_composed_display_height: usize,
     field_composed_display_capture_index: u64,
+    display_resolve_cache: RefCell<Option<DisplayResolveCache>>,
     visibility_cache: RefCell<Option<VisiblePresentationCache>>,
+    display_color_stats_cache: RefCell<VecDeque<DisplayColorStatsCache>>,
     visibility_cache_in_progress: Cell<bool>,
+    #[cfg(test)]
+    display_resolve_cache_hits: Cell<u64>,
+    #[cfg(test)]
+    display_resolve_cache_misses: Cell<u64>,
     #[cfg(test)]
     visibility_cache_hits: Cell<u64>,
     #[cfg(test)]
     visibility_cache_misses: Cell<u64>,
+    #[cfg(test)]
+    display_color_stats_cache_hits: Cell<u64>,
+    #[cfg(test)]
+    display_color_stats_cache_misses: Cell<u64>,
     #[cfg(test)]
     field_composed_capture_attempts: u64,
 }
@@ -1404,12 +1471,12 @@ impl Default for Gpu {
             recent_transfer_commands: Vec::new(),
             transfer_sequence: 0,
             image_upload_rects: Vec::new(),
-            recent_draw_commands: Vec::new(),
+            recent_draw_commands: GpuDrawTraceBuffer::new(),
             display_area_history: Vec::new(),
             largest_draw_command: None,
             top_draw_commands: Vec::new(),
-            focus_draw_commands: Vec::new(),
-            overlap_draw_commands: Vec::new(),
+            focus_draw_commands: GpuDrawTraceBuffer::new(),
+            overlap_draw_commands: GpuDrawTraceBuffer::new(),
             draw_sequence: 0,
             draw_capture_range: None,
             draw_capture_predicates: Vec::new(),
@@ -1441,12 +1508,24 @@ impl Default for Gpu {
             field_composed_display_width: 0,
             field_composed_display_height: 0,
             field_composed_display_capture_index: 0,
+            display_resolve_cache: RefCell::new(None),
             visibility_cache: RefCell::new(None),
+            display_color_stats_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_COLOR_STATS_CACHE_LIMIT,
+            )),
             visibility_cache_in_progress: Cell::new(false),
+            #[cfg(test)]
+            display_resolve_cache_hits: Cell::new(0),
+            #[cfg(test)]
+            display_resolve_cache_misses: Cell::new(0),
             #[cfg(test)]
             visibility_cache_hits: Cell::new(0),
             #[cfg(test)]
             visibility_cache_misses: Cell::new(0),
+            #[cfg(test)]
+            display_color_stats_cache_hits: Cell::new(0),
+            #[cfg(test)]
+            display_color_stats_cache_misses: Cell::new(0),
             #[cfg(test)]
             field_composed_capture_attempts: 0,
         }
@@ -1549,6 +1628,66 @@ impl Gpu {
         self.write_gp0_from(value, Some(source));
     }
 
+    pub(crate) fn write_recovery_gp0_command(
+        &mut self,
+        words: &[u32],
+        command_address: u32,
+        pc: Option<u32>,
+    ) {
+        if words.is_empty() {
+            return;
+        }
+        if !self.gp0_fifo.is_empty() {
+            for (index, word) in words.iter().copied().enumerate() {
+                self.write_gp0_with_source(
+                    word,
+                    GpuCommandSource::recovery_dma_linked_list(
+                        command_address.saturating_add(index as u32 * 4),
+                        pc,
+                    ),
+                );
+            }
+            return;
+        }
+
+        self.commands_seen = self.commands_seen.saturating_add(words.len() as u64);
+        let source = [Some(GpuCommandSource::recovery_dma_linked_list(
+            command_address,
+            pc,
+        ))];
+        let fingerprint = self.recovery_raster_command_fingerprint(words);
+        self.framebuffer.begin_recovery_raster_command(fingerprint);
+        self.execute_gp0_command(words, &source);
+        self.framebuffer.end_recovery_raster_command();
+    }
+
+    fn recovery_raster_command_fingerprint(&self, words: &[u32]) -> u64 {
+        let mut fingerprint = 0x6a09_e667_f3bc_c909u64;
+        for value in [
+            u64::from(self.drawing_area_top_left),
+            u64::from(self.drawing_area_bottom_right),
+            u64::from(self.drawing_offset),
+            u64::from(self.texture_page),
+            u64::from(self.texture_window.gp0_value()),
+            u64::from(self.set_mask_bit),
+            u64::from(self.check_mask_bit),
+            u64::from(self.display_area_start),
+        ] {
+            Self::visibility_mix_u64(&mut fingerprint, value);
+        }
+        if let Some((x, y)) = self.recovery_overlay_translation {
+            Self::visibility_mix_i32(&mut fingerprint, x);
+            Self::visibility_mix_i32(&mut fingerprint, y);
+        } else {
+            Self::visibility_mix_u64(&mut fingerprint, u64::MAX);
+        }
+        Self::visibility_mix_u64(&mut fingerprint, words.len() as u64);
+        for word in words {
+            Self::visibility_mix_u64(&mut fingerprint, u64::from(*word));
+        }
+        fingerprint
+    }
+
     pub fn begin_gp0_capture_batch(&mut self) {
         self.gp0_capture_batch_depth = self.gp0_capture_batch_depth.saturating_add(1);
     }
@@ -1574,6 +1713,21 @@ impl Gpu {
             self.best_observation_last_probe_draw_sequence = self.draw_sequence;
             self.capture_best_observation();
         }
+    }
+
+    pub(crate) fn end_gp0_capture_batch_without_probes(&mut self) {
+        if self.gp0_capture_batch_depth == 0 {
+            return;
+        }
+        self.gp0_capture_batch_depth -= 1;
+        if self.gp0_capture_batch_depth != 0 {
+            return;
+        }
+
+        // Recovery replay rebuilds an already-observed scene and can run several
+        // batches per vblank. Do not rescan the full display after every batch.
+        self.gp0_capture_batch_field_probe_pending = false;
+        self.gp0_capture_batch_best_probe_pending = false;
     }
 
     pub fn write_gp1_with_source(&mut self, value: u32, source: GpuCommandSource) {
@@ -3536,8 +3690,9 @@ impl Gpu {
         hash
     }
 
-    fn draw_trace_signature(traces: &[GpuDrawTrace]) -> u64 {
-        let mut hash = Self::visibility_signature_seed(traces.len());
+    fn draw_trace_signature<'a>(traces: impl IntoIterator<Item = &'a GpuDrawTrace>) -> u64 {
+        let traces = traces.into_iter();
+        let mut hash = Self::visibility_signature_seed(traces.size_hint().0);
         for trace in traces {
             Self::visibility_mix_u64(&mut hash, trace.sequence);
             Self::visibility_mix_str(&mut hash, trace.kind);
@@ -4249,6 +4404,33 @@ impl Gpu {
     pub fn raw_actual_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
         let output = self.current_raw_display_output_window();
         (output.width, output.height, self.display_output_rgb(output))
+    }
+
+    pub fn fast_gameplay_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
+        let (width, height) = self.display_dimensions();
+        if let Some(field_height) = self.interlaced_field_pair_height(height)
+            && let Some(cached) = self.cached_field_composed_display_output_window()
+            && cached.width == width
+            && cached.height == field_height.saturating_mul(2)
+            && self.cached_field_composed_output_matches_active_field_pair(cached, field_height)
+            && let Some(rgb) = self.field_composed_display_rgb.as_ref()
+            && rgb.len() == cached.width.saturating_mul(cached.height)
+        {
+            return (cached.width, cached.height, rgb.clone());
+        }
+
+        let (x, y) = display_area_start_xy(self.display_area_start);
+        (
+            width,
+            height,
+            self.framebuffer.psx_display_rgb_window_with_depth(
+                x,
+                y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
+        )
     }
 
     pub fn raw_actual_display_png(&self) -> Vec<u8> {
@@ -7031,7 +7213,7 @@ impl Gpu {
         let dominant_bucket = self
             .display_window_dominant_bucket_per_mille(window, width, height, false)
             .max(self.display_window_dominant_bucket_per_mille(window, width, height, true));
-        let dominant_bucket_ok = dominant_bucket >= 480 && dominant_bucket <= 680;
+        let dominant_bucket_ok = (480..=680).contains(&dominant_bucket);
         let dark_lower_band = (raw_color_stats.bottom_band_samples > 0
             && raw_color_stats.bottom_dark_samples.saturating_mul(100)
                 >= raw_color_stats.bottom_band_samples.saturating_mul(85))
@@ -7129,8 +7311,7 @@ impl Gpu {
         dense_field
             && dark_lower_band
             && red_backdrop
-            && dominant_bucket >= 300
-            && dominant_bucket <= 650
+            && (300..=650).contains(&dominant_bucket)
             && average_luma(window.stats) <= 40
             && !raw_color_stats.has_intro_caption_band()
             && !psx_color_stats.has_intro_caption_band()
@@ -8133,6 +8314,76 @@ impl Gpu {
         self.capture_current_presented_frame();
     }
 
+    pub(crate) fn capture_recovered_presented_frame(&mut self) {
+        let (display_width, display_height) = self.display_dimensions();
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        let current = FrameBufferWindow {
+            x: display_x,
+            y: display_y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                display_x,
+                display_y,
+                display_width,
+                display_height,
+                self.display_24bit_enabled(),
+            ),
+        };
+        let (width, height, window) = if screen_observation_worth_saving(current.stats) {
+            (display_width, display_height, current)
+        } else {
+            let output = self.current_display_output_window();
+            if output.cached
+                || !screen_observation_worth_saving(output.window.stats)
+                || self.display_window_is_texture_atlas_with_dimensions(
+                    output.window,
+                    output.width,
+                    output.height,
+                )
+            {
+                return;
+            }
+            (output.width, output.height, output.window)
+        };
+
+        self.presentation_captures = self.presentation_captures.saturating_add(1);
+        let unchanged = self.presented_frame_window.is_some_and(|current| {
+            current.x == window.x
+                && current.y == window.y
+                && current.stats.checksum == window.stats.checksum
+        });
+        if !unchanged {
+            let rgb = self.framebuffer.psx_display_rgb_window_with_depth(
+                window.x,
+                window.y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
+            self.presented_frame_png = None;
+            self.presented_frame_rgb = Some(rgb.clone());
+            self.presented_frame_window = Some(window);
+            self.presented_frame_width = width;
+            self.presented_frame_height = height;
+
+            if self.high_vertical_interlace_enabled()
+                && height >= DEFAULT_DISPLAY_HEIGHT * 2
+                && height.is_multiple_of(2)
+            {
+                self.field_composed_display_png = None;
+                self.field_composed_display_rgb = Some(rgb);
+                self.field_composed_display_window = Some(window);
+                self.field_composed_display_width = width;
+                self.field_composed_display_height = height;
+            }
+        }
+        self.presented_frame_capture_index = self.presentation_captures;
+        if self.field_composed_display_window == Some(window) {
+            self.field_composed_display_capture_index = self.presentation_captures;
+        }
+        *self.display_resolve_cache.borrow_mut() = None;
+        *self.visibility_cache.borrow_mut() = None;
+    }
+
     pub fn begin_recovered_draw_page_tracking(&mut self) {
         self.recovered_draw_page_tracking = true;
         self.recovered_field_local_clip = None;
@@ -8155,6 +8406,7 @@ impl Gpu {
         self.presented_frame_capture_index = 0;
 
         self.invalidate_field_composed_display_cache();
+        *self.display_resolve_cache.borrow_mut() = None;
         *self.visibility_cache.borrow_mut() = None;
     }
 
@@ -8179,6 +8431,30 @@ impl Gpu {
         }
         self.cancel_recovered_draw_page_tracking();
         if (drawing_x, drawing_y) == (current_x, current_y) {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        let target = FrameBufferWindow {
+            x: drawing_x,
+            y: drawing_y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                drawing_x,
+                drawing_y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
+        };
+        let current = self.current_display_window_with_dimensions(width, height);
+        if !screen_observation_worth_saving(target.stats)
+            && screen_observation_worth_saving(current.stats)
+        {
+            return false;
+        }
+        if self.display_window_is_texture_atlas_with_dimensions(target, width, height)
+            && !self.display_window_is_texture_atlas_with_dimensions(current, width, height)
+        {
             return false;
         }
 
@@ -8224,27 +8500,42 @@ impl Gpu {
 
     fn display_resolve(&self) -> DisplayResolve {
         let current = self.current_display_window();
-        if !self.should_resolve_display_from_candidates(current) {
-            return DisplayResolve {
-                source: "gp1_display_area",
-                promoted: false,
-                window: current,
-            };
+        let key = self.visible_presentation_cache_key(current);
+        if let Some(cached) = self.display_resolve_cache.borrow().as_ref().copied()
+            && cached.key == key
+        {
+            #[cfg(test)]
+            self.display_resolve_cache_hits
+                .set(self.display_resolve_cache_hits.get().saturating_add(1));
+            return cached.result;
         }
 
-        let Some((source, candidate)) = self.best_resolved_display_candidate(current) else {
-            return DisplayResolve {
+        #[cfg(test)]
+        self.display_resolve_cache_misses
+            .set(self.display_resolve_cache_misses.get().saturating_add(1));
+
+        let result = if !self.should_resolve_display_from_candidates(current) {
+            DisplayResolve {
                 source: "gp1_display_area",
                 promoted: false,
                 window: current,
-            };
+            }
+        } else if let Some((source, candidate)) = self.best_resolved_display_candidate(current) {
+            DisplayResolve {
+                source,
+                promoted: true,
+                window: candidate,
+            }
+        } else {
+            DisplayResolve {
+                source: "gp1_display_area",
+                promoted: false,
+                window: current,
+            }
         };
 
-        DisplayResolve {
-            source,
-            promoted: true,
-            window: candidate,
-        }
+        *self.display_resolve_cache.borrow_mut() = Some(DisplayResolveCache { key, result });
+        result
     }
 
     fn display_resolve_for_visibility_with_strict(&self, strict: DisplayResolve) -> DisplayResolve {
@@ -10244,6 +10535,11 @@ impl Gpu {
         )
     }
 
+    pub fn recovery_raster_cache_stats_json(&self) -> String {
+        let (hits, misses, entries, writes) = self.framebuffer.recovery_raster_cache_stats();
+        format!("{{\"hits\":{hits},\"misses\":{misses},\"entries\":{entries},\"writes\":{writes}}}")
+    }
+
     pub fn vram_stats(&self) -> FrameBufferStats {
         self.framebuffer.stats()
     }
@@ -11033,50 +11329,26 @@ impl Gpu {
         ) {
             (TexturedDrawStats::default(), TexturedDrawStats::default())
         } else if native_use_alternate_quad_split() {
-            (
-                self.framebuffer.draw_shaded_textured_triangle(
-                    a,
-                    b,
-                    d,
-                    [a_color, b_color, d_color],
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
-                self.framebuffer.draw_shaded_textured_triangle(
-                    a,
-                    c,
-                    d,
-                    [a_color, c_color, d_color],
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
+            self.framebuffer.draw_shaded_textured_quad_triangles_shared(
+                [a, b, d],
+                [a_color, b_color, d_color],
+                [a, c, d],
+                [a_color, c_color, d_color],
+                texture_page,
+                clut,
+                options,
+                self.texture_window,
             )
         } else {
-            (
-                self.framebuffer.draw_shaded_textured_triangle(
-                    a,
-                    b,
-                    c,
-                    [a_color, b_color, c_color],
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
-                self.framebuffer.draw_shaded_textured_triangle(
-                    b,
-                    c,
-                    d,
-                    [b_color, c_color, d_color],
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
+            self.framebuffer.draw_shaded_textured_quad_triangles_shared(
+                [a, b, c],
+                [a_color, b_color, c_color],
+                [b, c, d],
+                [b_color, c_color, d_color],
+                texture_page,
+                clut,
+                options,
+                self.texture_window,
             )
         };
         self.restore_drawing_clip_if(adjusted_clip);
@@ -11135,46 +11407,22 @@ impl Gpu {
             ) {
             (TexturedDrawStats::default(), TexturedDrawStats::default())
         } else if native_use_alternate_quad_split() {
-            (
-                self.framebuffer.draw_textured_triangle(
-                    a,
-                    b,
-                    d,
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
-                self.framebuffer.draw_textured_triangle(
-                    a,
-                    c,
-                    d,
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
+            self.framebuffer.draw_textured_quad_triangles_shared(
+                [a, b, d],
+                [a, c, d],
+                texture_page,
+                clut,
+                options,
+                self.texture_window,
             )
         } else {
-            (
-                self.framebuffer.draw_textured_triangle(
-                    a,
-                    b,
-                    c,
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
-                self.framebuffer.draw_textured_triangle(
-                    b,
-                    c,
-                    d,
-                    texture_page,
-                    clut,
-                    options,
-                    self.texture_window,
-                ),
+            self.framebuffer.draw_textured_quad_triangles_shared(
+                [a, b, c],
+                [b, c, d],
+                texture_page,
+                clut,
+                options,
+                self.texture_window,
             )
         };
         self.restore_drawing_clip_if(adjusted_clip);
@@ -11598,9 +11846,15 @@ impl Gpu {
         {
             self.largest_draw_command = Some(trace.clone());
         }
-        self.push_top_draw_command(trace.clone());
-        self.push_focus_draw_command(trace.clone());
-        self.push_overlap_draw_command(trace.clone());
+        if trace.score() > 0 {
+            self.push_top_draw_command(trace.clone());
+        }
+        if trace.is_focus_candidate() {
+            self.push_focus_draw_command(trace.clone());
+        }
+        if trace.overlaps_playfield() {
+            self.push_overlap_draw_command(trace.clone());
+        }
         self.capture_draw_if_requested(&trace);
         self.recent_draw_commands.push(trace);
         if self.recent_draw_commands.len() > GPU_RECENT_DRAW_LIMIT {
@@ -11701,6 +11955,7 @@ impl Gpu {
     fn draw_transfer_provenance_json(&self, trace: &GpuDrawTrace) -> String {
         let texture_raw_bounds = texture_raw_bounds_for_trace(trace);
         let clut_bounds = clut_bounds_for_trace(trace);
+        let clut_candidate_transfers = self.clut_candidate_transfers_json(trace);
         let latest_texture_raw_transfer = texture_raw_bounds.and_then(|bounds| {
             self.latest_transfer_dest_overlap(bounds, trace.command_order)
                 .map(|transfer| (bounds, transfer))
@@ -11723,12 +11978,13 @@ impl Gpu {
                 .is_none_or(|_| clut_transfer_before_draw.is_some_and(|before_draw| before_draw));
 
         format!(
-            "{{\"draw_command_order\":{},\"draw_presentation_vblank\":{},\"recent_transfer_count\":{},\"texture_raw_bounds\":{},\"clut_bounds\":{},\"texture_transfer_before_draw\":{},\"clut_transfer_before_draw\":{},\"generation_valid\":{},\"latest_texture_raw_transfer\":{},\"latest_clut_transfer\":{}}}",
+            "{{\"draw_command_order\":{},\"draw_presentation_vblank\":{},\"recent_transfer_count\":{},\"texture_raw_bounds\":{},\"clut_bounds\":{},\"clut_candidate_transfers\":[{}],\"texture_transfer_before_draw\":{},\"clut_transfer_before_draw\":{},\"generation_valid\":{},\"latest_texture_raw_transfer\":{},\"latest_clut_transfer\":{}}}",
             trace.command_order,
             trace.presentation_vblank,
             self.recent_transfer_commands.len(),
             optional_draw_bounds_json(texture_raw_bounds),
             optional_draw_bounds_json(clut_bounds),
+            clut_candidate_transfers,
             optional_bool_json(texture_transfer_before_draw),
             optional_bool_json(clut_transfer_before_draw),
             generation_valid,
@@ -11741,6 +11997,32 @@ impl Gpu {
                 |(bounds, transfer)| transfer.overlap_summary_json(bounds),
             )
         )
+    }
+
+    fn clut_candidate_transfers_json(&self, trace: &GpuDrawTrace) -> String {
+        clut_candidate_bounds_for_trace(trace)
+            .into_iter()
+            .map(|candidate| {
+                let latest_transfer = self
+                    .latest_transfer_dest_overlap(candidate.bounds, trace.command_order)
+                    .map(|transfer| (candidate.bounds, transfer));
+                let transfer_before_draw = latest_transfer.map(|(_, transfer)| {
+                    transfer.command_order <= trace.command_order
+                        && transfer.vblank <= trace.presentation_vblank
+                });
+                format!(
+                    "{{\"label\":\"{}\",\"bounds\":{},\"transfer_before_draw\":{},\"latest_transfer\":{}}}",
+                    candidate.label,
+                    candidate.bounds.json(),
+                    optional_bool_json(transfer_before_draw),
+                    latest_transfer.map_or_else(
+                        || "null".to_string(),
+                        |(bounds, transfer)| transfer.overlap_summary_json(bounds),
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn latest_transfer_dest_overlap(
@@ -11756,9 +12038,6 @@ impl Gpu {
     }
 
     fn push_top_draw_command(&mut self, trace: GpuDrawTrace) {
-        if trace.score() <= 0 {
-            return;
-        }
         self.top_draw_commands.push(trace);
         self.top_draw_commands.sort_by(|left, right| {
             right
@@ -11770,9 +12049,6 @@ impl Gpu {
     }
 
     fn push_focus_draw_command(&mut self, trace: GpuDrawTrace) {
-        if !trace.is_focus_candidate() {
-            return;
-        }
         self.focus_draw_commands.push(trace);
         if self.focus_draw_commands.len() > GPU_FOCUS_DRAW_LIMIT {
             self.focus_draw_commands.remove(0);
@@ -11780,9 +12056,6 @@ impl Gpu {
     }
 
     fn push_overlap_draw_command(&mut self, trace: GpuDrawTrace) {
-        if !trace.overlaps_playfield() {
-            return;
-        }
         self.overlap_draw_commands.push(trace);
         if self.overlap_draw_commands.len() > GPU_OVERLAP_DRAW_LIMIT {
             self.overlap_draw_commands.remove(0);
@@ -12185,7 +12458,7 @@ impl Gpu {
                 (score, json)
             })
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| right.0.cmp(&left.0));
+        candidates.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         candidates
             .into_iter()
             .take(limit)
@@ -13326,13 +13599,11 @@ impl Gpu {
                 output,
                 actual_color_stats,
             );
-        let has_actual_playfield = if caption_current_streamed_scene_recovery {
-            true
-        } else if high_vertical_actual_live_scene {
-            true
-        } else if safe_field_recovery {
-            true
-        } else if active_field_artifact_recovery {
+        let has_actual_playfield = if caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene
+            || safe_field_recovery
+            || active_field_artifact_recovery
+        {
             true
         } else if use_output {
             has_actual_gameplay_profile && (!current_is_texture_atlas || strong_live_field_output)
@@ -13830,13 +14101,11 @@ impl Gpu {
                 output,
                 actual_color_stats,
             );
-        let has_actual_playfield = if caption_current_streamed_scene_recovery {
-            true
-        } else if high_vertical_actual_live_scene {
-            true
-        } else if safe_field_recovery {
-            true
-        } else if active_field_artifact_recovery {
+        let has_actual_playfield = if caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene
+            || safe_field_recovery
+            || active_field_artifact_recovery
+        {
             true
         } else if use_output {
             has_actual_gameplay_profile && (!current_is_texture_atlas || strong_live_field_output)
@@ -14336,13 +14605,11 @@ impl Gpu {
                 output,
                 actual_color_stats,
             );
-        let has_actual_playfield = if caption_current_streamed_scene_recovery {
-            true
-        } else if high_vertical_actual_live_scene {
-            true
-        } else if safe_field_recovery {
-            true
-        } else if active_field_artifact_recovery {
+        let has_actual_playfield = if caption_current_streamed_scene_recovery
+            || high_vertical_actual_live_scene
+            || safe_field_recovery
+            || active_field_artifact_recovery
+        {
             true
         } else if use_output {
             has_actual_gameplay_profile && (!current_is_texture_atlas || strong_live_field_output)
@@ -17216,8 +17483,7 @@ impl Gpu {
             && average_luma(window.stats) <= 48
             && nonzero_percent >= pixel_count.saturating_mul(60)
             && nonzero_percent <= pixel_count.saturating_mul(90)
-            && dominant_bucket >= 250
-            && dominant_bucket <= 700
+            && (250..=700).contains(&dominant_bucket)
     }
 
     fn display_window_has_br2_low_color_select_texture_atlas_overlay(
@@ -17243,7 +17509,7 @@ impl Gpu {
             self.display_window_dominant_bucket_per_mille(window, width, height, true);
         let dark_lower_band = color_stats.bottom_dark_samples.saturating_mul(100)
             >= color_stats.bottom_band_samples.saturating_mul(78);
-        let low_color_backdrop = color_stats.bucket_count >= 3 && color_stats.bucket_count <= 48;
+        let low_color_backdrop = (3..=48).contains(&color_stats.bucket_count);
         let red_weight = color_stats.red_sum.saturating_mul(4)
             >= color_stats.green_sum.saturating_add(color_stats.blue_sum);
 
@@ -17253,8 +17519,7 @@ impl Gpu {
             && average_luma(window.stats) <= 56
             && nonzero_percent >= pixel_count.saturating_mul(24)
             && nonzero_percent <= pixel_count.saturating_mul(40)
-            && dominant_bucket >= 620
-            && dominant_bucket <= 820
+            && (620..=820).contains(&dominant_bucket)
     }
 
     fn display_window_color_stats(
@@ -17266,6 +17531,54 @@ impl Gpu {
     ) -> DisplayColorStats {
         let width = width.max(1);
         let height = height.max(1);
+        let key = DisplayColorStatsCacheKey {
+            window,
+            width,
+            height,
+            psx_wrap,
+            display_24bit: self.display_24bit_enabled(),
+            commands_seen: self.commands_seen,
+            draw_sequence: self.draw_sequence,
+            transfer_sequence: self.transfer_sequence,
+            presentation_captures: self.presentation_captures,
+            presented_frame_capture_index: self.presented_frame_capture_index,
+            field_composed_display_capture_index: self.field_composed_display_capture_index,
+        };
+        if let Some(cached) = self
+            .display_color_stats_cache
+            .borrow()
+            .iter()
+            .find(|cached| cached.key == key)
+            .copied()
+        {
+            #[cfg(test)]
+            self.display_color_stats_cache_hits
+                .set(self.display_color_stats_cache_hits.get().saturating_add(1));
+            return cached.stats;
+        }
+
+        #[cfg(test)]
+        self.display_color_stats_cache_misses.set(
+            self.display_color_stats_cache_misses
+                .get()
+                .saturating_add(1),
+        );
+        let stats = self.compute_display_window_color_stats(window, width, height, psx_wrap);
+        let mut cache = self.display_color_stats_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_COLOR_STATS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayColorStatsCache { key, stats });
+        stats
+    }
+
+    fn compute_display_window_color_stats(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> DisplayColorStats {
         let x_step = (width / 64).max(1);
         let y_step = (height / 64).max(1);
         let mut stats = DisplayColorStats::default();
@@ -18254,6 +18567,33 @@ struct VisiblePresentationCache {
     result: VisiblePresentationResult,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayResolveCache {
+    key: VisiblePresentationCacheKey,
+    result: DisplayResolve,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayColorStatsCacheKey {
+    window: FrameBufferWindow,
+    width: usize,
+    height: usize,
+    psx_wrap: bool,
+    display_24bit: bool,
+    commands_seen: u64,
+    draw_sequence: u64,
+    transfer_sequence: u64,
+    presentation_captures: u64,
+    presented_frame_capture_index: u64,
+    field_composed_display_capture_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayColorStatsCache {
+    key: DisplayColorStatsCacheKey,
+    stats: DisplayColorStats,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DisplayColorStats {
     samples: u64,
@@ -18786,7 +19126,7 @@ impl GpuDrawTrace {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DrawBounds {
     left: i32,
     top: i32,
@@ -19237,6 +19577,104 @@ fn clut_bounds_for_trace(trace: &GpuDrawTrace) -> Option<DrawBounds> {
     let entries = texture_palette_entries_for_diagnostics(texture_page)?;
     let (x, y) = clut_origin_for_diagnostics(clut);
     Some(rect_bounds(Point { x, y }, entries, 1))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClutCandidateBounds {
+    label: &'static str,
+    bounds: DrawBounds,
+}
+
+fn clut_candidate_bounds_for_trace(trace: &GpuDrawTrace) -> Vec<ClutCandidateBounds> {
+    let Some(texture_page) = trace.texture_page else {
+        return Vec::new();
+    };
+    let Some(clut) = trace.clut else {
+        return Vec::new();
+    };
+    let Some(entries) = texture_palette_entries_for_diagnostics(texture_page) else {
+        return Vec::new();
+    };
+    if entries != 16 || !br2_reused_texture_page_0039(texture_page) {
+        return Vec::new();
+    }
+
+    let (requested_x, requested_y) = clut_origin_for_diagnostics(clut);
+    let mut candidates = Vec::new();
+    push_clut_candidate_bounds(
+        &mut candidates,
+        "requested",
+        requested_x,
+        requested_y,
+        entries,
+    );
+    push_clut_candidate_bounds(
+        &mut candidates,
+        "requested_y16_base",
+        requested_x,
+        requested_y & !0x0f,
+        entries,
+    );
+    push_clut_candidate_bounds(
+        &mut candidates,
+        "requested_y32_base",
+        requested_x,
+        requested_y & !0x1f,
+        entries,
+    );
+
+    match clut {
+        0x785a => {
+            for (label, x) in [
+                ("br2_785a_selector_x256", 256),
+                ("br2_785a_selector_x384", 384),
+                ("br2_785a_selector_x400", 400),
+                ("br2_785a_selector_x432", 432),
+                ("br2_785a_selector_x448", 448),
+            ] {
+                push_clut_candidate_bounds(&mut candidates, label, x, requested_y, entries);
+            }
+        }
+        0x799a | 0x79d9 | 0x7a5a | 0x7a9a => {
+            push_clut_candidate_bounds(
+                &mut candidates,
+                "left_alias",
+                requested_x.saturating_sub(16),
+                requested_y,
+                entries,
+            );
+            push_clut_candidate_bounds(
+                &mut candidates,
+                "right_alias",
+                requested_x.saturating_add(16),
+                requested_y,
+                entries,
+            );
+        }
+        _ => {}
+    }
+
+    candidates
+}
+
+fn push_clut_candidate_bounds(
+    candidates: &mut Vec<ClutCandidateBounds>,
+    label: &'static str,
+    x: i32,
+    y: i32,
+    entries: i32,
+) {
+    if entries <= 0 || x < 0 || y < 0 {
+        return;
+    }
+    let bounds = rect_bounds(Point { x, y }, entries, 1);
+    if candidates
+        .iter()
+        .any(|candidate| candidate.label == label || candidate.bounds == bounds)
+    {
+        return;
+    }
+    candidates.push(ClutCandidateBounds { label, bounds });
 }
 
 fn texture_raw_width_for_diagnostics(texture_page: u16) -> i32 {
@@ -19791,7 +20229,7 @@ fn should_allow_br2_gameplay_polygon_palette_fallback(
     matches!(command, 0x24..=0x2f | 0x34..=0x3f)
         && (matches!((texture_page, clut), (0x002e, 0x7b9e))
             || (br2_reused_texture_page_0039(texture_page)
-                && matches!(clut, 0x799a | 0x79d9 | 0x7a5a | 0x7a9a))
+                && matches!(clut, 0x785a | 0x799a | 0x79d9 | 0x7a5a | 0x7a9a))
             || low_bank_character)
         && bounds.left <= 511
         && bounds.right >= 0
@@ -22036,9 +22474,10 @@ fn flatten_mdec_rgb555_macroblocks_as_240p_strips(
             }
         }
         let padding_rows = MDEC_STRIP_HEIGHT_PIXELS - (MDEC_240P_MACROBLOCK_ROWS * 16);
-        pixels.extend(
-            std::iter::repeat(0).take(padding_rows.saturating_mul(MDEC_STRIP_WIDTH_PIXELS)),
-        );
+        pixels.extend(std::iter::repeat_n(
+            0,
+            padding_rows.saturating_mul(MDEC_STRIP_WIDTH_PIXELS),
+        ));
     }
     for macroblock in &macroblocks[packed_len..] {
         pixels.extend_from_slice(macroblock);
@@ -22457,8 +22896,10 @@ mod tests {
 
     #[test]
     fn dma_interrupt_full_write_replaces_controls_and_preserves_unacknowledged_flags() {
-        let mut dma = super::Dma::default();
-        dma.interrupt = (1 << 23) | (1 << 20) | (1 << 28);
+        let mut dma = super::Dma {
+            interrupt: (1 << 23) | (1 << 20) | (1 << 28),
+            ..super::Dma::default()
+        };
 
         dma.write_u32(DMA_INTERRUPT, 0);
 
@@ -22727,7 +23168,7 @@ mod tests {
             ),
             "tiny ordinary quads must not borrow an unrelated low-bank palette"
         );
-        for clut in [0x799a, 0x79d9, 0x7a5a, 0x7a9a] {
+        for clut in [0x785a, 0x799a, 0x79d9, 0x7a5a, 0x7a9a] {
             for texture_page in [0x0039, 0x0239] {
                 assert!(
                     super::should_allow_br2_gameplay_polygon_palette_fallback(
@@ -23101,6 +23542,100 @@ mod tests {
         )
     }
 
+    fn display_resolve_cache_counts(io: &Io) -> (u64, u64) {
+        (
+            io.gpu.display_resolve_cache_hits.get(),
+            io.gpu.display_resolve_cache_misses.get(),
+        )
+    }
+
+    fn display_color_stats_cache_counts(io: &Io) -> (u64, u64) {
+        (
+            io.gpu.display_color_stats_cache_hits.get(),
+            io.gpu.display_color_stats_cache_misses.get(),
+        )
+    }
+
+    #[test]
+    fn gpu_display_color_stats_cache_reuses_identical_window() {
+        let io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let window = io.gpu.current_display_window();
+
+        let first = io
+            .gpu
+            .display_window_color_stats(window, width, height, true);
+        assert_eq!(display_color_stats_cache_counts(&io), (0, 1));
+        let second = io
+            .gpu
+            .display_window_color_stats(window, width, height, true);
+
+        assert_eq!(second, first);
+        assert_eq!(display_color_stats_cache_counts(&io), (1, 1));
+    }
+
+    #[test]
+    fn gpu_display_color_stats_cache_separates_psx_wrap_modes() {
+        let io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let window = io.gpu.current_display_window();
+
+        io.gpu
+            .display_window_color_stats(window, width, height, true);
+        io.gpu
+            .display_window_color_stats(window, width, height, false);
+
+        assert_eq!(display_color_stats_cache_counts(&io), (0, 2));
+    }
+
+    #[test]
+    fn gpu_display_color_stats_cache_invalidates_after_draw_sequence_change() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let window = io.gpu.current_display_window();
+        io.gpu
+            .display_window_color_stats(window, width, height, true);
+
+        io.gpu.draw_sequence = io.gpu.draw_sequence.saturating_add(1);
+        io.gpu
+            .display_window_color_stats(window, width, height, true);
+
+        assert_eq!(display_color_stats_cache_counts(&io), (0, 2));
+    }
+
+    #[test]
+    fn gpu_display_color_stats_cache_invalidates_after_presentation_change() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let window = io.gpu.current_display_window();
+        io.gpu
+            .display_window_color_stats(window, width, height, true);
+
+        io.gpu.presentation_captures = io.gpu.presentation_captures.saturating_add(1);
+        io.gpu.presented_frame_capture_index =
+            io.gpu.presented_frame_capture_index.saturating_add(1);
+        io.gpu
+            .display_window_color_stats(window, width, height, true);
+
+        assert_eq!(display_color_stats_cache_counts(&io), (0, 2));
+    }
+
+    #[test]
+    fn gpu_display_resolve_cache_reuses_unchanged_candidate_scan() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+
+        assert_eq!(display_resolve_cache_counts(&io), (0, 0));
+        let first = io.gpu.display_resolve();
+        assert_eq!(display_resolve_cache_counts(&io), (0, 1));
+        let second = io.gpu.display_resolve();
+
+        assert_eq!(second, first);
+        assert_eq!(display_resolve_cache_counts(&io), (1, 1));
+    }
+
     #[test]
     fn gpu_visibility_cache_reuses_unchanged_stale_dma_gate_result() {
         let mut io = Io::default();
@@ -23263,8 +23798,8 @@ mod tests {
                 let color = match (x / 4 + y / 4) % 4 {
                     0 => 0x0000_0000,
                     1 => 0x00f0_1010,
-                    2 => 0x0010_f0_f0,
-                    _ => 0x00f0_10_f0,
+                    2 => 0x0010_f0f0,
+                    _ => 0x00f0_10f0,
                 };
                 io.gpu
                     .framebuffer
@@ -23469,14 +24004,14 @@ mod tests {
             hud_y as i32,
             (width * 34 / 100) as i32,
             (height / 16).max(3) as i32,
-            0x00e8_e8_e8,
+            0x00e8_e8e8,
         );
         io.gpu.framebuffer.fill_rect_unclipped(
             x_offset.saturating_add(width * 76 / 100) as i32,
             hud_y as i32,
             (width * 18 / 100) as i32,
             (height / 14).max(3) as i32,
-            0x00d8_d8_d8,
+            0x00d8_d8d8,
         );
     }
 
@@ -23504,7 +24039,7 @@ mod tests {
                     3 => {
                         let red = 160 + noise.min(80);
                         let blue = 144 + ((noise * 3) % 96);
-                        (red << 16) | 0x0010_00 | blue
+                        (red << 16) | 0x0000_1000 | blue
                     }
                     4 => {
                         let green = 144 + noise.min(96);
@@ -23518,7 +24053,7 @@ mod tests {
                     6 => {
                         let red = 176 + noise.min(72);
                         let blue = 168 + ((noise * 7) % 80);
-                        (red << 16) | 0x0028_00 | blue
+                        (red << 16) | 0x0000_2800 | blue
                     }
                     _ => {
                         let red = 48 + ((x * 13 + y * 5 + noise as usize) % 176) as u32;
@@ -23662,9 +24197,9 @@ mod tests {
                 let color = if (x + y * 3) % 11 < 5 {
                     0x00d8_1020
                 } else if (x * 3 + y) % 13 < 3 {
-                    0x00e8_e8_e8
+                    0x00e8_e8e8
                 } else {
-                    0x0030_80_b0
+                    0x0030_80b0
                 };
                 io.gpu.framebuffer.fill_rect_unclipped(
                     x_offset.saturating_add(x) as i32,
@@ -23681,7 +24216,7 @@ mod tests {
                 let color = if (x / 18 + y / 12) % 3 == 0 {
                     0x00d8_1010
                 } else {
-                    0x00f0_f0_f0
+                    0x00f0_f0f0
                 };
                 io.gpu.framebuffer.fill_rect_unclipped(
                     x_offset.saturating_add(x) as i32,
@@ -23701,7 +24236,7 @@ mod tests {
                 y_offset.saturating_add(right_y + row * 5) as i32,
                 48,
                 4,
-                0x00f8_f8_d0,
+                0x00f8_f8d0,
             );
         }
 
@@ -23713,7 +24248,7 @@ mod tests {
                 y_offset.saturating_add(center_y + (index % 2) * 8) as i32,
                 10,
                 5,
-                0x00f0_f0_f0,
+                0x00f0_f0f0,
             );
         }
     }
@@ -25126,6 +25661,27 @@ mod tests {
     }
 
     #[test]
+    fn gpu_recovery_capture_publishes_full_frame_without_expensive_field_probe() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.field_composed_capture_attempts = 0;
+
+        io.gpu.capture_recovered_presented_frame();
+
+        let presented = io.gpu.presented_frame_window.expect("presented frame");
+        assert_eq!((presented.x, presented.y), (0, 0));
+        assert_eq!(
+            (io.gpu.presented_frame_width, io.gpu.presented_frame_height),
+            (512, 480)
+        );
+        assert_eq!(io.gpu.field_composed_capture_attempts, 0);
+        assert_eq!(io.gpu.field_composed_display_window, Some(presented));
+        assert_eq!(io.gpu.presentation_captures, 1);
+    }
+
+    #[test]
     fn gpu_draw_capture_survives_gp1_reset() {
         let mut io = Io::default();
 
@@ -25259,6 +25815,75 @@ mod tests {
         assert_eq!(
             io.gpu.best_observation_last_probe_draw_sequence,
             io.gpu.draw_sequence
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_batch_discards_draw_probes_without_blocking_next_guest_batch() {
+        let mut io = Io::default();
+        io.gpu.commands_seen = GP0_BEST_OBSERVATION_EAGER_COMMANDS;
+        io.gpu.best_observation_last_probe_command = io.gpu.commands_seen;
+        io.gpu.best_observation_last_probe_draw_sequence = io.gpu.draw_sequence;
+        io.gpu.field_composed_capture_attempts = 0;
+
+        io.gpu.begin_gp0_capture_batch();
+        for x in 0..GP0_BEST_OBSERVATION_DRAW_INTERVAL {
+            io.write_u32(GPU_GP0, 0x6800_00ff);
+            io.write_u32(GPU_GP0, x as u32);
+        }
+        io.gpu.end_gp0_capture_batch_without_probes();
+
+        assert_eq!(io.gpu.gp0_capture_batch_depth, 0);
+        assert!(!io.gpu.gp0_capture_batch_field_probe_pending);
+        assert!(!io.gpu.gp0_capture_batch_best_probe_pending);
+        assert_eq!(io.gpu.field_composed_capture_attempts, 0);
+        assert_eq!(
+            io.gpu.best_observation_last_probe_command,
+            GP0_BEST_OBSERVATION_EAGER_COMMANDS
+        );
+
+        io.gpu.begin_gp0_capture_batch();
+        for x in 0..GP0_BEST_OBSERVATION_DRAW_INTERVAL {
+            io.write_u32(GPU_GP0, 0x6800_00ff);
+            io.write_u32(GPU_GP0, 0x1000 + x as u32);
+        }
+        io.gpu.end_gp0_capture_batch();
+
+        assert_eq!(io.gpu.field_composed_capture_attempts, 1);
+        assert_eq!(
+            io.gpu.best_observation_last_probe_command,
+            io.gpu.commands_seen
+        );
+    }
+
+    #[test]
+    fn recovery_gp0_command_fast_path_matches_word_stream_execution() {
+        let command = [0x0200_7f3f, 0x0014_000c, 0x0018_0020];
+        let command_address = 0x0039_1000;
+        let pc = Some(0x802d_080c);
+        let mut streamed = Io::default();
+        let mut direct = Io::default();
+
+        for (index, word) in command.iter().copied().enumerate() {
+            streamed.gpu.write_gp0_with_source(
+                word,
+                GpuCommandSource::recovery_dma_linked_list(command_address + index as u32 * 4, pc),
+            );
+        }
+        direct
+            .gpu
+            .write_recovery_gp0_command(&command, command_address, pc);
+
+        assert_eq!(direct.gpu.commands_seen, streamed.gpu.commands_seen);
+        assert_eq!(direct.gpu.draw_sequence, streamed.gpu.draw_sequence);
+        assert_eq!(direct.gpu.vram_stats(), streamed.gpu.vram_stats());
+        assert_eq!(
+            direct.gpu.recent_gp0_commands_json(),
+            streamed.gpu.recent_gp0_commands_json()
+        );
+        assert_eq!(
+            direct.gpu.recent_draw_commands_json(),
+            streamed.gpu.recent_draw_commands_json()
         );
     }
 
@@ -25844,7 +26469,11 @@ mod tests {
                 } else {
                     0x02ff_ff00
                 };
-                for word in [color, (tile_y * 16) << 16 | tile_x * 16, 16 << 16 | 16] {
+                for word in [
+                    color,
+                    ((tile_y * 16) << 16) | (tile_x * 16),
+                    (16 << 16) | 16,
+                ] {
                     before.write_gp0(word);
                 }
             }
@@ -28996,7 +29625,7 @@ mod tests {
                     io.gpu
                         .framebuffer
                         .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00d8_1818);
-                } else if (local_x + local_y * 3) % 13 == 0 {
+                } else if (local_x + local_y * 3).is_multiple_of(13) {
                     io.gpu
                         .framebuffer
                         .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00f0_f0f0);
@@ -31123,9 +31752,12 @@ mod tests {
 
         let (frame_width, frame_height, frame) = io.gpu.actual_display_rgb_frame();
         let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let (fast_width, fast_height, fast_frame) = io.gpu.fast_gameplay_display_rgb_frame();
 
         assert_eq!((frame_width, frame_height), (width, height * 2));
         assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!((fast_width, fast_height), (width, display_height));
+        assert_eq!(fast_frame, frame);
         assert_eq!(gui_frame.len(), width * display_height);
         let top_pixel = frame[0];
         let bottom_pixel = frame[height * width];
@@ -32690,8 +33322,8 @@ mod tests {
             0x0018_7850,
             0x0028_b878,
             0x0068_4020,
-            0x00d8_d8_d8,
-            0x00f0_f8_ff,
+            0x00d8_d8d8,
+            0x00f0_f8ff,
             0x0008_1838,
             0x0010_2038,
             0x0030_8050,
@@ -32725,7 +33357,7 @@ mod tests {
                         1,
                         1,
                         if (x + y) % 7 == 0 {
-                            0x00f0_f8_ff
+                            0x00f0_f8ff
                         } else {
                             0x0040_60d8
                         },
@@ -33931,7 +34563,7 @@ mod tests {
             0x00a0_4020,
             0x0020_a040,
             0x0040_20a0,
-            0x00d8_d8_d8,
+            0x00d8_d8d8,
         ];
         for y in 0..field_height * 7 / 12 {
             for x in 0..width {
@@ -35845,12 +36477,15 @@ mod tests {
         let (frame_width, frame_height, frame) = io.gpu.display_rgb_frame();
         let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
         let (stable_width, stable_height, stable_frame) = io.gpu.stable_display_rgb_frame();
+        let (fast_width, fast_height, fast_frame) = io.gpu.fast_gameplay_display_rgb_frame();
 
         assert_eq!((frame_width, frame_height), (width, display_height));
         assert_eq!((actual_width, actual_height), (width, height * 2));
         assert_eq!(actual_frame, cached_frame);
         assert_eq!((stable_width, stable_height), (width, display_height));
         assert_eq!(frame, stable_frame);
+        assert_eq!((fast_width, fast_height), (width, height * 2));
+        assert_eq!(fast_frame, cached_frame);
         assert!(
             playability.contains("\"actual_display_source\":\"cached_gp1_display_area_fields\""),
             "{playability}"

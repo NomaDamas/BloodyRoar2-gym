@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const VRAM_WIDTH: usize = 1024;
 pub const VRAM_HEIGHT: usize = 1024;
@@ -9,18 +10,93 @@ pub const DEFAULT_DISPLAY_WIDTH: usize = 320;
 pub const DEFAULT_DISPLAY_HEIGHT: usize = 240;
 const GPU_MAX_PRIMITIVE_WIDTH: i32 = 1024;
 const GPU_MAX_PRIMITIVE_HEIGHT: i32 = 512;
+const RECOVERY_RASTER_CACHE_ENTRY_LIMIT: usize = 8_192;
+const RECOVERY_RASTER_CACHE_WRITE_LIMIT: usize = 4_194_304;
+const RECOVERY_RASTER_CACHE_SEEN_LIMIT: usize = 32_768;
+const RECOVERY_PALETTE_HISTORY_ENTRY_LIMIT: usize = 512;
+const VRAM_DEPENDENCY_TILE_SIZE: usize = 16;
+const VRAM_DEPENDENCY_TILE_COLUMNS: usize = VRAM_WIDTH / VRAM_DEPENDENCY_TILE_SIZE;
+const VRAM_DEPENDENCY_TILE_ROWS: usize = VRAM_HEIGHT / VRAM_DEPENDENCY_TILE_SIZE;
+const VRAM_DEPENDENCY_TILE_COUNT: usize = VRAM_DEPENDENCY_TILE_COLUMNS * VRAM_DEPENDENCY_TILE_ROWS;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NativeFrameBuffer {
     pixels: Vec<u32>,
     raw_pixels: Vec<u16>,
     clip: Option<ClipRect>,
+    recovery_raster_context: Option<u64>,
+    recovery_raster_capture: Option<Vec<(usize, u16)>>,
+    recovery_raster_cache: Arc<Mutex<RecoveryRasterCache>>,
+    recovery_palette_history: Arc<Mutex<RecoveryPaletteHistory>>,
+    vram_dependency_tile_hashes: Vec<u64>,
+    vram_dependency_tile_dirty: Vec<bool>,
+}
+
+impl Clone for NativeFrameBuffer {
+    fn clone(&self) -> Self {
+        Self {
+            pixels: self.pixels.clone(),
+            raw_pixels: self.raw_pixels.clone(),
+            clip: self.clip,
+            recovery_raster_context: None,
+            recovery_raster_capture: None,
+            // Recovery transactions clone the GPU every vblank. Share only the
+            // immutable-on-hit acceleration cache, never the framebuffer data.
+            recovery_raster_cache: Arc::clone(&self.recovery_raster_cache),
+            recovery_palette_history: Arc::clone(&self.recovery_palette_history),
+            vram_dependency_tile_hashes: self.vram_dependency_tile_hashes.clone(),
+            vram_dependency_tile_dirty: self.vram_dependency_tile_dirty.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RecoveryRasterCacheKey {
+    command: u64,
+    raster: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RecoveryRasterCacheEntry {
+    writes: Arc<Vec<(usize, u16)>>,
+    stats: [TexturedDrawStats; 2],
+}
+
+#[derive(Debug, Default)]
+struct RecoveryRasterCache {
+    entries: HashMap<RecoveryRasterCacheKey, RecoveryRasterCacheEntry>,
+    order: VecDeque<RecoveryRasterCacheKey>,
+    seen: HashSet<RecoveryRasterCacheKey>,
+    seen_order: VecDeque<RecoveryRasterCacheKey>,
+    writes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RecoveryPaletteHistoryKey {
+    texture_page: u16,
+    clut: u16,
+    texture_signature: u64,
+}
+
+#[derive(Debug, Default)]
+struct RecoveryPaletteHistory {
+    entries: HashMap<RecoveryPaletteHistoryKey, [u16; 16]>,
+    order: VecDeque<RecoveryPaletteHistoryKey>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrameBufferRegionSnapshot {
-    coordinates: Vec<(usize, usize)>,
+    rows: Vec<FrameBufferRegionSnapshotRow>,
     raw_pixels: Vec<u16>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameBufferRegionSnapshotRow {
+    vram_start: usize,
+    raw_start: usize,
+    len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +124,12 @@ impl Default for NativeFrameBuffer {
             pixels: vec![0; VRAM_WIDTH * VRAM_HEIGHT],
             raw_pixels: vec![0; VRAM_WIDTH * VRAM_HEIGHT],
             clip: None,
+            recovery_raster_context: None,
+            recovery_raster_capture: None,
+            recovery_raster_cache: Arc::new(Mutex::new(RecoveryRasterCache::default())),
+            recovery_palette_history: Arc::new(Mutex::new(RecoveryPaletteHistory::default())),
+            vram_dependency_tile_hashes: vec![0; VRAM_DEPENDENCY_TILE_COUNT],
+            vram_dependency_tile_dirty: vec![true; VRAM_DEPENDENCY_TILE_COUNT],
         }
     }
 }
@@ -136,9 +218,281 @@ impl NativeFrameBuffer {
         } else {
             color
         };
-        self.raw_pixels[index] = color;
+        if self.raw_pixels[index] != color {
+            self.raw_pixels[index] = color;
+            self.mark_vram_dependency_tile_dirty(index);
+        }
         self.pixels[index] = rgb555_to_rgb888(color);
+        if let Some(capture) = self.recovery_raster_capture.as_mut() {
+            capture.push((index, color));
+        }
         true
+    }
+
+    pub(crate) fn begin_recovery_raster_command(&mut self, fingerprint: u64) {
+        self.recovery_raster_context = Some(fingerprint);
+        self.recovery_raster_capture = None;
+    }
+
+    pub(crate) fn end_recovery_raster_command(&mut self) {
+        self.recovery_raster_capture = None;
+        self.recovery_raster_context = None;
+    }
+
+    pub(crate) fn recovery_raster_cache_stats(&self) -> (u64, u64, usize, usize) {
+        let cache = self
+            .recovery_raster_cache
+            .lock()
+            .expect("recovery raster cache lock");
+        (cache.hits, cache.misses, cache.entries.len(), cache.writes)
+    }
+
+    fn recovery_textured_raster_key(
+        &mut self,
+        kind: u64,
+        points: &[TexturedPoint],
+        extra: &[u64],
+        texture_page: u16,
+        clut: u16,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> Option<RecoveryRasterCacheKey> {
+        if native_disable_recovery_raster_cache() {
+            return None;
+        }
+        let command = self.recovery_raster_context?;
+        if options.semi_transparent || options.check_mask_bit {
+            return None;
+        }
+
+        let mut raster = recovery_raster_mix(0xcbf2_9ce4_8422_2325, kind);
+        raster = recovery_raster_mix(raster, u64::from(texture_page));
+        raster = recovery_raster_mix(raster, u64::from(clut));
+        raster = recovery_raster_mix(raster, u64::from(options.primitive_color));
+        raster = recovery_raster_mix(raster, u64::from(options.raw_texture));
+        raster = recovery_raster_mix(raster, u64::from(options.set_mask_bit));
+        raster = recovery_raster_mix(raster, u64::from(options.texture_flip_x));
+        raster = recovery_raster_mix(raster, u64::from(options.texture_flip_y));
+        raster = recovery_raster_mix(raster, u64::from(options.allow_palette_fallback));
+        raster = recovery_raster_mix(raster, u64::from(options.allow_texture_descriptor_alias));
+        raster = recovery_raster_mix(raster, u64::from(texture_window.gp0_value()));
+        if let Some(clip) = self.clip {
+            for value in [clip.left, clip.top, clip.right, clip.bottom] {
+                raster = recovery_raster_mix(raster, value as u32 as u64);
+            }
+        } else {
+            raster = recovery_raster_mix(raster, u64::MAX);
+        }
+        for point in points {
+            raster = recovery_raster_mix(raster, point.point.x as u32 as u64);
+            raster = recovery_raster_mix(raster, point.point.y as u32 as u64);
+            raster = recovery_raster_mix(raster, u64::from(point.u));
+            raster = recovery_raster_mix(raster, u64::from(point.v));
+        }
+        for value in extra {
+            raster = recovery_raster_mix(raster, *value);
+        }
+        raster = recovery_raster_mix(
+            raster,
+            self.recovery_texture_dependency_fingerprint(
+                texture_page,
+                clut,
+                TextureSamplingPolicy::from_draw_options(options),
+            ),
+        );
+
+        Some(RecoveryRasterCacheKey { command, raster })
+    }
+
+    fn recovery_texture_dependency_fingerprint(
+        &mut self,
+        texture_page: u16,
+        clut: u16,
+        sampling_policy: TextureSamplingPolicy,
+    ) -> u64 {
+        let (texture_page, clut) = sampling_policy.resolve_descriptor(texture_page, clut);
+        let mut fingerprint = 0x243f_6a88_85a3_08d3;
+        fingerprint = self.mix_vram_dependency_bounds(
+            fingerprint,
+            texture_page_raw_bounds_for_clut(texture_page, clut),
+        );
+
+        if let Some(palette_bounds) = texture_palette_raw_bounds(texture_page, clut) {
+            fingerprint = self.mix_vram_dependency_bounds(fingerprint, palette_bounds);
+            if sampling_policy.allow_palette_fallback {
+                fingerprint = self.mix_vram_dependency_bounds(
+                    fingerprint,
+                    recovery_palette_fallback_dependency_bounds(texture_page, clut),
+                );
+            }
+        }
+
+        fingerprint
+    }
+
+    fn mix_vram_dependency_bounds(
+        &mut self,
+        mut fingerprint: u64,
+        bounds: (i32, i32, i32, i32),
+    ) -> u64 {
+        let (left, top, right, bottom) = bounds;
+        let left = left.clamp(0, VRAM_WIDTH as i32 - 1) as usize;
+        let top = top.clamp(0, VRAM_HEIGHT as i32 - 1) as usize;
+        let right = right.clamp(0, VRAM_WIDTH as i32 - 1) as usize;
+        let bottom = bottom.clamp(0, VRAM_HEIGHT as i32 - 1) as usize;
+        if left > right || top > bottom {
+            return recovery_raster_mix(fingerprint, u64::MAX);
+        }
+
+        let first_tile_x = left / VRAM_DEPENDENCY_TILE_SIZE;
+        let last_tile_x = right / VRAM_DEPENDENCY_TILE_SIZE;
+        let first_tile_y = top / VRAM_DEPENDENCY_TILE_SIZE;
+        let last_tile_y = bottom / VRAM_DEPENDENCY_TILE_SIZE;
+        for tile_y in first_tile_y..=last_tile_y {
+            for tile_x in first_tile_x..=last_tile_x {
+                let tile_index = tile_y * VRAM_DEPENDENCY_TILE_COLUMNS + tile_x;
+                let tile_hash = self.vram_dependency_tile_hash(tile_index);
+                fingerprint = recovery_raster_mix(fingerprint, tile_index as u64);
+                fingerprint = recovery_raster_mix(fingerprint, tile_hash);
+            }
+        }
+        fingerprint
+    }
+
+    fn vram_dependency_tile_hash(&mut self, tile_index: usize) -> u64 {
+        if !self.vram_dependency_tile_dirty[tile_index] {
+            return self.vram_dependency_tile_hashes[tile_index];
+        }
+
+        let tile_x = tile_index % VRAM_DEPENDENCY_TILE_COLUMNS;
+        let tile_y = tile_index / VRAM_DEPENDENCY_TILE_COLUMNS;
+        let start_x = tile_x * VRAM_DEPENDENCY_TILE_SIZE;
+        let start_y = tile_y * VRAM_DEPENDENCY_TILE_SIZE;
+        let mut hash = recovery_raster_mix(0x1319_8a2e_0370_7344, tile_index as u64);
+        for y in start_y..(start_y + VRAM_DEPENDENCY_TILE_SIZE).min(VRAM_HEIGHT) {
+            let row_start = y * VRAM_WIDTH + start_x;
+            let row_end = row_start + VRAM_DEPENDENCY_TILE_SIZE.min(VRAM_WIDTH - start_x);
+            for raw in &self.raw_pixels[row_start..row_end] {
+                hash = recovery_raster_mix(hash, u64::from(*raw));
+            }
+        }
+        self.vram_dependency_tile_hashes[tile_index] = hash;
+        self.vram_dependency_tile_dirty[tile_index] = false;
+        hash
+    }
+
+    fn mark_vram_dependency_tile_dirty(&mut self, pixel_index: usize) {
+        let x = pixel_index % VRAM_WIDTH;
+        let y = pixel_index / VRAM_WIDTH;
+        let tile_index = (y / VRAM_DEPENDENCY_TILE_SIZE) * VRAM_DEPENDENCY_TILE_COLUMNS
+            + x / VRAM_DEPENDENCY_TILE_SIZE;
+        self.vram_dependency_tile_dirty[tile_index] = true;
+    }
+
+    fn try_replay_recovery_raster(
+        &mut self,
+        key: RecoveryRasterCacheKey,
+    ) -> Option<[TexturedDrawStats; 2]> {
+        let entry = {
+            let mut cache = self
+                .recovery_raster_cache
+                .lock()
+                .expect("recovery raster cache lock");
+            let entry = cache.entries.get(&key).cloned();
+            if entry.is_some() {
+                cache.hits = cache.hits.saturating_add(1);
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            for (index, raw) in entry.writes.iter().copied() {
+                if self.raw_pixels[index] != raw {
+                    self.raw_pixels[index] = raw;
+                    self.mark_vram_dependency_tile_dirty(index);
+                }
+                self.pixels[index] = rgb555_to_rgb888(raw);
+            }
+            return Some(entry.stats);
+        }
+
+        let repeated = {
+            let mut cache = self
+                .recovery_raster_cache
+                .lock()
+                .expect("recovery raster cache lock");
+            cache.misses = cache.misses.saturating_add(1);
+            let repeated = cache.seen.contains(&key);
+            if !repeated {
+                cache.seen.insert(key);
+                cache.seen_order.push_back(key);
+                while cache.seen.len() > RECOVERY_RASTER_CACHE_SEEN_LIMIT {
+                    let Some(oldest) = cache.seen_order.pop_front() else {
+                        break;
+                    };
+                    cache.seen.remove(&oldest);
+                }
+            }
+            repeated
+        };
+        if repeated {
+            self.recovery_raster_capture = Some(Vec::new());
+        }
+        None
+    }
+
+    fn finish_recovery_raster(
+        &mut self,
+        key: Option<RecoveryRasterCacheKey>,
+        stats: [TexturedDrawStats; 2],
+        source_independent: bool,
+    ) {
+        let writes = self.recovery_raster_capture.take();
+        let Some(key) = key else {
+            return;
+        };
+        let Some(mut writes) = writes else {
+            return;
+        };
+        if !source_independent || writes.len() > RECOVERY_RASTER_CACHE_WRITE_LIMIT {
+            return;
+        }
+
+        // Opaque triangles can touch the same edge pixel more than once. Keep
+        // only the final value so a hit is a compact direct framebuffer patch.
+        let mut retained = HashSet::with_capacity(writes.len());
+        writes.reverse();
+        writes.retain(|(index, _)| retained.insert(*index));
+        writes.reverse();
+
+        let mut cache = self
+            .recovery_raster_cache
+            .lock()
+            .expect("recovery raster cache lock");
+        if let Some(previous) = cache.entries.remove(&key) {
+            cache.writes = cache.writes.saturating_sub(previous.writes.len());
+            if let Some(position) = cache.order.iter().position(|queued| *queued == key) {
+                cache.order.remove(position);
+            }
+        }
+        while cache.entries.len() >= RECOVERY_RASTER_CACHE_ENTRY_LIMIT
+            || cache.writes.saturating_add(writes.len()) > RECOVERY_RASTER_CACHE_WRITE_LIMIT
+        {
+            let Some(oldest) = cache.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = cache.entries.remove(&oldest) {
+                cache.writes = cache.writes.saturating_sub(entry.writes.len());
+            }
+        }
+        cache.writes = cache.writes.saturating_add(writes.len());
+        cache.entries.insert(
+            key,
+            RecoveryRasterCacheEntry {
+                writes: Arc::new(writes),
+                stats,
+            },
+        );
+        cache.order.push_back(key);
     }
 
     pub fn pixel(&self, x: i32, y: i32) -> u32 {
@@ -164,33 +518,51 @@ impl NativeFrameBuffer {
         width: usize,
         height: usize,
     ) -> FrameBufferRegionSnapshot {
-        let mut coordinates = Vec::with_capacity(width.saturating_mul(height));
+        let row_segments = if width == 0 {
+            0
+        } else {
+            (x % VRAM_WIDTH).saturating_add(width).div_ceil(VRAM_WIDTH)
+        };
+        let mut rows = Vec::with_capacity(height.saturating_mul(row_segments));
         let mut raw_pixels = Vec::with_capacity(width.saturating_mul(height));
         for row in 0..height {
-            for column in 0..width {
+            let source_y = y.wrapping_add(row) % PSX_VRAM_HEIGHT;
+            let mut column = 0usize;
+            while column < width {
                 let source_x = x.wrapping_add(column) % VRAM_WIDTH;
-                let source_y = y.wrapping_add(row) % PSX_VRAM_HEIGHT;
-                let index = source_y * VRAM_WIDTH + source_x;
-                coordinates.push((source_x, source_y));
-                raw_pixels.push(self.raw_pixels[index]);
+                let len = (width - column).min(VRAM_WIDTH - source_x);
+                let vram_start = source_y * VRAM_WIDTH + source_x;
+                let raw_start = raw_pixels.len();
+                raw_pixels.extend_from_slice(&self.raw_pixels[vram_start..vram_start + len]);
+                rows.push(FrameBufferRegionSnapshotRow {
+                    vram_start,
+                    raw_start,
+                    len,
+                });
+                column += len;
             }
         }
-        FrameBufferRegionSnapshot {
-            coordinates,
-            raw_pixels,
-        }
+        FrameBufferRegionSnapshot { rows, raw_pixels }
     }
 
     pub(crate) fn restore_region_snapshot(&mut self, snapshot: &FrameBufferRegionSnapshot) {
-        for ((x, y), raw) in snapshot
-            .coordinates
-            .iter()
-            .copied()
-            .zip(snapshot.raw_pixels.iter().copied())
-        {
-            let index = y * VRAM_WIDTH + x;
-            self.raw_pixels[index] = raw;
-            self.pixels[index] = rgb555_to_rgb888(raw);
+        for row in &snapshot.rows {
+            let raw_end = row.raw_start + row.len;
+            let vram_end = row.vram_start + row.len;
+            let raw_slice = &snapshot.raw_pixels[row.raw_start..raw_end];
+            for (offset, raw) in raw_slice.iter().copied().enumerate() {
+                let index = row.vram_start + offset;
+                if self.raw_pixels[index] != raw {
+                    self.mark_vram_dependency_tile_dirty(index);
+                }
+            }
+            self.raw_pixels[row.vram_start..vram_end].copy_from_slice(raw_slice);
+            for (pixel, raw) in self.pixels[row.vram_start..vram_end]
+                .iter_mut()
+                .zip(raw_slice.iter().copied())
+            {
+                *pixel = rgb555_to_rgb888(raw);
+            }
         }
     }
 
@@ -520,89 +892,46 @@ impl NativeFrameBuffer {
         options: TextureDrawOptions,
         texture_window: TextureWindow,
     ) -> TexturedDrawStats {
-        let mut stats = TexturedDrawStats::default();
-        if triangle_exceeds_gpu_size_limit(a.point, b.point, c.point) {
-            return stats;
-        }
-        let (clip_left, clip_top, clip_right, clip_bottom) = self.clip_bounds();
-        if clip_left >= clip_right || clip_top >= clip_bottom {
-            return stats;
-        }
-
-        let min_x = a
-            .point
-            .x
-            .min(b.point.x)
-            .min(c.point.x)
-            .clamp(clip_left, clip_right - 1);
-        let max_x = a
-            .point
-            .x
-            .max(b.point.x)
-            .max(c.point.x)
-            .clamp(clip_left, clip_right - 1);
-        let min_y = a
-            .point
-            .y
-            .min(b.point.y)
-            .min(c.point.y)
-            .clamp(clip_top, clip_bottom - 1);
-        let max_y = a
-            .point
-            .y
-            .max(b.point.y)
-            .max(c.point.y)
-            .clamp(clip_top, clip_bottom - 1);
-        let area = edge(a.point, b.point, c.point);
-        if area == 0 {
-            return stats;
-        }
-
-        let dest_bounds = (min_x, min_y, max_x, max_y);
-        let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
-        let source_snapshot = self.textured_draw_requires_snapshot(
-            dest_bounds,
+        let Some(bounds) = self.textured_triangle_raster_bounds(a, b, c) else {
+            return TexturedDrawStats::default();
+        };
+        let cache_key = self.recovery_textured_raster_key(
+            1,
+            &[a, b, c],
+            &[],
             texture_page,
             clut,
-            sampling_policy.allow_texture_descriptor_alias,
+            options,
+            texture_window,
         );
-        let source_raw = source_snapshot.as_deref();
-        let sampler = PreparedTextureSampler::new(
-            source_raw.unwrap_or(&self.raw_pixels),
+        if let Some(key) = cache_key
+            && let Some(stats) = self.try_replay_recovery_raster(key)
+        {
+            return stats[0];
+        }
+        let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
+        let resources = PreparedTextureDrawResources::new(
+            self,
+            bounds.dest_bounds(),
             texture_page,
             clut,
             sampling_policy,
         );
-        let denom = area.unsigned_abs() as i64;
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let point = Point { x, y };
-                let Some((w0, w1, w2)) =
-                    psx_triangle_weights(a.point, b.point, c.point, point, area)
-                else {
-                    continue;
-                };
-
-                stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
-                let u = ((a.u as i64 * w0 + b.u as i64 * w1 + c.u as i64 * w2) / denom) as u8;
-                let v = ((a.v as i64 * w0 + b.v as i64 * w1 + c.v as i64 * w2) / denom) as u8;
-                let (u, v) = texture_window.apply(u, v);
-                let sample = sampler.sample(source_raw.unwrap_or(&self.raw_pixels), u, v);
-                stats.record_sample(sample);
-                if sample.color != 0 {
-                    let color = options.apply_color(sample.color);
-                    stats.record_color(color);
-                    stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
-                    if self.set_textured_pixel(x, y, color, options) {
-                        stats.written_pixels = stats.written_pixels.saturating_add(1);
-                    } else {
-                        stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
-                    }
-                } else {
-                    stats.transparent_pixels = stats.transparent_pixels.saturating_add(1);
-                }
-            }
-        }
+        let source_independent = resources.source_snapshot.is_none();
+        let stats = self.draw_textured_triangle_with_resources(
+            a,
+            b,
+            c,
+            bounds,
+            &resources,
+            options,
+            texture_window,
+        );
+        self.finish_recovery_raster(
+            cache_key,
+            [stats, TexturedDrawStats::default()],
+            source_independent,
+        );
         stats
     }
 
@@ -617,91 +946,193 @@ impl NativeFrameBuffer {
         options: TextureDrawOptions,
         texture_window: TextureWindow,
     ) -> TexturedDrawStats {
-        let mut stats = TexturedDrawStats::default();
-        if triangle_exceeds_gpu_size_limit(a.point, b.point, c.point) {
-            return stats;
-        }
-        let (clip_left, clip_top, clip_right, clip_bottom) = self.clip_bounds();
-        if clip_left >= clip_right || clip_top >= clip_bottom {
-            return stats;
-        }
-
-        let min_x = a
-            .point
-            .x
-            .min(b.point.x)
-            .min(c.point.x)
-            .clamp(clip_left, clip_right - 1);
-        let max_x = a
-            .point
-            .x
-            .max(b.point.x)
-            .max(c.point.x)
-            .clamp(clip_left, clip_right - 1);
-        let min_y = a
-            .point
-            .y
-            .min(b.point.y)
-            .min(c.point.y)
-            .clamp(clip_top, clip_bottom - 1);
-        let max_y = a
-            .point
-            .y
-            .max(b.point.y)
-            .max(c.point.y)
-            .clamp(clip_top, clip_bottom - 1);
-        let area = edge(a.point, b.point, c.point);
-        if area == 0 {
-            return stats;
-        }
-
-        let dest_bounds = (min_x, min_y, max_x, max_y);
-        let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
-        let source_snapshot = self.textured_draw_requires_snapshot(
-            dest_bounds,
+        let Some(bounds) = self.textured_triangle_raster_bounds(a, b, c) else {
+            return TexturedDrawStats::default();
+        };
+        let cache_key = self.recovery_textured_raster_key(
+            2,
+            &[a, b, c],
+            &colors.map(u64::from),
             texture_page,
             clut,
-            sampling_policy.allow_texture_descriptor_alias,
+            options,
+            texture_window,
         );
-        let source_raw = source_snapshot.as_deref();
-        let sampler = PreparedTextureSampler::new(
-            source_raw.unwrap_or(&self.raw_pixels),
+        if let Some(key) = cache_key
+            && let Some(stats) = self.try_replay_recovery_raster(key)
+        {
+            return stats[0];
+        }
+        let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
+        let resources = PreparedTextureDrawResources::new(
+            self,
+            bounds.dest_bounds(),
             texture_page,
             clut,
             sampling_policy,
         );
-        let denom = area.unsigned_abs() as i64;
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let point = Point { x, y };
-                let Some((w0, w1, w2)) =
-                    psx_triangle_weights(a.point, b.point, c.point, point, area)
-                else {
-                    continue;
-                };
-
-                stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
-                let u = ((a.u as i64 * w0 + b.u as i64 * w1 + c.u as i64 * w2) / denom) as u8;
-                let v = ((a.v as i64 * w0 + b.v as i64 * w1 + c.v as i64 * w2) / denom) as u8;
-                let (u, v) = texture_window.apply(u, v);
-                let sample = sampler.sample(source_raw.unwrap_or(&self.raw_pixels), u, v);
-                stats.record_sample(sample);
-                if sample.color != 0 {
-                    let primitive_color = interpolate_psx_rgb(colors, w0, w1, w2, denom);
-                    let color = options.apply_color_with_primitive(sample.color, primitive_color);
-                    stats.record_color(color);
-                    stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
-                    if self.set_textured_pixel(x, y, color, options) {
-                        stats.written_pixels = stats.written_pixels.saturating_add(1);
-                    } else {
-                        stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
-                    }
-                } else {
-                    stats.transparent_pixels = stats.transparent_pixels.saturating_add(1);
-                }
-            }
-        }
+        let source_independent = resources.source_snapshot.is_none();
+        let stats = self.draw_shaded_textured_triangle_with_resources(
+            a,
+            b,
+            c,
+            colors,
+            bounds,
+            &resources,
+            options,
+            texture_window,
+        );
+        self.finish_recovery_raster(
+            cache_key,
+            [stats, TexturedDrawStats::default()],
+            source_independent,
+        );
         stats
+    }
+
+    pub fn draw_textured_quad_triangles_shared(
+        &mut self,
+        first: [TexturedPoint; 3],
+        second: [TexturedPoint; 3],
+        texture_page: u16,
+        clut: u16,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> (TexturedDrawStats, TexturedDrawStats) {
+        let first_bounds = self.textured_triangle_raster_bounds(first[0], first[1], first[2]);
+        let second_bounds = self.textured_triangle_raster_bounds(second[0], second[1], second[2]);
+        let Some(dest_bounds) = shared_triangle_dest_bounds(first_bounds, second_bounds) else {
+            return (TexturedDrawStats::default(), TexturedDrawStats::default());
+        };
+        let points = [
+            first[0], first[1], first[2], second[0], second[1], second[2],
+        ];
+        let cache_key = self.recovery_textured_raster_key(
+            3,
+            &points,
+            &[],
+            texture_page,
+            clut,
+            options,
+            texture_window,
+        );
+        if let Some(key) = cache_key
+            && let Some(stats) = self.try_replay_recovery_raster(key)
+        {
+            return (stats[0], stats[1]);
+        }
+
+        let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
+        let resources = PreparedTextureDrawResources::new(
+            self,
+            dest_bounds,
+            texture_page,
+            clut,
+            sampling_policy,
+        );
+        let source_independent = resources.source_snapshot.is_none();
+        let first_stats = first_bounds.map_or_else(TexturedDrawStats::default, |bounds| {
+            self.draw_textured_triangle_with_resources(
+                first[0],
+                first[1],
+                first[2],
+                bounds,
+                &resources,
+                options,
+                texture_window,
+            )
+        });
+        let second_stats = second_bounds.map_or_else(TexturedDrawStats::default, |bounds| {
+            self.draw_textured_triangle_with_resources(
+                second[0],
+                second[1],
+                second[2],
+                bounds,
+                &resources,
+                options,
+                texture_window,
+            )
+        });
+        self.finish_recovery_raster(cache_key, [first_stats, second_stats], source_independent);
+        (first_stats, second_stats)
+    }
+
+    pub fn draw_shaded_textured_quad_triangles_shared(
+        &mut self,
+        first: [TexturedPoint; 3],
+        first_colors: [u32; 3],
+        second: [TexturedPoint; 3],
+        second_colors: [u32; 3],
+        texture_page: u16,
+        clut: u16,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> (TexturedDrawStats, TexturedDrawStats) {
+        let first_bounds = self.textured_triangle_raster_bounds(first[0], first[1], first[2]);
+        let second_bounds = self.textured_triangle_raster_bounds(second[0], second[1], second[2]);
+        let Some(dest_bounds) = shared_triangle_dest_bounds(first_bounds, second_bounds) else {
+            return (TexturedDrawStats::default(), TexturedDrawStats::default());
+        };
+        let points = [
+            first[0], first[1], first[2], second[0], second[1], second[2],
+        ];
+        let cache_key = self.recovery_textured_raster_key(
+            4,
+            &points,
+            &[
+                u64::from(first_colors[0]),
+                u64::from(first_colors[1]),
+                u64::from(first_colors[2]),
+                u64::from(second_colors[0]),
+                u64::from(second_colors[1]),
+                u64::from(second_colors[2]),
+            ],
+            texture_page,
+            clut,
+            options,
+            texture_window,
+        );
+        if let Some(key) = cache_key
+            && let Some(stats) = self.try_replay_recovery_raster(key)
+        {
+            return (stats[0], stats[1]);
+        }
+
+        let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
+        let resources = PreparedTextureDrawResources::new(
+            self,
+            dest_bounds,
+            texture_page,
+            clut,
+            sampling_policy,
+        );
+        let source_independent = resources.source_snapshot.is_none();
+        let first_stats = first_bounds.map_or_else(TexturedDrawStats::default, |bounds| {
+            self.draw_shaded_textured_triangle_with_resources(
+                first[0],
+                first[1],
+                first[2],
+                first_colors,
+                bounds,
+                &resources,
+                options,
+                texture_window,
+            )
+        });
+        let second_stats = second_bounds.map_or_else(TexturedDrawStats::default, |bounds| {
+            self.draw_shaded_textured_triangle_with_resources(
+                second[0],
+                second[1],
+                second[2],
+                second_colors,
+                bounds,
+                &resources,
+                options,
+                texture_window,
+            )
+        });
+        self.finish_recovery_raster(cache_key, [first_stats, second_stats], source_independent);
+        (first_stats, second_stats)
     }
 
     pub fn draw_textured_rect(
@@ -726,6 +1157,25 @@ impl NativeFrameBuffer {
             dest.x.saturating_add(width).saturating_sub(1),
             dest.y.saturating_add(height).saturating_sub(1),
         );
+        let textured_point = TexturedPoint {
+            point: dest,
+            u: uv.u,
+            v: uv.v,
+        };
+        let cache_key = self.recovery_textured_raster_key(
+            5,
+            &[textured_point],
+            &[width as u32 as u64, height as u32 as u64],
+            texture_page,
+            clut,
+            options,
+            texture_window,
+        );
+        if let Some(key) = cache_key
+            && let Some(stats) = self.try_replay_recovery_raster(key)
+        {
+            return stats[0];
+        }
         let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
         let source_snapshot = self.textured_draw_requires_snapshot(
             dest_bounds,
@@ -739,6 +1189,9 @@ impl NativeFrameBuffer {
             texture_page,
             clut,
             sampling_policy,
+            self.recovery_raster_context
+                .is_some()
+                .then_some(&self.recovery_palette_history),
         );
         for row in 0..height {
             for col in 0..width {
@@ -761,6 +1214,149 @@ impl NativeFrameBuffer {
                     stats.record_color(color);
                     stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
                     if self.set_textured_pixel(dest.x + col, dest.y + row, color, options) {
+                        stats.written_pixels = stats.written_pixels.saturating_add(1);
+                    } else {
+                        stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
+                    }
+                } else {
+                    stats.transparent_pixels = stats.transparent_pixels.saturating_add(1);
+                }
+            }
+        }
+        self.finish_recovery_raster(
+            cache_key,
+            [stats, TexturedDrawStats::default()],
+            source_snapshot.is_none(),
+        );
+        stats
+    }
+
+    fn textured_triangle_raster_bounds(
+        &self,
+        a: TexturedPoint,
+        b: TexturedPoint,
+        c: TexturedPoint,
+    ) -> Option<TexturedTriangleRasterBounds> {
+        if triangle_exceeds_gpu_size_limit(a.point, b.point, c.point) {
+            return None;
+        }
+        let (clip_left, clip_top, clip_right, clip_bottom) = self.clip_bounds();
+        if clip_left >= clip_right || clip_top >= clip_bottom {
+            return None;
+        }
+
+        let min_x = a
+            .point
+            .x
+            .min(b.point.x)
+            .min(c.point.x)
+            .clamp(clip_left, clip_right - 1);
+        let max_x = a
+            .point
+            .x
+            .max(b.point.x)
+            .max(c.point.x)
+            .clamp(clip_left, clip_right - 1);
+        let min_y = a
+            .point
+            .y
+            .min(b.point.y)
+            .min(c.point.y)
+            .clamp(clip_top, clip_bottom - 1);
+        let max_y = a
+            .point
+            .y
+            .max(b.point.y)
+            .max(c.point.y)
+            .clamp(clip_top, clip_bottom - 1);
+        let area = edge(a.point, b.point, c.point);
+        (area != 0).then_some(TexturedTriangleRasterBounds {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            area,
+        })
+    }
+
+    fn draw_textured_triangle_with_resources(
+        &mut self,
+        a: TexturedPoint,
+        b: TexturedPoint,
+        c: TexturedPoint,
+        bounds: TexturedTriangleRasterBounds,
+        resources: &PreparedTextureDrawResources,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> TexturedDrawStats {
+        let mut stats = TexturedDrawStats::default();
+        let denom = bounds.area.unsigned_abs() as i64;
+        for y in bounds.min_y..=bounds.max_y {
+            for x in bounds.min_x..=bounds.max_x {
+                let point = Point { x, y };
+                let Some((w0, w1, w2)) =
+                    psx_triangle_weights(a.point, b.point, c.point, point, bounds.area)
+                else {
+                    continue;
+                };
+
+                stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
+                let u = ((a.u as i64 * w0 + b.u as i64 * w1 + c.u as i64 * w2) / denom) as u8;
+                let v = ((a.v as i64 * w0 + b.v as i64 * w1 + c.v as i64 * w2) / denom) as u8;
+                let (u, v) = texture_window.apply(u, v);
+                let sample = resources.sample(self, u, v);
+                stats.record_sample(sample);
+                if sample.color != 0 {
+                    let color = options.apply_color(sample.color);
+                    stats.record_color(color);
+                    stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
+                    if self.set_textured_pixel(x, y, color, options) {
+                        stats.written_pixels = stats.written_pixels.saturating_add(1);
+                    } else {
+                        stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
+                    }
+                } else {
+                    stats.transparent_pixels = stats.transparent_pixels.saturating_add(1);
+                }
+            }
+        }
+        stats
+    }
+
+    fn draw_shaded_textured_triangle_with_resources(
+        &mut self,
+        a: TexturedPoint,
+        b: TexturedPoint,
+        c: TexturedPoint,
+        colors: [u32; 3],
+        bounds: TexturedTriangleRasterBounds,
+        resources: &PreparedTextureDrawResources,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> TexturedDrawStats {
+        let mut stats = TexturedDrawStats::default();
+        let denom = bounds.area.unsigned_abs() as i64;
+        for y in bounds.min_y..=bounds.max_y {
+            for x in bounds.min_x..=bounds.max_x {
+                let point = Point { x, y };
+                let Some((w0, w1, w2)) =
+                    psx_triangle_weights(a.point, b.point, c.point, point, bounds.area)
+                else {
+                    continue;
+                };
+
+                stats.sampled_pixels = stats.sampled_pixels.saturating_add(1);
+                let u = ((a.u as i64 * w0 + b.u as i64 * w1 + c.u as i64 * w2) / denom) as u8;
+                let v = ((a.v as i64 * w0 + b.v as i64 * w1 + c.v as i64 * w2) / denom) as u8;
+                let (u, v) = texture_window.apply(u, v);
+                let sample = resources.sample(self, u, v);
+                stats.record_sample(sample);
+                if sample.color != 0 {
+                    let primitive_color = interpolate_psx_rgb(colors, w0, w1, w2, denom);
+                    let color = options.apply_color_with_primitive(sample.color, primitive_color);
+                    stats.record_color(color);
+                    stats.drawn_pixels = stats.drawn_pixels.saturating_add(1);
+                    if self.set_textured_pixel(x, y, color, options) {
                         stats.written_pixels = stats.written_pixels.saturating_add(1);
                     } else {
                         stats.clipped_pixels = stats.clipped_pixels.saturating_add(1);
@@ -1078,15 +1674,7 @@ impl NativeFrameBuffer {
         if palette_entries == 16
             && let Some(candidate) =
                 fallback_br2_4bpp_palette_candidate(&self.raw_pixels, texture_page, clut)
-            && should_use_br2_4bpp_palette_sample(
-                texture_page,
-                clut,
-                true,
-                requested_stats.nonzero_entries,
-                requested_stats.unique_entries,
-                requested_stats.average_luma(),
-                requested_stats.max_luma,
-            )
+            && should_use_br2_4bpp_palette_sample(texture_page, clut, true, requested_stats)
         {
             return self.palette_region_png(candidate.x, candidate.y, palette_entries, false);
         }
@@ -1258,7 +1846,7 @@ impl NativeFrameBuffer {
         for y in 0..raw_height {
             for x in 0..raw_width {
                 let raw_x = candidate.x + x as i32;
-                let raw_y = candidate.y + y as i32;
+                let raw_y = candidate.y + y;
                 if raw_x < 0
                     || raw_y < 0
                     || raw_x >= VRAM_WIDTH as i32
@@ -2039,6 +2627,21 @@ pub struct TexturedPoint {
     pub v: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TexturedTriangleRasterBounds {
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    area: i64,
+}
+
+impl TexturedTriangleRasterBounds {
+    const fn dest_bounds(self) -> (i32, i32, i32, i32) {
+        (self.min_x, self.min_y, self.max_x, self.max_y)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TexturedDrawStats {
     pub sampled_pixels: u64,
@@ -2161,6 +2764,59 @@ impl TextureSamplingPolicy {
     }
 }
 
+struct PreparedTextureDrawResources {
+    source_snapshot: Option<Vec<u16>>,
+    sampler: PreparedTextureSampler,
+}
+
+impl PreparedTextureDrawResources {
+    fn new(
+        framebuffer: &NativeFrameBuffer,
+        dest_bounds: (i32, i32, i32, i32),
+        texture_page: u16,
+        clut: u16,
+        sampling_policy: TextureSamplingPolicy,
+    ) -> Self {
+        let source_snapshot = framebuffer.textured_draw_requires_snapshot(
+            dest_bounds,
+            texture_page,
+            clut,
+            sampling_policy.allow_texture_descriptor_alias,
+        );
+        let sampler = PreparedTextureSampler::new(
+            source_snapshot
+                .as_deref()
+                .unwrap_or(&framebuffer.raw_pixels),
+            texture_page,
+            clut,
+            sampling_policy,
+            framebuffer
+                .recovery_raster_context
+                .is_some()
+                .then_some(&framebuffer.recovery_palette_history),
+        );
+        Self {
+            source_snapshot,
+            sampler,
+        }
+    }
+
+    fn sample(&self, framebuffer: &NativeFrameBuffer, u: u8, v: u8) -> TextureSample {
+        self.sampler.sample(
+            self.source_snapshot
+                .as_deref()
+                .unwrap_or(&framebuffer.raw_pixels),
+            u,
+            v,
+        )
+    }
+
+    #[cfg(test)]
+    fn snapshot_used(&self) -> bool {
+        self.source_snapshot.is_some()
+    }
+}
+
 struct PreparedTextureSampler {
     mode: u16,
     origin_x: i32,
@@ -2176,22 +2832,20 @@ impl PreparedTextureSampler {
         texture_page: u16,
         clut: u16,
         sampling_policy: TextureSamplingPolicy,
+        recovery_palette_history: Option<&Arc<Mutex<RecoveryPaletteHistory>>>,
     ) -> Self {
         let (texture_page, clut) = sampling_policy.resolve_descriptor(texture_page, clut);
         let mode = texture_page_color_mode(texture_page);
         let (origin_x, origin_y) = texture_page_origin_for_clut(texture_page, clut);
         let entries = texture_palette_entries(texture_page);
-        let mut indexed_samples = [TextureSample::default(); 256];
-        for (index, sample) in indexed_samples.iter_mut().enumerate().take(entries) {
-            *sample = indexed_palette_sample_from(
-                raw_pixels,
-                texture_page,
-                clut,
-                index as i32,
-                entries,
-                sampling_policy.allow_palette_fallback,
-            );
-        }
+        let indexed_samples = prepared_indexed_palette_samples_with_history(
+            raw_pixels,
+            texture_page,
+            clut,
+            entries,
+            sampling_policy.allow_palette_fallback,
+            recovery_palette_history,
+        );
 
         Self {
             mode,
@@ -2236,6 +2890,284 @@ impl PreparedTextureSampler {
             }
         }
     }
+}
+
+fn prepared_indexed_palette_samples_with_history(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    entries: usize,
+    allow_palette_fallback: bool,
+    recovery_palette_history: Option<&Arc<Mutex<RecoveryPaletteHistory>>>,
+) -> [TextureSample; 256] {
+    let mut samples = prepared_indexed_palette_samples_from(
+        raw_pixels,
+        texture_page,
+        clut,
+        entries,
+        allow_palette_fallback,
+    );
+    let Some(history) = recovery_palette_history else {
+        return samples;
+    };
+    if entries != 16
+        || !allow_palette_fallback
+        || !br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut)
+    {
+        return samples;
+    }
+
+    let key = RecoveryPaletteHistoryKey {
+        texture_page: texture_page_without_dither(texture_page),
+        clut,
+        texture_signature: recovery_texture_page_signature(raw_pixels, texture_page, clut),
+    };
+    let stats = palette_colors_stats(samples[..16].iter().map(|sample| sample.color));
+    let trustworthy = stats.nonzero_entries >= 12
+        && stats.unique_entries >= 3
+        && stats.average_luma() >= 6
+        && stats.max_luma >= 6
+        && !stats.is_implausibly_dark_texture_row()
+        && !stats.is_low_bank_red_polluted();
+    let mut history = history.lock().expect("recovery palette history lock");
+    if trustworthy {
+        let mut colors = [0_u16; 16];
+        for (color, sample) in colors.iter_mut().zip(samples.iter()) {
+            *color = sample.color;
+        }
+        if !history.entries.contains_key(&key) {
+            history.order.push_back(key);
+        }
+        history.entries.insert(key, colors);
+        while history.entries.len() > RECOVERY_PALETTE_HISTORY_ENTRY_LIMIT {
+            let Some(oldest) = history.order.pop_front() else {
+                break;
+            };
+            history.entries.remove(&oldest);
+        }
+        return samples;
+    }
+
+    let Some(colors) = history.entries.get(&key).copied() else {
+        return samples;
+    };
+    drop(history);
+    for (index, sample) in samples.iter_mut().enumerate().take(16) {
+        sample.color = colors[index];
+        sample.clut_nonzero = colors[index] != 0;
+        sample.clut_blank = false;
+        sample.palette_fallback = true;
+    }
+    if br2_character_model_palette_index_zero_transparent(texture_page, clut)
+        || native_palette_index_zero_transparent(texture_page, samples[0].color)
+    {
+        samples[0].color = 0;
+        samples[0].clut_nonzero = false;
+    }
+    samples
+}
+
+fn recovery_texture_page_signature(raw_pixels: &[u16], texture_page: u16, clut: u16) -> u64 {
+    let (origin_x, origin_y) = texture_page_origin_for_clut(texture_page, clut);
+    let raw_width = texture_page_raw_width(texture_page).max(1);
+    let x_stride = (raw_width / 8).max(1);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+
+    for y in (0..256).step_by(16) {
+        for x in (0..raw_width).step_by(x_stride) {
+            let color = raw_pixel_from(raw_pixels, origin_x + x as i32, origin_y + y);
+            hash ^= u64::from(color) | ((x as u64) << 16) | ((y as u64) << 32);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn prepared_indexed_palette_samples_from(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    entries: usize,
+    allow_palette_fallback: bool,
+) -> [TextureSample; 256] {
+    let mut samples = [TextureSample::default(); 256];
+    if entries == 256 {
+        let requested_stats = palette_row_stats(raw_pixels, clut, entries);
+        let linear_candidate =
+            fallback_linear_256_palette_candidate(raw_pixels, texture_page, clut);
+        let tiled_candidate = fallback_tiled_256_palette_candidate(raw_pixels, texture_page, clut);
+        let force_y16_base = allow_palette_fallback && native_force_y16_base_256_palette();
+
+        for (index, sample) in samples.iter_mut().enumerate() {
+            let requested_color = palette_raw_pixel_from(raw_pixels, clut, index as i32);
+            *sample = TextureSample {
+                color: requested_color,
+                texture_nonzero: index != 0,
+                zero_texel: index == 0,
+                clut_nonzero: requested_color != 0,
+                ..TextureSample::default()
+            };
+
+            if index == 0 {
+                if br2_character_model_palette_index_zero_transparent(texture_page, clut)
+                    || native_palette_index_zero_transparent(texture_page, sample.color)
+                {
+                    sample.color = 0;
+                    sample.clut_nonzero = false;
+                }
+                continue;
+            }
+
+            sample.clut_blank = requested_stats.nonzero_entries == 0;
+            if force_y16_base {
+                let color = palette_y16_base_raw_pixel_from(raw_pixels, clut, index as i32);
+                sample.color = color;
+                sample.palette_fallback = true;
+                sample.clut_nonzero = color != 0;
+                continue;
+            }
+
+            if let Some(candidate) = linear_candidate
+                && should_use_linear_256_palette_sample(
+                    texture_page,
+                    clut,
+                    allow_palette_fallback,
+                    requested_stats.nonzero_entries,
+                    candidate.nonzero_entries,
+                    requested_color,
+                )
+            {
+                sample.color = raw_pixel_from(raw_pixels, candidate.x + index as i32, candidate.y);
+                sample.palette_fallback = true;
+                sample.clut_nonzero = sample.color != 0;
+                continue;
+            }
+
+            if let Some(candidate) = tiled_candidate
+                && should_use_tiled_256_palette_sample(
+                    texture_page,
+                    clut,
+                    allow_palette_fallback,
+                    requested_stats.nonzero_entries,
+                    candidate.nonzero_entries,
+                    requested_color,
+                )
+            {
+                sample.color = raw_pixel_from(
+                    raw_pixels,
+                    candidate.x + (index as i32 & 0x0f),
+                    candidate.y + index as i32 / 16,
+                );
+                sample.palette_fallback = true;
+                sample.clut_nonzero = sample.color != 0;
+                continue;
+            }
+
+            if requested_color != 0 || !sample.clut_blank || !allow_palette_fallback {
+                continue;
+            }
+
+            if let Some(candidate) = tiled_candidate {
+                let fallback = raw_pixel_from(
+                    raw_pixels,
+                    candidate.x + (index as i32 & 0x0f),
+                    candidate.y + index as i32 / 16,
+                );
+                if fallback != 0 {
+                    sample.color = fallback;
+                    sample.palette_fallback = true;
+                }
+            }
+        }
+        return samples;
+    }
+    if entries != 16 {
+        return samples;
+    }
+
+    let requested_stats = palette_row_stats(raw_pixels, clut, entries);
+    let use_br2_fallback = fallback_br2_4bpp_palette_candidate(raw_pixels, texture_page, clut)
+        .filter(|_| {
+            should_use_br2_4bpp_palette_sample(
+                texture_page,
+                clut,
+                allow_palette_fallback,
+                requested_stats,
+            )
+        });
+    let use_zn_fallback = fallback_zn_4bpp_palette_candidate(raw_pixels, texture_page, clut)
+        .filter(|candidate| {
+            should_use_zn_4bpp_palette_sample(
+                texture_page,
+                clut,
+                allow_palette_fallback,
+                requested_stats.nonzero_entries,
+                requested_stats.unique_entries,
+                candidate.nonzero_entries,
+                candidate.unique_entries,
+            )
+        });
+    let missing_body_material = allow_palette_fallback
+        && br2_gameplay_body_missing_palette_descriptor(texture_page, clut)
+        && requested_stats.nonzero_entries == 0
+        && should_use_br2_4bpp_palette_sample(
+            texture_page,
+            clut,
+            allow_palette_fallback,
+            requested_stats,
+        );
+
+    for (index, sample) in samples.iter_mut().enumerate().take(entries) {
+        let requested_color = palette_raw_pixel_from(raw_pixels, clut, index as i32);
+        *sample = TextureSample {
+            color: requested_color,
+            texture_nonzero: index != 0,
+            zero_texel: index == 0,
+            clut_nonzero: requested_color != 0,
+            clut_blank: index != 0 && requested_stats.nonzero_entries == 0,
+            ..TextureSample::default()
+        };
+
+        if let Some(candidate) = use_br2_fallback {
+            sample.color = raw_pixel_from(raw_pixels, candidate.x + index as i32, candidate.y);
+            sample.palette_fallback = true;
+            sample.clut_nonzero = sample.color != 0;
+        } else if index != 0 && missing_body_material {
+            sample.color = 0x7fff;
+            sample.palette_fallback = true;
+            sample.clut_nonzero = true;
+        } else if index != 0
+            && let Some(candidate) = use_zn_fallback
+        {
+            sample.color = raw_pixel_from(raw_pixels, candidate.x + index as i32, candidate.y);
+            sample.palette_fallback = true;
+            sample.clut_nonzero = sample.color != 0;
+        } else if index != 0
+            && requested_color == 0
+            && requested_stats.nonzero_entries == 0
+            && allow_palette_fallback
+            && let Some(fallback) = fallback_palette_raw_pixel_from(
+                raw_pixels,
+                texture_page,
+                clut,
+                index as i32,
+                entries,
+            )
+        {
+            sample.color = fallback;
+            sample.palette_fallback = true;
+        }
+
+        if index == 0
+            && (br2_character_model_palette_index_zero_transparent(texture_page, clut)
+                || native_palette_index_zero_transparent(texture_page, sample.color))
+        {
+            sample.color = 0;
+            sample.clut_nonzero = false;
+        }
+    }
+
+    samples
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2330,6 +3262,13 @@ fn edge(a: Point, b: Point, c: Point) -> i64 {
     ((c.x - a.x) as i64 * (b.y - a.y) as i64) - ((c.y - a.y) as i64 * (b.x - a.x) as i64)
 }
 
+fn recovery_raster_mix(hash: u64, value: u64) -> u64 {
+    hash ^ value
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(hash << 6)
+        .wrapping_add(hash >> 2)
+}
+
 fn psx_top_left_edge(a: Point, b: Point, area: i64) -> bool {
     let (dx, dy) = if area > 0 {
         (b.x - a.x, b.y - a.y)
@@ -2376,6 +3315,22 @@ fn triangle_exceeds_gpu_size_limit(a: Point, b: Point, c: Point) -> bool {
     let width = max_x.saturating_sub(min_x).saturating_add(1);
     let height = max_y.saturating_sub(min_y).saturating_add(1);
     width > GPU_MAX_PRIMITIVE_WIDTH || height > GPU_MAX_PRIMITIVE_HEIGHT
+}
+
+fn shared_triangle_dest_bounds(
+    first: Option<TexturedTriangleRasterBounds>,
+    second: Option<TexturedTriangleRasterBounds>,
+) -> Option<(i32, i32, i32, i32)> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some((
+            first.min_x.min(second.min_x),
+            first.min_y.min(second.min_y),
+            first.max_x.max(second.max_x),
+            first.max_y.max(second.max_y),
+        )),
+        (Some(bounds), None) | (None, Some(bounds)) => Some(bounds.dest_bounds()),
+        (None, None) => None,
+    }
 }
 
 fn integral_rect(integral: &[u32], x: usize, y: usize, width: usize, height: usize) -> u64 {
@@ -2670,42 +3625,22 @@ fn indexed_palette_sample_from(
     if index == 0 {
         if allow_palette_fallback
             && entries == 16
-            && (br2_character_model_texture_descriptor(texture_page, clut)
-                || br2_gameplay_body_missing_palette_descriptor(texture_page, clut))
-            && should_use_br2_4bpp_palette_sample(
-                texture_page,
-                clut,
-                allow_palette_fallback,
-                requested_stats.nonzero_entries,
-                requested_stats.unique_entries,
-                requested_stats.average_luma(),
-                requested_stats.max_luma,
-            )
-        {
-            sample.color = 0;
-            sample.clut_nonzero = false;
-            sample.palette_fallback = true;
-            return sample;
-        }
-        if allow_palette_fallback
-            && entries == 16
             && let Some(fallback) =
                 fallback_br2_4bpp_palette_sample(raw_pixels, texture_page, clut, index)
             && should_use_br2_4bpp_palette_sample(
                 texture_page,
                 clut,
                 allow_palette_fallback,
-                requested_stats.nonzero_entries,
-                requested_stats.unique_entries,
-                requested_stats.average_luma(),
-                requested_stats.max_luma,
+                requested_stats,
             )
         {
             sample.color = fallback.color;
             sample.palette_fallback = true;
             sample.clut_nonzero = fallback.color != 0;
         }
-        if native_palette_index_zero_transparent(texture_page, sample.color) {
+        if br2_character_model_palette_index_zero_transparent(texture_page, clut)
+            || native_palette_index_zero_transparent(texture_page, sample.color)
+        {
             sample.color = 0;
             sample.clut_nonzero = false;
         }
@@ -2721,10 +3656,7 @@ fn indexed_palette_sample_from(
             texture_page,
             clut,
             allow_palette_fallback,
-            requested_stats.nonzero_entries,
-            requested_stats.unique_entries,
-            requested_stats.average_luma(),
-            requested_stats.max_luma,
+            requested_stats,
         )
     {
         sample.color = fallback.color;
@@ -2740,10 +3672,7 @@ fn indexed_palette_sample_from(
             texture_page,
             clut,
             allow_palette_fallback,
-            requested_stats.nonzero_entries,
-            requested_stats.unique_entries,
-            requested_stats.average_luma(),
-            requested_stats.max_luma,
+            requested_stats,
         )
     {
         // If the shared fighter bank is unavailable, preserve the material
@@ -2858,6 +3787,10 @@ struct PaletteRegionStats {
     nonzero_entries: usize,
     unique_entries: usize,
     luma_sum: u32,
+    red_sum: u32,
+    green_sum: u32,
+    blue_sum: u32,
+    red_only_entries: usize,
     entries: usize,
     max_luma: u8,
 }
@@ -2868,6 +3801,47 @@ impl PaletteRegionStats {
             .checked_div(self.entries as u32)
             .unwrap_or(0)
             .min(31) as u8
+    }
+
+    fn average_red(self) -> u8 {
+        self.average_nonzero_channel(self.red_sum)
+    }
+
+    fn average_green(self) -> u8 {
+        self.average_nonzero_channel(self.green_sum)
+    }
+
+    fn average_blue(self) -> u8 {
+        self.average_nonzero_channel(self.blue_sum)
+    }
+
+    fn average_nonzero_channel(self, sum: u32) -> u8 {
+        sum.checked_div(self.nonzero_entries as u32)
+            .unwrap_or(0)
+            .min(31) as u8
+    }
+
+    fn is_low_bank_red_polluted(self) -> bool {
+        self.nonzero_entries >= 12
+            && self.unique_entries >= 8
+            && self.average_luma() <= 10
+            && self.max_luma <= 14
+            && self.red_only_entries >= 6
+            && self.average_red() >= 8
+            && self.average_green() <= 4
+            && self.average_blue() <= 4
+            && self.red_sum
+                >= self
+                    .green_sum
+                    .saturating_add(self.blue_sum)
+                    .saturating_mul(2)
+    }
+
+    fn is_implausibly_dark_texture_row(self) -> bool {
+        self.nonzero_entries == self.entries
+            && (self.unique_entries.saturating_add(4) >= self.entries || self.red_only_entries >= 5)
+            && self.average_luma() <= 8
+            && self.max_luma <= 8
     }
 }
 
@@ -2900,11 +3874,24 @@ fn palette_region_stats(
     let mut unique_entries = 0usize;
     let mut nonzero_entries = 0usize;
     let mut luma_sum = 0_u32;
+    let mut red_sum = 0_u32;
+    let mut green_sum = 0_u32;
+    let mut blue_sum = 0_u32;
+    let mut red_only_entries = 0usize;
     let mut max_luma = 0_u8;
     for offset in 0..entries {
         let color = raw_pixel_from(raw_pixels, x + offset as i32, y);
         if color != 0 {
             nonzero_entries = nonzero_entries.saturating_add(1);
+        }
+        let red = color & 0x001f;
+        let green = (color >> 5) & 0x001f;
+        let blue = (color >> 10) & 0x001f;
+        red_sum = red_sum.saturating_add(u32::from(red));
+        green_sum = green_sum.saturating_add(u32::from(green));
+        blue_sum = blue_sum.saturating_add(u32::from(blue));
+        if color != 0 && red >= 8 && green <= 1 && blue == 0 {
+            red_only_entries = red_only_entries.saturating_add(1);
         }
         let luma = rgb555_luma(color);
         luma_sum = luma_sum.saturating_add(u32::from(luma));
@@ -2919,9 +3906,59 @@ fn palette_region_stats(
         nonzero_entries,
         unique_entries,
         luma_sum,
+        red_sum,
+        green_sum,
+        blue_sum,
+        red_only_entries,
         entries,
         max_luma,
     })
+}
+
+fn palette_colors_stats(colors: impl IntoIterator<Item = u16>) -> PaletteRegionStats {
+    let colors = colors.into_iter().collect::<Vec<_>>();
+    let mut unique = [0_u16; 256];
+    let mut unique_entries = 0usize;
+    let mut nonzero_entries = 0usize;
+    let mut luma_sum = 0_u32;
+    let mut red_sum = 0_u32;
+    let mut green_sum = 0_u32;
+    let mut blue_sum = 0_u32;
+    let mut red_only_entries = 0usize;
+    let mut max_luma = 0_u8;
+    for color in colors.iter().copied() {
+        if color != 0 {
+            nonzero_entries = nonzero_entries.saturating_add(1);
+        }
+        let red = color & 0x001f;
+        let green = (color >> 5) & 0x001f;
+        let blue = (color >> 10) & 0x001f;
+        red_sum = red_sum.saturating_add(u32::from(red));
+        green_sum = green_sum.saturating_add(u32::from(green));
+        blue_sum = blue_sum.saturating_add(u32::from(blue));
+        if color != 0 && red >= 8 && green <= 1 && blue == 0 {
+            red_only_entries = red_only_entries.saturating_add(1);
+        }
+        let luma = rgb555_luma(color);
+        luma_sum = luma_sum.saturating_add(u32::from(luma));
+        max_luma = max_luma.max(luma);
+        if !unique[..unique_entries].contains(&color) {
+            unique[unique_entries] = color;
+            unique_entries = unique_entries.saturating_add(1);
+        }
+    }
+
+    PaletteRegionStats {
+        nonzero_entries,
+        unique_entries,
+        luma_sum,
+        red_sum,
+        green_sum,
+        blue_sum,
+        red_only_entries,
+        entries: colors.len(),
+        max_luma,
+    }
 }
 
 fn fallback_br2_4bpp_palette_sample(
@@ -3005,6 +4042,21 @@ fn br2_character_model_palette_candidate_with_override(
     }
     let requested_x = ((clut & 0x3f) as i32) * 16;
     let requested_y = clut_y(clut) as i32;
+    if let Some(candidate_x) = preferred_x_override
+        && candidate_x != requested_x
+        && (br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut)
+            || br2_character_model_texture_descriptor(texture_page, clut))
+    {
+        let stats = palette_region_stats(raw_pixels, candidate_x, requested_y, 16)?;
+        if stats.nonzero_entries >= 12 && stats.unique_entries >= 8 {
+            return Some(LinearPaletteCandidate {
+                x: candidate_x,
+                y: requested_y,
+                nonzero_entries: stats.nonzero_entries,
+                unique_entries: stats.unique_entries,
+            });
+        }
+    }
     let (x, y) = if br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut) {
         let requested_stats = palette_region_stats(raw_pixels, requested_x, requested_y, 16)?;
         if let Some(candidate_x) = preferred_x_override
@@ -3022,16 +4074,19 @@ fn br2_character_model_palette_candidate_with_override(
         }
         let requested_is_rich =
             requested_stats.nonzero_entries >= 12 && requested_stats.unique_entries >= 8;
-        let requested_is_implausibly_dark = requested_is_rich
-            && requested_stats.average_luma() <= 6
-            && requested_stats.max_luma <= 7;
-        if requested_is_rich && !requested_is_implausibly_dark {
+        let requested_is_implausibly_dark =
+            requested_is_rich && requested_stats.is_implausibly_dark_texture_row();
+        let requested_is_red_polluted = requested_stats.is_low_bank_red_polluted();
+        if requested_is_rich && !requested_is_implausibly_dark && !requested_is_red_polluted {
             return None;
         }
-        if requested_is_implausibly_dark {
+        if requested_is_implausibly_dark || requested_is_red_polluted {
             let preferred_x = preferred_x_override.unwrap_or(32);
             let previous_y = requested_y.saturating_sub(16);
             let base_y = requested_y & !0x0f;
+            let yugo_previous_material_row = texture_page_without_dither(texture_page) == 0x0008
+                && clut == 0x7a00
+                && preferred_x_override.is_none();
             let candidates = [
                 (requested_x, previous_y),
                 (preferred_x, previous_y),
@@ -3049,9 +4104,14 @@ fn br2_character_model_palette_candidate_with_override(
                         }
                         let stats = palette_region_stats(raw_pixels, candidate_x, candidate_y, 16)?;
                         let candidate_luma = stats.average_luma();
+                        let captured_yugo_previous = yugo_previous_material_row
+                            && (candidate_x, candidate_y) == (requested_x, previous_y);
+                        let minimum_unique_entries = if captured_yugo_previous { 2 } else { 3 };
+                        let minimum_luma = if captured_yugo_previous { 4 } else { 6 };
                         (stats.nonzero_entries >= 12
-                            && stats.unique_entries >= 3
-                            && candidate_luma >= 6
+                            && stats.unique_entries >= minimum_unique_entries
+                            && !stats.is_low_bank_red_polluted()
+                            && candidate_luma >= minimum_luma
                             && candidate_luma >= requested_stats.average_luma().saturating_add(2))
                         .then_some(LinearPaletteCandidate {
                             x: candidate_x,
@@ -3067,40 +4127,41 @@ fn br2_character_model_palette_candidate_with_override(
         // Keep the runtime-selected bank first so real VRAM captures can
         // validate character palette placement without recompiling.
         let preferred_x = preferred_x_override.unwrap_or(32);
-        let candidate_xs = [
-            preferred_x,
-            requested_x.saturating_sub(16),
-            requested_x.saturating_add(16),
-        ];
+        let candidate_xs = if requested_x == 0 {
+            [requested_x + 16, preferred_x, requested_x]
+        } else {
+            [
+                preferred_x,
+                requested_x.saturating_sub(16),
+                requested_x.saturating_add(16),
+            ]
+        };
         let candidate = candidate_xs.into_iter().find_map(|candidate_x| {
+            if candidate_x == requested_x {
+                return None;
+            }
             let stats = palette_region_stats(raw_pixels, candidate_x, requested_y, 16)?;
-            (stats.nonzero_entries >= 12 && stats.unique_entries >= 8).then_some(
-                LinearPaletteCandidate {
-                    x: candidate_x,
-                    y: requested_y,
-                    nonzero_entries: stats.nonzero_entries,
-                    unique_entries: stats.unique_entries,
-                },
-            )
+            (stats.nonzero_entries >= 12
+                && stats.unique_entries >= 8
+                && !stats.is_low_bank_red_polluted())
+            .then_some(LinearPaletteCandidate {
+                x: candidate_x,
+                y: requested_y,
+                nonzero_entries: stats.nonzero_entries,
+                unique_entries: stats.unique_entries,
+            })
         })?;
         return Some(candidate);
     } else if !br2_character_model_texture_descriptor(texture_page, clut) {
         return None;
     } else {
-        let requested_stats = palette_region_stats(raw_pixels, requested_x, requested_y, 16)?;
-        // Some BR2 model CLUTs intentionally leave the unused upper indices
-        // transparent. Keep those coherent sparse rows instead of replacing
-        // them with the adjacent material ramp, which renders fighters as
-        // black/red silhouettes. The damaged 0x79d9 row observed in match
-        // captures falls below both thresholds and still resolves through its
-        // adjacent uploaded palette.
-        if requested_stats.nonzero_entries >= 8 && requested_stats.unique_entries >= 8 {
-            return None;
-        }
         // Match captures for the y=486/y=490 model descriptors point at an
-        // empty row while the coherent 16-color material palette is uploaded
-        // at the start of the same 16-row CLUT block. Prefer that block base
-        // over the adjacent rows, which contain red/dark stage material data.
+        // interleaved texture-data row while the coherent 16-color material
+        // palette is uploaded at the start of the same 16-row CLUT block or in
+        // the adjacent 16-word row. A populated requested row is not
+        // authoritative for these descriptors: the live 0x7a9a capture has 15
+        // unrelated colors at x=416 and the actual grayscale material ramp at
+        // x=432.
         if matches!(requested_y, 486 | 490) {
             let base_y = requested_y & !0x0f;
             let base_stats = palette_region_stats(raw_pixels, requested_x, base_y, 16)?;
@@ -3200,10 +4261,7 @@ fn should_use_br2_4bpp_palette_sample(
     texture_page: u16,
     clut: u16,
     allow_palette_fallback: bool,
-    requested_nonzero_entries: usize,
-    requested_unique_entries: usize,
-    requested_average_luma: u8,
-    requested_max_luma: u8,
+    requested_stats: PaletteRegionStats,
 ) -> bool {
     if !allow_palette_fallback || texture_page_color_mode(texture_page) != 0 {
         return false;
@@ -3214,18 +4272,17 @@ fn should_use_br2_4bpp_palette_sample(
     {
         return true;
     }
-
     // BR2 model descriptors address texture data where a conventional PSX CLUT
     // would live. A populated requested row is therefore not evidence that it
     // is a palette; captured model uploads use the validated alias candidate.
     br2_character_model_texture_descriptor(texture_page, clut)
         || (br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut)
-            && requested_nonzero_entries >= 12
-            && requested_unique_entries >= 8
-            && requested_average_luma <= 6
-            && requested_max_luma <= 7)
-        || requested_nonzero_entries < 12
-        || requested_unique_entries < 8
+            && requested_stats.nonzero_entries >= 12
+            && requested_stats.unique_entries >= 8
+            && (requested_stats.is_implausibly_dark_texture_row()
+                || requested_stats.is_low_bank_red_polluted()))
+        || requested_stats.nonzero_entries < 12
+        || requested_stats.unique_entries < 8
 }
 
 fn rgb555_luma(color: u16) -> u8 {
@@ -3376,14 +4433,23 @@ fn fallback_linear_256_palette_sample(
     clut: u16,
     index: i32,
 ) -> Option<LinearPaletteSample> {
+    let candidate = fallback_linear_256_palette_candidate(raw_pixels, texture_page, clut)?;
+    Some(LinearPaletteSample {
+        color: raw_pixel_from(raw_pixels, candidate.x + index, candidate.y),
+        nonzero_entries: candidate.nonzero_entries,
+        unique_entries: candidate.unique_entries,
+    })
+}
+
+fn fallback_linear_256_palette_candidate(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+) -> Option<LinearPaletteCandidate> {
     if let Some(candidate) =
         br2_character_select_256_palette_candidate(raw_pixels, texture_page, clut)
     {
-        return Some(LinearPaletteSample {
-            color: raw_pixel_from(raw_pixels, candidate.x + index, candidate.y),
-            nonzero_entries: candidate.nonzero_entries,
-            unique_entries: candidate.unique_entries,
-        });
+        return Some(candidate);
     }
 
     let clut_x = ((clut & 0x3f) as i32) * 16;
@@ -3415,11 +4481,7 @@ fn fallback_linear_256_palette_sample(
         best = prefer_linear_256_palette_candidate(best, candidate);
     }
 
-    best.map(|candidate| LinearPaletteSample {
-        color: raw_pixel_from(raw_pixels, candidate.x + index, candidate.y),
-        nonzero_entries: candidate.nonzero_entries,
-        unique_entries: candidate.unique_entries,
-    })
+    best
 }
 
 fn br2_character_select_256_palette_candidate(
@@ -3862,6 +4924,60 @@ fn texture_palette_raw_bounds(texture_page: u16, clut: u16) -> Option<(i32, i32,
     Some((left, top, left + entries as i32 - 1, top))
 }
 
+fn recovery_palette_fallback_dependency_bounds(
+    texture_page: u16,
+    clut: u16,
+) -> (i32, i32, i32, i32) {
+    recovery_palette_fallback_dependency_bounds_with_override(
+        texture_page,
+        clut,
+        native_br2_character_palette_x_override(),
+    )
+}
+
+fn recovery_palette_fallback_dependency_bounds_with_override(
+    texture_page: u16,
+    clut: u16,
+    character_palette_x_override: Option<i32>,
+) -> (i32, i32, i32, i32) {
+    let clut_x = ((clut & 0x3f) as i32) * 16;
+    let clut_y = clut_y(clut) as i32;
+    let entries = texture_palette_entries(texture_page);
+
+    if entries == 16 {
+        // Every 4bpp fallback path reads only the requested CLUT column, its
+        // immediate neighbors, and nearby 16/32-row aliases. Low-bank BR2
+        // fighters may additionally use the shared x=32 material bank.
+        let character_descriptor =
+            br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut)
+                || br2_character_model_texture_descriptor(texture_page, clut);
+        let preferred_x = if character_descriptor {
+            character_palette_x_override.unwrap_or_else(|| {
+                if br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut) {
+                    32
+                } else {
+                    clut_x
+                }
+            })
+        } else {
+            clut_x
+        };
+        let left = clut_x.saturating_sub(16).min(preferred_x);
+        let right = clut_x
+            .saturating_add(31)
+            .max(preferred_x.saturating_add(15));
+        let top = clut_y.saturating_sub(16).min(clut_y & !0x1f);
+        let bottom = clut_y.saturating_add(16).max(clut_y & !0x0f);
+        return (left, top, right, bottom);
+    }
+
+    // 8bpp recovery probes several tiled palette banks across the CLUT upload
+    // row. Preserve that wider dependency until those candidates are indexed.
+    let band_top = (clut_y & !0x1f).saturating_sub(16);
+    let band_bottom = (clut_y | 0x1f).saturating_add(16);
+    (0, band_top, VRAM_WIDTH as i32 - 1, band_bottom)
+}
+
 fn texture_page_origin(texture_page: u16) -> (i32, i32) {
     if texture_page_uses_zn_low_bank_y0_alias(texture_page) {
         return (
@@ -3913,6 +5029,11 @@ fn br2_gameplay_4bpp_texture_origin(
     let descriptor = texture_page_without_dither(texture_page);
     let clut_x = ((clut & 0x3f) as i32) * 16;
     let clut_y = clut_y(clut);
+    if descriptor == 0x003f && matches!(clut, 0x7818 | 0x7958) {
+        // These live match descriptors reuse the title page bits after the
+        // stage atlas has moved to the paired high VRAM bank.
+        return Some((page_x, PSX_VRAM_HEIGHT as i32 / 2));
+    }
     if matches!(descriptor, 0x000c | 0x000d) && clut_x == 64 && (480..=486).contains(&clut_y) {
         // Gameplay body packets retain the low-bank page bits, while the
         // character atlas is uploaded to the paired y=256 bank. HUD packets
@@ -4074,6 +5195,14 @@ fn native_disable_br2_character_model_palette_alias() -> bool {
     })
 }
 
+fn native_disable_recovery_raster_cache() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BLOODYROAR2_NATIVE_DISABLE_RECOVERY_RASTER_CACHE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
 fn native_br2_character_palette_x_override() -> Option<i32> {
     static OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| {
@@ -4176,6 +5305,10 @@ fn native_palette_index_zero_transparent(texture_page: u16, color: u16) -> bool 
     color == 0 && texture_mode <= 1 && (texture_page & 0x0200 != 0 || texture_page & 0x2000 != 0)
 }
 
+fn br2_character_model_palette_index_zero_transparent(texture_page: u16, clut: u16) -> bool {
+    br2_character_model_texture_descriptor(texture_page, clut)
+}
+
 fn native_force_palette_index_zero_transparent() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -4252,15 +5385,133 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeFrameBuffer, PSX_VRAM_HEIGHT, PixelWriteOptions, Point, PreparedTextureSampler,
-        TextureCoordinate, TextureDrawOptions, TextureSamplingPolicy, TextureWindow, VRAM_HEIGHT,
+        NativeFrameBuffer, PSX_VRAM_HEIGHT, PixelWriteOptions, Point, PreparedTextureDrawResources,
+        PreparedTextureSampler, RecoveryRasterCacheKey, TextureCoordinate, TextureDrawOptions,
+        TextureSamplingPolicy, TextureWindow, TexturedDrawStats, TexturedPoint, VRAM_HEIGHT,
         VRAM_WIDTH, br2_character_model_palette_candidate_with_override,
         br2_character_model_palette_candidate_with_policy, br2_texture_descriptor_alias,
-        fallback_tiled_256_palette_candidate, low_bank_y0_alias_page_x,
-        preferred_tiled_256_palette_x, texture_page_origin, texture_page_origin_for_clut,
-        texture_page_origin_for_sample, texture_page_raw_bounds_for_clut,
-        tiled_256_palette_x_candidates,
+        fallback_tiled_256_palette_candidate, indexed_palette_sample_from,
+        low_bank_y0_alias_page_x, palette_colors_stats, palette_region_stats,
+        preferred_tiled_256_palette_x, prepared_indexed_palette_samples_from,
+        prepared_indexed_palette_samples_with_history,
+        recovery_palette_fallback_dependency_bounds_with_override, texture_page_origin,
+        texture_page_origin_for_clut, texture_page_origin_for_sample,
+        texture_page_raw_bounds_for_clut, tiled_256_palette_x_candidates,
     };
+
+    const TEST_4BPP_TEXTURE_PAGE: u16 = 0x0000;
+    const TEST_4BPP_CLUT: u16 = 300 << 6;
+    const TEST_RAW15_TEXTURE_PAGE: u16 = 0x0100;
+
+    fn textured_point(x: i32, y: i32, u: u8, v: u8) -> TexturedPoint {
+        TexturedPoint {
+            point: Point { x, y },
+            u,
+            v,
+        }
+    }
+
+    fn write_4bpp_texel(framebuffer: &mut NativeFrameBuffer, u: i32, v: i32, index: u16) {
+        let x = u / 4;
+        let shift = ((u & 3) * 4) as u16;
+        let mask = 0x000f_u16 << shift;
+        let packed = (framebuffer.raw_pixel(x, v) & !mask) | ((index & 0x000f) << shift);
+        framebuffer.set_raw_pixel(x, v, packed);
+    }
+
+    fn test_4bpp_framebuffer() -> NativeFrameBuffer {
+        let mut framebuffer = NativeFrameBuffer::default();
+        for index in 0..16 {
+            framebuffer.set_raw_pixel(index, 300, 0x0421_u16.saturating_mul(index as u16));
+        }
+        for v in 0..32 {
+            for u in 0..32 {
+                write_4bpp_texel(&mut framebuffer, u, v, ((u + v) % 15 + 1) as u16);
+            }
+        }
+        framebuffer
+    }
+
+    fn test_textured_quad_triangles() -> ([TexturedPoint; 3], [TexturedPoint; 3]) {
+        (
+            [
+                textured_point(120, 120, 0, 0),
+                textured_point(128, 120, 16, 0),
+                textured_point(120, 128, 0, 16),
+            ],
+            [
+                textured_point(128, 120, 16, 0),
+                textured_point(120, 128, 0, 16),
+                textured_point(128, 128, 16, 16),
+            ],
+        )
+    }
+
+    fn draw_textured_quad_as_separate_triangles(
+        framebuffer: &mut NativeFrameBuffer,
+        first: [TexturedPoint; 3],
+        second: [TexturedPoint; 3],
+        texture_page: u16,
+        clut: u16,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> (TexturedDrawStats, TexturedDrawStats) {
+        (
+            framebuffer.draw_textured_triangle(
+                first[0],
+                first[1],
+                first[2],
+                texture_page,
+                clut,
+                options,
+                texture_window,
+            ),
+            framebuffer.draw_textured_triangle(
+                second[0],
+                second[1],
+                second[2],
+                texture_page,
+                clut,
+                options,
+                texture_window,
+            ),
+        )
+    }
+
+    fn draw_shaded_textured_quad_as_separate_triangles(
+        framebuffer: &mut NativeFrameBuffer,
+        first: [TexturedPoint; 3],
+        first_colors: [u32; 3],
+        second: [TexturedPoint; 3],
+        second_colors: [u32; 3],
+        texture_page: u16,
+        clut: u16,
+        options: TextureDrawOptions,
+        texture_window: TextureWindow,
+    ) -> (TexturedDrawStats, TexturedDrawStats) {
+        (
+            framebuffer.draw_shaded_textured_triangle(
+                first[0],
+                first[1],
+                first[2],
+                first_colors,
+                texture_page,
+                clut,
+                options,
+                texture_window,
+            ),
+            framebuffer.draw_shaded_textured_triangle(
+                second[0],
+                second[1],
+                second[2],
+                second_colors,
+                texture_page,
+                clut,
+                options,
+                texture_window,
+            ),
+        )
+    }
 
     #[test]
     fn prepared_texture_sampler_matches_scalar_sampling() {
@@ -4279,6 +5530,7 @@ mod tests {
                 texture_page,
                 clut,
                 sampling_policy,
+                None,
             );
             for (u, v) in [(0, 0), (1, 2), (31, 17), (127, 63), (255, 255)] {
                 assert_eq!(
@@ -4294,6 +5546,216 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn prepared_4bpp_palette_matches_scalar_fallback_resolution() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        for y in 468..=500 {
+            for x in 0..96 {
+                let color = (((x * 7 + y * 3) as u16) & 0x7fff).max(1);
+                framebuffer.set_raw_pixel(x, y, color);
+            }
+        }
+
+        for (texture_page, clut, allow_fallback) in [
+            (0x020b, 0x7903, true),
+            (0x020c, 0x7904, true),
+            (0x020b, 0x7903, false),
+            (0x0000, 0x7903, true),
+        ] {
+            let prepared = prepared_indexed_palette_samples_from(
+                &framebuffer.raw_pixels,
+                texture_page,
+                clut,
+                16,
+                allow_fallback,
+            );
+            for (index, actual) in prepared.iter().enumerate().take(16) {
+                let expected = indexed_palette_sample_from(
+                    &framebuffer.raw_pixels,
+                    texture_page,
+                    clut,
+                    index as i32,
+                    16,
+                    allow_fallback,
+                );
+                assert_eq!(
+                    *actual, expected,
+                    "texture_page=0x{texture_page:04x} clut=0x{clut:04x} index={index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_8bpp_palette_matches_scalar_fallback_resolution() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        for y in 464..512 {
+            for x in 0..768 {
+                let value = if (x + y) % 11 == 0 {
+                    0
+                } else {
+                    (((x * 17 + y * 31) as u16) & 0x7fff).max(1)
+                };
+                framebuffer.set_raw_pixel(x, y, value);
+            }
+        }
+
+        for (texture_page, clut, allow_fallback) in [
+            (0x0088, 0x7d40, true),
+            (0x008a, 0x7d80, true),
+            (0x0299, 0x7c80, true),
+            (0x0088, 0x7d40, false),
+        ] {
+            let prepared = prepared_indexed_palette_samples_from(
+                &framebuffer.raw_pixels,
+                texture_page,
+                clut,
+                256,
+                allow_fallback,
+            );
+            for (index, actual) in prepared.iter().enumerate() {
+                let expected = indexed_palette_sample_from(
+                    &framebuffer.raw_pixels,
+                    texture_page,
+                    clut,
+                    index as i32,
+                    256,
+                    allow_fallback,
+                );
+                assert_eq!(
+                    *actual, expected,
+                    "texture_page=0x{texture_page:04x} clut=0x{clut:04x} index={index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn framebuffer_textured_quad_shared_sampler_matches_separate_triangles() {
+        let base = test_4bpp_framebuffer();
+        let (first, second) = test_textured_quad_triangles();
+        let options = TextureDrawOptions::opaque_raw();
+        let texture_window = TextureWindow::default();
+
+        let mut separate = base.clone();
+        let expected = draw_textured_quad_as_separate_triangles(
+            &mut separate,
+            first,
+            second,
+            TEST_4BPP_TEXTURE_PAGE,
+            TEST_4BPP_CLUT,
+            options,
+            texture_window,
+        );
+
+        let mut shared = base;
+        let actual = shared.draw_textured_quad_triangles_shared(
+            first,
+            second,
+            TEST_4BPP_TEXTURE_PAGE,
+            TEST_4BPP_CLUT,
+            options,
+            texture_window,
+        );
+
+        assert_eq!(actual, expected);
+        assert_eq!(shared.raw_pixels, separate.raw_pixels);
+    }
+
+    #[test]
+    fn framebuffer_shaded_textured_quad_shared_sampler_matches_separate_triangles() {
+        let base = test_4bpp_framebuffer();
+        let (first, second) = test_textured_quad_triangles();
+        let first_colors = [0x0080_8080, 0x00c0_8080, 0x0080_c080];
+        let second_colors = [0x00c0_8080, 0x0080_c080, 0x00c0_c080];
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.raw_texture = false;
+        let texture_window = TextureWindow::default();
+
+        let mut separate = base.clone();
+        let expected = draw_shaded_textured_quad_as_separate_triangles(
+            &mut separate,
+            first,
+            first_colors,
+            second,
+            second_colors,
+            TEST_4BPP_TEXTURE_PAGE,
+            TEST_4BPP_CLUT,
+            options,
+            texture_window,
+        );
+
+        let mut shared = base;
+        let actual = shared.draw_shaded_textured_quad_triangles_shared(
+            first,
+            first_colors,
+            second,
+            second_colors,
+            TEST_4BPP_TEXTURE_PAGE,
+            TEST_4BPP_CLUT,
+            options,
+            texture_window,
+        );
+
+        assert_eq!(actual, expected);
+        assert_eq!(shared.raw_pixels, separate.raw_pixels);
+    }
+
+    #[test]
+    fn framebuffer_textured_quad_shared_snapshot_matches_separate_triangles() {
+        let mut base = NativeFrameBuffer::default();
+        for y in 40..=48 {
+            for x in 40..=48 {
+                base.set_raw_pixel(x, y, 0x001f + ((x + y) as u16 & 0x03e0));
+            }
+        }
+        let first = [
+            textured_point(8, 8, 40, 40),
+            textured_point(16, 8, 48, 40),
+            textured_point(8, 16, 40, 48),
+        ];
+        let second = [
+            textured_point(16, 8, 48, 40),
+            textured_point(8, 16, 40, 48),
+            textured_point(16, 16, 48, 48),
+        ];
+        let options = TextureDrawOptions::opaque_raw();
+        let texture_window = TextureWindow::default();
+        let union_bounds = (8, 8, 16, 16);
+        let resources = PreparedTextureDrawResources::new(
+            &base,
+            union_bounds,
+            TEST_RAW15_TEXTURE_PAGE,
+            0,
+            TextureSamplingPolicy::from_draw_options(options),
+        );
+        assert!(resources.snapshot_used());
+
+        let mut separate = base.clone();
+        let expected = draw_textured_quad_as_separate_triangles(
+            &mut separate,
+            first,
+            second,
+            TEST_RAW15_TEXTURE_PAGE,
+            0,
+            options,
+            texture_window,
+        );
+
+        let mut shared = base;
+        let actual = shared.draw_textured_quad_triangles_shared(
+            first,
+            second,
+            TEST_RAW15_TEXTURE_PAGE,
+            0,
+            options,
+            texture_window,
+        );
+
+        assert_eq!(actual, expected);
+        assert_eq!(shared.raw_pixels, separate.raw_pixels);
     }
 
     #[test]
@@ -4322,6 +5784,7 @@ mod tests {
                 stale_texture_page,
                 stale_clut,
                 sampling_policy,
+                None,
             );
             let prepared = sampler.sample(&framebuffer.raw_pixels, 0, 0);
             let scalar = framebuffer.sample_texture_sample_from(
@@ -4496,6 +5959,8 @@ mod tests {
         framebuffer.set_raw_pixel(700, 8, 0x03e0);
         let snapshot = framebuffer.snapshot_psx_display_region(0, 0, 320, 240);
 
+        assert_eq!(snapshot.rows.len(), 240);
+        assert_eq!(snapshot.raw_pixels.len(), 320 * 240);
         framebuffer.set_raw_pixel(8, 8, 0x7c00);
         framebuffer.set_raw_pixel(700, 8, 0x7fff);
         framebuffer.restore_region_snapshot(&snapshot);
@@ -4521,6 +5986,39 @@ mod tests {
 
         assert_eq!(framebuffer.raw_pixel(0, PSX_VRAM_HEIGHT as i32 - 1), 0x001f);
         assert_eq!(framebuffer.raw_pixel(0, 0), 0x03e0);
+    }
+
+    #[test]
+    fn framebuffer_region_snapshot_wraps_x_and_y_as_row_segments() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let right = VRAM_WIDTH as i32 - 1;
+        let bottom = PSX_VRAM_HEIGHT as i32 - 1;
+        framebuffer.set_raw_pixel(right, bottom, 0x001f);
+        framebuffer.set_raw_pixel(0, bottom, 0x03e0);
+        framebuffer.set_raw_pixel(right, 0, 0x7c00);
+        framebuffer.set_raw_pixel(0, 0, 0x7fff);
+        framebuffer.set_raw_pixel(1, 0, 0x4210);
+
+        let snapshot =
+            framebuffer.snapshot_psx_display_region(VRAM_WIDTH - 1, PSX_VRAM_HEIGHT - 1, 2, 2);
+
+        assert_eq!(snapshot.rows.len(), 4);
+        assert_eq!(snapshot.raw_pixels, vec![0x001f, 0x03e0, 0x7c00, 0x7fff]);
+        framebuffer.set_raw_pixel(right, bottom, 0x0001);
+        framebuffer.set_raw_pixel(0, bottom, 0x0002);
+        framebuffer.set_raw_pixel(right, 0, 0x0003);
+        framebuffer.set_raw_pixel(0, 0, 0x0004);
+        framebuffer.restore_region_snapshot(&snapshot);
+
+        assert_eq!(framebuffer.raw_pixel(right, bottom), 0x001f);
+        assert_eq!(framebuffer.raw_pixel(0, bottom), 0x03e0);
+        assert_eq!(framebuffer.raw_pixel(right, 0), 0x7c00);
+        assert_eq!(framebuffer.raw_pixel(0, 0), 0x7fff);
+        assert_eq!(
+            framebuffer.raw_pixel(1, 0),
+            0x4210,
+            "restoring a wrapped display snapshot must not touch pixels outside the snapshot"
+        );
     }
 
     #[test]
@@ -4642,6 +6140,327 @@ mod tests {
         );
 
         assert_eq!(framebuffer.pixel(8, 8), 0x00ff_0000);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_br2_live_003f_stage_bank_without_breaking_title_alias() {
+        let texture_page = 0x003f;
+        assert_eq!(texture_page_origin(texture_page), (960, 0));
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page, 0x7818),
+            (960, 256)
+        );
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page, 0x7958),
+            (960, 256)
+        );
+        assert_eq!(texture_page_origin_for_clut(texture_page, 0), (960, 0));
+
+        let mut framebuffer = NativeFrameBuffer::default();
+        framebuffer.set_raw_pixel(960, 0, 0x0001);
+        framebuffer.set_raw_pixel(960, 256, 0x0002);
+        let clut_x = (0x7818 & 0x3f) * 16;
+        let clut_y = (0x7818 >> 6) & 0x03ff;
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 2, clut_y, 0x03e0);
+        framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            0x7818,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(framebuffer.pixel(8, 8), 0x0000_ff00);
+    }
+
+    #[test]
+    fn recovery_raster_cache_promotes_repeated_opaque_draw_and_restores_pixels() {
+        let mut framebuffer = test_4bpp_framebuffer();
+        let dest = Point { x: 128, y: 128 };
+        let options = TextureDrawOptions::opaque_raw();
+
+        framebuffer.begin_recovery_raster_command(0x1111);
+        let expected_stats = framebuffer.draw_textured_rect(
+            dest,
+            (8, 8),
+            TEST_4BPP_TEXTURE_PAGE,
+            TEST_4BPP_CLUT,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+        framebuffer.end_recovery_raster_command();
+        let expected = framebuffer.raw_pixel(dest.x, dest.y);
+        assert_ne!(expected, 0);
+        assert_eq!(framebuffer.recovery_raster_cache_stats(), (0, 1, 0, 0));
+
+        framebuffer.begin_recovery_raster_command(0x1111);
+        let promoted_stats = framebuffer.draw_textured_rect(
+            dest,
+            (8, 8),
+            TEST_4BPP_TEXTURE_PAGE,
+            TEST_4BPP_CLUT,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+        framebuffer.end_recovery_raster_command();
+        assert_eq!(promoted_stats, expected_stats);
+        let (_, misses, entries, writes) = framebuffer.recovery_raster_cache_stats();
+        assert_eq!(misses, 2);
+        assert_eq!(entries, 1);
+        assert!(writes > 0);
+
+        framebuffer.set_raw_pixel(dest.x, dest.y, 0);
+        framebuffer.begin_recovery_raster_command(0x1111);
+        let replayed_stats = framebuffer.draw_textured_rect(
+            dest,
+            (8, 8),
+            TEST_4BPP_TEXTURE_PAGE,
+            TEST_4BPP_CLUT,
+            TextureCoordinate { u: 0, v: 0 },
+            options,
+            TextureWindow::default(),
+        );
+        framebuffer.end_recovery_raster_command();
+
+        assert_eq!(replayed_stats, expected_stats);
+        assert_eq!(framebuffer.raw_pixel(dest.x, dest.y), expected);
+        assert_eq!(framebuffer.recovery_raster_cache_stats().0, 1);
+    }
+
+    #[test]
+    fn recovery_raster_cache_separates_context_and_rejects_unsafe_draws() {
+        let mut framebuffer = test_4bpp_framebuffer();
+        let dest = Point { x: 128, y: 128 };
+
+        for fingerprint in [0x1111, 0x2222] {
+            framebuffer.begin_recovery_raster_command(fingerprint);
+            framebuffer.draw_textured_rect(
+                dest,
+                (8, 8),
+                TEST_4BPP_TEXTURE_PAGE,
+                TEST_4BPP_CLUT,
+                TextureCoordinate { u: 0, v: 0 },
+                TextureDrawOptions::opaque_raw(),
+                TextureWindow::default(),
+            );
+            framebuffer.end_recovery_raster_command();
+        }
+        assert_eq!(framebuffer.recovery_raster_cache_stats(), (0, 2, 0, 0));
+
+        let mut semi_transparent = TextureDrawOptions::opaque_raw();
+        semi_transparent.semi_transparent = true;
+        for _ in 0..3 {
+            framebuffer.begin_recovery_raster_command(0x3333);
+            framebuffer.draw_textured_rect(
+                dest,
+                (8, 8),
+                TEST_4BPP_TEXTURE_PAGE,
+                TEST_4BPP_CLUT,
+                TextureCoordinate { u: 0, v: 0 },
+                semi_transparent,
+                TextureWindow::default(),
+            );
+            framebuffer.end_recovery_raster_command();
+        }
+        assert_eq!(framebuffer.recovery_raster_cache_stats(), (0, 2, 0, 0));
+
+        for _ in 0..3 {
+            framebuffer.begin_recovery_raster_command(0x4444);
+            framebuffer.draw_textured_rect(
+                Point { x: 0, y: 0 },
+                (8, 8),
+                TEST_4BPP_TEXTURE_PAGE,
+                TEST_4BPP_CLUT,
+                TextureCoordinate { u: 0, v: 0 },
+                TextureDrawOptions::opaque_raw(),
+                TextureWindow::default(),
+            );
+            framebuffer.end_recovery_raster_command();
+        }
+        let (hits, misses, entries, writes) = framebuffer.recovery_raster_cache_stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 5);
+        assert_eq!(entries, 0);
+        assert_eq!(writes, 0);
+    }
+
+    #[test]
+    fn recovery_raster_cache_ignores_unrelated_vram_writes() {
+        let mut framebuffer = test_4bpp_framebuffer();
+        let dest = Point { x: 128, y: 128 };
+        let draw = |framebuffer: &mut NativeFrameBuffer| {
+            framebuffer.begin_recovery_raster_command(0x5555);
+            framebuffer.draw_textured_rect(
+                dest,
+                (8, 8),
+                TEST_4BPP_TEXTURE_PAGE,
+                TEST_4BPP_CLUT,
+                TextureCoordinate { u: 0, v: 0 },
+                TextureDrawOptions::opaque_raw(),
+                TextureWindow::default(),
+            );
+            framebuffer.end_recovery_raster_command();
+        };
+
+        draw(&mut framebuffer);
+        draw(&mut framebuffer);
+        assert_eq!(framebuffer.recovery_raster_cache_stats().0, 0);
+
+        framebuffer.set_raw_pixel(900, 700, 0x7fff);
+        framebuffer.fill_rect_unclipped(dest.x, dest.y, 8, 8, 0);
+        draw(&mut framebuffer);
+
+        assert_eq!(framebuffer.recovery_raster_cache_stats().0, 1);
+        assert_ne!(framebuffer.raw_pixel(dest.x, dest.y), 0);
+    }
+
+    #[test]
+    fn recovery_raster_cache_invalidates_changed_texture_content() {
+        let mut framebuffer = test_4bpp_framebuffer();
+        let dest = Point { x: 128, y: 128 };
+        let draw = |framebuffer: &mut NativeFrameBuffer| {
+            framebuffer.begin_recovery_raster_command(0x6666);
+            framebuffer.draw_textured_rect(
+                dest,
+                (8, 8),
+                TEST_4BPP_TEXTURE_PAGE,
+                TEST_4BPP_CLUT,
+                TextureCoordinate { u: 0, v: 0 },
+                TextureDrawOptions::opaque_raw(),
+                TextureWindow::default(),
+            );
+            framebuffer.end_recovery_raster_command();
+        };
+
+        draw(&mut framebuffer);
+        draw(&mut framebuffer);
+        let original = framebuffer.raw_pixel(dest.x, dest.y);
+        assert_eq!(framebuffer.recovery_raster_cache_stats(), (0, 2, 1, 64));
+
+        write_4bpp_texel(&mut framebuffer, 0, 0, 15);
+        framebuffer.fill_rect_unclipped(dest.x, dest.y, 8, 8, 0);
+        draw(&mut framebuffer);
+
+        let (hits, misses, entries, _) = framebuffer.recovery_raster_cache_stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 3);
+        assert_eq!(entries, 1);
+        assert_ne!(framebuffer.raw_pixel(dest.x, dest.y), original);
+    }
+
+    #[test]
+    fn recovery_raster_cache_separates_textured_rect_sizes() {
+        let mut framebuffer = test_4bpp_framebuffer();
+        let dest = Point { x: 128, y: 128 };
+        let draw = |framebuffer: &mut NativeFrameBuffer, size| {
+            framebuffer.begin_recovery_raster_command(0x7777);
+            framebuffer.draw_textured_rect(
+                dest,
+                size,
+                TEST_4BPP_TEXTURE_PAGE,
+                TEST_4BPP_CLUT,
+                TextureCoordinate { u: 0, v: 0 },
+                TextureDrawOptions::opaque_raw(),
+                TextureWindow::default(),
+            );
+            framebuffer.end_recovery_raster_command();
+        };
+
+        draw(&mut framebuffer, (8, 8));
+        draw(&mut framebuffer, (8, 8));
+        framebuffer.fill_rect_unclipped(dest.x, dest.y, 16, 16, 0);
+        draw(&mut framebuffer, (16, 16));
+
+        let (hits, misses, entries, _) = framebuffer.recovery_raster_cache_stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 3);
+        assert_eq!(entries, 1);
+        assert_ne!(framebuffer.raw_pixel(dest.x + 15, dest.y + 15), 0);
+    }
+
+    #[test]
+    fn recovery_raster_cache_separates_shaded_vertex_colors() {
+        let mut framebuffer = test_4bpp_framebuffer();
+        let points = [
+            textured_point(128, 128, 0, 0),
+            textured_point(144, 128, 16, 0),
+            textured_point(128, 144, 0, 16),
+        ];
+        let mut options = TextureDrawOptions::opaque_raw();
+        options.raw_texture = false;
+        let draw = |framebuffer: &mut NativeFrameBuffer, colors| {
+            framebuffer.begin_recovery_raster_command(0x8888);
+            framebuffer.draw_shaded_textured_triangle(
+                points[0],
+                points[1],
+                points[2],
+                colors,
+                TEST_4BPP_TEXTURE_PAGE,
+                TEST_4BPP_CLUT,
+                options,
+                TextureWindow::default(),
+            );
+            framebuffer.end_recovery_raster_command();
+        };
+
+        draw(&mut framebuffer, [0x0000_00ff; 3]);
+        draw(&mut framebuffer, [0x0000_00ff; 3]);
+        let blue = framebuffer.raw_pixel(130, 130);
+        framebuffer.fill_rect_unclipped(128, 128, 17, 17, 0);
+        draw(&mut framebuffer, [0x00ff_0000; 3]);
+        let red = framebuffer.raw_pixel(130, 130);
+
+        let (hits, misses, entries, _) = framebuffer.recovery_raster_cache_stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 3);
+        assert_eq!(entries, 1);
+        assert_ne!(blue, red);
+    }
+
+    #[test]
+    fn recovery_palette_dependencies_include_high_bank_character_override() {
+        let texture_page = 0x0039;
+        let clut = 0x799a;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let bounds =
+            recovery_palette_fallback_dependency_bounds_with_override(texture_page, clut, Some(32));
+
+        assert!(bounds.0 <= 32);
+        assert!(bounds.2 >= requested_x + 15);
+        assert!(bounds.1 <= 486);
+        assert!(bounds.3 >= 486);
+    }
+
+    #[test]
+    fn recovery_raster_cache_replaces_existing_key_without_write_leak() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let key = RecoveryRasterCacheKey {
+            command: 0x1234,
+            raster: 0x5678,
+        };
+        let stats = [TexturedDrawStats::default(); 2];
+
+        framebuffer.recovery_raster_capture = Some(vec![(1, 0x001f)]);
+        framebuffer.finish_recovery_raster(Some(key), stats, true);
+        assert_eq!(framebuffer.recovery_raster_cache_stats(), (0, 0, 1, 1));
+
+        framebuffer.recovery_raster_capture = Some(vec![(1, 0x03e0), (2, 0x7c00), (3, 0x7fff)]);
+        framebuffer.finish_recovery_raster(Some(key), stats, true);
+
+        assert_eq!(framebuffer.recovery_raster_cache_stats(), (0, 0, 1, 3));
+        let cache = framebuffer
+            .recovery_raster_cache
+            .lock()
+            .expect("recovery raster cache lock");
+        assert_eq!(
+            cache.order.iter().filter(|queued| **queued == key).count(),
+            1
+        );
     }
 
     #[test]
@@ -4961,7 +6780,7 @@ mod tests {
     }
 
     #[test]
-    fn framebuffer_texture_sampling_uses_br2_7a5a_fallback_transparency() {
+    fn framebuffer_texture_sampling_keeps_br2_7a5a_model_index_zero_transparent() {
         let mut framebuffer = NativeFrameBuffer::default();
         let texture_page = 0x0039;
         let clut = 0x7a5a;
@@ -4989,11 +6808,11 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(false, true),
         );
         assert_eq!(sample.color, 0);
         assert!(sample.zero_texel);
-        assert!(sample.palette_fallback);
+        assert!(!sample.palette_fallback);
 
         framebuffer.draw_textured_rect(
             Point { x: 8, y: 8 },
@@ -5169,15 +6988,17 @@ mod tests {
     }
 
     #[test]
-    fn framebuffer_low_bank_fighter_palette_recovers_x32_from_x0_descriptor() {
+    fn framebuffer_low_bank_fighter_palette_prefers_adjacent_x16_from_x0_descriptor() {
         let mut raw_pixels = vec![0u16; VRAM_WIDTH * VRAM_HEIGHT];
         let texture_page = 0x0208;
         let clut = 0x7900;
         let requested_y = ((clut >> 6) & 0x03ff) as i32;
 
         for index in 0..16 {
-            raw_pixels[requested_y as usize * VRAM_WIDTH + 32 + index] =
+            raw_pixels[requested_y as usize * VRAM_WIDTH + 16 + index] =
                 if index == 0 { 0 } else { 0x0800 + index as u16 };
+            raw_pixels[requested_y as usize * VRAM_WIDTH + 32 + index] =
+                if index == 0 { 0 } else { 0x1000 + index as u16 };
         }
 
         let candidate = br2_character_model_palette_candidate_with_policy(
@@ -5186,8 +7007,8 @@ mod tests {
             clut,
             true,
         )
-        .expect("x=0 fighter descriptor must recover the shared x=32 upload");
-        assert_eq!((candidate.x, candidate.y), (32, requested_y));
+        .expect("x=0 fighter descriptor must recover the adjacent x=16 upload");
+        assert_eq!((candidate.x, candidate.y), (16, requested_y));
     }
 
     #[test]
@@ -5241,7 +7062,7 @@ mod tests {
     }
 
     #[test]
-    fn framebuffer_texture_sampling_recovers_captured_dark_low_bank_fighter_palette() {
+    fn framebuffer_texture_sampling_recovers_captured_implausibly_dark_low_bank_fighter_palette() {
         let mut framebuffer = NativeFrameBuffer::default();
         let texture_page = 0x000a;
         let clut = 0x7a41;
@@ -5280,7 +7101,7 @@ mod tests {
             clut,
             true,
         )
-        .expect("captured dark fighter CLUT must resolve to its preceding material row");
+        .expect("the captured near-black fighter row should use its uploaded material palette");
         assert_eq!((candidate.x, candidate.y), (requested_x, previous_y));
 
         let sample = framebuffer.sample_texture_sample_from(
@@ -5297,6 +7118,61 @@ mod tests {
     }
 
     #[test]
+    fn br2_captured_0x7840_fighter_palette_recovers_previous_material_row() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0208;
+        let clut = 0x7840;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let previous_y = requested_y - 16;
+        let captured_dark = [
+            0x0421, 0x0421, 0x0001, 0x0421, 0x0002, 0x0003, 0x0421, 0x0421, 0x0402, 0x0004, 0x0821,
+            0x0005, 0x0422, 0x0006, 0x0423, 0x0404,
+        ];
+        let uploaded_material = [0x214c, 0x214d, 0x296e];
+
+        for index in 0..16 {
+            framebuffer.set_raw_pixel(
+                requested_x + index,
+                requested_y,
+                captured_dark[index as usize],
+            );
+            framebuffer.set_raw_pixel(
+                requested_x + index,
+                previous_y,
+                uploaded_material[index as usize % uploaded_material.len()],
+            );
+        }
+
+        let requested_stats =
+            palette_region_stats(&framebuffer.raw_pixels, requested_x, requested_y, 16)
+                .expect("captured palette row must be addressable");
+        assert_eq!(requested_stats.unique_entries, 12);
+        assert!(requested_stats.is_implausibly_dark_texture_row());
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("the captured 0x7840 texture row must use its previous material palette");
+        assert_eq!((candidate.x, candidate.y), (requested_x, previous_y));
+    }
+
+    #[test]
+    fn br2_low_bank_dark_repeating_palette_is_not_treated_as_texture_data() {
+        let stats = palette_colors_stats([
+            0x0421, 0x0842, 0x0c63, 0x1084, 0x14a5, 0x18c6, 0x1ce7, 0x2108, 0x0421, 0x0842, 0x0c63,
+            0x1084, 0x14a5, 0x18c6, 0x1ce7, 0x2108,
+        ]);
+
+        assert_eq!(stats.nonzero_entries, 16);
+        assert_eq!(stats.unique_entries, 8);
+        assert!(!stats.is_implausibly_dark_texture_row());
+    }
+
+    #[test]
     fn framebuffer_texture_sampling_resolves_br2_relocated_stage_descriptor() {
         for stale_texture_page in [0x0039, 0x0239] {
             let mut framebuffer = NativeFrameBuffer::default();
@@ -5307,8 +7183,8 @@ mod tests {
             let (live_x, live_y) = texture_page_origin(live_texture_page);
             let stale_clut_x = ((stale_clut & 0x3f) as i32) * 16;
             let stale_clut_y = ((stale_clut >> 6) & 0x03ff) as i32;
-            let live_clut_x = ((live_clut & 0x3f) as i32) * 16;
-            let live_clut_y = ((live_clut >> 6) & 0x03ff) as i32;
+            let live_clut_x = (live_clut & 0x3f) * 16;
+            let live_clut_y = (live_clut >> 6) & 0x03ff;
 
             framebuffer.set_raw_pixel(stale_x, stale_y, 0x0001);
             framebuffer.set_raw_pixel(stale_clut_x + 1, stale_clut_y, 0x03e0);
@@ -5336,7 +7212,7 @@ mod tests {
     fn framebuffer_texture_sampling_keeps_other_br2_page_0039_descriptors() {
         let mut framebuffer = NativeFrameBuffer::default();
         let texture_page = 0x0039;
-        let clut = 0x785a;
+        let clut = 0x785b;
         let (page_x, page_y) = texture_page_origin(texture_page);
         let clut_x = ((clut & 0x3f) as i32) * 16;
         let clut_y = ((clut >> 6) & 0x03ff) as i32;
@@ -5350,7 +7226,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(false, true),
+            TextureSamplingPolicy::new(true, true),
         );
 
         assert_eq!(sample.color, 0x03e0);
@@ -6723,7 +8599,55 @@ mod tests {
     }
 
     #[test]
-    fn br2_captured_low_bank_fighter_palette_keeps_populated_requested_clut() {
+    fn br2_character_model_palette_uses_rich_adjacent_upload_over_texture_data_row() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0039;
+        let clut = 0x7a9a;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let uploaded_x = requested_x + 16;
+        let texture_data = [
+            0x1d55, 0x1e15, 0x307f, 0x07bc, 0x291c, 0x2db7, 0x35c9, 0x72b0, 0x0e71, 0x30bb, 0x21dc,
+            0x21dc, 0x21bc, 0x0aa0, 0x2193, 0x00fd,
+        ];
+
+        for (index, color) in texture_data.into_iter().enumerate() {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+            framebuffer.set_raw_pixel(
+                uploaded_x + index as i32,
+                requested_y,
+                if index == 0 {
+                    0
+                } else {
+                    0x0400 + index as u16 * 0x21
+                },
+            );
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("the adjacent uploaded material palette must be selected");
+        assert_eq!((candidate.x, candidate.y), (uploaded_x, requested_y));
+
+        framebuffer.set_raw_pixel(576, 256, 0x0001);
+        let sample = framebuffer.sample_texture_sample_from(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            0,
+            0,
+            TextureSamplingPolicy::new(true, true),
+        );
+        assert!(sample.palette_fallback);
+        assert_eq!(sample.color, 0x0421);
+    }
+
+    #[test]
+    fn br2_captured_low_bank_fighter_palette_rejects_implausibly_dark_requested_clut() {
         let mut framebuffer = NativeFrameBuffer::default();
         let texture_page = 0x020b;
         let clut = 0x7903;
@@ -6750,16 +8674,14 @@ mod tests {
             framebuffer.set_raw_pixel(candidate_x + index as i32, requested_y, color);
         }
 
-        assert_eq!(
-            br2_character_model_palette_candidate_with_policy(
-                &framebuffer.raw_pixels,
-                texture_page,
-                clut,
-                true,
-            ),
-            None,
-            "a populated coherent requested CLUT must not be replaced by a brighter neighbor"
-        );
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("the captured near-black fighter CLUT must use its uploaded material row");
+        assert_eq!((candidate.x, candidate.y), (candidate_x, requested_y));
 
         framebuffer.set_raw_pixel(704, 0, 0x0001);
         let sample = framebuffer.sample_texture_sample_from(
@@ -6770,8 +8692,496 @@ mod tests {
             0,
             TextureSamplingPolicy::new(true, true),
         );
-        assert_eq!(sample.color, 0x1ce7);
-        assert!(!sample.palette_fallback);
+        assert_eq!(sample.color, 0x001e);
+        assert!(sample.palette_fallback);
+    }
+
+    #[test]
+    fn br2_captured_low_bank_fighter_palette_recovers_requested_index_zero() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7903;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let candidate_x = requested_x + 16;
+
+        for (index, color) in [
+            0x10c9, 0x1ce7, 0x0018, 0x10cc, 0x0019, 0x1108, 0x001a, 0x4d01, 0x001b, 0x2108, 0x10cd,
+            0x001c, 0x1129, 0x150b, 0x001d, 0x10ee,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+        }
+        for (index, color) in [
+            0x2529, 0x001e, 0x112a, 0x001f, 0x0cd3, 0x112d, 0x150f, 0x294a, 0x154b, 0x045f, 0x2d6b,
+            0x1931, 0x194f, 0x4588, 0x158c, 0x65a2,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(candidate_x + index as i32, requested_y, color);
+        }
+
+        let sample = super::indexed_palette_sample_from(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            0,
+            16,
+            true,
+        );
+        assert_eq!(sample.color, 0x2529);
+        assert!(sample.zero_texel);
+        assert!(sample.palette_fallback);
+        assert!(sample.clut_nonzero);
+
+        framebuffer.set_raw_pixel(704, 0, 0x0000);
+        framebuffer.set_raw_pixel(8, 8, 0x7c00);
+        let stats = framebuffer.draw_textured_rect(
+            Point { x: 8, y: 8 },
+            (1, 1),
+            texture_page,
+            clut,
+            TextureCoordinate { u: 0, v: 0 },
+            TextureDrawOptions::opaque_raw(),
+            TextureWindow::default(),
+        );
+
+        assert_eq!(stats.zero_texel_samples, 1);
+        assert_eq!(stats.transparent_pixels, 0);
+        assert_eq!(stats.palette_fallback_samples, 1);
+        assert_ne!(framebuffer.raw_pixel(8, 8), 0x7c00);
+    }
+
+    #[test]
+    fn br2_captured_low_bank_fighter_palette_recovers_0x7883_clut() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7883;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+
+        for (index, color) in [
+            0x10c9, 0x1ce7, 0x0018, 0x10cc, 0x0019, 0x1108, 0x001a, 0x4d01, 0x001b, 0x2108, 0x10cd,
+            0x001c, 0x1129, 0x150b, 0x001d, 0x001d,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+            framebuffer.set_raw_pixel(32 + index as i32, requested_y, 0x3000 + index as u16 * 0x21);
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("the captured near-black 0x7883 CLUT must use the uploaded material row");
+        assert_eq!((candidate.x, candidate.y), (32, requested_y));
+
+        framebuffer.set_raw_pixel(704, 0, 0x0001);
+        let sample = framebuffer.sample_texture_sample_from(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            0,
+            0,
+            TextureSamplingPolicy::new(true, true),
+        );
+        assert_eq!(sample.color, 0x3021);
+        assert!(sample.palette_fallback);
+    }
+
+    #[test]
+    fn br2_low_bank_fighter_palette_does_not_replace_coherent_requested_bank() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7903;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+
+        for index in 0..16 {
+            framebuffer.set_raw_pixel(
+                requested_x + index,
+                requested_y,
+                0x3000 + index as u16 * 0x21,
+            );
+            framebuffer.set_raw_pixel(64 + index, requested_y, 0x7c00 + index as u16);
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        );
+        assert_eq!(candidate, None);
+    }
+
+    #[test]
+    fn br2_captured_yugo_palette_recovers_shared_material_bank() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0208;
+        let clut = 0x7a00;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+
+        for (index, color) in [
+            0x0421, 0x0421, 0x0001, 0x0002, 0x0800, 0x0003, 0x0421, 0x0420, 0x0004, 0x0005, 0x0022,
+            0x0006, 0x1420, 0x0442, 0x0006, 0x0c40,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+            framebuffer.set_raw_pixel(
+                requested_x + index as i32,
+                requested_y - 16,
+                if index.is_multiple_of(2) {
+                    0x18c6
+                } else {
+                    0x1084
+                },
+            );
+        }
+        for (index, color) in [
+            0x0008, 0x1841, 0x0044, 0x0843, 0x0009, 0x000a, 0x000b, 0x1081, 0x2461, 0x0863, 0x000c,
+            0x0429, 0x0066, 0x1c64, 0x000d, 0x2882,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(16 + index as i32, requested_y, color);
+        }
+        for (index, color) in [
+            0x000e, 0x0c85, 0x1ca2, 0x14c0, 0x000f, 0x0088, 0x0011, 0x3082, 0x0012, 0x10a6, 0x0089,
+            0x34a2, 0x1900, 0x0013, 0x20e3, 0x0014,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(32 + index as i32, requested_y, color);
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("the captured Yugo texture row must resolve to its previous material row");
+        assert_eq!((candidate.x, candidate.y), (requested_x, requested_y - 16));
+
+        let scalar =
+            indexed_palette_sample_from(&framebuffer.raw_pixels, texture_page, clut, 2, 16, true);
+        assert_eq!(scalar.color, 0x18c6);
+        assert!(scalar.palette_fallback);
+
+        let prepared = prepared_indexed_palette_samples_from(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            16,
+            true,
+        );
+        assert_eq!(prepared[2].color, 0x18c6);
+        assert!(prepared[2].palette_fallback);
+    }
+
+    #[test]
+    fn br2_recovery_palette_history_survives_material_row_overwrite() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0208;
+        let clut = 0x7a00;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let previous_y = requested_y - 16;
+        let material = [0x18e9, 0x18c6, 0x1ce6];
+
+        for (index, color) in [
+            0x0421, 0x0421, 0x0001, 0x0002, 0x0800, 0x0003, 0x0421, 0x0420, 0x0004, 0x0005, 0x0022,
+            0x0006, 0x1420, 0x0442, 0x0006, 0x0c40,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+            framebuffer.set_raw_pixel(
+                requested_x + index as i32,
+                previous_y,
+                material[index % material.len()],
+            );
+        }
+
+        let initial = prepared_indexed_palette_samples_with_history(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            16,
+            true,
+            Some(&framebuffer.recovery_palette_history),
+        );
+        assert_eq!(initial[2].color, material[2]);
+
+        for index in 0..16 {
+            framebuffer.set_raw_pixel(requested_x + index, previous_y, 0);
+            framebuffer.set_raw_pixel(16 + index, requested_y, 1 + index as u16);
+            framebuffer.set_raw_pixel(32 + index, requested_y, 1 + index as u16);
+        }
+
+        let recovered = prepared_indexed_palette_samples_with_history(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            16,
+            true,
+            Some(&framebuffer.recovery_palette_history),
+        );
+        assert_eq!(recovered[2].color, material[2]);
+        assert!(recovered[2].palette_fallback);
+    }
+
+    #[test]
+    fn br2_recovery_palette_history_does_not_cross_texture_generations() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0208;
+        let clut = 0x7a00;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let previous_y = requested_y - 16;
+        let material = [0x18e9, 0x18c6, 0x1ce6];
+
+        for (index, color) in [
+            0x0421, 0x0421, 0x0001, 0x0002, 0x0800, 0x0003, 0x0421, 0x0420, 0x0004, 0x0005, 0x0022,
+            0x0006, 0x1420, 0x0442, 0x0006, 0x0c40,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+            framebuffer.set_raw_pixel(
+                requested_x + index as i32,
+                previous_y,
+                material[index % material.len()],
+            );
+        }
+
+        let initial = prepared_indexed_palette_samples_with_history(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            16,
+            true,
+            Some(&framebuffer.recovery_palette_history),
+        );
+        assert_eq!(initial[2].color, material[2]);
+
+        for index in 0..16 {
+            framebuffer.set_raw_pixel(requested_x + index, previous_y, 0);
+            framebuffer.set_raw_pixel(16 + index, requested_y, 1 + index as u16);
+            framebuffer.set_raw_pixel(32 + index, requested_y, 1 + index as u16);
+        }
+        let (page_x, page_y) = texture_page_origin_for_clut(texture_page, clut);
+        framebuffer.set_raw_pixel(page_x, page_y, 0x1234);
+
+        let recovered = prepared_indexed_palette_samples_with_history(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            16,
+            true,
+            Some(&framebuffer.recovery_palette_history),
+        );
+        assert_ne!(
+            recovered[2].color, material[2],
+            "a new texture generation must not reuse the prior scene palette"
+        );
+    }
+
+    #[test]
+    fn br2_low_bank_fighter_palette_recovers_implausibly_dark_requested_bank() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7903;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let previous_y = requested_y - 16;
+
+        for index in 0..16 {
+            framebuffer.set_raw_pixel(requested_x + index, requested_y, 1 + index as u16);
+            framebuffer.set_raw_pixel(
+                requested_x + index,
+                previous_y,
+                0x1084 + index as u16 * 0x21,
+            );
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("an implausibly dark fighter CLUT should resolve to its uploaded material row");
+        assert_eq!((candidate.x, candidate.y), (requested_x, previous_y));
+    }
+
+    #[test]
+    fn br2_low_bank_fighter_palette_keeps_dense_red_material_bank() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7903;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let balanced_x = requested_x + 16;
+
+        for index in 0..16u16 {
+            let requested = if index == 0 {
+                0
+            } else {
+                let red = 20 + index % 8;
+                let green = 3 + index % 3;
+                let blue = 2 + index % 2;
+                red | (green << 5) | (blue << 10)
+            };
+            let balanced = if index == 0 {
+                0
+            } else {
+                let red = 12 + index % 4;
+                let green = 10 + (index * 3) % 6;
+                let blue = 9 + (index * 5) % 7;
+                red | (green << 5) | (blue << 10)
+            };
+            framebuffer.set_raw_pixel(requested_x + i32::from(index), requested_y, requested);
+            framebuffer.set_raw_pixel(balanced_x + i32::from(index), requested_y, balanced);
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        );
+        assert_eq!(
+            candidate, None,
+            "a dense red fighter material CLUT must remain authoritative"
+        );
+    }
+
+    #[test]
+    fn br2_low_bank_fighter_palette_replaces_pure_red_polluted_requested_bank() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7903;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let balanced_x = requested_x + 16;
+
+        for index in 0..16u16 {
+            let polluted = if index == 0 {
+                0
+            } else {
+                (8 + index) | (u16::from(index.is_multiple_of(5)) << 5)
+            };
+            let balanced = if index == 0 {
+                0
+            } else {
+                let red = 10 + index % 5;
+                let green = 9 + (index * 3) % 7;
+                let blue = 8 + (index * 5) % 8;
+                red | (green << 5) | (blue << 10)
+            };
+            framebuffer.set_raw_pixel(requested_x + i32::from(index), requested_y, polluted);
+            framebuffer.set_raw_pixel(balanced_x + i32::from(index), requested_y, balanced);
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("a pure-red polluted fighter CLUT must use the balanced adjacent upload");
+        assert_eq!((candidate.x, candidate.y), (balanced_x, requested_y));
+    }
+
+    #[test]
+    fn br2_low_bank_fighter_palette_skips_pure_red_polluted_fallback_candidate() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7903;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let polluted_x = requested_x - 16;
+        let balanced_x = requested_x + 16;
+
+        for index in 0..16u16 {
+            framebuffer.set_raw_pixel(requested_x + i32::from(index), requested_y, 1 + index);
+            framebuffer.set_raw_pixel(
+                polluted_x + i32::from(index),
+                requested_y,
+                if index == 0 { 0 } else { 8 + index },
+            );
+            framebuffer.set_raw_pixel(
+                balanced_x + i32::from(index),
+                requested_y,
+                if index == 0 {
+                    0
+                } else {
+                    let red = 11 + index % 4;
+                    let green = 10 + (index * 3) % 6;
+                    let blue = 9 + (index * 5) % 7;
+                    red | (green << 5) | (blue << 10)
+                },
+            );
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        )
+        .expect("the balanced candidate after a polluted row must remain selectable");
+        assert_eq!((candidate.x, candidate.y), (balanced_x, requested_y));
+    }
+
+    #[test]
+    fn br2_low_bank_fighter_palette_does_not_replace_red_pollution_with_more_red_pollution() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020b;
+        let clut = 0x7903;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let polluted_x = requested_x - 16;
+
+        for index in 0..16u16 {
+            framebuffer.set_raw_pixel(
+                requested_x + i32::from(index),
+                requested_y,
+                if index == 0 { 0 } else { 8 + index },
+            );
+            framebuffer.set_raw_pixel(
+                polluted_x + i32::from(index),
+                requested_y,
+                if index == 0 { 0 } else { 9 + index },
+            );
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_policy(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+        );
+        assert_eq!(
+            candidate, None,
+            "a second pure-red row is not a safe recovery palette"
+        );
     }
 
     #[test]
@@ -6796,6 +9206,31 @@ mod tests {
             Some(override_x),
         )
         .expect("explicit fighter palette override should select a populated CLUT");
+        assert_eq!((candidate.x, candidate.y), (override_x, requested_y));
+    }
+
+    #[test]
+    fn br2_captured_high_bank_model_palette_honors_explicit_clut_x_override() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0039;
+        let clut = 0x79d9;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let override_x = 320;
+
+        for index in 0..16 {
+            framebuffer.set_raw_pixel(requested_x + index, requested_y, 0x1000 + index as u16);
+            framebuffer.set_raw_pixel(override_x + index, requested_y, 0x3000 + index as u16);
+        }
+
+        let candidate = br2_character_model_palette_candidate_with_override(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            true,
+            Some(override_x),
+        )
+        .expect("explicit high-bank model palette override should select a populated CLUT");
         assert_eq!((candidate.x, candidate.y), (override_x, requested_y));
     }
 
@@ -7204,7 +9639,7 @@ mod tests {
             &framebuffer.raw_pixels,
             texture_page,
             clut,
-            index as i32,
+            index,
         )
         .expect("BR2 right portrait palette row should resolve to the 256-color block base");
         assert_eq!(fallback.color, 0x03e0);
@@ -7214,7 +9649,7 @@ mod tests {
                 &framebuffer.raw_pixels,
                 texture_page,
                 clut,
-                index as i32,
+                index,
                 256,
                 options.allow_palette_fallback,
             )

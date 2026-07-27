@@ -89,6 +89,32 @@ impl NativeEmulator {
         self.executed_steps - start_steps
     }
 
+    fn step_instruction_untracked(&mut self) {
+        if self.cpu.halted {
+            self.last_outcome = StepOutcome::Halted;
+            return;
+        }
+
+        let cycles_before = self.cpu.cycles;
+        self.last_outcome = self.cpu.step(&mut self.bus);
+        if self.cpu.cycles > cycles_before {
+            self.executed_steps = self.executed_steps.saturating_add(1);
+        }
+    }
+
+    pub fn step_instructions_until_vblank_untracked(&mut self, count: u64) -> u64 {
+        let start_steps = self.executed_steps;
+        let start_vblank = self.bus.vblank_count();
+        let max_instructions = count.max(1);
+        while self.executed_steps - start_steps < max_instructions
+            && self.bus.vblank_count() == start_vblank
+            && self.last_outcome == StepOutcome::Continue
+        {
+            self.step_instruction_untracked();
+        }
+        self.executed_steps - start_steps
+    }
+
     pub fn step_until_next_vblank(&mut self, max_instructions: u64) -> u64 {
         let start_steps = self.executed_steps;
         let start_vblank = self.bus.vblank_count();
@@ -112,6 +138,22 @@ impl NativeEmulator {
 
     pub fn set_vblank_presentation_capture_interval(&mut self, interval: Option<u64>) {
         self.bus.set_vblank_presentation_capture_interval(interval);
+    }
+
+    pub fn set_native_otc_dma_recovery_suppressed(&mut self, suppressed: bool) {
+        self.bus.set_native_otc_dma_recovery_suppressed(suppressed);
+    }
+
+    pub fn native_otc_dma_recovery_suppressed(&self) -> bool {
+        self.bus.native_otc_dma_recovery_suppressed()
+    }
+
+    pub fn set_native_otc_dma_recovery_interval(&mut self, interval: u64) {
+        self.bus.set_native_otc_dma_recovery_interval(interval);
+    }
+
+    pub fn native_otc_dma_recovery_interval(&self) -> u64 {
+        self.bus.native_otc_dma_recovery_interval()
     }
 
     pub fn capture_vblank_presented_frame(&mut self) {
@@ -467,9 +509,9 @@ impl NativeEmulator {
 
     fn arm_trace_watch_if_ready(&mut self, config: &NativeTraceConfig, watch_armed: &mut bool) {
         if *watch_armed
-            || !config
+            || config
                 .watch_after_vblank
-                .is_some_and(|threshold| self.bus.vblank_count() >= threshold)
+                .is_none_or(|threshold| self.bus.vblank_count() < threshold)
         {
             return;
         }
@@ -556,6 +598,15 @@ impl NativeEmulator {
         }
     }
 
+    pub fn fast_gameplay_display_frame(&self) -> NativeDisplayFrame {
+        let (width, height, pixels) = self.bus.fast_gameplay_display_rgb_frame();
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     pub fn actual_display_png(&self) -> Vec<u8> {
         self.bus.io.gpu.actual_display_png()
     }
@@ -601,6 +652,10 @@ impl NativeEmulator {
 
     pub fn input_activity(&self) -> NativeInputActivity {
         self.bus.input_activity()
+    }
+
+    pub fn recovery_raster_cache_stats_json(&self) -> String {
+        self.bus.recovery_raster_cache_stats_json()
     }
 
     pub fn br2_native_credit_hle_accepted_seen(&self) -> bool {
@@ -2969,6 +3024,35 @@ mod tests {
     }
 
     #[test]
+    fn untracked_step_until_vblank_preserves_last_step_boundary() {
+        let rom = program(&[
+            i_type(0x09, 0, 2, 42),   // addiu v0, zero, 42
+            i_type(0x09, 0, 3, 7),    // addiu v1, zero, 7
+            r_type(0, 0, 0, 0, 0x0d), // break
+        ]);
+        let mut emulator = NativeEmulator {
+            cpu: Cpu::default(),
+            bus: Bus::new(rom, 2 * 1024 * 1024),
+            rom_compatibility: NativeRomCompatibilityReport::missing_all_required_assets(),
+            last_outcome: StepOutcome::Continue,
+            executed_steps: 0,
+            last_step: None,
+        };
+
+        let first_report = emulator.step_instruction();
+        let tracked_boundary = emulator.last_step;
+        let executed = emulator.step_instructions_until_vblank_untracked(10);
+
+        assert_eq!(first_report.outcome, StepOutcome::Continue);
+        assert_eq!(executed, 2);
+        assert_eq!(emulator.cpu.regs[2], 42);
+        assert_eq!(emulator.cpu.regs[3], 7);
+        assert_eq!(emulator.cpu.cycles, 3);
+        assert_eq!(emulator.last_outcome, StepOutcome::Halted);
+        assert_eq!(emulator.last_step, tracked_boundary);
+    }
+
+    #[test]
     fn display_frame_uses_stable_gui_display_instead_of_sparse_raw_actual() {
         let mut emulator = test_emulator();
         let (width, height) = emulator.bus.io.gpu.display_dimensions();
@@ -3074,7 +3158,7 @@ mod tests {
             0x0018_1010,
             0x0050_4008,
             0x00d8_1010,
-            0x00f0_f0_d8,
+            0x00f0_f0d8,
             0x0008_2038,
             0x00e0_d000,
             0x0070_7040,
@@ -3107,7 +3191,7 @@ mod tests {
                     if local_x < 112 && (local_x / 4 + local_y / 3) % 2 == 0 {
                         0x00d8_1010
                     } else if local_x >= 120 && local_y % 5 != 0 {
-                        0x00f0_f0_d8
+                        0x00f0_f0d8
                     } else {
                         0
                     };
@@ -3171,7 +3255,7 @@ mod tests {
                 let color = if local_x < 88 {
                     0x00d0_1818
                 } else if (local_x + local_y) % 3 == 0 {
-                    0x00f0_f0_e0
+                    0x00f0_f0e0
                 } else {
                     0x0018_2040
                 };
@@ -3299,7 +3383,7 @@ mod tests {
                     continue;
                 }
                 let seed = (x / 7 + y * 11 + if slot < 5 { 0 } else { 97 }) as u32;
-                pixels[y * width + x] = if seed % 3 == 0 {
+                pixels[y * width + x] = if seed.is_multiple_of(3) {
                     let red = 72 + (seed % 48);
                     let low = 12 + (seed % 20);
                     (red << 16) | (low << 8) | low
@@ -3472,7 +3556,7 @@ mod tests {
                 pixels[y * width + x] = if (x / 8 + y / 5) % 3 == 0 {
                     0x00e0_1810
                 } else {
-                    0x00d8_d8_d8
+                    0x00d8_d8d8
                 };
             }
         }

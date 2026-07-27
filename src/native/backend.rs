@@ -2,10 +2,18 @@ use std::path::PathBuf;
 
 use crate::action::ActionButtons;
 use crate::backend::{Backend, BackendError, Observation};
-use crate::native::emulator::NativeEmulator;
+use crate::native::emulator::{NativeDisplayFrame, NativeEmulator};
 
 const NATIVE_BACKEND_VBLANK_CAPTURE_INTERVAL: u64 = 6_000;
-const NATIVE_BACKEND_UNLINKED_PRIMITIVE_REPLAY_INTERVAL: u64 = 5;
+const NATIVE_BACKEND_OTC_RECOVERY_INTERVAL: u64 = 4;
+const NATIVE_BACKEND_MIN_VBLANK_INSTRUCTION_BUDGET: u64 = 2_000_000;
+const NATIVE_HUD_WIDTH: usize = 512;
+const NATIVE_HUD_HEIGHT: usize = 480;
+const NATIVE_P1_HEALTH_X: std::ops::Range<usize> = 35..230;
+const NATIVE_P2_HEALTH_X: std::ops::Range<usize> = 282..477;
+const NATIVE_HEALTH_Y: std::ops::Range<usize> = 42..51;
+const NATIVE_P1_BEAST_X: std::ops::Range<usize> = 36..130;
+const NATIVE_BEAST_Y: std::ops::Range<usize> = 431..440;
 
 #[derive(Clone, Debug)]
 pub struct NativeBackend {
@@ -13,6 +21,11 @@ pub struct NativeBackend {
     rom_path: PathBuf,
     frame: u64,
     instructions_per_frame: u64,
+    player_health: f32,
+    opponent_health: f32,
+    beast_meter: f32,
+    include_screenshot: bool,
+    requires_reset: bool,
 }
 
 impl NativeBackend {
@@ -29,23 +42,83 @@ impl NativeBackend {
             rom_path,
             frame: 0,
             instructions_per_frame: instructions_per_frame.max(1),
+            player_health: 1.0,
+            opponent_health: 1.0,
+            beast_meter: 0.0,
+            include_screenshot: false,
+            requires_reset: false,
         })
     }
 
-    fn observe(&self) -> Observation {
+    fn observe(&mut self) -> Observation {
+        self.update_hud_observation();
         Observation {
             frame: self.frame,
-            player_health: 1.0,
-            opponent_health: 1.0,
-            beast_meter: self.emulator.progress_signal(),
+            player_health: self.player_health,
+            opponent_health: self.opponent_health,
+            beast_meter: self.beast_meter,
             round_time: (99.0 - (self.frame as f32 / 60.0)).max(0.0),
-            terminal: self.emulator.is_terminal(),
-            screenshot_b64: Some(self.emulator.display_window_png_base64()),
+            terminal: self.emulator.is_terminal()
+                || self.player_health <= f32::EPSILON
+                || self.opponent_health <= f32::EPSILON,
+            screenshot_b64: self
+                .include_screenshot
+                .then(|| self.emulator.display_window_png_base64()),
         }
+    }
+
+    fn update_hud_observation(&mut self) {
+        if !self.emulator.native_playable_candidate() {
+            return;
+        }
+        let frame = self.emulator.display_frame();
+        if let Some(health) = native_hud_bar_fill(&frame, NATIVE_P1_HEALTH_X, NATIVE_HEALTH_Y) {
+            self.player_health = health;
+        }
+        if let Some(health) = native_hud_bar_fill(&frame, NATIVE_P2_HEALTH_X, NATIVE_HEALTH_Y) {
+            self.opponent_health = health;
+        }
+        if let Some(meter) = native_hud_bar_fill(&frame, NATIVE_P1_BEAST_X, NATIVE_BEAST_Y) {
+            self.beast_meter = meter;
+        }
+    }
+
+    fn advance_one_vblank(&mut self) -> Result<u64, BackendError> {
+        let start_vblank = self.emulator.vblank_count();
+        let instruction_budget = self
+            .instructions_per_frame
+            .max(NATIVE_BACKEND_MIN_VBLANK_INSTRUCTION_BUDGET);
+        let mut executed = 0_u64;
+
+        while self.emulator.vblank_count() == start_vblank
+            && !self.emulator.is_terminal()
+            && executed < instruction_budget
+        {
+            let remaining = instruction_budget.saturating_sub(executed);
+            let batch = self.instructions_per_frame.min(remaining).max(1);
+            let batch_executed = self.emulator.step_until_next_vblank(batch);
+            executed = executed.saturating_add(batch_executed);
+            if batch_executed == 0 {
+                break;
+            }
+        }
+
+        let advanced = self.emulator.vblank_count().saturating_sub(start_vblank);
+        if advanced == 0 {
+            self.requires_reset = true;
+            return Err(BackendError::new(format!(
+                "native backend did not reach the next vblank within {instruction_budget} instructions; reset is required before the next step"
+            )));
+        }
+        Ok(advanced)
     }
 }
 
 impl Backend for NativeBackend {
+    fn set_observation_screenshot(&mut self, enabled: bool) {
+        self.include_screenshot = enabled;
+    }
+
     fn reset(&mut self) -> Result<Observation, BackendError> {
         self.emulator = NativeEmulator::from_rom_zip(self.rom_path.clone())?;
         self.emulator
@@ -53,15 +126,24 @@ impl Backend for NativeBackend {
             .validate_native_runtime()?;
         configure_native_backend_emulator(&mut self.emulator);
         self.frame = 0;
+        self.player_health = 1.0;
+        self.opponent_health = 1.0;
+        self.beast_meter = 0.0;
+        self.requires_reset = false;
         Ok(self.observe())
     }
 
     fn step(&mut self, buttons: ActionButtons, frames: u32) -> Result<Observation, BackendError> {
-        let frames = frames.max(1) as u64;
+        if self.requires_reset {
+            return Err(BackendError::new(
+                "native backend requires reset after a failed vblank step",
+            ));
+        }
+        let requested_frames = frames.max(1) as u64;
         self.emulator.set_input(buttons);
-        for _ in 0..frames {
-            self.emulator.step_instructions(self.instructions_per_frame);
-            self.frame += 1;
+        for _ in 0..requested_frames {
+            let advanced = self.advance_one_vblank()?;
+            self.frame = self.frame.saturating_add(advanced);
             if self.emulator.is_terminal() {
                 break;
             }
@@ -72,8 +154,88 @@ impl Backend for NativeBackend {
 
 fn configure_native_backend_emulator(emulator: &mut NativeEmulator) {
     emulator.apply_auto_coin_input_mapping();
+    emulator.set_native_otc_dma_recovery_interval(NATIVE_BACKEND_OTC_RECOVERY_INTERVAL);
     emulator.set_vblank_presentation_capture_interval(Some(NATIVE_BACKEND_VBLANK_CAPTURE_INTERVAL));
-    emulator.set_unlinked_primitive_replay_interval(Some(
-        NATIVE_BACKEND_UNLINKED_PRIMITIVE_REPLAY_INTERVAL,
-    ));
+    emulator.set_unlinked_primitive_replay_enabled(false);
+    emulator.set_unlinked_primitive_replay_interval(None);
+}
+
+fn native_hud_bar_fill(
+    frame: &NativeDisplayFrame,
+    x_range: std::ops::Range<usize>,
+    y_range: std::ops::Range<usize>,
+) -> Option<f32> {
+    if frame.width < NATIVE_HUD_WIDTH
+        || frame.height < NATIVE_HUD_HEIGHT
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+        || x_range.is_empty()
+        || y_range.is_empty()
+    {
+        return None;
+    }
+
+    let active_columns = x_range
+        .clone()
+        .filter(|&x| {
+            let active_pixels = y_range
+                .clone()
+                .filter(|&y| native_hud_meter_pixel(frame.pixels[y * frame.width + x]))
+                .count();
+            active_pixels * 2 >= y_range.len()
+        })
+        .count();
+    Some(active_columns as f32 / x_range.len() as f32)
+}
+
+fn native_hud_meter_pixel(pixel: u32) -> bool {
+    let red = ((pixel >> 16) & 0xff) as i32;
+    let green = ((pixel >> 8) & 0xff) as i32;
+    let blue = (pixel & 0xff) as i32;
+    let maximum = red.max(green).max(blue);
+    let minimum = red.min(green).min(blue);
+    maximum >= 80
+        && maximum - minimum >= 24
+        && (red >= blue.saturating_add(20) || green >= blue.saturating_add(20))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NATIVE_HEALTH_Y, NATIVE_HUD_HEIGHT, NATIVE_HUD_WIDTH, NATIVE_P1_HEALTH_X,
+        NativeDisplayFrame, native_hud_bar_fill,
+    };
+
+    #[test]
+    fn native_hud_bar_fill_tracks_colored_meter_columns() {
+        let mut frame = NativeDisplayFrame {
+            width: NATIVE_HUD_WIDTH,
+            height: NATIVE_HUD_HEIGHT,
+            pixels: vec![0; NATIVE_HUD_WIDTH * NATIVE_HUD_HEIGHT],
+        };
+        let filled = NATIVE_P1_HEALTH_X.len() / 2;
+        for y in NATIVE_HEALTH_Y {
+            for x in NATIVE_P1_HEALTH_X.start..NATIVE_P1_HEALTH_X.start + filled {
+                frame.pixels[y * frame.width + x] = 0x00e0_c020;
+            }
+        }
+
+        let fill = native_hud_bar_fill(&frame, NATIVE_P1_HEALTH_X, NATIVE_HEALTH_Y)
+            .expect("valid HUD frame");
+
+        assert!((fill - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn native_hud_bar_fill_rejects_partial_frames() {
+        let frame = NativeDisplayFrame {
+            width: 512,
+            height: 240,
+            pixels: vec![0; 512 * 240],
+        };
+
+        assert_eq!(
+            native_hud_bar_fill(&frame, NATIVE_P1_HEALTH_X, NATIVE_HEALTH_Y),
+            None
+        );
+    }
 }
