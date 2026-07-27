@@ -2,8 +2,9 @@ use crate::ACTION_SPACE;
 
 pub fn api_index_json() -> String {
     format!(
-        "{{\"name\":\"bloodyroar2-gym\",\"version\":\"{}\",\"endpoints\":[\"GET /\",\"GET /action_space\",\"GET /observation_space\",\"POST /reset\",\"POST /step\"],\"request_options\":{{\"screenshot\":\"optional boolean; defaults false\"}},\"asset_policy\":\"No ROMs, BIOS files, or proprietary game binaries are included. Provide legally obtained assets at runtime.\"}}",
-        env!("CARGO_PKG_VERSION")
+        "{{\"name\":\"bloodyroar2-gym\",\"version\":\"{}\",\"endpoints\":[\"GET /\",\"GET /action_space\",\"GET /observation_space\",\"POST /reset\",\"POST /step\"],\"request_options\":{{\"step_control\":\"provide exactly one of action or buttons\",\"action\":\"backward-compatible discrete action index\",\"buttons\":\"arbitrary simultaneous boolean controls\",\"frames\":\"integer from 1 through {}\",\"screenshot\":\"optional boolean; defaults false\"}},\"native_defaults\":{{\"reset\":\"playable match checkpoint\",\"screenshot\":\"640x480 GUI-equivalent PNG\"}},\"asset_policy\":\"No ROMs, BIOS files, or proprietary game binaries are included. Provide legally obtained assets at runtime.\"}}",
+        env!("CARGO_PKG_VERSION"),
+        crate::env::MAX_STEP_FRAMES,
     )
 }
 

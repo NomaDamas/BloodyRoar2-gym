@@ -10,8 +10,9 @@ use bloodyroar2_gym::{
     ACTION_SPACE, Action, ActionButtons, BloodyRoar2Env, MameConfig, MameRuntime,
     NativeDisplayFrame, NativeEmulator, NativeGpuDrawCapturePredicate, NativeInputActivity,
     NativeRomSet, NativeTraceConfig, NullBackend, ZincConfig, ZincRuntime, action_space_json,
-    api_index_json, native_window_frame_from_display, native_window_prefers_stronger_stacked_field,
-    observation_space_json, png_from_rgb888_pixels,
+    api_index_json, native_aspect_corrected_gui_frame, native_playable_match_entry_script,
+    native_update_aspect_corrected_gui_frame, native_window_frame_from_display,
+    native_window_prefers_stronger_stacked_field, observation_space_json, png_from_rgb888_pixels,
 };
 use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 
@@ -43,6 +44,7 @@ const NATIVE_PLAY_GUI_PRESENTED_CAPTURE_HEARTBEAT_FRAMES: u64 = 60;
 const NATIVE_PLAY_GUI_PLAYABILITY_REFRESH_FRAMES: u64 = 15;
 const NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES: u64 = 30;
 const NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_INTERVAL: u64 = 5;
+const NATIVE_PLAY_WINDOW_ACTIVATION_BACKGROUND_RETRY_INTERVAL: u64 = 60;
 const NATIVE_PLAY_WINDOW_TARGET_FPS: usize = 60;
 const NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME: u64 =
     NATIVE_PLAY_SCRIPT_INSTRUCTIONS_PER_FRAME;
@@ -3905,7 +3907,7 @@ fn run_native_play(
         current_presented_frame.width,
         current_presented_frame.height,
         WindowOptions {
-            resize: true,
+            resize: false,
             scale,
             scale_mode: ScaleMode::AspectRatioStretch,
             ..WindowOptions::default()
@@ -4406,9 +4408,12 @@ fn run_native_play(
     let gameplay_ready = native_playable_observed_or_final
         && final_native_playable_candidate
         && final_frame_render_verified;
+    let presented_buffer_size_verified = final_frame.width == NATIVE_PLAY_SCALED_WINDOW_WIDTH
+        && final_frame.height == NATIVE_PLAY_MIN_WINDOW_HEIGHT;
     let playable = native_playable_observed_or_final
         && final_native_playable_candidate
-        && final_frame_render_verified;
+        && final_frame_render_verified
+        && presented_buffer_size_verified;
     let scripted_target_frames = script_segments
         .iter()
         .map(|segment| segment.frames)
@@ -4509,6 +4514,23 @@ fn run_native_play(
         playable,
         emulator.display_diagnosis_json()
     );
+    if !playable {
+        return Err(format!(
+            "native play verification failed: playable_candidate={} render_verified={} presented_size={}x{} expected={}x{}",
+            final_native_playable_candidate,
+            final_frame_render_verified,
+            final_frame.width,
+            final_frame.height,
+            NATIVE_PLAY_SCALED_WINDOW_WIDTH,
+            NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        ));
+    }
+    if test_input_enabled && !native_play_test_input_verified {
+        return Err(
+            "native play GUI test input failed to reach all guest direction and play controls"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -4643,9 +4665,13 @@ fn native_play_should_retry_window_activation(
     gui_rendered_frames: u64,
     window_active: bool,
 ) -> bool {
-    gui_rendered_frames < NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES
-        && gui_rendered_frames.is_multiple_of(NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_INTERVAL)
-        && !window_active
+    if window_active {
+        return false;
+    }
+    if gui_rendered_frames < NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES {
+        return gui_rendered_frames.is_multiple_of(NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_INTERVAL);
+    }
+    gui_rendered_frames.is_multiple_of(NATIVE_PLAY_WINDOW_ACTIVATION_BACKGROUND_RETRY_INTERVAL)
 }
 
 fn native_play_gui_capture_dir() -> Option<PathBuf> {
@@ -8298,59 +8324,14 @@ fn native_play_present_native_resolution_actual_frame(
 }
 
 fn native_play_aspect_corrected_gui_frame(frame: &NativeDisplayFrame) -> NativeDisplayFrame {
-    let mut output = NativeDisplayFrame {
-        width: 0,
-        height: 0,
-        pixels: Vec::new(),
-    };
-    native_play_update_aspect_corrected_gui_frame(frame, &mut output);
-    output
+    native_aspect_corrected_gui_frame(frame)
 }
 
 fn native_play_update_aspect_corrected_gui_frame(
     frame: &NativeDisplayFrame,
     output: &mut NativeDisplayFrame,
 ) {
-    if frame.width == 0
-        || frame.height == 0
-        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
-    {
-        output.width = NATIVE_PLAY_SCALED_WINDOW_WIDTH;
-        output.height = NATIVE_PLAY_MIN_WINDOW_HEIGHT;
-        output.pixels.resize(
-            NATIVE_PLAY_SCALED_WINDOW_WIDTH.saturating_mul(NATIVE_PLAY_MIN_WINDOW_HEIGHT),
-            0,
-        );
-        output.pixels.fill(0);
-        return;
-    }
-
-    let target_width = NATIVE_PLAY_SCALED_WINDOW_WIDTH;
-    let target_height = NATIVE_PLAY_MIN_WINDOW_HEIGHT;
-    output.width = target_width;
-    output.height = target_height;
-    output
-        .pixels
-        .resize(target_width.saturating_mul(target_height), 0);
-    if frame.width == target_width && frame.height == target_height {
-        let source_len = frame.width.saturating_mul(frame.height);
-        output.pixels[..source_len].copy_from_slice(&frame.pixels[..source_len]);
-        return;
-    }
-
-    for y in 0..target_height {
-        let source_y = y.saturating_mul(frame.height) / target_height;
-        let source_row = source_y.saturating_mul(frame.width);
-        let target_row = y.saturating_mul(target_width);
-        for x in 0..target_width {
-            let source_x = x
-                .saturating_mul(frame.width)
-                .checked_div(target_width)
-                .unwrap_or_default()
-                .min(frame.width.saturating_sub(1));
-            output.pixels[target_row + x] = frame.pixels[source_row + source_x];
-        }
-    }
+    native_update_aspect_corrected_gui_frame(frame, output);
 }
 
 fn native_play_should_preserve_raw_frame_over_deinterlace(
@@ -15066,50 +15047,13 @@ fn native_snapshot_handoff_script(match_script: bool) -> Vec<NativeScriptSegment
 }
 
 fn native_snapshot_match_entry_script() -> Vec<NativeScriptSegment> {
-    let mut segments = native_warning_skip_to_title_script();
-    segments.extend([
-        NativeScriptSegment {
-            action: Action::Coin,
-            frames: 12,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 24,
-        },
-        NativeScriptSegment {
-            action: Action::Start,
-            frames: 18,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 120,
-        },
-        NativeScriptSegment {
-            action: Action::Punch,
-            frames: 30,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 120,
-        },
-        NativeScriptSegment {
-            action: Action::Punch,
-            frames: 30,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 180,
-        },
-    ]);
-    // Keep the complete control proof ahead of the snapshot wall timeout. The
-    // prior long sweep reached Beast at frame 879 and could capture its flash
-    // before the trailing stable gameplay frame was ever rendered.
-    segments.extend(native_control_sweep_script(6, 6));
-    segments.push(NativeScriptSegment {
-        action: Action::Noop,
-        frames: 180,
-    });
-    segments
+    native_playable_match_entry_script()
+        .into_iter()
+        .map(|segment| NativeScriptSegment {
+            action: segment.action,
+            frames: segment.frames,
+        })
+        .collect()
 }
 
 fn native_manual_entry_script() -> Vec<NativeScriptSegment> {
@@ -19151,9 +19095,17 @@ fn asset_check(path: &str) -> Result<(), String> {
     }
 
     let lowercase = path.to_ascii_lowercase();
-    let risky_extension = [".zip", ".bin", ".cue", ".iso", ".chd", ".exe", ".dll"]
-        .iter()
-        .any(|extension| lowercase.ends_with(extension));
+    let risky_extension = [
+        ".zip", ".7z", ".rar", ".rom", ".bin", ".cue", ".iso", ".chd", ".img", ".ecm", ".ccd",
+        ".sub", ".mdf", ".mds", ".pbp", ".exe", ".dll", ".dylib", ".so", ".znc",
+    ]
+    .iter()
+    .any(|extension| lowercase.ends_with(extension))
+        || lowercase.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.len() == 3
+                && extension.starts_with('z')
+                && extension[1..].bytes().all(|byte| byte.is_ascii_digit())
+        });
 
     println!(
         "{{\"path\":\"{}\",\"size_bytes\":{},\"git_policy\":\"keep outside repository\",\"requires_legal_source\":{},\"note\":\"This tool does not validate ownership. Use only assets you are legally allowed to use.\"}}",
@@ -28868,7 +28820,7 @@ mod tests {
     }
 
     #[test]
-    fn native_window_activation_retries_only_while_initial_window_is_inactive() {
+    fn native_window_activation_retries_while_window_remains_inactive() {
         assert!(super::native_play_should_retry_window_activation(0, false));
         assert!(super::native_play_should_retry_window_activation(5, false));
         assert!(!super::native_play_should_retry_window_activation(4, false));
@@ -28876,6 +28828,7 @@ mod tests {
         assert!(!super::native_play_should_retry_window_activation(
             30, false
         ));
+        assert!(super::native_play_should_retry_window_activation(60, false));
     }
 
     #[test]

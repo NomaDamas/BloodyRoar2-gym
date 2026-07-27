@@ -158,14 +158,14 @@ same deterministic JSON CPU/IO state.
 Exercise one native backend environment step from the CLI:
 
 ```sh
-cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
+cargo run -- native-env-step assets/roms/<game-romset.zip> 5 1 500000
 ```
 
 Run a deterministic input script and write a normalized 512x480 diagnostic
 frame:
 
 ```sh
-cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
+cargo run -- native-scripted-step assets/roms/<game-romset.zip> 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
 ```
 
 Each script segment is `<action:frames>` where `action` is either an action
@@ -183,7 +183,7 @@ For the exact 640x480 aspect-corrected buffer presented by `native-play`, use
 Serve the native backend over the Gym-style HTTP API:
 
 ```sh
-cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 500000
+cargo run -- serve-native 127.0.0.1:8765 assets/roms/<game-romset.zip> 500000
 ```
 
 Probe the API from another shell:
@@ -195,11 +195,22 @@ curl -sS -X POST http://127.0.0.1:8765/reset
 curl -sS -X POST http://127.0.0.1:8765/step -d '{"action":5,"frames":1}'
 curl -sS -X POST http://127.0.0.1:8765/step \
   -d '{"action":5,"frames":1,"screenshot":true}'
+curl -sS -X POST http://127.0.0.1:8765/step \
+  -d '{"buttons":{"left":true,"punch":true,"guard":true},"frames":2}'
 ```
 
 `screenshot` defaults to `false` for compact RL/LLM responses. Native steps
-advance the requested number of emulated vblanks and report an error rather
-than silently returning a partial frame count.
+advance 1 through 600 emulated vblanks and report an error rather than silently
+returning a partial frame count. Provide exactly one of the backward-compatible
+discrete `action` index or an arbitrary simultaneous `buttons` object. Native
+screenshots are the same 640x480 aspect-corrected buffer presented by the GUI.
+The response `info` records requested controls, total and per-step guest input
+activity, playable state, checkpoint startup metadata, and screenshot
+dimensions/source.
+
+The native backend performs the warning/title/coin/start/select/match-entry
+sequence once when it is created. `/reset` then clones that verified playable
+checkpoint, avoiding a repeated cold boot for every RL episode.
 
 The Python standard-library client can target the same server:
 
@@ -245,9 +256,9 @@ but the native renderer or branch stability is not yet complete.
 Open the native macOS play window:
 
 ```sh
-cargo run --release -- native-cache-prepare assets/BloodRoar2-combined.zip
-cargo run --release -- native-cache-path assets/BloodRoar2-combined.zip
-cargo run --release -- native-play assets/BloodRoar2-combined.zip 500000 fit
+cargo run --release -- native-cache-prepare <local-rom-archive.zip>
+cargo run --release -- native-cache-path <local-rom-archive.zip>
+cargo run --release -- native-play <local-rom-archive.zip> 500000 fit
 cargo run --release -- native-autoplay assets/roms 500000 fit
 cargo run --release -- native-play assets/roms 500000 fit
 ```

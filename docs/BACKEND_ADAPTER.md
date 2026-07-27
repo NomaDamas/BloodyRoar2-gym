@@ -38,7 +38,7 @@ code can be developed without ROMs or proprietary binaries.
 The repository provides a MAME runtime helper:
 
 ```sh
-cargo run -- prepare-assets "BloodRoar2 (2).zip" assets/roms
+cargo run -- prepare-assets <local-rom-archive.zip> assets/roms
 cargo run -- mame-check assets/roms
 cargo run -- play assets/roms
 ```

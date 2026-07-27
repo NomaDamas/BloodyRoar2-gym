@@ -16,6 +16,8 @@ const NATIVE_COIN_MAPPING_ENV: &str = "BLOODYROAR2_NATIVE_COIN_MAPPING";
 const NATIVE_LEGACY_ZINC_INPUT_ENV: &str = "BLOODYROAR2_NATIVE_LEGACY_ZINC_INPUT";
 const NATIVE_WINDOW_FRAME_WIDTH: usize = 512;
 const NATIVE_WINDOW_FRAME_HEIGHT: usize = 480;
+const NATIVE_GUI_FRAME_WIDTH: usize = 640;
+const NATIVE_GUI_FRAME_HEIGHT: usize = 480;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDisplayFrame {
@@ -578,6 +580,19 @@ impl NativeEmulator {
 
     pub fn display_window_png_base64(&self) -> String {
         bytes_base64(&self.display_window_png())
+    }
+
+    pub fn display_gui_frame(&self) -> NativeDisplayFrame {
+        native_aspect_corrected_gui_frame(&self.display_window_frame())
+    }
+
+    pub fn display_gui_png(&self) -> Vec<u8> {
+        let frame = self.display_gui_frame();
+        png_from_rgb888_pixels(frame.width, frame.height, &frame.pixels)
+    }
+
+    pub fn display_gui_png_base64(&self) -> String {
+        bytes_base64(&self.display_gui_png())
     }
 
     pub fn actual_display_frame(&self) -> NativeDisplayFrame {
@@ -1329,6 +1344,51 @@ pub fn native_window_frame_from_display(frame: &NativeDisplayFrame) -> NativeDis
     }
 
     native_window_expand_sparse_vertical_frame(&scaled)
+}
+
+pub fn native_aspect_corrected_gui_frame(frame: &NativeDisplayFrame) -> NativeDisplayFrame {
+    let mut output = NativeDisplayFrame {
+        width: 0,
+        height: 0,
+        pixels: Vec::new(),
+    };
+    native_update_aspect_corrected_gui_frame(frame, &mut output);
+    output
+}
+
+pub fn native_update_aspect_corrected_gui_frame(
+    frame: &NativeDisplayFrame,
+    output: &mut NativeDisplayFrame,
+) {
+    output.width = NATIVE_GUI_FRAME_WIDTH;
+    output.height = NATIVE_GUI_FRAME_HEIGHT;
+    output
+        .pixels
+        .resize(NATIVE_GUI_FRAME_WIDTH * NATIVE_GUI_FRAME_HEIGHT, 0);
+    if frame.width == 0
+        || frame.height == 0
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        output.pixels.fill(0);
+        return;
+    }
+
+    if frame.width == output.width && frame.height == output.height {
+        output
+            .pixels
+            .copy_from_slice(&frame.pixels[..frame.width.saturating_mul(frame.height)]);
+        return;
+    }
+
+    for y in 0..output.height {
+        let source_y = y.saturating_mul(frame.height) / output.height;
+        let source_row = source_y.saturating_mul(frame.width);
+        let target_row = y.saturating_mul(output.width);
+        for x in 0..output.width {
+            let source_x = x.saturating_mul(frame.width) / output.width;
+            output.pixels[target_row + x] = frame.pixels[source_row + source_x];
+        }
+    }
 }
 
 fn native_window_expand_sparse_vertical_frame(frame: &NativeDisplayFrame) -> NativeDisplayFrame {

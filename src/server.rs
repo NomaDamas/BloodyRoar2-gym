@@ -3,14 +3,20 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::action::Action;
+use crate::action::{Action, ActionButtons};
 use crate::backend::{Backend, BackendError, NullBackend};
-use crate::env::BloodyRoar2Env;
+use crate::env::{BloodyRoar2Env, MAX_STEP_FRAMES};
 use crate::native::NativeBackend;
 use crate::protocol::{action_space_json, api_index_json, observation_space_json};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepControl {
+    Action(usize),
+    Buttons(ActionButtons),
+}
 
 pub fn serve(address: &str) -> Result<(), BackendError> {
     serve_with_backend(address, NullBackend::default())
@@ -102,8 +108,9 @@ where
                 env.set_observation_screenshot(include_screenshot);
                 match env.reset() {
                     Ok(observation) => ok(format!(
-                        "{{\"observation\":{},\"info\":{{}}}}",
-                        observation.json()
+                        "{{\"observation\":{},\"info\":{}}}",
+                        observation.json(),
+                        observation.info_json
                     )),
                     Err(error) => internal_error(error.to_string()),
                 }
@@ -113,22 +120,28 @@ where
     } else if first_line.starts_with("POST /step ") {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
         match parse_step_request(body) {
-            Ok((action_index, frames, include_screenshot)) => {
-                match Action::from_index(action_index) {
-                    Some(action) => {
-                        let mut env = env
-                            .lock()
-                            .map_err(|_| BackendError::new("environment lock poisoned"))?;
-                        env.set_observation_screenshot(include_screenshot);
-                        match env.step(action, frames) {
-                            Ok(step) => ok(step.json()),
-                            Err(error) => internal_error(error.to_string()),
+            Ok((control, frames, include_screenshot)) => {
+                let buttons = match control {
+                    StepControl::Action(action_index) => match Action::from_index(action_index) {
+                        Some(action) => action.buttons(),
+                        None => {
+                            return Ok(bad_request(format!(
+                                "{{\"error\":\"action must be between 0 and {}\"}}",
+                                crate::ACTION_SPACE.len() - 1
+                            )));
                         }
+                    },
+                    StepControl::Buttons(buttons) => buttons,
+                };
+                {
+                    let mut env = env
+                        .lock()
+                        .map_err(|_| BackendError::new("environment lock poisoned"))?;
+                    env.set_observation_screenshot(include_screenshot);
+                    match env.step_buttons(buttons, frames) {
+                        Ok(step) => ok(step.json()),
+                        Err(error) => internal_error(error.to_string()),
                     }
-                    None => bad_request(format!(
-                        "{{\"error\":\"action must be between 0 and {}\"}}",
-                        crate::ACTION_SPACE.len() - 1
-                    )),
                 }
             }
             Err(message) => bad_request(error_json(&message)),
@@ -204,18 +217,29 @@ fn parse_content_length(headers: &str) -> Result<usize, String> {
     Ok(0)
 }
 
-fn parse_step_request(body: &str) -> Result<(usize, u32, bool), String> {
+fn parse_step_request(body: &str) -> Result<(StepControl, u32, bool), String> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|error| format!("invalid JSON body: {error}"))?;
     let object = value
         .as_object()
         .ok_or_else(|| "request body must be a JSON object".to_string())?;
-    let action = object
-        .get("action")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| "action must be a non-negative integer".to_string())?;
-    let action =
-        usize::try_from(action).map_err(|_| "action is outside the supported range".to_string())?;
+    let action = object.get("action");
+    let buttons = object.get("buttons");
+    let control = match (action, buttons) {
+        (Some(_), Some(_)) => {
+            return Err("provide exactly one of action or buttons, not both".to_string());
+        }
+        (None, None) => return Err("provide exactly one of action or buttons".to_string()),
+        (Some(action), None) => {
+            let action = action
+                .as_u64()
+                .ok_or_else(|| "action must be a non-negative integer".to_string())?;
+            let action = usize::try_from(action)
+                .map_err(|_| "action is outside the supported range".to_string())?;
+            StepControl::Action(action)
+        }
+        (None, Some(buttons)) => StepControl::Buttons(parse_action_buttons(buttons)?),
+    };
     let frames = object
         .get("frames")
         .map(|value| {
@@ -225,11 +249,48 @@ fn parse_step_request(body: &str) -> Result<(usize, u32, bool), String> {
         })
         .transpose()?
         .unwrap_or(1);
-    if frames == 0 || frames > u32::MAX as u64 {
-        return Err(format!("frames must be between 1 and {}", u32::MAX));
+    if frames == 0 || frames > MAX_STEP_FRAMES as u64 {
+        return Err(format!("frames must be between 1 and {MAX_STEP_FRAMES}"));
     }
     let include_screenshot = parse_screenshot_option(object)?;
-    Ok((action, frames as u32, include_screenshot))
+    Ok((control, frames as u32, include_screenshot))
+}
+
+fn parse_action_buttons(value: &serde_json::Value) -> Result<ActionButtons, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "buttons must be a JSON object".to_string())?;
+    let allowed = [
+        "start", "coin", "service", "up", "down", "left", "right", "punch", "kick", "beast",
+        "guard",
+    ];
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("unknown buttons field: {key}"));
+    }
+    let read = |name: &str| -> Result<bool, String> {
+        object
+            .get(name)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| format!("buttons.{name} must be a boolean"))
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(false))
+    };
+    Ok(ActionButtons {
+        start: read("start")?,
+        coin: read("coin")?,
+        service: read("service")?,
+        up: read("up")?,
+        down: read("down")?,
+        left: read("left")?,
+        right: read("right")?,
+        punch: read("punch")?,
+        kick: read("kick")?,
+        beast: read("beast")?,
+        guard: read("guard")?,
+    })
 }
 
 fn parse_observation_options(body: &str) -> Result<bool, String> {
@@ -295,8 +356,8 @@ mod tests {
     use crate::env::BloodyRoar2Env;
 
     use super::{
-        find_header_end, internal_error, parse_content_length, parse_observation_options,
-        parse_step_request, route_request,
+        StepControl, find_header_end, internal_error, parse_content_length,
+        parse_observation_options, parse_step_request, route_request,
     };
 
     #[derive(Default)]
@@ -315,6 +376,7 @@ mod tests {
                 round_time: 99.0,
                 terminal: false,
                 screenshot_b64: self.include_screenshot.then(|| "test-png".to_string()),
+                info_json: format!("{{\"frame\":{}}}", self.frame),
             }
         }
     }
@@ -349,23 +411,49 @@ mod tests {
 
     #[test]
     fn step_request_requires_valid_integer_action_and_positive_frames() {
-        assert_eq!(parse_step_request(r#"{"action":5}"#), Ok((5, 1, false)));
+        assert_eq!(
+            parse_step_request(r#"{"action":5}"#),
+            Ok((StepControl::Action(5), 1, false))
+        );
         assert_eq!(
             parse_step_request(r#"{"action":5,"frames":4}"#),
-            Ok((5, 4, false))
+            Ok((StepControl::Action(5), 4, false))
         );
         assert_eq!(
             parse_step_request(r#"{"action":5,"frames":4,"screenshot":true}"#),
-            Ok((5, 4, true))
+            Ok((StepControl::Action(5), 4, true))
         );
         assert_eq!(
             parse_step_request(r#"{"action":5,"screenshot":false}"#),
-            Ok((5, 1, false))
+            Ok((StepControl::Action(5), 1, false))
+        );
+        assert_eq!(
+            parse_step_request(r#"{"buttons":{"up":true,"punch":true,"guard":true},"frames":2}"#),
+            Ok((
+                StepControl::Buttons(ActionButtons {
+                    up: true,
+                    punch: true,
+                    guard: true,
+                    ..ActionButtons::default()
+                }),
+                2,
+                false
+            ))
         );
         assert!(parse_step_request(r#"{}"#).is_err());
+        assert!(parse_step_request(r#"{"action":5,"buttons":{}}"#).is_err());
         assert!(parse_step_request(r#"{"action":"5"}"#).is_err());
         assert!(parse_step_request(r#"{"action":-1}"#).is_err());
         assert!(parse_step_request(r#"{"action":5,"frames":0}"#).is_err());
+        assert!(
+            parse_step_request(&format!(
+                r#"{{"action":5,"frames":{}}}"#,
+                crate::env::MAX_STEP_FRAMES + 1
+            ))
+            .is_err()
+        );
+        assert!(parse_step_request(r#"{"buttons":{"up":1}}"#).is_err());
+        assert!(parse_step_request(r#"{"buttons":{"turbo":true}}"#).is_err());
         assert!(parse_step_request(r#"{"action":5,"screenshot":1}"#).is_err());
         assert!(parse_step_request(r#"{"action":5"#).is_err());
     }
@@ -396,6 +484,7 @@ mod tests {
             response_json(&reset_with_image)["observation"]["screenshot_b64"],
             "test-png"
         );
+        assert_eq!(response_json(&reset_with_image)["info"]["frame"], 0);
 
         let step_without_image = route_request(
             "POST /step HTTP/1.1\r\nContent-Length: 12\r\n\r\n{\"action\":5}",
@@ -416,6 +505,14 @@ mod tests {
             response_json(&step_with_image)["observation"]["screenshot_b64"],
             "test-png"
         );
+        assert_eq!(response_json(&step_with_image)["info"]["frame"], 2);
+
+        let step_with_buttons = route_request(
+            "POST /step HTTP/1.1\r\nContent-Length: 50\r\n\r\n{\"buttons\":{\"up\":true,\"punch\":true},\"frames\":3}",
+            &env,
+        )
+        .expect("step with simultaneous buttons");
+        assert_eq!(response_json(&step_with_buttons)["info"]["frame"], 5);
 
         let reset_without_image =
             route_request("POST /reset HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", &env)

@@ -15,8 +15,8 @@ validated first on arm64 macOS.
 
 Other Unix-like hosts may work for asset-free Rust development, but they are
 secondary and should not be assumed to have the same runtime coverage. Windows
-ZiNc compatibility remains a legacy fallback path and is not the default target
-for emulator-core work.
+ZiNc compatibility remains a default-denied legacy path and is not the default
+target for emulator-core work.
 
 ## macOS Apple Silicon setup
 
@@ -24,7 +24,6 @@ Required baseline for development on Apple Silicon:
 
 ```sh
 xcode-select --install
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 brew install rustup-init mame
 rustup-init
 rustup default stable
@@ -36,14 +35,18 @@ cargo test
 Notes:
 
 - The repository uses Rust edition 2024, so keep the stable toolchain current.
+- Install Homebrew from the official https://brew.sh instructions if `brew` is
+  not already available; this README intentionally does not provide a
+  pipe-to-shell installer shortcut.
 - `aarch64-apple-darwin` is the primary target; Rosetta/x86_64 builds are not
   the default validation path.
 - Xcode Command Line Tools provide the macOS SDK and linker used by Cargo.
-- Homebrew MAME is required for the local macOS play path and ROM-set checks.
+- Homebrew MAME is optional and used only for external compatibility checks;
+  the Rust-native macOS play path does not launch MAME.
 - Python is optional and only needed for scripts that wrap the HTTP API in
   `examples/python`; the client itself uses the Python standard library.
-- Wine is optional and only relevant to the legacy ZiNc compatibility path, not
-  native emulator development.
+- Wine is optional and only relevant to the unsafe, default-denied legacy ZiNc
+  compatibility path, not native emulator development.
 
 Keep ROMs, BIOS files, ZiNc bundles, MAME samples, captures, save states, and
 other proprietary runtime assets in ignored local directories such as `assets/`,
@@ -81,7 +84,7 @@ cargo run -- serve 127.0.0.1:8765
 Run the Rust-native Apple Silicon play window with legally supplied local assets:
 
 ```sh
-cargo run -- native-cache-prepare assets/BloodRoar2-combined.zip
+cargo run -- native-cache-prepare assets/local-romset.zip
 cargo run -- native-play
 cargo run -- native-input-check
 cargo run -- native-health-check
@@ -95,7 +98,7 @@ materializes recognized ROM entries once under ignored
 `native-cache-prepare` reports `cache_hit` and `materialized`, records the latest
 cache directory, and `native-cache-path` prints the resolved ROM directory. For
 repeat play sessions, omit the ROM argument: native commands use the latest cache
-directory first, then `assets/BloodRoar2-combined.zip`, then `assets/roms`. That
+directory first, then ignored local asset paths configured by the runtime. That
 keeps repeat runs off the source ZIP unless you intentionally rebuild the cache.
 Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
 outside the repo.
@@ -150,15 +153,15 @@ cargo run -- native-play 120000 fit 1000
 cargo run -- native-autoplay 120000 fit 1000
 cargo run -- native-manual 120000 2 700
 cargo run -- native-window-snapshot 40505333 tmp/native-validation/manual-window.png
-cargo run -- native-play-snapshot assets/BloodRoar2-combined.zip 120000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
+cargo run -- native-play-snapshot assets/local-romset.zip 120000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
 cargo run --release -- native-play assets/roms 120000 1 150 \
   --gui-test-input coin:6 start:6 up:6 down:6 left:6 right:6 \
   punch:6 kick:6 beast:6 guard:6 noop:25
 ```
 
-In `native-play assets/BloodRoar2-combined.zip 120000 1`, the final `1` is the
+In `native-play assets/local-romset.zip 120000 1`, the final `1` is the
 window scale, not a frame limit. Use a fourth argument for bounded smoke runs,
-for example `native-play assets/BloodRoar2-combined.zip 120000 1 600`.
+for example `native-play assets/local-romset.zip 120000 1 600`.
 `--gui-test-input` is an opt-in QA path that traverses the same GUI input latch
 and guest registers while keeping its result separate from physical-keyboard
 verification. The final JSON reports `native_play_test_input_verified`.
@@ -172,7 +175,7 @@ Install MAME if you also want an external compatibility reference:
 
 ```sh
 brew install mame
-cargo run -- prepare-assets "BloodRoar2 (2).zip" assets/roms
+cargo run -- prepare-assets <local-archive.zip> assets/roms
 cargo run -- rom-ident assets/roms
 cargo run -- mame-required assets/roms
 cargo run -- mame-check assets/roms
@@ -197,13 +200,15 @@ default or recommended path.
 
 ## ZiNc compatibility path
 
-The downloaded bundle is structured for ZiNc on Windows. On Apple Silicon this
-is not native, but it can be attempted through Rosetta plus Wine:
+The local legacy bundle is structured for ZiNc on Windows. On Apple Silicon this
+is not native, and `zinc-play` is disabled by default because it launches a local
+Windows executable through Wine. Only use it in an isolated environment after
+you explicitly accept that host risk:
 
 ```sh
-cargo run -- prepare-zinc "BloodRoar2 (2).zip" assets/extracted
-cargo run -- zinc-check assets/extracted/BloodRoar2
-cargo run -- zinc-play assets/extracted/BloodRoar2
+cargo run -- prepare-zinc <local-zinc-bundle-archive.zip> assets/extracted
+cargo run -- zinc-check assets/extracted/<zinc-bundle-dir>
+BLOODYROAR2_ALLOW_UNSAFE_ZINC_WINE=1 cargo run -- zinc-play assets/extracted/<zinc-bundle-dir>
 ```
 
 Configuration:
@@ -213,6 +218,9 @@ Configuration:
 - `BLOODYROAR2_ZINC_RENDERER`: override renderer, default `renderer-sft.znc`.
 - `BLOODYROAR2_ZINC_RENDERER_CFG`: override renderer config, default
   `zenith-renderer70.cfg`.
+- `BLOODYROAR2_ALLOW_UNSAFE_ZINC_WINE=1`: required unsafe opt-in for
+  `zinc-play`; without it the command fails before launching Wine or the Windows
+  executable.
 
 If Wine is missing, install a Wine distribution manually. Homebrew
 `wine-stable` may require `sudo` for its GStreamer dependency and may not be
@@ -226,16 +234,16 @@ execution foundation, memory bus, DMA, GPU framebuffer renderer, input mapping,
 Gym-style native backend, and a minifb-powered local play window:
 
 ```sh
-cargo run -- native-inspect assets/roms/bldyror2.zip
-cargo run -- native-rom-summary assets/roms/bldyror2.zip
-cargo run -- native-step assets/roms/bldyror2.zip 16
-cargo run -- native-step assets/roms/bldyror2.zip 1000000
-cargo run -- native-env-step assets/roms/bldyror2.zip 5 1 10000
-cargo run -- native-scripted-step assets/roms/bldyror2.zip 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
+cargo run -- native-inspect assets/roms/<game-romset.zip>
+cargo run -- native-rom-summary assets/roms/<game-romset.zip>
+cargo run -- native-step assets/roms/<game-romset.zip> 16
+cargo run -- native-step assets/roms/<game-romset.zip> 1000000
+cargo run -- native-env-step assets/roms/<game-romset.zip> 5 1 10000
+cargo run -- native-scripted-step assets/roms/<game-romset.zip> 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
 cargo run -- native-input-check 120000
 cargo run -- native-health-check 120000
 cargo run -- native-play 120000 fit
-cargo run -- serve-native 127.0.0.1:8765 assets/roms/bldyror2.zip 500000
+cargo run -- serve-native 127.0.0.1:8765 assets/roms/<game-romset.zip> 500000
 ```
 
 The native path is intentionally separated from MAME and ZiNc compatibility
@@ -248,7 +256,10 @@ quality, and exposes CPU/IO/GPU state for iterative validation.
 release gates for full-scene composition, input coverage, and gameplay-scene
 rendering.
 `native-env-step` and `serve-native` connect the native core to the same
-Gym-style action/observation contract used by the null backend.
+Gym-style action/observation contract used by the null backend. Native backend
+creation performs the match-entry sequence once, stores a playable emulator
+checkpoint, and clones that checkpoint for subsequent `/reset` calls instead
+of cold-booting the game again.
 `native-scripted-step` applies a sequence of Gym actions to the native core and
 writes a normalized 512x480 diagnostic frame, with raw/window frame stats in
 JSON for repeatable boot/input debugging. `native-play-snapshot` additionally
@@ -270,13 +281,20 @@ curl -sS -X POST http://127.0.0.1:8765/step \
   -d '{"action":5,"frames":1}'
 curl -sS -X POST http://127.0.0.1:8765/step \
   -d '{"action":5,"frames":1,"screenshot":true}'
+curl -sS -X POST http://127.0.0.1:8765/step \
+  -d '{"buttons":{"up":true,"punch":true,"guard":true},"frames":2}'
 ```
 
 `screenshot` defaults to `false` on both `/reset` and `/step` to keep
 non-vision-agent responses small. Set it to `true` only when a base64 PNG is
-needed. Native `/step` advances the requested number of emulated vblanks; if
-the core cannot reach the next vblank within its safety budget, the request
-fails instead of returning a partial frame count.
+needed. Native screenshots use the same aspect-corrected 640x480 buffer as the
+macOS GUI. Each `/step` must provide exactly one of `action` or `buttons`.
+`action` preserves the `Discrete(20)` contract; `buttons` permits any
+simultaneous boolean control combination. `frames` must be between 1 and 600.
+If the core cannot reach the next vblank within its safety budget, the request
+fails instead of returning a partial frame count. The response `info` contains
+the requested buttons, total and per-step guest input activity, playable-state
+status, startup checkpoint details, and screenshot dimensions/source.
 
 Endpoints:
 
@@ -292,6 +310,7 @@ Action space:
 
 - Type: `Discrete(20)`
 - Values: see `cargo run -- action-space`
+- Extended control: a `buttons` object for arbitrary simultaneous controls
 
 Observation space:
 
@@ -314,7 +333,8 @@ Observation space:
 ## Backend status
 
 `serve-native` connects the Rust-native emulator directly to the `Backend`
-trait, including deterministic vblank stepping, mapped controller input, HUD
-observations, and optional PNG observations. `serve` remains a ROM-free null
+trait, including deterministic bounded vblank stepping, mapped simultaneous
+controller input, playable checkpoint reset, HUD observations, guest input
+proof, and optional 640x480 PNG observations. `serve` remains a ROM-free null
 backend for client development, while `play` is an optional MAME compatibility
 reference.

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::action::ActionButtons;
 use crate::backend::{Backend, BackendError, Observation};
 use crate::native::emulator::{NativeDisplayFrame, NativeEmulator};
+use crate::native::playable::{NativePlayableStartup, prepare_native_playable_emulator};
 
 const NATIVE_BACKEND_VBLANK_CAPTURE_INTERVAL: u64 = 6_000;
 const NATIVE_BACKEND_OTC_RECOVERY_INTERVAL: u64 = 4;
@@ -18,7 +19,7 @@ const NATIVE_BEAST_Y: std::ops::Range<usize> = 431..440;
 #[derive(Clone, Debug)]
 pub struct NativeBackend {
     emulator: NativeEmulator,
-    rom_path: PathBuf,
+    reset_checkpoint: NativeEmulator,
     frame: u64,
     instructions_per_frame: u64,
     player_health: f32,
@@ -26,6 +27,7 @@ pub struct NativeBackend {
     beast_meter: f32,
     include_screenshot: bool,
     requires_reset: bool,
+    startup: NativePlayableStartup,
 }
 
 impl NativeBackend {
@@ -33,13 +35,14 @@ impl NativeBackend {
         rom_path: impl Into<PathBuf>,
         instructions_per_frame: u64,
     ) -> Result<Self, BackendError> {
-        let rom_path = rom_path.into();
-        let mut emulator = NativeEmulator::from_rom_zip(rom_path.clone())?;
+        let mut emulator = NativeEmulator::from_rom_zip(rom_path.into())?;
         emulator.rom_compatibility().validate_native_runtime()?;
         configure_native_backend_emulator(&mut emulator);
+        let startup = prepare_native_playable_emulator(&mut emulator)?;
+        let reset_checkpoint = emulator.clone();
         Ok(Self {
             emulator,
-            rom_path,
+            reset_checkpoint,
             frame: 0,
             instructions_per_frame: instructions_per_frame.max(1),
             player_health: 1.0,
@@ -47,11 +50,20 @@ impl NativeBackend {
             beast_meter: 0.0,
             include_screenshot: false,
             requires_reset: false,
+            startup,
         })
     }
 
-    fn observe(&mut self) -> Observation {
+    fn observe(
+        &mut self,
+        requested_buttons: ActionButtons,
+        activity_baseline: crate::native::NativeInputActivity,
+    ) -> Observation {
         self.update_hud_observation();
+        let input_activity = self.emulator.input_activity();
+        let input_delta = input_activity.saturating_subtracted(activity_baseline);
+        let screenshot_frame = self.emulator.display_gui_frame();
+        let native_playable_candidate = self.emulator.native_playable_candidate();
         Observation {
             frame: self.frame,
             player_health: self.player_health,
@@ -63,7 +75,22 @@ impl NativeBackend {
                 || self.opponent_health <= f32::EPSILON,
             screenshot_b64: self
                 .include_screenshot
-                .then(|| self.emulator.display_window_png_base64()),
+                .then(|| self.emulator.display_gui_png_base64()),
+            info_json: format!(
+                "{{\"requested_buttons\":{},\"input_activity\":{},\"input_activity_delta\":{},\"native_playable_candidate\":{},\"startup\":{{\"mode\":\"playable_checkpoint\",\"frames\":{},\"playable\":{}}},\"screenshot\":{{\"included\":{},\"width\":{},\"height\":{},\"source\":\"native_gui_aspect_corrected\"}},\"guest_input_proof\":{{\"any\":{},\"play_controls\":{},\"full_controls\":{}}}}}",
+                requested_buttons.json(),
+                input_activity.json(),
+                input_delta.json(),
+                native_playable_candidate,
+                self.startup.frames,
+                self.startup.playable,
+                self.include_screenshot,
+                screenshot_frame.width,
+                screenshot_frame.height,
+                input_delta.has_any_control_activity(),
+                input_delta.has_play_control_activity(),
+                input_delta.has_full_control_activity(),
+            ),
         }
     }
 
@@ -120,17 +147,14 @@ impl Backend for NativeBackend {
     }
 
     fn reset(&mut self) -> Result<Observation, BackendError> {
-        self.emulator = NativeEmulator::from_rom_zip(self.rom_path.clone())?;
-        self.emulator
-            .rom_compatibility()
-            .validate_native_runtime()?;
-        configure_native_backend_emulator(&mut self.emulator);
+        self.emulator = self.reset_checkpoint.clone();
         self.frame = 0;
         self.player_health = 1.0;
         self.opponent_health = 1.0;
         self.beast_meter = 0.0;
         self.requires_reset = false;
-        Ok(self.observe())
+        let activity_baseline = self.emulator.input_activity();
+        Ok(self.observe(ActionButtons::default(), activity_baseline))
     }
 
     fn step(&mut self, buttons: ActionButtons, frames: u32) -> Result<Observation, BackendError> {
@@ -139,7 +163,14 @@ impl Backend for NativeBackend {
                 "native backend requires reset after a failed vblank step",
             ));
         }
-        let requested_frames = frames.max(1) as u64;
+        if frames == 0 || frames > crate::env::MAX_STEP_FRAMES {
+            return Err(BackendError::new(format!(
+                "frames must be between 1 and {}",
+                crate::env::MAX_STEP_FRAMES
+            )));
+        }
+        let requested_frames = frames as u64;
+        let activity_baseline = self.emulator.input_activity();
         self.emulator.set_input(buttons);
         for _ in 0..requested_frames {
             let advanced = self.advance_one_vblank()?;
@@ -148,7 +179,7 @@ impl Backend for NativeBackend {
                 break;
             }
         }
-        Ok(self.observe())
+        Ok(self.observe(buttons, activity_baseline))
     }
 }
 

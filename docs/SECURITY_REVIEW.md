@@ -4,21 +4,22 @@ Date: 2026-06-18
 
 ## Reviewed files
 
-The working directory initially contained only a split archive set:
+The working directory initially contained a user-supplied split/archive set.
+Concrete archive names and hashes are intentionally not recorded in this
+repository because they identify proprietary runtime content that must remain
+local and untracked.
 
-| File | SHA-256 |
+| Category | Repository handling |
 | --- | --- |
-| `BloodRoar2 (2).zip` | `4ee0e3aefbdd693a9556ebe6ae96b0f37c9dba7f99fb45a58694f36241ff519a` |
-| `BloodRoar2 (2).z01` | `ce8f6b8f67a87dc48bef664b4fb56acad25b3009450c722c184c180747cd69a0` |
-| `BloodRoar2 (2).z02` | `b74fab481bbea3f2f57e945ab82db7ffe1adcb39bfbd4492b83d2fca4e145282` |
+| User-supplied archive parts | Local only, ignored by Git |
+| Extracted ROM/game payloads | Local only, ignored by Git |
+| Emulator executable/plugin binaries | Local only, ignored by Git |
 
 ## Static findings
 
-- The archive listing includes Windows executables: `zenith.exe` and `ZiNc.exe`.
-- The archive listing includes Windows DLL/plugin-style binaries:
-  `s11player.dll`, `renderer-*.znc`, `controller*.znc`, and `sound.znc`.
-- The archive listing includes ROM zip files under `BloodRoar2/roms/`, including
-  `bldyror2.zip`.
+- The archive listing includes Windows executable files.
+- The archive listing includes Windows DLL/plugin-style binary files.
+- The archive listing includes ROM ZIP entries.
 - `unzip` reported that the `.zip` claims to be the last disk of a multi-part
   archive, so extraction should not be trusted unless the parts are joined or
   handled by a tool that supports split ZIP archives correctly.
@@ -37,10 +38,15 @@ This repository excludes the archive, extracted game files, ROMs, BIOS files,
 EXEs, DLLs, and plugin binaries from Git. The Rust adaptation is a clean-room
 control harness that expects legally obtained assets to be supplied locally at
 runtime and never committed.
+The legacy `zinc-play` command is default-denied and fails before launching Wine
+unless `BLOODYROAR2_ALLOW_UNSAFE_ZINC_WINE=1` is set by the operator.
 
 ## Recommended handling
 
 - Do not execute the bundled Windows binaries on macOS.
+- Do not use `zinc-play` on the host by default; if it is needed for isolated
+  compatibility testing, set `BLOODYROAR2_ALLOW_UNSAFE_ZINC_WINE=1` only inside
+  a disposable VM or sandbox after scanning the local bundle.
 - If deeper malware analysis is needed, use an isolated VM or sandbox with no
   sensitive credentials.
 - Scan the joined archive with a current antivirus engine before any extraction.

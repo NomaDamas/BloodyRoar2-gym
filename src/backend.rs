@@ -12,6 +12,7 @@ pub struct Observation {
     pub round_time: f32,
     pub terminal: bool,
     pub screenshot_b64: Option<String>,
+    pub info_json: String,
 }
 
 impl Observation {
@@ -91,6 +92,7 @@ impl NullBackend {
             round_time: (99.0 - (self.frame as f32 / 60.0)).max(0.0),
             terminal: self.player_health <= 0.0 || self.opponent_health <= 0.0,
             screenshot_b64: None,
+            info_json: "{}".to_string(),
         }
     }
 }
