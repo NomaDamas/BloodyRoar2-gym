@@ -5285,6 +5285,10 @@ impl Bus {
         self.io.native_playable_candidate()
     }
 
+    pub fn native_render_context_candidates(&self) -> (bool, bool) {
+        self.io.native_render_context_candidates()
+    }
+
     pub fn native_rendered_scene_candidate(&self) -> bool {
         self.io.native_rendered_scene_candidate()
     }
@@ -5432,8 +5436,16 @@ impl Bus {
         self.br2_native_credit_hle.accepted > 0
     }
 
+    pub fn br2_native_credit_hle_accepted_count(&self) -> u64 {
+        self.br2_native_credit_hle.accepted
+    }
+
     pub fn br2_native_credit_hle_game_start_accepted_seen(&self) -> bool {
         self.br2_native_credit_hle.game_start_accepted > 0
+    }
+
+    pub fn br2_native_credit_hle_game_start_accepted_count(&self) -> u64 {
+        self.br2_native_credit_hle.game_start_accepted
     }
 
     fn record_zn_board_input_read(&self, address: u32, width: u8, value: u32) {

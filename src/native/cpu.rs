@@ -3061,8 +3061,9 @@ impl Cpu {
             return report;
         }
 
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_scene_callback(start_pc, cycles_before, bus)
+        if self.pc == BR2_RUNTIME_INVALID_CALLBACK_ENTRY
+            && let Some(report) =
+                self.try_hle_br2_runtime_invalid_scene_callback(start_pc, cycles_before, bus)
         {
             bus.tick(report.cycles_elapsed);
             bus.clear_trace_context();
@@ -3071,81 +3072,41 @@ impl Cpu {
 
         self.try_hle_br2_render_submit_gate(start_pc, bus);
 
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_callback_object(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_relation_callback(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_callback_dispatch(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_indexed_packed_transform(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_post_vs_packed_vertex_helper(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_model_relation(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_vertex_pack(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_packed_transform(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_link_splice(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_hle_br2_runtime_invalid_model_cleanup(start_pc, cycles_before, bus)
-        {
+        // Runtime recovery hooks are sparse fixed-PC entry points. Dispatch by
+        // PC so normal guest instructions do not pay for every hook's argument
+        // validation, guest-memory probes, and signature checks.
+        let runtime_recovery_report = match self.pc {
+            BR2_RUNTIME_INVALID_CALLBACK_OBJECT_ENTRY => {
+                self.try_hle_br2_runtime_invalid_callback_object(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_RELATION_CALLBACK_ENTRY => {
+                self.try_hle_br2_runtime_invalid_relation_callback(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_INVALID_CALLBACK_DISPATCH_PC => {
+                self.try_hle_br2_runtime_invalid_callback_dispatch(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_INDEXED_PACKED_TRANSFORM_ENTRY => self
+                .try_hle_br2_runtime_invalid_indexed_packed_transform(start_pc, cycles_before, bus),
+            BR2_POST_VS_PACKED_VERTEX_HELPER_START => self
+                .try_hle_br2_post_vs_packed_vertex_helper(start_pc, cycles_before, bus)
+                .or_else(|| {
+                    self.try_hle_br2_runtime_invalid_packed_transform(start_pc, cycles_before, bus)
+                }),
+            BR2_RUNTIME_INVALID_MODEL_RELATION_ENTRY => {
+                self.try_hle_br2_runtime_invalid_model_relation(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_INVALID_VERTEX_PACK_ENTRY => {
+                self.try_hle_br2_runtime_invalid_vertex_pack(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_LINK_SPLICE_ENTRY => {
+                self.try_hle_br2_runtime_invalid_link_splice(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_MODEL_CLEANUP_ENTRY => {
+                self.try_hle_br2_runtime_invalid_model_cleanup(start_pc, cycles_before, bus)
+            }
+            _ => None,
+        };
+        if let Some(report) = runtime_recovery_report {
             bus.tick(report.cycles_elapsed);
             bus.clear_trace_context();
             return report;
@@ -8371,11 +8332,18 @@ impl Cpu {
         cycles_before: u64,
         bus: &mut Bus,
     ) -> Option<StepReport> {
+        // This hook is checked for every interpreted instruction. Reject the
+        // overwhelmingly common non-entry case before touching guest memory or
+        // validating code signatures.
+        if self.pc != BR2_RUNTIME_MODEL_CLEANUP_ENTRY
+            || self.next_pc != self.pc.wrapping_add(4)
+            || self.delay_slot_branch_pc.is_some()
+            || self.br2_runtime_recovery_hle_disabled("runtime_invalid_model_cleanup")
+        {
+            return None;
+        }
+
         let model = self.regs[16];
-        let disabled = self.br2_runtime_recovery_hle_disabled("runtime_invalid_model_cleanup");
-        let at_entry = self.pc == BR2_RUNTIME_MODEL_CLEANUP_ENTRY;
-        let sequential_next_pc = self.next_pc == self.pc.wrapping_add(4);
-        let outside_delay_slot = self.delay_slot_branch_pc.is_none();
         let invalid_model =
             model == 0 || model & 0x03 != 0 || !br2_readable_byte_range(model, 0x48, bus);
         let stack = self.regs[29];
@@ -8411,11 +8379,7 @@ impl Cpu {
         let unlink_signature =
             br2_instruction_signature_matches(bus, &BR2_RUNTIME_MODEL_UNLINK_SIGNATURE);
 
-        if disabled
-            || !at_entry
-            || !sequential_next_pc
-            || !outside_delay_slot
-            || !invalid_model
+        if !invalid_model
             || !valid_stack_frame
             || !expected_caller
             || !entry_signature
@@ -11786,8 +11750,15 @@ fn gte_lm(instruction: u32) -> bool {
     instruction & (1 << 10) != 0
 }
 
+fn cached_bool(cache: &'static OnceLock<bool>, init: impl FnOnce() -> bool) -> bool {
+    *cache.get_or_init(init)
+}
+
 fn invert_gte_nclip() -> bool {
-    std::env::var_os("BR2_NATIVE_INVERT_GTE_NCLIP").is_some()
+    static INVERT_GTE_NCLIP: OnceLock<bool> = OnceLock::new();
+    cached_bool(&INVERT_GTE_NCLIP, || {
+        std::env::var_os("BR2_NATIVE_INVERT_GTE_NCLIP").is_some()
+    })
 }
 
 fn shamt(instruction: u32) -> u32 {
@@ -21391,6 +21362,22 @@ mod tests {
 
         assert_eq!(cpu.cop2_data[24] as i32, 100);
         assert_eq!(cpu.cop2_data[31], 0);
+    }
+
+    #[test]
+    fn cached_bool_initializes_hot_path_flag_once() {
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(super::cached_bool(&CACHE, || {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }));
+        assert!(super::cached_bool(&CACHE, || {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }));
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

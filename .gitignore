@@ -2,6 +2,7 @@ target/
 tmp/
 .runtime-cache/
 .DS_Store
+.tmp-*.lua
 
 # Proprietary game dumps, BIOS files, extracted emulator bundles, and split archives.
 BloodRoar2*/

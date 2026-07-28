@@ -26,6 +26,15 @@ pub struct NativeDisplayFrame {
     pub pixels: Vec<u32>,
 }
 
+fn insert_bounded_unique<T: Ord>(values: &mut Vec<T>, value: T, limit: usize) {
+    if values.len() >= limit {
+        return;
+    }
+    if let Err(index) = values.binary_search(&value) {
+        values.insert(index, value);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeEmulator {
     pub cpu: Cpu,
@@ -677,8 +686,16 @@ impl NativeEmulator {
         self.bus.br2_native_credit_hle_accepted_seen()
     }
 
+    pub fn br2_native_credit_hle_accepted_count(&self) -> u64 {
+        self.bus.br2_native_credit_hle_accepted_count()
+    }
+
     pub fn br2_native_credit_hle_game_start_accepted_seen(&self) -> bool {
         self.bus.br2_native_credit_hle_game_start_accepted_seen()
+    }
+
+    pub fn br2_native_credit_hle_game_start_accepted_count(&self) -> u64 {
+        self.bus.br2_native_credit_hle_game_start_accepted_count()
     }
 
     pub fn br2_native_credit_hle_json(&self) -> String {
@@ -722,19 +739,25 @@ impl NativeEmulator {
         gpu_rendered_scene_candidate: bool,
         gte_gameplay_signal: bool,
     ) -> bool {
+        let native_3d_gameplay_candidate = gpu_rendered_scene_candidate && gte_gameplay_signal;
+        if !gpu_playable_candidate && !native_3d_gameplay_candidate {
+            return false;
+        }
         let display_frame_guard = self
             .native_display_frame_supports_playable_candidate_with_context(
                 gpu_playable_candidate,
                 gpu_rendered_scene_candidate,
                 gte_gameplay_signal,
             );
-        let native_3d_gameplay_candidate =
-            display_frame_guard && gpu_rendered_scene_candidate && gte_gameplay_signal;
         display_frame_guard && (gpu_playable_candidate || native_3d_gameplay_candidate)
     }
 
     pub fn gpu_native_playable_candidate(&self) -> bool {
         self.bus.native_playable_candidate()
+    }
+
+    pub fn gpu_native_render_context_candidates(&self) -> (bool, bool) {
+        self.bus.native_render_context_candidates()
     }
 
     pub fn gpu_native_rendered_scene_candidate(&self) -> bool {
@@ -1109,6 +1132,24 @@ impl NativeEmulator {
         )
     }
 
+    pub fn gui_runtime_probe_json(&self) -> String {
+        format!(
+            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{}}},\"vblank_count\":{},\"input_activity\":{},\"br2_credit_hle\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"development_stage\":\"native_gui_runtime\"}}",
+            self.cpu.pc,
+            self.cpu.pc,
+            self.cpu.next_pc,
+            self.cpu.next_pc,
+            self.cpu.cycles,
+            self.cpu.halted,
+            self.vblank_count(),
+            self.bus.input_activity().json(),
+            self.bus.br2_native_credit_hle_json(),
+            self.rom_compatibility.summary_json(),
+            self.executed_steps,
+            self.last_outcome,
+        )
+    }
+
     pub fn input_check_probe_json(&self) -> String {
         let gpu_playable_candidate = self.gpu_native_playable_candidate();
         let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
@@ -1384,6 +1425,26 @@ pub fn native_update_aspect_corrected_gui_frame(
         return;
     }
 
+    if frame.width == 512 && frame.height == 480 {
+        for (source_row, target_row) in frame
+            .pixels
+            .chunks_exact(512)
+            .zip(output.pixels.chunks_exact_mut(640))
+        {
+            for (source, target) in source_row
+                .chunks_exact(4)
+                .zip(target_row.chunks_exact_mut(5))
+            {
+                target[0] = source[0];
+                target[1] = source[0];
+                target[2] = source[1];
+                target[3] = source[2];
+                target[4] = source[3];
+            }
+        }
+        return;
+    }
+
     for y in 0..output.height {
         let source_y = y.saturating_mul(frame.height) / output.height;
         let source_row = source_y.saturating_mul(frame.width);
@@ -1483,9 +1544,7 @@ fn native_window_sparse_frame_is_text_screen(frame: &NativeDisplayFrame) -> bool
             if color != 0 {
                 nonzero_pixels = nonzero_pixels.saturating_add(1);
                 row_nonzero_pixels = row_nonzero_pixels.saturating_add(1);
-                if unique_colors.len() < 49 && !unique_colors.contains(&color) {
-                    unique_colors.push(color);
-                }
+                insert_bounded_unique(&mut unique_colors, color, 49);
             }
             if x > 0 {
                 let previous =
@@ -1834,9 +1893,7 @@ fn native_window_field_has_live_scene_density(frame: &NativeDisplayFrame) -> boo
                 if red.max(green).max(blue) >= 0x80 {
                     bright = bright.saturating_add(1);
                 }
-                if unique_colors.len() < 97 && !unique_colors.contains(&color) {
-                    unique_colors.push(color);
-                }
+                insert_bounded_unique(&mut unique_colors, color, 97);
             }
             if previous.is_some_and(|previous| previous != color) {
                 horizontal_changes = horizontal_changes.saturating_add(1);
@@ -2300,9 +2357,7 @@ fn native_display_frame_has_caption_stalled_select_ui_artifact(frame: &NativeDis
                     bottom_caption_pixels = bottom_caption_pixels.saturating_add(1);
                 }
             }
-            if unique_colors.len() < 257 && !unique_colors.contains(&color) {
-                unique_colors.push(color);
-            }
+            insert_bounded_unique(&mut unique_colors, color, 257);
             let bucket = (((red >> 4) as usize) << 8)
                 | (((green >> 4) as usize) << 4)
                 | ((blue >> 4) as usize);
@@ -2417,9 +2472,7 @@ fn native_display_frame_has_texture_page_fragment_artifact(frame: &NativeDisplay
                 horizontal_changes = horizontal_changes.saturating_add(1);
             }
             previous = Some(color);
-            if unique_colors.len() < 161 && !unique_colors.contains(&color) {
-                unique_colors.push(color);
-            }
+            insert_bounded_unique(&mut unique_colors, color, 161);
             let bucket = (((red >> 4) as usize) << 8)
                 | (((green >> 4) as usize) << 4)
                 | ((blue >> 4) as usize);
@@ -2566,9 +2619,7 @@ fn native_display_frame_has_context_full_live_scene(frame: &NativeDisplayFrame) 
                 horizontal_changes = horizontal_changes.saturating_add(1);
             }
             previous = Some(color);
-            if unique_colors.len() < 65 && !unique_colors.contains(&color) {
-                unique_colors.push(color);
-            }
+            insert_bounded_unique(&mut unique_colors, color, 65);
             let bucket = (((red >> 4) as usize) << 8)
                 | (((green >> 4) as usize) << 4)
                 | ((blue >> 4) as usize);
@@ -2800,9 +2851,7 @@ fn native_display_frame_has_glyph_texture_atlas_artifact(frame: &NativeDisplayFr
             }
             previous = Some(color);
 
-            if unique_colors.len() < 129 && !unique_colors.contains(&color) {
-                unique_colors.push(color);
-            }
+            insert_bounded_unique(&mut unique_colors, color, 129);
             let bucket = (((red >> 4) as usize) << 8)
                 | (((green >> 4) as usize) << 4)
                 | ((blue >> 4) as usize);

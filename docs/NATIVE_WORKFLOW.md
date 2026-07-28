@@ -270,18 +270,20 @@ native emulator starts reuse that cache until the source archive changes or
 that cache is removed. Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to
 store the runtime cache outside the repository.
 
-`native-play` fast-forwards the built-in
-warning/title/coin/start/select/match-entry assist before opening the native
-macOS keyboard window, so the visible session starts near the manual play
-handoff instead of at warning or intro screens. `native-manual` opens a cold-boot
-keyboard window with no entry script. Use `native-autoplay` when you need a
-visible scripted assist, bounded pre-window fast-forward diagnostics, or custom
-scripted smoke runs. `native-autoplay` bounded-fast-forwards the supplied entry
-script first, continues any remaining scripted input in the visible window until
-manual takeover, then returns control to the keyboard. The bounded phase uses a
-full vblank-sized instruction budget so it does not mistake partial warning,
-transition, or stale frames for progress. `native-play` scales the pre-window
-wall timeout from that frame budget; set
+`native-play` fast-forwards only the warning sequence, opens the native macOS
+keyboard window at the title screen, and waits for the player. One `Enter` press
+retries guest-vblank-timed coin pulses until credit is accepted, then retries
+Start pulses until the game accepts the player session. This feedback-driven
+sequence reaches character selection even when the title polls controls
+sparsely. `native-manual` opens a cold-boot keyboard window with no entry script.
+Use `native-autoplay` when you need the full scripted
+coin/start/select/match-entry assist, bounded pre-window fast-forward
+diagnostics, or custom scripted smoke runs. `native-autoplay` performs a bounded
+fast-forward of the supplied entry script first, continues any remaining
+scripted input in the visible window until manual takeover, then returns control
+to the keyboard. The bounded phase uses a full vblank-sized instruction budget
+so it does not mistake partial warning, transition, or stale frames for progress.
+`native-play` scales the pre-window wall timeout from that frame budget; set
 `BR2_NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS` to override it on unusually
 slow systems.
 
@@ -302,17 +304,25 @@ Controls:
 - `Enter`: coin+start for one-key title entry. `P`: start only.
 - `Esc`: quit.
 
-For non-interactive smoke validation, pass a frame limit:
+For non-interactive smoke validation, use autoplay, a headless snapshot, or
+explicit GUI test input. A bounded `native-play` without input intentionally
+waits at the title screen:
 
 ```sh
 cargo run --release -- native-autoplay assets/roms 500000 fit 1000
-cargo run --release -- native-play assets/roms 500000 fit 1000
 cargo run --release -- native-play-snapshot assets/roms 500000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
+cargo run --release -- native-enter-probe assets/roms 500000 720
+cargo run --release -- native-play assets/roms 500000 fit 150 \
+  --gui-test-input coin:6 start:6 up:6 down:6 left:6 right:6 \
+  punch:6 kick:6 beast:6 guard:6 noop:25
 ```
 
 The third `native-play` argument is the window scale. For example,
-`native-play assets/BloodRoar2-combined.zip 120000 1` uses scale `1` and has no
+`native-play assets/BloodRoar2-combined.zip 240000 1` uses scale `1` and has no
 frame limit; add a fourth argument such as `600` for bounded smoke validation.
+`native-enter-probe` uses the real title boot state and the same physical Enter
+coin/release/start sequencer as the GUI, then requires both guest acceptance
+counters and a clean transition away from the title.
 
 `native-play-snapshot` is intentionally stricter than the quick GUI path: it
 fails unless the final window frame satisfies gameplay-scene heuristics. A

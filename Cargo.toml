@@ -7,4 +7,11 @@ description = "Rust RL/LLM control harness for legally supplied Bloody Roar 2-co
 
 [dependencies]
 minifb = "0.28.0"
+raw-window-handle = "0.6.2"
 serde_json = "1.0"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"

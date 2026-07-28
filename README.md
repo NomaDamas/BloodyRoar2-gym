@@ -104,19 +104,21 @@ Set `BLOODYROAR2_NATIVE_ROM_CACHE_DIR=/path/to/cache` to keep the runtime cache
 outside the repo.
 
 `native-play` and `native-manual` use the cached ROM directory and open a macOS
-keyboard window. `native-play` fast-forwards the built-in
-warning/title/coin/start/select/match-entry assist before opening the window, so
-the visible session starts near the manual play handoff instead of at warning or
-intro screens. Its pre-window timeout scales with the scripted frame budget;
-set `BR2_NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS` only when an unusually slow
-machine needs an explicit override. Use `native-manual` for a cold-boot window
-with no entry script.
+keyboard window. `native-play` fast-forwards only the warning sequence, opens at
+the title screen, and waits for physical input. Press `Enter` once to start a
+guest-feedback-driven entry sequence: coin pulses repeat until the guest accepts
+credit, then Start pulses repeat until the game accepts the player session. The
+game then advances to character selection under keyboard control without
+depending on sparse input poll timing. Its pre-window timeout scales with the
+scripted frame budget; set `BR2_NATIVE_PLAY_FAST_FORWARD_WALL_TIMEOUT_SECS` only
+when an unusually slow machine needs an explicit override. Use `native-manual`
+for a cold-boot window with no entry script.
 `native-startup-probe` executes the exact pre-window path without opening a GUI.
 Use `optimized` for the production path and `tracked` for the legacy
 diagnostic-capture path; its JSON reports startup timing and the final
 render/playability gates.
-Use `native-autoplay` when you intentionally want a visible scripted assist or
-custom entry-assist diagnostics.
+Use `native-autoplay` when you intentionally want the full scripted
+coin/start/select/match-entry assist or custom entry-assist diagnostics.
 `native-window-snapshot` writes the normalized native display frame without
 opening a window. `native-play-snapshot` writes the exact 640x480
 aspect-corrected presentation used by the GUI, which is useful when checking
@@ -146,25 +148,30 @@ Window controls:
 - `Enter`: coin+start for one-key title entry. `P`: start only.
 - `Esc`: quit.
 
-For automated smoke tests, pass an optional frame limit:
+For automated smoke tests, use autoplay, a headless snapshot, or explicit GUI
+test input. A bounded `native-play` without input intentionally waits at the
+title screen and is not a non-interactive pass:
 
 ```sh
-cargo run -- native-play 120000 fit 1000
-cargo run -- native-autoplay 120000 fit 1000
-cargo run -- native-manual 120000 2 700
+cargo run --release -- native-autoplay 240000 fit 1000
+cargo run --release -- native-manual 240000 2 700
 cargo run -- native-window-snapshot 40505333 tmp/native-validation/manual-window.png
-cargo run -- native-play-snapshot assets/local-romset.zip 120000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
-cargo run --release -- native-play assets/roms 120000 1 150 \
+cargo run --release -- native-play-snapshot assets/local-romset.zip 240000 tmp/native-validation/smoke --match-script --fast-forward-frames 2400
+cargo run --release -- native-enter-probe assets/roms 240000 720
+cargo run --release -- native-play assets/roms 240000 1 150 \
   --gui-test-input coin:6 start:6 up:6 down:6 left:6 right:6 \
   punch:6 kick:6 beast:6 guard:6 noop:25
 ```
 
-In `native-play assets/local-romset.zip 120000 1`, the final `1` is the
+In `native-play assets/local-romset.zip 240000 1`, the final `1` is the
 window scale, not a frame limit. Use a fourth argument for bounded smoke runs,
-for example `native-play assets/local-romset.zip 120000 1 600`.
+for example `native-play assets/local-romset.zip 240000 1 600`.
 `--gui-test-input` is an opt-in QA path that traverses the same GUI input latch
 and guest registers while keeping its result separate from physical-keyboard
 verification. The final JSON reports `native_play_test_input_verified`.
+`native-enter-probe` boots the real title state and injects one Enter edge
+through the same feedback-driven coin/start sequencer used by the GUI. It fails
+unless credit, game start, and a clean non-title transition are all observed.
 
 `native-play-snapshot` exits non-zero unless the final rendered window frame
 meets the stricter gameplay-scene criteria. Warning screens, black letterboxed
