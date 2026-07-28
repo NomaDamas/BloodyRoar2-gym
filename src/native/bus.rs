@@ -648,6 +648,7 @@ pub struct Br2NativeCreditHleCheck {
 struct Br2NativeCreditHleStats {
     calls: u64,
     accepted: u64,
+    game_start_accepted: u64,
     rejected: u64,
     freeplay: u64,
     injected_coin_edges: u64,
@@ -667,6 +668,10 @@ impl Br2NativeCreditHleStats {
             self.rejected = self.rejected.saturating_add(1);
         } else {
             self.accepted = self.accepted.saturating_add(1);
+            let consumed_credit = check.credit_after < check.credit_before;
+            if check.source == "cpu_credit_check" && (check.freeplay || consumed_credit) {
+                self.game_start_accepted = self.game_start_accepted.saturating_add(1);
+            }
         }
         self.last = Some(check);
     }
@@ -692,8 +697,14 @@ impl Br2NativeCreditHleStats {
             },
         );
         format!(
-            "{{\"calls\":{},\"accepted\":{},\"rejected\":{},\"freeplay\":{},\"injected_coin_edges\":{},\"last\":{}}}",
-            self.calls, self.accepted, self.rejected, self.freeplay, self.injected_coin_edges, last
+            "{{\"calls\":{},\"accepted\":{},\"game_start_accepted\":{},\"rejected\":{},\"freeplay\":{},\"injected_coin_edges\":{},\"last\":{}}}",
+            self.calls,
+            self.accepted,
+            self.game_start_accepted,
+            self.rejected,
+            self.freeplay,
+            self.injected_coin_edges,
+            last
         )
     }
 }
@@ -5421,6 +5432,10 @@ impl Bus {
         self.br2_native_credit_hle.accepted > 0
     }
 
+    pub fn br2_native_credit_hle_game_start_accepted_seen(&self) -> bool {
+        self.br2_native_credit_hle.game_start_accepted > 0
+    }
+
     fn record_zn_board_input_read(&self, address: u32, width: u8, value: u32) {
         if !is_zn_input_read_address(address) {
             return;
@@ -5973,24 +5988,46 @@ impl Bus {
             return;
         };
 
-        if control & DMA_DIRECTION_FROM_RAM == 0 {
-            self.process_gpu_read_dma(channel.madr, channel.bcr, control);
+        let post_madr = if control & DMA_DIRECTION_FROM_RAM == 0 {
+            Some(self.process_gpu_read_dma(channel.madr, channel.bcr, control))
         } else if control & DMA_LINKED_LIST_MODE != 0 {
             self.native_otc_dma_recovery
                 .observe_guest_linked_list_dma(self.vblank_count);
             self.process_gpu_linked_list_dma(channel.madr);
             self.io.gpu.capture_vblank_presented_frame();
+            Some(0x00ff_ffff)
         } else {
-            self.process_gpu_block_dma(channel.madr, channel.bcr, control);
+            let post_madr = self.process_gpu_block_dma(channel.madr, channel.bcr, control);
             self.io.gpu.capture_vblank_presented_frame();
-        }
+            Some(post_madr)
+        };
+        // GPU command processing is synchronous in this core. Re-arm DMA2 as
+        // soon as the payload has been consumed so a back-to-back CHCR start
+        // write is not lost while the delayed completion IRQ is pending.
+        self.io
+            .dma
+            .finish_channel_data_phase(DMA_GPU_CHANNEL, post_madr);
         self.schedule_dma_completion(DMA_GPU_CHANNEL, DMA_GPU_COMPLETION_DELAY_CYCLES);
     }
 
     fn process_gpu_linked_list_dma(&mut self, start_address: u32) {
-        self.io.gpu.begin_gp0_capture_batch();
-        let mut address = start_address & 0x00ff_fffc;
+        let first_node = start_address & 0x00ff_ffff;
+        let mut address = first_node & 0x00ff_fffc;
         let mut stats = GpuLinkedListDmaRunStats::started(start_address, address);
+        if gpu_linked_list_terminator(first_node) {
+            stats.terminated = true;
+            stats.record_context(
+                self.trace_pc.get(),
+                self.vblank_count,
+                self.trace_cycles.get(),
+            );
+            self.gpu_linked_list_generation = self.gpu_linked_list_generation.saturating_add(1);
+            self.record_gpu_linked_list_dma_activity(start_address, &stats);
+            self.gpu_linked_list_dma.merge_last(stats);
+            return;
+        }
+
+        self.io.gpu.begin_gp0_capture_batch();
         for _ in 0..GPU_LINKED_LIST_NODE_LIMIT {
             let header = self.read_u32(address);
             let words = (header >> 24).min(1024);
@@ -6301,6 +6338,19 @@ impl Bus {
             self.record_native_otc_chain_filter_rejection(commands, range, "stale_draw_body");
             return 0;
         }
+        let node_header_address = commands
+            .first()
+            .and_then(|(address, _)| address.checked_sub(4))
+            .map(|address| address & 0x00ff_fffc);
+        if self.gpu_recovery_command_range_is_stale_character_model_generation(
+            commands,
+            range.clone(),
+            &range_words,
+            node_header_address,
+        ) {
+            self.record_native_otc_chain_filter_rejection(commands, range, "stale_draw_body");
+            return 0;
+        }
         let (drawing_offset, safe_draw_ranges) = self.gpu_otc_replay_safe_draw_ranges(&range_words);
         if gp0_command_is_unsafe_br2_785a_recovery_draw(&range_words, drawing_offset) {
             self.record_native_otc_chain_filter_rejection(commands, range, "unsafe_otc_draw");
@@ -6475,13 +6525,18 @@ impl Bus {
             gp0_command_texture_descriptor(&words).is_some_and(|descriptor| {
                 br2_low_ram_character_model_descriptor(*range_start_address, descriptor)
             });
-        if (!allow_stale_draw_body || low_ram_character_model_draw)
+        if self.gpu_recovery_command_range_is_stale_character_model_generation(
+            commands,
+            range.clone(),
+            &words,
+            node_header_address,
+        ) || ((!allow_stale_draw_body || low_ram_character_model_draw)
             && self.gpu_linked_list_command_range_has_stale_draw_body(
                 commands,
                 range.clone(),
                 &words,
                 node_header_address,
-            )
+            ))
         {
             self.record_native_otc_chain_filter_rejection(
                 commands,
@@ -6690,6 +6745,47 @@ impl Bus {
         oldest_command_vblank < min_vblank
             && header_vblank.saturating_sub(oldest_command_vblank)
                 >= BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW
+    }
+
+    fn gpu_recovery_command_range_is_stale_character_model_generation(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        words: &[u32],
+        node_header_address: Option<u32>,
+    ) -> bool {
+        let Some((range_start_address, _)) = commands.get(range.start) else {
+            return false;
+        };
+        let Some(descriptor) = gp0_command_texture_descriptor(words) else {
+            return false;
+        };
+        if !br2_character_model_texture(descriptor)
+            && !br2_low_ram_character_model_descriptor(*range_start_address, descriptor)
+        {
+            return false;
+        }
+
+        let header_generation = node_header_address.and_then(|address| {
+            self.primitive_ram_writes
+                .header_write_vblank(address & 0x00ff_fffc)
+        });
+        let command_generation = commands[range]
+            .iter()
+            .filter_map(|(address, _)| {
+                self.primitive_ram_writes
+                    .word_write_vblank(*address & 0x00ff_fffc)
+            })
+            .max();
+        // The draw payload is the model generation. A linked-list header can
+        // be refreshed later while still pointing at an obsolete fighter
+        // body, so only use the header as a fallback when no body write was
+        // observed.
+        let Some(generation) = command_generation.or(header_generation) else {
+            return false;
+        };
+
+        self.vblank_count.saturating_sub(generation) > BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS
     }
 
     fn gpu_recovery_command_range_is_stale_atlas_artifact(
@@ -9084,14 +9180,18 @@ impl Bus {
                         validation.reason = "missing_command";
                         return validation;
                     };
-                    if gp0_command_is_corrupt_br2_character_model_draw_for_packet(
-                        *range_start_address,
-                        &command_words,
-                    ) {
-                        validation.reason = "unsafe_model_draw";
-                        return validation;
-                    }
+                    // Structural validation must keep walking a current OTC
+                    // chain even when one model primitive is torn. Submission
+                    // applies the stricter per-range model guard, allowing the
+                    // live stage, HUD, and coherent model packets in the same
+                    // chain to advance instead of freezing the previous frame.
+                    let corrupt_model_draw =
+                        gp0_command_is_corrupt_br2_character_model_draw_for_packet(
+                            *range_start_address,
+                            &command_words,
+                        );
                     let current_playfield_draw = in_primitive
+                        && !corrupt_model_draw
                         && command_words.first().is_some_and(|command| {
                             looks_like_draw_primitive_opcode((command >> 24) as u8)
                         })
@@ -10706,10 +10806,41 @@ impl Bus {
         ordered
     }
 
-    fn process_gpu_block_dma(&mut self, start_address: u32, bcr: u32, control: u32) {
+    fn process_gpu_block_dma(&mut self, start_address: u32, bcr: u32, control: u32) -> u32 {
         let words = dma_word_count(bcr, control).min(self.ram.len() as u32 / 4);
         let mut address = start_address & 0x00ff_fffc;
         let step = dma_address_step(control);
+        if std::env::var_os("BR2_NATIVE_DEBUG_GPU_BLOCK_DMA").is_some() {
+            let sequence = self
+                .dma_lifetime_activity
+                .get(DMA_GPU_CHANNEL)
+                .map(|stats| stats.gpu_block_write.saturating_add(1))
+                .unwrap_or(1);
+            let samples = (0..4)
+                .filter(|index| *index < words)
+                .map(|index| {
+                    let sample_address = address.wrapping_add(step.wrapping_mul(index));
+                    format!(
+                        "0x{:08x}:0x{:08x}",
+                        sample_address,
+                        self.read_u32_fast_no_trace(sample_address)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "BR2 gpu-block-dma: sequence={} vblank={} cycles={} pc={} start=0x{:08x} bcr=0x{:08x} chcr=0x{:08x} words={} samples=[{}]",
+                sequence,
+                self.vblank_count,
+                self.trace_cycles.get(),
+                optional_u32_hex_json(self.trace_pc.get()),
+                address,
+                bcr,
+                control,
+                words,
+                samples
+            );
+        }
         self.io.gpu.begin_gp0_capture_batch();
         for _ in 0..words {
             let command = self.read_u32(address);
@@ -10721,9 +10852,10 @@ impl Bus {
         }
         self.io.gpu.end_gp0_capture_batch();
         self.record_gpu_block_dma_activity(start_address, words, control);
+        address & 0x00ff_ffff
     }
 
-    fn process_gpu_read_dma(&mut self, start_address: u32, bcr: u32, control: u32) {
+    fn process_gpu_read_dma(&mut self, start_address: u32, bcr: u32, control: u32) -> u32 {
         let words = dma_word_count(bcr, control).min(self.ram.len() as u32 / 4);
         let mut address = start_address & 0x00ff_fffc;
         let step = dma_address_step(control);
@@ -10732,6 +10864,7 @@ impl Bus {
             address = address.wrapping_add(step);
         }
         self.record_gpu_read_dma_activity(start_address, words, control);
+        address & 0x00ff_ffff
     }
 
     fn process_otc_dma(&mut self) {
@@ -15833,6 +15966,35 @@ mod tests {
         );
         assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
         assert!(bus.br2_native_credit_hle_accepted_seen());
+        assert!(!bus.br2_native_credit_hle_game_start_accepted_seen());
+    }
+
+    #[test]
+    fn bus_distinguishes_credit_insertion_from_game_start_acceptance() {
+        let mut bus = Bus::with_board_assets(
+            Vec::new(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            NativeBoardAssets::default(),
+        );
+        bus.record_br2_native_credit_hle_check(Br2NativeCreditHleCheck {
+            source: "cpu_credit_check",
+            player: 0,
+            freeplay: false,
+            required: 1,
+            credit_slot: BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET,
+            credit_before: 1,
+            credit_after: 0,
+            pending_coin_edges: 0,
+            result: 0,
+        });
+
+        assert!(bus.br2_native_credit_hle_accepted_seen());
+        assert!(bus.br2_native_credit_hle_game_start_accepted_seen());
+        assert!(
+            bus.br2_native_credit_hle_json()
+                .contains("\"game_start_accepted\":1")
+        );
     }
 
     #[test]
@@ -17329,7 +17491,7 @@ mod tests {
     #[test]
     fn gpu_linked_list_dma_feeds_gp0_commands() {
         let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
-        bus.write_u32(0x0000_1000, 0x0200_ffff);
+        bus.write_u32(0x0000_1000, 0x02ff_ffff);
         bus.write_u32(0x0000_1004, 0xe100_0400);
         bus.write_u32(0x0000_1008, 0xe600_0000);
         bus.write_u32(DMA_INTERRUPT, (1 << 23) | (1 << 18));
@@ -17340,11 +17502,12 @@ mod tests {
         assert_eq!(bus.io.gpu.gp0_read, 0);
         assert_eq!(bus.io.gpu.commands_seen, 2);
         assert_eq!(bus.io.irq.status & (1 << 3), 0);
-        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 1 << 24);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
+        assert_eq!(bus.read_u32(DMA_GPU_MADR), 0x00ff_ffff);
 
         bus.tick(DMA_GPU_COMPLETION_DELAY_CYCLES - 1);
         assert_eq!(bus.io.irq.status & (1 << 3), 0);
-        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 1 << 24);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
 
         bus.tick(1);
         assert_eq!(bus.io.irq.status & (1 << 3), 1 << 3);
@@ -17364,7 +17527,7 @@ mod tests {
         bus.write_u16(DMA_GPU_CHCR + 2, 0x0100);
 
         assert_eq!(bus.io.gpu.commands_seen, 2);
-        assert_eq!(bus.read_u32(DMA_GPU_CHCR), 0x0100_0401);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR), 0x0000_0401);
         assert!(
             bus.native_sync_json()
                 .contains("\"kind\":\"gpu_linked_list\"")
@@ -17385,11 +17548,11 @@ mod tests {
         bus.write_u8(DMA_GPU_CHCR + 3, 0x01);
 
         assert_eq!(bus.io.gpu.commands_seen, 2);
-        assert_eq!(bus.read_u32(DMA_GPU_CHCR), 0x0100_0401);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR), 0x0000_0401);
     }
 
     #[test]
-    fn gpu_linked_list_dma_ignores_duplicate_word_chcr_start_write() {
+    fn gpu_linked_list_dma_rearms_for_a_new_word_chcr_start_write() {
         let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
         bus.write_u32(0x0000_1000, 0x0200_ffff);
         bus.write_u32(0x0000_1004, 0xe100_0400);
@@ -17398,11 +17561,33 @@ mod tests {
 
         bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
         bus.tick(DMA_GPU_COMPLETION_DELAY_CYCLES - 1);
+        bus.write_u32(DMA_GPU_MADR, 0x0000_1000);
+        bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
+
+        assert_eq!(bus.io.gpu.commands_seen, 4);
+        bus.tick(1);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
+    }
+
+    #[test]
+    fn gpu_linked_list_dma_chcr_only_restart_from_post_madr_sentinel_is_empty() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        bus.write_u32(0x0000_1000, 0x02ff_ffff);
+        bus.write_u32(0x0000_1004, 0xe100_0400);
+        bus.write_u32(0x0000_1008, 0xe600_0000);
+        bus.write_u32(DMA_GPU_MADR, 0x0000_1000);
         bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
 
         assert_eq!(bus.io.gpu.commands_seen, 2);
-        bus.tick(1);
-        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
+        assert_eq!(bus.read_u32(DMA_GPU_MADR), 0x00ff_ffff);
+
+        bus.write_u32(DMA_GPU_CHCR, 0x0100_0401);
+
+        assert_eq!(bus.io.gpu.commands_seen, 2);
+        assert_eq!(bus.gpu_linked_list_dma.last_nodes, 0);
+        assert!(bus.gpu_linked_list_dma.last_terminated);
+        assert!(!bus.gpu_linked_list_dma.last_hit_node_limit);
+        assert_eq!(bus.gpu_linked_list_dma.node_limit_hits, 0);
     }
 
     #[test]
@@ -22697,6 +22882,95 @@ mod tests {
     }
 
     #[test]
+    fn native_otc_recovery_bounds_character_model_generation_age() {
+        let fighter_limb = [
+            0x2c80_8080,
+            0x00c0_0120,
+            0x7954_4080,
+            0x00c8_0140,
+            0x000c_40bf,
+            0x00f0_0118,
+            0x0000_7f80,
+            0x00f8_0138,
+            0x0000_7fbf,
+        ];
+
+        for (age, expected_words) in [
+            (
+                BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS,
+                fighter_limb.len(),
+            ),
+            (BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS + 1, 0),
+        ] {
+            for trusted_current_otc_chain in [false, true] {
+                let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+                let packet = 0x0006_0000;
+                bus.vblank_count = 100;
+                for (index, word) in fighter_limb.iter().copied().enumerate() {
+                    bus.write_u32(packet + 4 + index as u32 * 4, word);
+                }
+                bus.write_u32(packet, 0x0900_0000 | 0x00ff_ffff);
+                bus.vblank_count += age;
+                bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+
+                let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+                    packet,
+                    true,
+                    trusted_current_otc_chain,
+                    false,
+                    true,
+                    None,
+                );
+
+                assert_eq!(
+                    submitted, expected_words,
+                    "fighter recovery age={age}, trusted={trusted_current_otc_chain}"
+                );
+                assert_eq!(
+                    bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+                    u32::from(expected_words == 0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_otc_recovery_rejects_fresh_header_with_stale_character_model_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0006_0000;
+        let fighter_limb = [
+            0x2c80_8080,
+            0x00c0_0120,
+            0x7954_4080,
+            0x00c8_0140,
+            0x000c_40bf,
+            0x00f0_0118,
+            0x0000_7f80,
+            0x00f8_0138,
+            0x0000_7fbf,
+        ];
+        bus.vblank_count = 100;
+        for (index, word) in fighter_limb.iter().copied().enumerate() {
+            bus.write_u32(packet + 4 + index as u32 * 4, word);
+        }
+        bus.vblank_count = 100 + BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS + 1;
+        bus.write_u32(packet, 0x0900_0000 | 0x00ff_ffff);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+
+        assert_eq!(
+            bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+                packet, true, true, false, true, None,
+            ),
+            0,
+            "a current OTC header must not revive an obsolete fighter payload"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            1
+        );
+    }
+
+    #[test]
     fn native_otc_recovery_rejects_captured_fresh_character_select_atlas_corruption() {
         let corrupt_atlases = [
             [
@@ -24199,7 +24473,7 @@ mod tests {
     }
 
     #[test]
-    fn native_otc_recovery_validation_rejects_corrupt_character_model_body() {
+    fn native_otc_recovery_validation_defers_corrupt_character_model_body_to_range_filter() {
         let corrupt_triangle = [
             0x2401_0101,
             0x0130_00ef,
@@ -24226,8 +24500,20 @@ mod tests {
         }
 
         let validation = bus.validate_native_otc_dma_recovery_chain(key, start);
-        assert!(!validation.ready);
-        assert_eq!(validation.reason, "unsafe_model_draw");
+        assert!(validation.ready);
+        assert_eq!(validation.reason, "ready");
+
+        let commands = corrupt_triangle
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (start + 4 + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range(&commands, 0..commands.len(),),
+            0,
+            "the submission filter must still reject the torn model primitive"
+        );
     }
 
     #[test]
@@ -25270,6 +25556,27 @@ mod tests {
 
         assert_eq!(bus.io.gpu.gp0_pending_words(), 0);
         assert!(bus.io_json().contains("\"gpu_image_upload_commands\":1"));
+        assert_eq!(bus.read_u32(DMA_GPU_MADR), 0x0001_8014);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
+    }
+
+    #[test]
+    fn gpu_block_dma_rearms_back_to_back_palette_upload_without_tick() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        bus.write_u32(0x0000_3000, 0xe100_0400);
+        bus.write_u32(0x0000_4000, 0xe600_0000);
+
+        bus.write_u32(DMA_GPU_MADR, 0x0000_3000);
+        bus.write_u32(DMA_GPU_BCR, 1);
+        bus.write_u32(DMA_GPU_CHCR, (1 << 24) | 1);
+        bus.write_u32(DMA_GPU_MADR, 0x0000_4000);
+        bus.write_u32(DMA_GPU_BCR, 1);
+        bus.write_u32(DMA_GPU_CHCR, (1 << 24) | 1);
+
+        assert_eq!(bus.io.gpu.commands_seen, 2);
+        assert_eq!(bus.read_u32(DMA_GPU_MADR), 0x0000_4004);
+        assert_eq!(bus.read_u32(DMA_GPU_CHCR) & (1 << 24), 0);
+        assert!(bus.native_sync_json().contains("\"gpu_block_write\":2"));
     }
 
     #[test]

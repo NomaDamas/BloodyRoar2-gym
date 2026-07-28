@@ -27,11 +27,14 @@ const NATIVE_PLAY_WINDOW_POSITION_Y: isize = 80;
 const NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES: u64 = 9_000;
 const NATIVE_PLAY_SCRIPT_INSTRUCTIONS_PER_FRAME: u64 = 500_000;
 const NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME: u64 = 240_000;
+const NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME: u64 = NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE;
 const NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE: u64 = 5_000;
-const NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES: u64 = 1;
+const NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES: u64 = 4;
+const NATIVE_PLAY_GUI_PLATFORM_INPUT_SAMPLE_POLL_SLICES: u64 = 1;
 const NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE_ENV: &str = "BR2_NATIVE_GUI_POLL_INSTRUCTION_SLICE";
 const NATIVE_PLAY_GUI_CAPTURE_DIR_ENV: &str = "BR2_NATIVE_GUI_CAPTURE_DIR";
 const NATIVE_PLAY_GUI_CAPTURE_INTERVAL_ENV: &str = "BR2_NATIVE_GUI_CAPTURE_INTERVAL";
+const NATIVE_PLAY_GUI_ALLOW_SYNTHETIC_INPUT_ENV: &str = "BR2_NATIVE_GUI_ALLOW_SYNTHETIC_INPUT";
 const NATIVE_PLAY_GUI_INPUT_TRACE_ENV: &str = "BR2_NATIVE_TRACE_GUI_INPUT";
 const NATIVE_PLAY_GUI_INPUT_TRACE_COMPAT_ENV: &str = "BR2_NATIVE_PLAY_GUI_INPUT_TRACE";
 const NATIVE_PLAY_GUI_TEST_INPUT_SCRIPT_ENV: &str = "BR2_NATIVE_GUI_TEST_INPUT_SCRIPT";
@@ -99,8 +102,11 @@ const NATIVE_CREDIT_MAPPING_PROBE_WALL_TIMEOUT_SECS_ENV: &str =
     "BR2_NATIVE_CREDIT_MAPPING_PROBE_WALL_TIMEOUT_SECS";
 // Brief physical key taps survive at least one default GUI emulation frame so
 // BR2 cannot miss them between its comparatively sparse input polls.
-const NATIVE_PLAY_DIRECTION_INPUT_LATCH_POLLS: u16 = 64;
-const NATIVE_PLAY_EDGE_INPUT_LATCH_POLLS: u16 = 96;
+const NATIVE_PLAY_DIRECTION_INPUT_LATCH_POLLS: u16 = 100;
+const NATIVE_PLAY_EDGE_INPUT_LATCH_POLLS: u16 = 120;
+const NATIVE_PLAY_COIN_START_COIN_POLLS: u16 = 120;
+const NATIVE_PLAY_COIN_START_GAP_POLLS: u16 = 120;
+const NATIVE_PLAY_COIN_START_START_POLLS: u16 = 120;
 const NATIVE_VBLANK_TRACE_MAX_INSTRUCTIONS: u64 = 1_000_000;
 const NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG: &str = "500000";
 const NATIVE_RAM_DIFF_MAX_RANGE_SAMPLES: usize = 64;
@@ -3639,8 +3645,10 @@ fn run_native_play(
     let mut manual_input_observed = false;
     let mut manual_takeover_observed = false;
     let mut observed_physical_buttons = ActionButtons::default();
+    let mut observed_physical_guest_buttons = ActionButtons::default();
     let mut physical_input_activity = NativeInputActivity::default();
     let mut observed_test_input_buttons = ActionButtons::default();
+    let mut observed_test_guest_buttons = ActionButtons::default();
     let mut test_input_activity = NativeInputActivity::default();
     let mut pending_manual_takeover_buttons: Option<ActionButtons> = None;
     let mut last_effective_buttons = ActionButtons::default();
@@ -3664,6 +3672,7 @@ fn run_native_play(
     let mut boot_fast_forwarded = false;
     let mut boot_fast_forwarded_frames = 0u64;
     let mut boot_fast_forward_stop_reason = "not_requested";
+    let mut preserved_fast_forward_window_frame = None;
 
     if autoplay_enabled && fast_forward_script {
         let fast_forward_instructions_per_frame =
@@ -3682,12 +3691,14 @@ fn run_native_play(
             fast_forward_wall_timeout.as_secs()
         );
         let script_progress = if stop_script_at_first_playable {
-            run_native_play_match_entry_fast_forward_progress(
+            let fast_forward = run_native_play_match_entry_fast_forward_progress(
                 &mut emulator,
                 fast_forward_instructions_per_frame,
                 &script_segments,
                 fast_forward_script_frame_budget,
-            )
+            );
+            preserved_fast_forward_window_frame = fast_forward.safe_window_frame;
+            fast_forward.progress
         } else {
             run_native_script_observed_with_stop(
                 &mut emulator,
@@ -3706,9 +3717,24 @@ fn run_native_play(
         last_native_playable_frame = scripted_run.last_native_playable_frame;
         script_segment_index = script_progress.segment_index;
         script_segment_frame = script_progress.segment_frame;
-        let fast_forward_handoff_ready = native_play_lightweight_emulator_handoff_ready(&emulator);
+        let preserved_handoff_ready =
+            preserved_fast_forward_window_frame
+                .as_ref()
+                .is_some_and(|frame| {
+                    native_play_preserved_gui_handoff_frame_is_safe(
+                        emulator.br2_native_credit_hle_game_start_accepted_seen(),
+                        NativeFrameStats::from_frame(frame),
+                    )
+                });
+        if preserved_handoff_ready {
+            observed_native_playable_candidate = true;
+            first_native_playable_frame.get_or_insert(scripted_run.total_frames);
+            last_native_playable_frame = Some(scripted_run.total_frames);
+        }
+        let fast_forward_handoff_ready =
+            native_play_lightweight_emulator_handoff_ready(&emulator) || preserved_handoff_ready;
         if stop_script_at_first_playable
-            && observed_native_playable_candidate
+            && emulator.br2_native_credit_hle_game_start_accepted_seen()
             && fast_forward_handoff_ready
         {
             script_segment_index = script_segments.len();
@@ -3782,19 +3808,38 @@ fn run_native_play(
     let mut gui_gpu_native_playable_candidate = emulator.gpu_native_playable_candidate();
     let mut gui_gpu_rendered_scene_candidate = emulator.gpu_native_rendered_scene_candidate();
     let mut gui_native_3d_gameplay_signal = emulator.native_3d_gameplay_signal();
+    let preserved_fast_forward_stats = preserved_fast_forward_window_frame
+        .as_ref()
+        .map(NativeFrameStats::from_frame);
+    let preserved_fast_forward_handoff_ready = preserved_fast_forward_stats.is_some_and(|stats| {
+        native_play_preserved_gui_handoff_frame_is_safe(
+            emulator.br2_native_credit_hle_game_start_accepted_seen(),
+            stats,
+        )
+    });
     let lightweight_native_playable_candidate =
-        native_play_lightweight_playable_candidate(&emulator);
-    let lightweight_gpu_gameplay_context = native_play_cached_gpu_gameplay_context(
-        lightweight_native_playable_candidate,
-        gui_gpu_native_playable_candidate,
-        gui_gpu_rendered_scene_candidate,
-        gui_native_3d_gameplay_signal,
-    );
-    let fast_initial_gui_frame = native_play_fast_initial_gui_frame(
-        &emulator,
-        lightweight_native_playable_candidate,
-        lightweight_gpu_gameplay_context,
-    );
+        native_play_lightweight_playable_candidate(&emulator)
+            || preserved_fast_forward_handoff_ready;
+    let lightweight_gpu_gameplay_context = preserved_fast_forward_handoff_ready
+        || native_play_cached_gpu_gameplay_context(
+            lightweight_native_playable_candidate,
+            gui_gpu_native_playable_candidate,
+            gui_gpu_rendered_scene_candidate,
+            gui_native_3d_gameplay_signal,
+        );
+    let fast_initial_gui_frame = preserved_fast_forward_window_frame
+        .filter(|_| preserved_fast_forward_handoff_ready)
+        .map(|frame| {
+            let stats = NativeFrameStats::from_frame(&frame);
+            (frame, stats)
+        })
+        .or_else(|| {
+            native_play_fast_initial_gui_frame(
+                &emulator,
+                lightweight_native_playable_candidate,
+                lightweight_gpu_gameplay_context,
+            )
+        });
     let mut gui_native_playable_candidate =
         if lightweight_native_playable_candidate && fast_initial_gui_frame.is_some() {
             true
@@ -3887,6 +3932,7 @@ fn run_native_play(
     let mut current_visible_window_frame = initial_frame.clone();
     let mut current_visible_stats = NativeFrameStats::from_frame(&initial_frame);
     let mut current_presented_frame = native_play_aspect_corrected_gui_frame(&initial_frame);
+    let mut last_presented_window_checksum = native_frame_checksum(&initial_frame);
     let mut last_gui_presented_at = Instant::now();
     let mut last_gui_presented_frame = rendered_frames;
     let mut pending_display_refresh = false;
@@ -3899,7 +3945,7 @@ fn run_native_play(
     } else if autoplay_enabled {
         "Bloody Roar 2 native Rust - visible assist, keys layer until title then cancel script, Esc quit"
     } else {
-        "Bloody Roar 2 native Rust - arrows/WASD move, Z/Space/J punch, X/K kick, Q/L beast, E/I guard, C coin, V service, Enter coin+start, P start, Esc quit"
+        "Bloody Roar 2 native Rust - arrows/WASD move, Z/Space/J punch, X/K kick, Q/L beast, E/I guard, C coin, V service, Enter credit then start, P start, Esc quit"
     };
     native_play_prepare_foreground_application();
     let mut window = Window::new(
@@ -3930,6 +3976,7 @@ fn run_native_play(
     ));
     let mut input_latch = NativeInputLatch::default();
     let mut physical_input_latch = NativeInputLatch::default();
+    let mut physical_enter = NativePhysicalEnterSequencer::default();
     let mut input_trace = NativeGuiInputTrace::from_env(emulator.input_activity());
     let mut test_input_script =
         NativeGuiTestInputScript::from_segments_or_env(&gui_test_input_segments)?;
@@ -4014,6 +4061,7 @@ fn run_native_play(
             manual_takeover_enabled,
             &mut input_latch,
             &mut physical_input_latch,
+            &mut physical_enter,
             &mut input_trace,
             &test_input_script,
             retried_window_activation,
@@ -4056,10 +4104,14 @@ fn run_native_play(
         }
         observed_physical_buttons =
             merge_action_buttons(observed_physical_buttons, step.physical_buttons);
+        observed_physical_guest_buttons =
+            merge_action_buttons(observed_physical_guest_buttons, step.physical_guest_buttons);
         physical_input_activity =
             physical_input_activity.saturating_added(step.physical_input_activity);
         observed_test_input_buttons =
             merge_action_buttons(observed_test_input_buttons, step.test_input_buttons);
+        observed_test_guest_buttons =
+            merge_action_buttons(observed_test_guest_buttons, step.test_guest_buttons);
         test_input_activity = test_input_activity.saturating_added(step.test_input_activity);
         test_input_observed |= step.test_input_override;
         let cancel_for_manual_takeover = manual_takeover || pending_takeover_buttons.is_some();
@@ -4242,9 +4294,9 @@ fn run_native_play(
                 frame_stats,
             );
         if refresh_display {
-            native_play_update_aspect_corrected_gui_frame(
+            let frame_change = native_play_gui_window_frame_change(
+                last_presented_window_checksum,
                 &current_visible_window_frame,
-                &mut current_presented_frame,
             );
             let present_elapsed_frames = native_play_gui_present_elapsed_frames(
                 last_gui_presented_frame,
@@ -4260,13 +4312,20 @@ fn run_native_play(
             if !pacing_delay.is_zero() {
                 std::thread::sleep(pacing_delay);
             }
-            window
-                .update_with_buffer(
-                    &current_presented_frame.pixels,
-                    current_presented_frame.width,
-                    current_presented_frame.height,
-                )
-                .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+            if frame_change.changed {
+                native_play_update_aspect_corrected_gui_frame(
+                    &current_visible_window_frame,
+                    &mut current_presented_frame,
+                );
+                window
+                    .update_with_buffer(
+                        &current_presented_frame.pixels,
+                        current_presented_frame.width,
+                        current_presented_frame.height,
+                    )
+                    .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+                last_presented_window_checksum = frame_change.checksum;
+            }
             last_gui_presented_at = Instant::now();
             last_gui_presented_frame =
                 native_play_gui_present_frame(gui_rendered_frames, step.vblank_advanced);
@@ -4377,18 +4436,26 @@ fn run_native_play(
         action_buttons_have_play_control_coverage(observed_physical_buttons);
     let physical_full_input_observed =
         physical_direction_input_observed && physical_play_input_observed;
-    let physical_any_input_guest_verified = physical_input_activity.has_any_control_activity();
-    let physical_play_input_guest_verified = physical_input_activity.has_play_control_activity();
-    let physical_full_input_guest_verified = physical_input_activity.has_full_control_activity();
+    let physical_any_input_guest_verified = action_buttons_any(observed_physical_guest_buttons);
+    let physical_play_input_guest_verified =
+        action_buttons_have_play_control_coverage(observed_physical_guest_buttons);
+    let physical_full_input_guest_verified =
+        action_buttons_have_direction_coverage(observed_physical_guest_buttons)
+            && physical_play_input_guest_verified;
     let test_any_input_observed = action_buttons_any(observed_test_input_buttons);
     let test_direction_input_observed =
         action_buttons_have_direction_coverage(observed_test_input_buttons);
     let test_play_input_observed =
-        action_buttons_have_play_control_coverage(observed_test_input_buttons);
+        action_buttons_have_combat_control_coverage(observed_test_input_buttons);
     let test_full_input_observed = test_direction_input_observed && test_play_input_observed;
     let test_any_input_guest_verified = test_input_activity.has_any_control_activity();
-    let test_play_input_guest_verified = test_input_activity.has_play_control_activity();
-    let test_full_input_guest_verified = test_input_activity.has_full_control_activity();
+    let test_play_input_guest_verified =
+        action_buttons_have_combat_control_coverage(observed_test_guest_buttons);
+    let test_full_input_guest_verified =
+        action_buttons_have_direction_coverage(observed_test_guest_buttons)
+            && test_play_input_guest_verified;
+    let test_requested_input_guest_verified =
+        action_buttons_cover(observed_test_guest_buttons, observed_test_input_buttons);
     let native_playable_observed_or_final = observed_native_playable_candidate
         || (final_native_playable_candidate && final_frame_render_verified);
     let native_play_any_input_verified = native_playable_observed_or_final
@@ -4401,19 +4468,21 @@ fn run_native_play(
         && physical_full_input_observed
         && physical_full_input_guest_verified;
     let native_play_test_input_verified = native_playable_observed_or_final
-        && test_full_input_observed
-        && test_full_input_guest_verified;
+        && test_input_observed
+        && test_requested_input_guest_verified;
     let render_ready =
         (observed_render_ready || final_frame_render_verified) && final_frame_render_ready;
-    let gameplay_ready = native_playable_observed_or_final
-        && final_native_playable_candidate
-        && final_frame_render_verified;
+    let player_session_started = emulator.br2_native_credit_hle_game_start_accepted_seen();
+    let gameplay_ready =
+        player_session_started && native_playable_observed_or_final && final_frame_render_verified;
     let presented_buffer_size_verified = final_frame.width == NATIVE_PLAY_SCALED_WINDOW_WIDTH
         && final_frame.height == NATIVE_PLAY_MIN_WINDOW_HEIGHT;
-    let playable = native_playable_observed_or_final
-        && final_native_playable_candidate
-        && final_frame_render_verified
-        && presented_buffer_size_verified;
+    let playable = native_play_gui_session_playable(
+        player_session_started,
+        native_playable_observed_or_final,
+        final_frame_render_verified,
+        presented_buffer_size_verified,
+    );
     let scripted_target_frames = script_segments
         .iter()
         .map(|segment| segment.frames)
@@ -4430,7 +4499,7 @@ fn run_native_play(
     let first_render_ready_frame = optional_u64_json(first_render_ready_frame);
     let last_render_ready_frame = optional_u64_json(last_render_ready_frame);
     println!(
-        "{{\"rendered_frames\":{},\"gui_rendered_frames\":{},\"manual_override_frames\":{},\"manual_input_observed\":{},\"manual_takeover_observed\":{},\"physical_input_buttons\":{},\"physical_input_activity\":{},\"physical_any_input_observed\":{},\"physical_direction_input_observed\":{},\"physical_play_input_observed\":{},\"physical_full_input_observed\":{},\"physical_any_input_guest_verified\":{},\"physical_play_input_guest_verified\":{},\"physical_full_input_guest_verified\":{},\"test_input_enabled\":{},\"test_input_observed\":{},\"test_input_buttons\":{},\"test_input_activity\":{},\"test_any_input_observed\":{},\"test_direction_input_observed\":{},\"test_play_input_observed\":{},\"test_full_input_observed\":{},\"test_any_input_guest_verified\":{},\"test_play_input_guest_verified\":{},\"test_full_input_guest_verified\":{},\"native_play_test_input_verified\":{},\"last_effective_buttons\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_fast_forwarded\":{},\"autoplay_stop_at_first_playable\":{},\"boot_fast_forwarded\":{},\"boot_fast_forwarded_frames\":{},\"boot_fast_forward_stop_reason\":\"{}\",\"autoplay_fast_forward_max_frames\":{},\"autoplay_fast_forward_instructions_per_frame\":{},\"gui_instructions_per_frame\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_missed_vblank_frames\":{},\"autoplay_segments\":[{}],\"initial_raw_frame\":{},\"initial_window_frame\":{},\"final_raw_frame\":{},\"final_window_size\":{{\"width\":{},\"height\":{}}},\"input_activity\":{},\"render_ready\":{},\"observed_render_ready\":{},\"first_render_ready_frame\":{},\"last_render_ready_frame\":{},\"gameplay_ready\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"any_input_controls_active\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_any_input_verified\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_visible_content\":{},\"final_frame_scene_detail\":{},\"final_frame_render_ready\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
+        "{{\"rendered_frames\":{},\"gui_rendered_frames\":{},\"manual_override_frames\":{},\"manual_input_observed\":{},\"manual_takeover_observed\":{},\"physical_input_buttons\":{},\"physical_input_activity\":{},\"physical_any_input_observed\":{},\"physical_direction_input_observed\":{},\"physical_play_input_observed\":{},\"physical_full_input_observed\":{},\"physical_any_input_guest_verified\":{},\"physical_play_input_guest_verified\":{},\"physical_full_input_guest_verified\":{},\"test_input_enabled\":{},\"test_input_observed\":{},\"test_input_buttons\":{},\"test_input_activity\":{},\"test_any_input_observed\":{},\"test_direction_input_observed\":{},\"test_play_input_observed\":{},\"test_full_input_observed\":{},\"test_any_input_guest_verified\":{},\"test_play_input_guest_verified\":{},\"test_full_input_guest_verified\":{},\"native_play_test_input_verified\":{},\"last_effective_buttons\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_fast_forwarded\":{},\"autoplay_stop_at_first_playable\":{},\"boot_fast_forwarded\":{},\"boot_fast_forwarded_frames\":{},\"boot_fast_forward_stop_reason\":\"{}\",\"autoplay_fast_forward_max_frames\":{},\"autoplay_fast_forward_instructions_per_frame\":{},\"gui_instructions_per_frame\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_missed_vblank_frames\":{},\"autoplay_segments\":[{}],\"initial_raw_frame\":{},\"initial_window_frame\":{},\"final_raw_frame\":{},\"final_window_size\":{{\"width\":{},\"height\":{}}},\"input_activity\":{},\"render_ready\":{},\"observed_render_ready\":{},\"first_render_ready_frame\":{},\"last_render_ready_frame\":{},\"player_session_started\":{},\"gameplay_ready\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"any_input_controls_active\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_any_input_verified\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_visible_content\":{},\"final_frame_scene_detail\":{},\"final_frame_render_ready\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
         rendered_frames,
         gui_rendered_frames,
         manual_override_frames,
@@ -4491,6 +4560,7 @@ fn run_native_play(
         observed_render_ready,
         first_render_ready_frame,
         last_render_ready_frame,
+        player_session_started,
         gameplay_ready,
         final_native_playable_candidate,
         observed_native_playable_candidate,
@@ -4527,8 +4597,7 @@ fn run_native_play(
     }
     if test_input_enabled && !native_play_test_input_verified {
         return Err(
-            "native play GUI test input failed to reach all guest direction and play controls"
-                .to_string(),
+            "native play GUI test input failed to reach every requested guest control".to_string(),
         );
     }
     Ok(())
@@ -4546,6 +4615,7 @@ fn native_play_prepare_foreground_application() {
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn GetCurrentProcess(psn: *mut ProcessSerialNumber) -> i16;
+        fn SetFrontProcess(psn: *const ProcessSerialNumber) -> i32;
         fn ShowHideProcess(psn: *const ProcessSerialNumber, visible: u8) -> i16;
         fn SetFrontProcessWithOptions(psn: *const ProcessSerialNumber, options: u32) -> i32;
         fn TransformProcessType(psn: *const ProcessSerialNumber, transform_state: u32) -> i32;
@@ -4566,6 +4636,7 @@ fn native_play_prepare_foreground_application() {
                 FOREGROUND_TRANSFORMED.store(true, std::sync::atomic::Ordering::Release);
             }
             let _ = ShowHideProcess(&process, 1);
+            let _ = SetFrontProcess(&process);
             let _ = SetFrontProcessWithOptions(
                 &process,
                 SET_FRONT_PROCESS_FRONT_WINDOW_ONLY | SET_FRONT_PROCESS_CAUSED_BY_USER,
@@ -4615,6 +4686,10 @@ fn native_play_activate_window(window: &Window) {
                 shared_application,
                 sel_registerName(c"setActivationPolicy:".as_ptr()),
                 0,
+            );
+            msg_send_void(
+                shared_application,
+                sel_registerName(c"finishLaunching".as_ptr()),
             );
             msg_send_object(
                 shared_application,
@@ -4739,20 +4814,63 @@ fn write_native_play_gui_capture(
     )
 }
 
+struct NativePlayFastForwardResult {
+    progress: NativeScriptProgress,
+    safe_window_frame: Option<NativeDisplayFrame>,
+}
+
+struct NativePlaySafeFrameCapture {
+    last_safe: Option<NativeDisplayFrame>,
+    current: NativeDisplayFrame,
+}
+
+impl Default for NativePlaySafeFrameCapture {
+    fn default() -> Self {
+        Self {
+            last_safe: None,
+            current: NativeDisplayFrame {
+                width: NATIVE_PLAY_WINDOW_WIDTH,
+                height: NATIVE_PLAY_MIN_WINDOW_HEIGHT,
+                pixels: vec![0; NATIVE_PLAY_WINDOW_WIDTH * NATIVE_PLAY_MIN_WINDOW_HEIGHT],
+            },
+        }
+    }
+}
+
+impl NativePlaySafeFrameCapture {
+    fn remember(&mut self, emulator: &NativeEmulator) {
+        native_play_snapshot_remember_sampled_safe_window_frame(
+            emulator,
+            &mut self.last_safe,
+            &mut self.current,
+        );
+    }
+
+    fn into_safe_window_frame(self) -> Option<NativeDisplayFrame> {
+        self.last_safe
+    }
+}
+
 fn run_native_play_match_entry_fast_forward_progress(
     emulator: &mut NativeEmulator,
     instructions_per_frame: u64,
     segments: &[NativeScriptSegment],
     script_frame_budget: u64,
-) -> NativeScriptProgress {
-    run_native_play_match_entry_fast_forward_progress_with_policy(
+) -> NativePlayFastForwardResult {
+    let mut safe_frame_capture = NativePlaySafeFrameCapture::default();
+    let progress = run_native_play_match_entry_fast_forward_progress_with_policy_and_capture(
         emulator,
         instructions_per_frame,
         segments,
         script_frame_budget,
         NativeScriptExecutionPolicy::HIDDEN_FAST_FORWARD,
         NativeScriptStopMode::None,
-    )
+        Some(&mut safe_frame_capture),
+    );
+    NativePlayFastForwardResult {
+        progress,
+        safe_window_frame: safe_frame_capture.into_safe_window_frame(),
+    }
 }
 
 fn run_native_play_match_entry_fast_forward_progress_with_policy(
@@ -4762,6 +4880,27 @@ fn run_native_play_match_entry_fast_forward_progress_with_policy(
     script_frame_budget: u64,
     hidden_execution_policy: NativeScriptExecutionPolicy,
     render_settle_stop_mode: NativeScriptStopMode,
+) -> NativeScriptProgress {
+    run_native_play_match_entry_fast_forward_progress_with_policy_and_capture(
+        emulator,
+        instructions_per_frame,
+        segments,
+        script_frame_budget,
+        hidden_execution_policy,
+        render_settle_stop_mode,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_native_play_match_entry_fast_forward_progress_with_policy_and_capture(
+    emulator: &mut NativeEmulator,
+    instructions_per_frame: u64,
+    segments: &[NativeScriptSegment],
+    script_frame_budget: u64,
+    hidden_execution_policy: NativeScriptExecutionPolicy,
+    render_settle_stop_mode: NativeScriptStopMode,
+    mut safe_frame_capture: Option<&mut NativePlaySafeFrameCapture>,
 ) -> NativeScriptProgress {
     let started_at = Instant::now();
     let wall_timeout = native_play_fast_forward_wall_timeout(script_frame_budget);
@@ -4808,21 +4947,52 @@ fn run_native_play_match_entry_fast_forward_progress_with_policy(
         NativeScriptProgress::skipped("skipped_native_play_boot_timeout")
     } else if let Some(tail_wall_timeout) = native_remaining_wall_timeout(started_at, wall_timeout)
     {
-        run_native_script_observed_with_stop_and_timeout_execution_policy(
-            emulator,
-            instructions_per_frame,
-            &tail_segments,
-            // The lightweight playable signal also occurs during BR2's attract
-            // fight. Run the bounded entry tail to completion so the GUI opens
-            // after the injected credit/start/selection sequence, not on the
-            // first demo frame that happens to contain 3D geometry.
-            NativeScriptStopMode::None,
-            Some(native_script_max_frames_for_segments(&tail_segments)),
-            Some(tail_wall_timeout),
-            false,
-            None,
-            hidden_execution_policy,
-        )
+        let tail_max_frames = native_script_max_frames_for_segments(&tail_segments);
+        if let Some(capture) = safe_frame_capture.as_deref_mut() {
+            // Boot raster recovery is disposable, but the credited match tail
+            // contains the frame that the interactive window must inherit.
+            emulator.set_native_otc_dma_recovery_interval(native_play_gui_otc_recovery_interval());
+            emulator.set_native_otc_dma_recovery_suppressed(false);
+            let mut frame_observer = |emulator: &mut NativeEmulator,
+                                      _segment_index: usize,
+                                      segment_frame: u64,
+                                      segment: NativeScriptSegment,
+                                      total_frames: u64| {
+                if native_play_snapshot_should_sample_safe_frame(
+                    total_frames,
+                    segment_frame,
+                    segment.frames,
+                ) {
+                    capture.remember(emulator);
+                }
+                false
+            };
+            run_native_script_observed_with_stop_and_timeout_execution_policy(
+                emulator,
+                instructions_per_frame,
+                &tail_segments,
+                NativeScriptStopMode::None,
+                Some(tail_max_frames),
+                Some(tail_wall_timeout),
+                false,
+                Some(&mut frame_observer),
+                NativeScriptExecutionPolicy::DEFAULT,
+            )
+        } else {
+            run_native_script_observed_with_stop_and_timeout_execution_policy(
+                emulator,
+                instructions_per_frame,
+                &tail_segments,
+                // The lightweight playable signal also occurs during BR2's
+                // attract fight. Run the bounded entry tail to completion.
+                NativeScriptStopMode::None,
+                Some(tail_max_frames),
+                Some(tail_wall_timeout),
+                false,
+                None,
+                hidden_execution_policy,
+            )
+        }
     } else {
         NativeScriptProgress::skipped("skipped_native_play_tail_timeout")
     };
@@ -4837,20 +5007,51 @@ fn run_native_play_match_entry_fast_forward_progress_with_policy(
         native_remaining_wall_timeout(started_at, wall_timeout)
     {
         emulator.set_native_otc_dma_recovery_suppressed(false);
-        run_native_script_observed_with_stop_and_timeout_execution_policy(
-            emulator,
-            instructions_per_frame,
-            &[NativeScriptSegment {
-                action: Action::Noop,
-                frames: NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES,
-            }],
-            render_settle_stop_mode,
-            Some(NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES),
-            Some(render_wall_timeout),
-            false,
-            None,
-            NativeScriptExecutionPolicy::DEFAULT,
-        )
+        let settle_segments = [NativeScriptSegment {
+            action: Action::Noop,
+            frames: NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES,
+        }];
+        if let Some(capture) = safe_frame_capture.as_deref_mut() {
+            let mut frame_observer = |emulator: &mut NativeEmulator,
+                                      _segment_index: usize,
+                                      segment_frame: u64,
+                                      segment: NativeScriptSegment,
+                                      total_frames: u64| {
+                if native_play_snapshot_should_sample_safe_frame(
+                    total_frames,
+                    segment_frame,
+                    segment.frames,
+                ) {
+                    capture.remember(emulator);
+                }
+                false
+            };
+            let progress = run_native_script_observed_with_stop_and_timeout_execution_policy(
+                emulator,
+                instructions_per_frame,
+                &settle_segments,
+                render_settle_stop_mode,
+                Some(NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES),
+                Some(render_wall_timeout),
+                false,
+                Some(&mut frame_observer),
+                NativeScriptExecutionPolicy::DEFAULT,
+            );
+            capture.remember(emulator);
+            progress
+        } else {
+            run_native_script_observed_with_stop_and_timeout_execution_policy(
+                emulator,
+                instructions_per_frame,
+                &settle_segments,
+                render_settle_stop_mode,
+                Some(NATIVE_PLAY_SNAPSHOT_RENDER_SETTLE_FRAMES),
+                Some(render_wall_timeout),
+                false,
+                None,
+                NativeScriptExecutionPolicy::DEFAULT,
+            )
+        }
     } else {
         emulator.set_native_otc_dma_recovery_suppressed(false);
         NativeScriptProgress::skipped("skipped_native_play_render_timeout")
@@ -5731,11 +5932,13 @@ fn run_native_play_snapshot(
                 final_frame_gameplay_scene || final_frame_handoff_scene || final_frame_context_scene
             },
     );
-    let final_playable = final_native_playable_candidate && final_render_verified;
+    let player_session_started = emulator.br2_native_credit_hle_game_start_accepted_seen();
+    let final_playable =
+        player_session_started && final_native_playable_candidate && final_render_verified;
     let required_playable = if final_stage_required {
         final_playable
     } else {
-        handoff_playable
+        player_session_started && handoff_playable
     };
     let required_frame_gameplay_scene = if final_stage_required {
         final_frame_gameplay_scene
@@ -5765,7 +5968,7 @@ fn run_native_play_snapshot(
     } else {
         emulator.input_activity()
     };
-    let br2_credit_hle_accepted_seen = emulator.br2_native_credit_hle_accepted_seen();
+    let br2_credit_hle_accepted_seen = emulator.br2_native_credit_hle_game_start_accepted_seen();
     let rom_compatibility = emulator.rom_compatibility();
     let assets_complete = rom_compatibility.native_runtime_usable();
     let exact_mame_assets = rom_compatibility.compatible();
@@ -6470,7 +6673,8 @@ fn native_play_snapshot_caption_ui_allows_gameplay(stats: NativeFrameStats) -> b
         && !native_play_frame_has_blocking_render_artifact(stats)
         && ((!stats.has_bottom_caption_band() && !stats.has_intro_caption_band())
             || (stats.has_native_context_caption_ui()
-                && !stats.has_large_bottom_caption_video_band()))
+                && !stats.has_large_bottom_caption_video_band())
+            || (stats.has_dense_native_fight_hud() && !stats.has_large_bottom_caption_video_band()))
 }
 
 fn native_play_safe_render_ready_fallback_frame_stats(stats: NativeFrameStats) -> bool {
@@ -6492,12 +6696,17 @@ fn native_play_snapshot_final_playability_candidate(
     runtime_playable_candidate: bool,
     stats: NativeFrameStats,
 ) -> bool {
+    let caption_ui_gameplay = (stats.has_native_context_caption_ui()
+        || stats.has_dense_native_fight_hud())
+        && native_play_snapshot_caption_ui_allows_gameplay(stats)
+        && native_play_snapshot_frame_has_lightweight_gpu_context(stats);
     (runtime_playable_candidate
         && !native_play_frame_has_blocking_render_artifact(stats)
         && !stats.has_title_screen_frame()
         && !stats.has_warning_text_overlay()
         && (stats.has_gameplay_scene()
             || stats.has_handoff_scene()
+            || caption_ui_gameplay
             || (!stats.has_intro_caption_band()
                 && (stats.has_letterboxed_live_stage_scene() || stats.has_native_context_scene()))))
         || (!require_gameplay_scene
@@ -7170,10 +7379,13 @@ fn run_native_gap_probe(
         || final_frame_handoff_scene
         || native_play_frame_ready_with_context(final_native_playable_candidate, &window_frame);
     let final_render_verified = final_frame_full_size && final_frame_scene_accepted;
-    let final_playable = final_native_playable_candidate && final_render_verified;
+    let player_session_started = emulator.br2_native_credit_hle_game_start_accepted_seen();
+    let final_playable =
+        player_session_started && final_native_playable_candidate && final_render_verified;
     let best_observed_render_verified =
         best_observed_frame.is_some_and(|frame| frame.render_verified);
-    let best_observed_playable = best_observed_frame.is_some_and(|frame| frame.playable);
+    let best_observed_playable =
+        player_session_started && best_observed_frame.is_some_and(|frame| frame.playable);
     let observed_playable = final_playable || best_observed_playable;
     let input_activity = emulator.input_activity();
     let rom_compatibility = emulator.rom_compatibility();
@@ -8473,6 +8685,22 @@ fn native_play_fast_gui_frame_stats_are_safe(
         )
 }
 
+fn native_play_preserved_gui_handoff_frame_is_safe(
+    player_session_started: bool,
+    stats: NativeFrameStats,
+) -> bool {
+    player_session_started
+        && stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
+        && stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        && stats.has_visible_content()
+        && stats.has_scene_detail()
+        && !stats.has_title_screen_frame()
+        && !stats.has_warning_text_overlay()
+        && !stats.has_blocking_display_artifact()
+        && !native_play_frame_has_blocking_render_artifact(stats)
+        && native_play_snapshot_frame_has_lightweight_gpu_context(stats)
+}
+
 fn native_play_fast_initial_gui_frame(
     emulator: &NativeEmulator,
     native_playable_candidate: bool,
@@ -8962,8 +9190,10 @@ struct NativePlayWindowStep {
     raw_buttons: ActionButtons,
     latched_buttons: ActionButtons,
     physical_buttons: ActionButtons,
+    physical_guest_buttons: ActionButtons,
     physical_input_activity: NativeInputActivity,
     test_input_buttons: ActionButtons,
+    test_guest_buttons: ActionButtons,
     test_input_activity: NativeInputActivity,
     buttons: ActionButtons,
     manual_override: bool,
@@ -8975,6 +9205,7 @@ fn native_play_gui_idle_fast_path_allowed(
     scripted_action: Option<Action>,
     input_latch: &NativeInputLatch,
     physical_input_latch: &NativeInputLatch,
+    physical_enter: &NativePhysicalEnterSequencer,
     input_trace: &NativeGuiInputTrace,
     test_input_script: &NativeGuiTestInputScript,
     defer_edge_key_sample: bool,
@@ -8983,11 +9214,18 @@ fn native_play_gui_idle_fast_path_allowed(
     scripted_action.is_none()
         && input_latch.is_empty()
         && physical_input_latch.is_empty()
+        && physical_enter.is_empty()
         && !input_trace.is_enabled()
         && !test_input_script.is_enabled()
         && !defer_edge_key_sample
+        && !input_sample.physical_enter_down
+        && !input_sample.physical_enter_pressed
         && !action_buttons_any(input_sample.merged)
         && !action_buttons_any(input_sample.test_sidecar)
+}
+
+fn native_play_gui_should_sample_platform_input(input_poll_index: u64) -> bool {
+    input_poll_index.is_multiple_of(NATIVE_PLAY_GUI_PLATFORM_INPUT_SAMPLE_POLL_SLICES)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8999,6 +9237,7 @@ fn step_native_play_window_frame_checked(
     manual_takeover_enabled: bool,
     input_latch: &mut NativeInputLatch,
     physical_input_latch: &mut NativeInputLatch,
+    physical_enter: &mut NativePhysicalEnterSequencer,
     input_trace: &mut NativeGuiInputTrace,
     test_input_script: &NativeGuiTestInputScript,
     defer_edge_key_sample: bool,
@@ -9013,10 +9252,14 @@ fn step_native_play_window_frame_checked(
     let mut raw_buttons = ActionButtons::default();
     let mut latched_buttons = ActionButtons::default();
     let mut physical_buttons = ActionButtons::default();
+    let mut physical_guest_buttons = ActionButtons::default();
     let mut physical_input_activity = NativeInputActivity::default();
     let mut test_input_buttons = ActionButtons::default();
+    let mut test_guest_buttons = ActionButtons::default();
     let mut test_input_activity = NativeInputActivity::default();
     let mut buttons = ActionButtons::default();
+    let mut input_poll_index = 0u64;
+    let mut cached_platform_context = None;
     while remaining > 0
         && emulator.vblank_count() == start_vblank
         && !emulator.is_terminal()
@@ -9026,9 +9269,27 @@ fn step_native_play_window_frame_checked(
         window.update();
         let raw_window_active = window.is_active();
         let window_active = native_play_window_is_active(window, raw_window_active);
-        let consume_pressed_edges = !defer_edge_key_sample;
+        // Activation retries must not discard Enter/coin/attack edge events.
+        // Held-state polling alone is insufficient for normal short taps.
+        let consume_pressed_edges = true;
+        let sampled_platform_input = native_play_gui_should_sample_platform_input(input_poll_index);
+        let mut input_sample = native_window_button_sample(
+            window,
+            window_active,
+            consume_pressed_edges,
+            sampled_platform_input,
+        );
+        if sampled_platform_input {
+            cached_platform_context = Some(input_sample);
+        } else {
+            input_sample = native_window_button_sample_with_cached_platform_context(
+                input_sample,
+                cached_platform_context,
+            );
+        }
+        input_poll_index = input_poll_index.saturating_add(1);
         let input_sample = native_window_button_sample_with_test_sidecar(
-            native_window_button_sample(window, window_active, consume_pressed_edges),
+            input_sample,
             raw_window_active,
             test_input_script.current_buttons(),
         );
@@ -9036,6 +9297,7 @@ fn step_native_play_window_frame_checked(
             scripted_action,
             input_latch,
             physical_input_latch,
+            physical_enter,
             input_trace,
             test_input_script,
             defer_edge_key_sample,
@@ -9051,6 +9313,7 @@ fn step_native_play_window_frame_checked(
         let resolved = native_play_resolve_input_poll(
             input_latch,
             physical_input_latch,
+            physical_enter,
             input_sample,
             scripted_action,
             manual_takeover_enabled,
@@ -9070,14 +9333,29 @@ fn step_native_play_window_frame_checked(
         let activity_after = emulator.input_activity();
         let activity_delta = activity_after.saturating_subtracted(activity_before);
         if action_buttons_any(resolved.physical_buttons) {
-            physical_input_activity = physical_input_activity.saturating_added(
-                native_input_activity_for_buttons(activity_delta, resolved.physical_buttons),
+            let filtered_physical_activity =
+                native_input_activity_for_buttons(activity_delta, resolved.physical_buttons);
+            physical_guest_buttons = merge_action_buttons(
+                physical_guest_buttons,
+                native_guest_observed_buttons_for_input_activity(
+                    resolved.physical_buttons,
+                    filtered_physical_activity,
+                ),
             );
+            physical_input_activity =
+                physical_input_activity.saturating_added(filtered_physical_activity);
         }
         if action_buttons_any(input_sample.test_sidecar) {
-            test_input_activity = test_input_activity.saturating_added(
-                native_input_activity_for_buttons(activity_delta, input_sample.test_sidecar),
+            let filtered_test_activity =
+                native_input_activity_for_buttons(activity_delta, input_sample.test_sidecar);
+            test_guest_buttons = merge_action_buttons(
+                test_guest_buttons,
+                native_guest_observed_buttons_for_input_activity(
+                    input_sample.test_sidecar,
+                    filtered_test_activity,
+                ),
             );
+            test_input_activity = test_input_activity.saturating_added(filtered_test_activity);
         }
         input_trace.record(
             emulator.vblank_count(),
@@ -9096,8 +9374,10 @@ fn step_native_play_window_frame_checked(
         raw_buttons,
         latched_buttons,
         physical_buttons,
+        physical_guest_buttons,
         physical_input_activity,
         test_input_buttons,
+        test_guest_buttons,
         test_input_activity,
         buttons,
         manual_override,
@@ -9874,8 +10154,11 @@ fn run_native_health_check(
         credit_system_port_ready,
     );
     let input_ready = input_poll_ready && credit_ready;
-    let gameplay_ready =
-        control_sweep_reaches_playable && full_scene_rendering && match_entry_rendering_complete;
+    let player_session_started = match_entry.br2_native_credit_hle_game_start_accepted_seen();
+    let gameplay_ready = player_session_started
+        && control_sweep_reaches_playable
+        && full_scene_rendering
+        && match_entry_rendering_complete;
     let known_rendering_gap = match_entry_known_rendering_gap
         || rendering_present && (!full_scene_rendering || !control_sweep_reaches_playable);
     let input_ok_rendering_gap = input_ready && known_rendering_gap && !gameplay_ready;
@@ -10289,7 +10572,10 @@ fn run_native_credit_mapping_probe(
         let input_ready = input_poll_ready && credit_ready;
         let gameplay_scene =
             native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
-        let reached_gameplay = input_ready && native_playable_candidate && gameplay_scene;
+        let reached_gameplay = emulator.br2_native_credit_hle_game_start_accepted_seen()
+            && input_ready
+            && native_playable_candidate
+            && gameplay_scene;
         eprintln!(
             "native-credit-mapping-probe mapping={} frames={} stop_reason={} input_ready={} reached_gameplay={} playable={}",
             mapping,
@@ -10449,7 +10735,10 @@ fn run_native_credit_bit_probe(
         let input_ready = input_poll_ready && credit_ready;
         let gameplay_scene =
             native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
-        let reached_gameplay = input_ready && native_playable_candidate && gameplay_scene;
+        let reached_gameplay = emulator.br2_native_credit_hle_game_start_accepted_seen()
+            && input_ready
+            && native_playable_candidate
+            && gameplay_scene;
         eprintln!(
             "native-credit-bit-probe bit=0x{bit:08x} frames={} stop_reason={} input_ready={} reached_gameplay={} playable={}",
             run.total_frames,
@@ -10700,7 +10989,10 @@ fn run_native_credit_projection_probe(
         let input_ready = input_poll_ready && credit_ready;
         let gameplay_scene =
             native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
-        let reached_gameplay = input_ready && native_playable_candidate && gameplay_scene;
+        let reached_gameplay = emulator.br2_native_credit_hle_game_start_accepted_seen()
+            && input_ready
+            && native_playable_candidate
+            && gameplay_scene;
         let debug_words = native_credit_debug_words_json(&emulator);
         eprintln!(
             "native-credit-projection-probe projection={} bit=0x{bit:08x} frames={} stop_reason={} input_ready={} reached_gameplay={} playable={}",
@@ -10845,7 +11137,9 @@ fn run_native_credit_ram_probe(
         let native_playable_candidate = emulator.native_playable_candidate();
         let gameplay_scene =
             native_play_gameplay_scene_with_context(native_playable_candidate, frame_stats);
-        let reached_gameplay = native_playable_candidate && gameplay_scene;
+        let reached_gameplay = emulator.br2_native_credit_hle_game_start_accepted_seen()
+            && native_playable_candidate
+            && gameplay_scene;
         eprintln!(
             "native-credit-ram-probe bit=0x{bit:08x} frames={} ram_changed={} scratch_changed={} frame_changed={} reached_gameplay={}",
             run.total_frames,
@@ -12057,6 +12351,31 @@ impl NativeFrameStats {
             && self.bottom_caption_pixels.saturating_mul(100) <= self.total_pixels
     }
 
+    fn has_dense_native_fight_hud(self) -> bool {
+        if self.total_pixels == 0
+            || self.width < NATIVE_PLAY_WINDOW_WIDTH
+            || self.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+            || !self.has_scene_detail()
+            || self.has_large_bottom_caption_video_band()
+        {
+            return false;
+        }
+
+        let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        bottom_band_pixels > 0
+            && self.unique_colors >= 192
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(70)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(30)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(35)
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(20)
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(90)
+            && self.bottom_dark_pixels.saturating_mul(100) <= bottom_band_pixels.saturating_mul(20)
+            && self.right_title_bright_pixels.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(2)
+    }
+
     fn has_title_logo_overlay(self) -> bool {
         if self.total_pixels == 0 || !self.has_native_actual_artifact_size() {
             return false;
@@ -13201,10 +13520,18 @@ impl NativeFrameStats {
         if !self.has_title_logo_overlay()
             || !self.has_scene_detail()
             || self.has_warning_text_overlay()
-            || self.has_bottom_caption_band()
             || self.has_large_bottom_caption_video_band()
-            || self.has_intro_caption_band()
         {
+            return false;
+        }
+
+        // A live fight HUD can resemble both the title mark and caption-band
+        // classifiers because of PRESS START and the bottom power gauges.
+        if self.has_dense_native_fight_hud() {
+            return true;
+        }
+
+        if self.has_bottom_caption_band() || self.has_intro_caption_band() {
             return false;
         }
 
@@ -13978,8 +14305,15 @@ fn native_combined_full_controls_active(
 struct NativeWindowButtonSample {
     raw_window_active: bool,
     window_active: bool,
+    window_is_key_or_main: bool,
+    application_active: bool,
+    window_visible: bool,
+    quartz_sampled: bool,
+    quartz_fallback_active: bool,
     minifb: ActionButtons,
     platform: ActionButtons,
+    physical_enter_down: bool,
+    physical_enter_pressed: bool,
     test_sidecar: ActionButtons,
     merged: ActionButtons,
 }
@@ -14006,9 +14340,23 @@ fn native_window_button_sample_with_test_sidecar(
     sample
 }
 
+fn native_window_button_sample_with_cached_platform_context(
+    mut sample: NativeWindowButtonSample,
+    cached: Option<NativeWindowButtonSample>,
+) -> NativeWindowButtonSample {
+    if let Some(cached) = cached {
+        sample.window_is_key_or_main = cached.window_is_key_or_main;
+        sample.application_active = cached.application_active;
+        sample.window_visible = cached.window_visible;
+        sample.quartz_fallback_active = cached.quartz_fallback_active;
+    }
+    sample
+}
+
 fn native_play_resolve_input_poll(
     input_latch: &mut NativeInputLatch,
     physical_input_latch: &mut NativeInputLatch,
+    physical_enter: &mut NativePhysicalEnterSequencer,
     input_sample: NativeWindowButtonSample,
     scripted_action: Option<Action>,
     manual_takeover_enabled: bool,
@@ -14018,8 +14366,22 @@ fn native_play_resolve_input_poll(
     // or platform input may trigger manual takeover and manual-input proof.
     let physical_buttons = merge_action_buttons(input_sample.minifb, input_sample.platform);
     let physical_latched_buttons = physical_input_latch.buttons(physical_buttons);
-    let raw_buttons = input_sample.merged;
-    let latched_buttons = input_latch.buttons(raw_buttons);
+    let enter_buttons = physical_enter.buttons(
+        input_sample.physical_enter_down,
+        input_sample.physical_enter_pressed,
+    );
+    let raw_enter_buttons =
+        if input_sample.physical_enter_down || input_sample.physical_enter_pressed {
+            Action::CoinStart.buttons()
+        } else {
+            ActionButtons::default()
+        };
+    let raw_buttons = merge_action_buttons(input_sample.merged, raw_enter_buttons);
+    // The sequenced Enter pulses must bypass the generic edge latch so the
+    // explicit release gap remains visible to the arcade input poller.
+    let latched_buttons =
+        merge_action_buttons(input_latch.buttons(input_sample.merged), enter_buttons);
+    let physical_latched_buttons = merge_action_buttons(physical_latched_buttons, enter_buttons);
     let effective_buttons =
         native_play_effective_buttons(latched_buttons, scripted_action, manual_takeover_enabled);
     NativeResolvedGuiInputPoll {
@@ -14027,7 +14389,9 @@ fn native_play_resolve_input_poll(
         latched_buttons,
         physical_buttons: physical_latched_buttons,
         effective_buttons,
-        raw_manual_override: action_buttons_any(physical_buttons),
+        raw_manual_override: action_buttons_any(physical_buttons)
+            || input_sample.physical_enter_down
+            || input_sample.physical_enter_pressed,
         manual_override: action_buttons_any(physical_latched_buttons),
         test_input_override: action_buttons_any(input_sample.test_sidecar),
     }
@@ -14039,6 +14403,7 @@ struct NativeGuiInputTrace {
     last_sample: NativeWindowButtonSample,
     last_latched: ActionButtons,
     last_effective: ActionButtons,
+    last_activity_active: bool,
     activity_baseline: NativeInputActivity,
 }
 
@@ -14050,6 +14415,7 @@ impl NativeGuiInputTrace {
             last_sample: NativeWindowButtonSample::default(),
             last_latched: ActionButtons::default(),
             last_effective: ActionButtons::default(),
+            last_activity_active: false,
             activity_baseline,
         }
     }
@@ -14061,6 +14427,7 @@ impl NativeGuiInputTrace {
             last_sample: NativeWindowButtonSample::default(),
             last_latched: ActionButtons::default(),
             last_effective: ActionButtons::default(),
+            last_activity_active: false,
             activity_baseline,
         }
     }
@@ -14072,6 +14439,7 @@ impl NativeGuiInputTrace {
             last_sample: NativeWindowButtonSample::default(),
             last_latched: ActionButtons::default(),
             last_effective: ActionButtons::default(),
+            last_activity_active: false,
             activity_baseline,
         }
     }
@@ -14087,11 +14455,12 @@ impl NativeGuiInputTrace {
         effective: ActionButtons,
         activity_delta: NativeInputActivity,
     ) -> bool {
+        let activity_active = activity_delta.has_any_control_activity();
         self.enabled
-            && (sample != self.last_sample
+            && (native_gui_input_trace_sample_changed(sample, self.last_sample)
                 || latched != self.last_latched
                 || effective != self.last_effective
-                || activity_delta.has_any_control_activity())
+                || activity_active != self.last_activity_active)
     }
 
     fn record(
@@ -14105,15 +14474,28 @@ impl NativeGuiInputTrace {
     ) {
         if self.should_emit(sample, latched, effective, activity_delta) {
             let total_delta = activity.saturating_subtracted(self.activity_baseline);
+            let resolved_raw = if sample.physical_enter_down || sample.physical_enter_pressed {
+                merge_action_buttons(sample.merged, Action::CoinStart.buttons())
+            } else {
+                sample.merged
+            };
             eprintln!(
-                "native-gui-input vblank={} focus_raw={} focus_effective={} minifb={} macos={} test_sidecar={} raw={} latched={} effective={} guest_delta={} guest_total={}",
+                "native-gui-input vblank={} focus_raw={} focus_effective={} key_or_main={} app_active={} visible={} quartz_sampled={} quartz_active={} enter_down={} enter_pressed={} minifb={} macos={} test_sidecar={} source_raw={} resolved_raw={} latched={} effective={} guest_delta={} guest_total={}",
                 vblank,
                 sample.raw_window_active,
                 sample.window_active,
+                sample.window_is_key_or_main,
+                sample.application_active,
+                sample.window_visible,
+                sample.quartz_sampled,
+                sample.quartz_fallback_active,
+                sample.physical_enter_down,
+                sample.physical_enter_pressed,
                 action_buttons_label(sample.minifb),
                 action_buttons_label(sample.platform),
                 action_buttons_label(sample.test_sidecar),
                 action_buttons_label(sample.merged),
+                action_buttons_label(resolved_raw),
                 action_buttons_label(latched),
                 action_buttons_label(effective),
                 activity_delta.json(),
@@ -14123,7 +14505,30 @@ impl NativeGuiInputTrace {
         self.last_sample = sample;
         self.last_latched = latched;
         self.last_effective = effective;
+        self.last_activity_active = activity_delta.has_any_control_activity();
     }
+}
+
+fn native_gui_input_trace_sample_changed(
+    mut sample: NativeWindowButtonSample,
+    mut previous: NativeWindowButtonSample,
+) -> bool {
+    // Sampling Quartz periodically inside an emulated frame is an
+    // implementation detail.
+    // Do not emit two trace lines per frame when no focus or key state changed.
+    sample.quartz_sampled = false;
+    previous.quartz_sampled = false;
+    sample != previous
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum NativeCoinStartPhase {
+    #[default]
+    Idle,
+    Coin,
+    Gap,
+    Start,
+    WaitRelease,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -14152,17 +14557,6 @@ impl NativeInputLatch {
         let has_current_directions = action_buttons_any(current_directions);
         let has_current_edges = action_buttons_any(current_edges);
 
-        if has_current_directions && !has_current_edges {
-            // A new direction must not carry stale system input, while combat
-            // edges remain latched until the guest input poll observes them.
-            self.edge_buttons.start = false;
-            self.edge_buttons.coin = false;
-            self.edge_buttons.service = false;
-            if !action_buttons_any(self.edge_buttons) {
-                self.edge_polls_remaining = 0;
-            }
-        }
-
         if has_current_directions {
             self.direction_buttons = current_directions;
             self.direction_polls_remaining = NATIVE_PLAY_DIRECTION_INPUT_LATCH_POLLS;
@@ -14182,6 +14576,66 @@ impl NativeInputLatch {
         }
 
         merge_action_buttons(self.direction_buttons, self.edge_buttons)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativePhysicalEnterSequencer {
+    phase: NativeCoinStartPhase,
+    polls_remaining: u16,
+    enter_down: bool,
+}
+
+impl NativePhysicalEnterSequencer {
+    fn is_empty(&self) -> bool {
+        self.phase == NativeCoinStartPhase::Idle
+    }
+
+    fn buttons(&mut self, enter_down: bool, enter_pressed: bool) -> ActionButtons {
+        let entered = enter_pressed || (enter_down && !self.enter_down);
+        self.enter_down = enter_down;
+        if entered && self.phase == NativeCoinStartPhase::Idle {
+            self.phase = NativeCoinStartPhase::Coin;
+            self.polls_remaining = NATIVE_PLAY_COIN_START_COIN_POLLS;
+        }
+
+        let mut buttons = ActionButtons::default();
+        match self.phase {
+            NativeCoinStartPhase::Idle => return buttons,
+            NativeCoinStartPhase::Coin => buttons.coin = true,
+            NativeCoinStartPhase::Gap | NativeCoinStartPhase::WaitRelease => {}
+            NativeCoinStartPhase::Start => buttons.start = true,
+        }
+
+        self.polls_remaining = self.polls_remaining.saturating_sub(1);
+        if self.polls_remaining == 0 {
+            match self.phase {
+                NativeCoinStartPhase::Idle => {}
+                NativeCoinStartPhase::Coin => {
+                    self.phase = NativeCoinStartPhase::Gap;
+                    self.polls_remaining = NATIVE_PLAY_COIN_START_GAP_POLLS;
+                }
+                NativeCoinStartPhase::Gap => {
+                    self.phase = NativeCoinStartPhase::Start;
+                    self.polls_remaining = NATIVE_PLAY_COIN_START_START_POLLS;
+                }
+                NativeCoinStartPhase::Start => {
+                    self.phase = if self.enter_down {
+                        NativeCoinStartPhase::WaitRelease
+                    } else {
+                        NativeCoinStartPhase::Idle
+                    };
+                }
+                NativeCoinStartPhase::WaitRelease => {
+                    if !self.enter_down {
+                        self.phase = NativeCoinStartPhase::Idle;
+                    }
+                }
+            }
+        } else if self.phase == NativeCoinStartPhase::WaitRelease && !self.enter_down {
+            self.phase = NativeCoinStartPhase::Idle;
+        }
+        buttons
     }
 }
 
@@ -14226,8 +14680,38 @@ fn action_buttons_have_direction_coverage(buttons: ActionButtons) -> bool {
     buttons.up && buttons.down && buttons.left && buttons.right
 }
 
+fn action_buttons_have_combat_control_coverage(buttons: ActionButtons) -> bool {
+    buttons.punch && buttons.kick && buttons.beast && buttons.guard
+}
+
 fn action_buttons_have_play_control_coverage(buttons: ActionButtons) -> bool {
-    buttons.punch && buttons.kick && buttons.beast && buttons.guard && buttons.coin && buttons.start
+    action_buttons_have_combat_control_coverage(buttons) && buttons.coin && buttons.start
+}
+
+fn action_buttons_cover(observed: ActionButtons, required: ActionButtons) -> bool {
+    (!required.start || observed.start)
+        && (!required.coin || observed.coin)
+        && (!required.service || observed.service)
+        && (!required.up || observed.up)
+        && (!required.down || observed.down)
+        && (!required.left || observed.left)
+        && (!required.right || observed.right)
+        && (!required.punch || observed.punch)
+        && (!required.kick || observed.kick)
+        && (!required.beast || observed.beast)
+        && (!required.guard || observed.guard)
+}
+
+fn native_play_gui_session_playable(
+    player_session_started: bool,
+    native_playable_observed_or_final: bool,
+    final_frame_render_verified: bool,
+    presented_buffer_size_verified: bool,
+) -> bool {
+    player_session_started
+        && native_playable_observed_or_final
+        && final_frame_render_verified
+        && presented_buffer_size_verified
 }
 
 #[allow(clippy::obfuscated_if_else)]
@@ -14350,6 +14834,33 @@ fn native_input_activity_for_buttons(
             .coin
             .then_some(activity.last_coin_register)
             .unwrap_or(0),
+    }
+}
+
+fn native_guest_observed_buttons_for_input_activity(
+    buttons: ActionButtons,
+    activity: NativeInputActivity,
+) -> ActionButtons {
+    ActionButtons {
+        start: buttons.start
+            && (activity.system_start_active_reads > 0
+                || activity.p1_start_active_reads > 0
+                || activity.legacy_system_start_latch_edges > 0),
+        coin: buttons.coin
+            && (activity.system_coin_active_reads > 0
+                || activity.coin_register_active_reads > 0
+                || activity.coin_insert_edges > 0
+                || activity.coin_counter_0_edges > 0
+                || activity.coin_counter_1_edges > 0),
+        service: buttons.service && activity.system_service_active_reads > 0,
+        up: buttons.up && activity.p1_up_active_reads > 0,
+        down: buttons.down && activity.p1_down_active_reads > 0,
+        left: buttons.left && activity.p1_left_active_reads > 0,
+        right: buttons.right && activity.p1_right_active_reads > 0,
+        punch: buttons.punch && activity.p1_punch_active_reads > 0,
+        kick: buttons.kick && activity.p1_kick_active_reads > 0,
+        beast: buttons.beast && activity.p1_beast_active_reads > 0,
+        guard: buttons.guard && activity.p3_guard_active_reads > 0,
     }
 }
 
@@ -14575,22 +15086,23 @@ fn native_window_button_sample(
     window: &mut Window,
     window_active: bool,
     consume_pressed_edges: bool,
+    _sample_platform_input: bool,
 ) -> NativeWindowButtonSample {
     if !window_active {
         return NativeWindowButtonSample::default();
     }
-    let pressed = native_pressed_key_buttons(consume_pressed_edges, || {
+    let pressed = native_pressed_window_key_sample(consume_pressed_edges, || {
         window.get_keys_pressed(KeyRepeat::Yes)
     });
-    let minifb = merge_action_buttons(
-        native_keys_down_to_buttons(|key| window.is_key_down(key)),
-        pressed,
-    );
+    let held = native_keys_down_to_window_key_sample(|key| window.is_key_down(key));
+    let minifb = merge_action_buttons(held.buttons, pressed.buttons);
     NativeWindowButtonSample {
         raw_window_active: window_active,
         window_active,
         minifb,
         platform: ActionButtons::default(),
+        physical_enter_down: held.enter || pressed.enter,
+        physical_enter_pressed: pressed.enter,
         test_sidecar: ActionButtons::default(),
         merged: minifb,
     }
@@ -14601,29 +15113,61 @@ fn native_window_button_sample(
     window: &mut Window,
     window_active: bool,
     consume_pressed_edges: bool,
+    sample_platform_input: bool,
 ) -> NativeWindowButtonSample {
     // minifb's macOS active flag is inverted in 0.28 and can lag AppKit focus
     // changes. Its key state is window-local, so always keep it available.
     // Only the Quartz global fallback must require the AppKit key/main window.
-    let pressed = native_pressed_key_buttons(consume_pressed_edges, || {
+    let pressed = native_pressed_window_key_sample(consume_pressed_edges, || {
         window.get_keys_pressed(KeyRepeat::Yes)
     });
-    let minifb = merge_action_buttons(
-        native_keys_down_to_buttons(|key| window.is_key_down(key)),
-        pressed,
+    let held = native_keys_down_to_window_key_sample(|key| window.is_key_down(key));
+    let minifb = merge_action_buttons(held.buttons, pressed.buttons);
+    if !sample_platform_input {
+        return NativeWindowButtonSample {
+            raw_window_active: window_active,
+            window_active,
+            minifb,
+            platform: ActionButtons::default(),
+            physical_enter_down: held.enter || pressed.enter,
+            physical_enter_pressed: pressed.enter,
+            test_sidecar: ActionButtons::default(),
+            merged: minifb,
+            ..NativeWindowButtonSample::default()
+        };
+    }
+    // AppKit can lag minifb's event pump for command-line applications that
+    // were promoted to foreground after startup. Either focus source is
+    // sufficient to keep the physical-key fallback active.
+    let window_is_key_or_main = native_macos_window_is_key_or_main(window);
+    let application_active = native_macos_application_is_active();
+    let window_visible = native_macos_window_is_visible(window);
+    let quartz_fallback_active = native_macos_quartz_fallback_active(
+        window_active,
+        window_is_key_or_main,
+        application_active,
+        window_visible,
     );
-    let quartz_fallback_active = native_macos_window_is_key_or_main(window);
-    let platform = if quartz_fallback_active {
-        native_macos_window_buttons(window)
+    let quartz_sampled = sample_platform_input && quartz_fallback_active;
+    let platform = if quartz_sampled {
+        native_macos_window_key_sample(window, window_is_key_or_main || application_active)
     } else {
-        ActionButtons::default()
+        NativeWindowKeySample::default()
     };
-    native_macos_window_button_sample_from_sources_with_quartz_gate(
+    let mut sample = native_macos_window_button_sample_from_sources_with_quartz_gate(
         window_active,
         quartz_fallback_active,
         minifb,
-        platform,
-    )
+        platform.buttons,
+    );
+    sample.window_is_key_or_main = window_is_key_or_main;
+    sample.application_active = application_active;
+    sample.window_visible = window_visible;
+    sample.quartz_sampled = quartz_sampled;
+    sample.quartz_fallback_active = quartz_fallback_active;
+    sample.physical_enter_down = held.enter || pressed.enter || platform.enter;
+    sample.physical_enter_pressed = pressed.enter;
+    sample
 }
 
 #[cfg(target_os = "macos")]
@@ -14646,6 +15190,69 @@ fn native_macos_window_is_key_or_main(window: &Window) -> bool {
         msg_send_bool(native_window, sel_registerName(c"isKeyWindow".as_ptr()))
             || msg_send_bool(native_window, sel_registerName(c"isMainWindow".as_ptr()))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn native_macos_window_is_visible(window: &Window) -> bool {
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+
+    let native_window = window.get_window_handle();
+    if native_window.is_null() {
+        return false;
+    }
+
+    unsafe {
+        let msg_send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
+        msg_send_bool(native_window, sel_registerName(c"isVisible".as_ptr()))
+            && !msg_send_bool(native_window, sel_registerName(c"isMiniaturized".as_ptr()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_macos_application_is_active() -> bool {
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    type MsgSendId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+
+    unsafe {
+        let ns_application = objc_getClass(c"NSApplication".as_ptr());
+        if ns_application.is_null() {
+            return false;
+        }
+        let msg_send_id: MsgSendId = std::mem::transmute(objc_msgSend as *const ());
+        let msg_send_bool: MsgSendBool = std::mem::transmute(objc_msgSend as *const ());
+        let application = msg_send_id(
+            ns_application,
+            sel_registerName(c"sharedApplication".as_ptr()),
+        );
+        !application.is_null() && msg_send_bool(application, sel_registerName(c"isActive".as_ptr()))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn native_macos_quartz_fallback_active(
+    window_active: bool,
+    window_is_key_or_main: bool,
+    application_active: bool,
+    window_visible: bool,
+) -> bool {
+    // CLI-launched AppKit windows can remain visible while both activation
+    // APIs report false. The fallback samples only the fixed game-control
+    // keycodes on a bounded polling cadence, avoiding both missed short taps
+    // and the old every-poll overhead.
+    window_active || window_is_key_or_main || application_active || window_visible
 }
 
 #[cfg(test)]
@@ -14679,27 +15286,69 @@ fn native_macos_window_button_sample_from_sources_with_quartz_gate(
         window_active,
         minifb,
         platform,
+        physical_enter_down: false,
+        physical_enter_pressed: false,
         test_sidecar: ActionButtons::default(),
         merged: merge_action_buttons(minifb, platform),
+        ..NativeWindowButtonSample::default()
     }
 }
 
 #[cfg(target_os = "macos")]
-fn native_macos_window_buttons(window: &mut Window) -> ActionButtons {
+fn native_macos_window_key_sample(
+    window: &mut Window,
+    foreground_for_synthetic_input: bool,
+) -> NativeWindowKeySample {
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
     }
 
     let _ = window;
-    native_macos_key_states_to_buttons(|key| unsafe { CGEventSourceKeyState(0, key) })
+    let allow_synthetic_input = native_macos_synthetic_input_allowed(
+        env::var_os(NATIVE_PLAY_GUI_ALLOW_SYNTHETIC_INPUT_ENV).is_some(),
+        foreground_for_synthetic_input,
+    );
+    native_macos_key_states_to_window_key_sample(|key| unsafe {
+        let hid_down = CGEventSourceKeyState(1, key);
+        let combined_down = allow_synthetic_input && CGEventSourceKeyState(0, key);
+        native_macos_quartz_key_active(hid_down, combined_down, allow_synthetic_input)
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn native_macos_key_states_to_buttons(mut is_key_down: impl FnMut(u16) -> bool) -> ActionButtons {
+fn native_macos_synthetic_input_allowed(
+    explicitly_enabled: bool,
+    foreground_for_synthetic_input: bool,
+) -> bool {
+    explicitly_enabled && foreground_for_synthetic_input
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn native_macos_quartz_key_active(
+    hid_down: bool,
+    combined_down: bool,
+    allow_synthetic_input: bool,
+) -> bool {
+    // Production input follows physical HID state. Combined-session state can
+    // retain synthetic key-down events after an automation client exits, so it
+    // is available only for explicit GUI QA.
+    hid_down || (allow_synthetic_input && combined_down)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeWindowKeySample {
+    buttons: ActionButtons,
+    enter: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn native_macos_key_states_to_window_key_sample(
+    mut is_key_down: impl FnMut(u16) -> bool,
+) -> NativeWindowKeySample {
+    let enter = is_key_down(36);
     let mut buttons = ActionButtons::default();
     for (key, action) in [
-        (36, Action::CoinStart),
         (35, Action::Start),
         (8, Action::Coin),
         (9, Action::Service),
@@ -14729,9 +15378,31 @@ fn native_macos_key_states_to_buttons(mut is_key_down: impl FnMut(u16) -> bool) 
             buttons = merge_action_buttons(buttons, action.buttons());
         }
     }
-    buttons
+    NativeWindowKeySample { buttons, enter }
 }
 
+#[cfg(test)]
+fn native_macos_key_states_to_buttons(mut is_key_down: impl FnMut(u16) -> bool) -> ActionButtons {
+    let sample = native_macos_key_states_to_window_key_sample(&mut is_key_down);
+    if sample.enter {
+        merge_action_buttons(sample.buttons, Action::CoinStart.buttons())
+    } else {
+        sample.buttons
+    }
+}
+
+fn native_pressed_window_key_sample(
+    consume_pressed_edges: bool,
+    read_pressed: impl FnOnce() -> Vec<Key>,
+) -> NativeWindowKeySample {
+    if consume_pressed_edges {
+        native_keys_to_window_key_sample(read_pressed())
+    } else {
+        NativeWindowKeySample::default()
+    }
+}
+
+#[cfg(test)]
 fn native_pressed_key_buttons(
     consume_pressed_edges: bool,
     read_pressed: impl FnOnce() -> Vec<Key>,
@@ -14743,6 +15414,45 @@ fn native_pressed_key_buttons(
     }
 }
 
+fn native_keys_down_to_window_key_sample(
+    mut is_key_down: impl FnMut(Key) -> bool,
+) -> NativeWindowKeySample {
+    let mut keys = Vec::new();
+    for key in [
+        Key::Enter,
+        Key::P,
+        Key::C,
+        Key::V,
+        Key::Up,
+        Key::W,
+        Key::Down,
+        Key::S,
+        Key::Left,
+        Key::A,
+        Key::Right,
+        Key::D,
+        Key::Z,
+        Key::Space,
+        Key::J,
+        Key::F,
+        Key::X,
+        Key::K,
+        Key::H,
+        Key::Q,
+        Key::L,
+        Key::B,
+        Key::E,
+        Key::I,
+        Key::G,
+    ] {
+        if is_key_down(key) {
+            keys.push(key);
+        }
+    }
+    native_keys_to_window_key_sample(keys)
+}
+
+#[cfg(test)]
 fn native_keys_down_to_buttons(mut is_key_down: impl FnMut(Key) -> bool) -> ActionButtons {
     let mut buttons = ActionButtons::default();
     for key in [
@@ -14777,6 +15487,21 @@ fn native_keys_down_to_buttons(mut is_key_down: impl FnMut(Key) -> bool) -> Acti
         }
     }
     buttons
+}
+
+fn native_keys_to_window_key_sample<I>(keys: I) -> NativeWindowKeySample
+where
+    I: IntoIterator<Item = Key>,
+{
+    let mut sample = NativeWindowKeySample::default();
+    for key in keys {
+        if key == Key::Enter {
+            sample.enter = true;
+        } else {
+            sample.buttons = merge_action_buttons(sample.buttons, native_keys_to_buttons([key]));
+        }
+    }
+    sample
 }
 
 fn native_keys_to_buttons<I>(keys: I) -> ActionButtons
@@ -14843,7 +15568,7 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 
 fn print_help() {
     println!(
-        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-frame-stats-png <project_png>\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-gap-probe [rom_zip_or_dir] [instructions_per_frame] [--match-script|--handoff-only] [--max-frames n]\n  native-startup-probe [rom_zip_or_dir] [instructions_per_frame] [optimized|tracked]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [--gui-test-input action:frames...]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-compact <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip_or_dir] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play fast-forwards the built-in warning/title/coin/start/select/match-entry assist before opening the macOS window, so the visible session starts near manual play handoff; any physical key immediately cancels any remaining assist: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, V service, Enter coin+start, P start, Esc quit. Pass --gui-test-input only for bounded GUI QA; its actions traverse the same GUI latch and guest input registers without being counted as physical input. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 512x480 GUI frame without opening a window; native-frame-stats-png prints Rust classifier stats for project-generated PNGs. native-autoplay keeps the visible or custom scripted-assist path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-startup-probe runs the exact pre-window native-play path without opening a GUI and compares the optimized hidden-capture path with the legacy diagnostic path. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
+        "bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-frame-stats-png <project_png>\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-gap-probe [rom_zip_or_dir] [instructions_per_frame] [--match-script|--handoff-only] [--max-frames n]\n  native-startup-probe [rom_zip_or_dir] [instructions_per_frame] [optimized|tracked]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [--gui-test-input action:frames...]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-compact <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip_or_dir] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play fast-forwards the built-in warning/title/coin/start/select/match-entry assist before opening the macOS window, so the visible session starts near manual play handoff; any physical key immediately cancels any remaining assist: arrows/WASD move, Z/Space/J confirm or punch, X/K kick, Q/L/B beast, E/I/G guard, C coin, V service, Enter inserts credit then starts, P start, Esc quit. Pass --gui-test-input only for bounded GUI QA; its actions traverse the same GUI latch and guest input registers without being counted as physical input. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 512x480 GUI frame without opening a window; native-frame-stats-png prints Rust classifier stats for project-generated PNGs. native-autoplay keeps the visible or custom scripted-assist path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-startup-probe runs the exact pre-window native-play path without opening a GUI and compares the optimized hidden-capture path with the legacy diagnostic path. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git."
     );
     println!(
         "  native-scripted-fast-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
@@ -19136,7 +19861,10 @@ fn native_play_gui_instructions_per_frame(requested: u64) -> u64 {
     if requested == 0 {
         NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME
     } else {
-        requested.clamp(1, NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME)
+        requested.clamp(
+            NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME,
+            NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME,
+        )
     }
 }
 
@@ -19188,6 +19916,23 @@ fn native_play_gui_pacing_delay(
     present_interval.saturating_sub(now.saturating_duration_since(last_presented_at))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePlayGuiFrameChange {
+    checksum: u32,
+    changed: bool,
+}
+
+fn native_play_gui_window_frame_change(
+    last_presented_checksum: u32,
+    frame: &NativeDisplayFrame,
+) -> NativePlayGuiFrameChange {
+    let checksum = native_frame_checksum(frame);
+    NativePlayGuiFrameChange {
+        checksum,
+        changed: checksum != last_presented_checksum,
+    }
+}
+
 fn native_play_gui_should_capture_presented_frame(
     vblank_advanced: bool,
     rendered_frames: u64,
@@ -19225,10 +19970,30 @@ fn native_play_gui_idle_fast_path_instruction_slice(
     if remaining == 0 {
         return 0;
     }
+    let fast_path_slices = if poll_instruction_slice == 0 {
+        1
+    } else {
+        NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES
+    };
     let max_idle_slice = poll_instruction_slice
         .max(1)
-        .saturating_mul(NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES);
+        .saturating_mul(fast_path_slices);
     remaining.min(max_idle_slice).max(1)
+}
+
+#[cfg(test)]
+fn native_play_gui_poll_count_for_instruction_budget(
+    instructions_per_frame: u64,
+    poll_instruction_slice: u64,
+    idle_fast_path: bool,
+) -> u64 {
+    let budget = instructions_per_frame.max(1);
+    let slice = if idle_fast_path {
+        native_play_gui_idle_fast_path_instruction_slice(budget, poll_instruction_slice)
+    } else {
+        poll_instruction_slice.max(1)
+    };
+    budget.saturating_add(slice.saturating_sub(1)) / slice
 }
 
 fn native_play_gui_poll_instruction_slice() -> u64 {
@@ -19564,9 +20329,10 @@ mod tests {
         native_play_gui_handoff_frame_ready, native_play_gui_idle_fast_path_allowed,
         native_play_gui_idle_fast_path_instruction_slice, native_play_gui_instructions_per_frame,
         native_play_gui_otc_recovery_interval, native_play_gui_pacing_delay,
-        native_play_gui_present_elapsed_frames, native_play_gui_present_frame,
-        native_play_gui_present_interval, native_play_gui_should_capture_presented_frame,
-        native_play_gui_should_refresh_display, native_play_manual_takeover,
+        native_play_gui_poll_count_for_instruction_budget, native_play_gui_present_elapsed_frames,
+        native_play_gui_present_frame, native_play_gui_present_interval,
+        native_play_gui_should_capture_presented_frame, native_play_gui_should_refresh_display,
+        native_play_gui_window_frame_change, native_play_manual_takeover,
         native_play_native_resolution_actual_should_replace_window_candidate,
         native_play_native_resolution_stage_frame_stats_with_context,
         native_play_present_native_resolution_actual_frame, native_play_presentable_frame_stats,
@@ -19882,12 +20648,30 @@ mod tests {
     }
 
     #[test]
+    fn native_play_gui_detects_unchanged_presented_window_frame() {
+        let frame = test_solid_frame(0x0012_3456);
+        let checksum = native_frame_checksum(&frame);
+
+        let unchanged = native_play_gui_window_frame_change(checksum, &frame);
+        assert_eq!(unchanged.checksum, checksum);
+        assert!(!unchanged.changed);
+
+        let changed_frame = test_solid_frame(0x0065_4321);
+        let changed = native_play_gui_window_frame_change(checksum, &changed_frame);
+        assert_ne!(changed.checksum, checksum);
+        assert!(changed.changed);
+    }
+
+    #[test]
     fn native_play_gui_idle_fast_path_keeps_event_pump_bounded() {
         let poll_slice = 5_000;
         let bounded = poll_slice * NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES;
 
         assert_eq!(
-            native_play_gui_idle_fast_path_instruction_slice(240_000, poll_slice),
+            native_play_gui_idle_fast_path_instruction_slice(
+                super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+                poll_slice,
+            ),
             bounded
         );
         assert_eq!(
@@ -19899,6 +20683,41 @@ mod tests {
             0
         );
         assert_eq!(native_play_gui_idle_fast_path_instruction_slice(10, 0), 1);
+    }
+
+    #[test]
+    fn native_play_gui_idle_fast_path_keeps_physical_input_polling_responsive() {
+        let active_poll_count = native_play_gui_poll_count_for_instruction_budget(
+            super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+            super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+            false,
+        );
+        let idle_poll_count = native_play_gui_poll_count_for_instruction_budget(
+            super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+            super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+            true,
+        );
+
+        assert_eq!(active_poll_count, 48);
+        assert_eq!(idle_poll_count, 12);
+        assert_eq!(
+            native_play_gui_idle_fast_path_instruction_slice(
+                super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+                super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+            ),
+            super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE
+                * super::NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES,
+            "idle frames may coalesce empty polls, but only while no input is observed"
+        );
+    }
+
+    #[test]
+    fn native_play_gui_resamples_platform_input_inside_slow_frames() {
+        let sampled_polls = (0..12)
+            .filter(|poll| super::native_play_gui_should_sample_platform_input(*poll))
+            .collect::<Vec<_>>();
+
+        assert_eq!(sampled_polls, (0..12).collect::<Vec<_>>());
     }
 
     fn test_gradient_playfield_frame() -> NativeDisplayFrame {
@@ -21771,17 +22590,36 @@ mod tests {
     }
 
     #[test]
-    fn native_play_gui_caps_requested_instruction_budget_for_responsiveness() {
+    fn native_play_gui_honors_requested_budget_and_caps_oversized_frames() {
         assert_eq!(
             native_play_gui_instructions_per_frame(0),
             super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME
         );
-        assert_eq!(native_play_gui_instructions_per_frame(1), 1);
-        assert_eq!(native_play_gui_instructions_per_frame(10_000), 10_000);
+        assert_eq!(
+            native_play_gui_instructions_per_frame(1),
+            super::NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME
+        );
         assert_eq!(native_play_gui_instructions_per_frame(120_000), 120_000);
         assert_eq!(
             native_play_gui_instructions_per_frame(600_000),
-            super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME
+            super::NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
+        );
+
+        assert_eq!(
+            native_play_gui_poll_count_for_instruction_budget(
+                super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+                super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+                false,
+            ),
+            48
+        );
+        assert_eq!(
+            native_play_gui_poll_count_for_instruction_budget(
+                native_play_gui_instructions_per_frame(120_000),
+                super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+                false,
+            ),
+            24
         );
     }
 
@@ -23508,19 +24346,19 @@ mod tests {
                 .iter()
                 .filter(|segment| segment.action == Action::Coin)
                 .count(),
-            1
+            2
         );
         assert_eq!(
             entry_tail
                 .iter()
                 .filter(|segment| segment.action == Action::Start)
                 .count(),
-            1
+            2
         );
         assert!(
             !entry_tail
                 .iter()
-                .any(|segment| { matches!(segment.action, Action::Service | Action::CoinStart) })
+                .any(|segment| segment.action == Action::Service)
         );
         assert!(
             entry_tail
@@ -23567,8 +24405,11 @@ mod tests {
             latest_first_control_frame <= 1_200,
             "control sweep must finish before the final sustained gameplay input"
         );
+        let slow_macos_validation_frame_budget =
+            super::NATIVE_PLAY_SNAPSHOT_MATCH_BOOT_WALL_TIMEOUT_SECS.saturating_mul(10);
         assert!(
-            tail.iter().map(|segment| segment.frames).sum::<u64>() <= 810,
+            tail.iter().map(|segment| segment.frames).sum::<u64>()
+                <= slow_macos_validation_frame_budget,
             "snapshot tail must complete within the slow macOS validation budget"
         );
         assert_eq!(
@@ -23785,14 +24626,14 @@ mod tests {
                 .iter()
                 .filter(|segment| segment.action == Action::Coin && segment.frames >= 12)
                 .count(),
-            1
+            2
         );
         assert_eq!(
             entry_tail
                 .iter()
                 .filter(|segment| segment.action == Action::Start && segment.frames >= 18)
                 .count(),
-            1
+            2
         );
         assert!(
             entry_tail
@@ -26950,6 +27791,85 @@ mod tests {
     }
 
     #[test]
+    fn native_play_snapshot_accepts_captured_fight_hud_misdetected_as_caption() {
+        let stats = NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 209_318,
+            black_pixels: 36_442,
+            warm_pixels: 11_663,
+            red_dominant_pixels: 18_832,
+            magenta_dominant_pixels: 0,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 40_704,
+            horizontal_color_changes: 77_550,
+            periodic_horizontal_match_per_mille: 159,
+            occupied_rows: 461,
+            occupied_row_span: 472,
+            right_title_red_pixels: 861,
+            right_title_bright_pixels: 15_520,
+            top_left_warning_region_dark_pixels: 10_235,
+            top_left_warning_text_pixels: 10_767,
+            top_left_warning_text_rows: 92,
+            bottom_caption_pixels: 35_635,
+            bottom_dark_pixels: 4_710,
+        };
+
+        assert!(stats.has_intro_caption_band(), "{stats:?}");
+        assert!(!stats.has_native_context_caption_ui(), "{stats:?}");
+        assert!(stats.has_dense_native_fight_hud(), "{stats:?}");
+        assert!(stats.has_render_ready_scene(), "{stats:?}");
+        assert!(
+            super::native_play_snapshot_caption_ui_allows_gameplay(stats),
+            "{stats:?}"
+        );
+        assert!(
+            super::native_play_snapshot_final_playability_candidate(true, true, stats),
+            "a runtime-confirmed textured fight must not be rejected because the bottom HUD resembles a caption band"
+        );
+    }
+
+    #[test]
+    fn native_play_dense_fight_hud_title_mark_does_not_freeze_gui() {
+        let stats = NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 205_914,
+            black_pixels: 39_846,
+            warm_pixels: 8_720,
+            red_dominant_pixels: 15_700,
+            magenta_dominant_pixels: 512,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 44_690,
+            horizontal_color_changes: 77_327,
+            periodic_horizontal_match_per_mille: 163,
+            occupied_rows: 461,
+            occupied_row_span: 472,
+            right_title_red_pixels: 2_779,
+            right_title_bright_pixels: 15_181,
+            top_left_warning_region_dark_pixels: 12_137,
+            top_left_warning_text_pixels: 11_918,
+            top_left_warning_text_rows: 118,
+            bottom_caption_pixels: 35_932,
+            bottom_dark_pixels: 6_636,
+        };
+
+        assert!(stats.has_title_logo_overlay(), "{stats:?}");
+        assert!(stats.has_bottom_caption_band(), "{stats:?}");
+        assert!(stats.has_intro_caption_band(), "{stats:?}");
+        assert!(stats.has_dense_native_fight_hud(), "{stats:?}");
+        assert!(stats.has_title_logo_stage_context(), "{stats:?}");
+        assert!(!stats.has_blocking_title_logo_overlay(), "{stats:?}");
+        assert!(
+            !super::native_play_frame_has_blocking_render_artifact(stats),
+            "{stats:?}"
+        );
+        assert!(stats.has_render_ready_scene(), "{stats:?}");
+    }
+
+    #[test]
     fn native_play_gpu_context_does_not_replace_stale_title_with_stage_smear() {
         let frame = test_letterboxed_stage_field_smear_frame();
         let stats = NativeFrameStats::from_frame(&frame);
@@ -27965,6 +28885,61 @@ mod tests {
     }
 
     #[test]
+    fn native_physical_enter_sequences_coin_release_gap_start() {
+        let mut enter = super::NativePhysicalEnterSequencer::default();
+        let coin = Action::Coin.buttons();
+        let start = Action::Start.buttons();
+
+        for poll in 0..super::NATIVE_PLAY_COIN_START_COIN_POLLS {
+            assert_eq!(
+                enter.buttons(poll == 0, poll == 0),
+                coin,
+                "coin poll {poll}"
+            );
+        }
+        for poll in 0..super::NATIVE_PLAY_COIN_START_GAP_POLLS {
+            assert_eq!(
+                enter.buttons(false, false),
+                ActionButtons::default(),
+                "release-gap poll {poll}"
+            );
+        }
+        for poll in 0..super::NATIVE_PLAY_COIN_START_START_POLLS {
+            assert_eq!(enter.buttons(false, false), start, "start poll {poll}");
+        }
+        assert!(enter.is_empty());
+    }
+
+    #[test]
+    fn native_physical_enter_does_not_repeat_while_held() {
+        let mut enter = super::NativePhysicalEnterSequencer::default();
+        let sequence_polls = u32::from(super::NATIVE_PLAY_COIN_START_COIN_POLLS)
+            + u32::from(super::NATIVE_PLAY_COIN_START_GAP_POLLS)
+            + u32::from(super::NATIVE_PLAY_COIN_START_START_POLLS);
+
+        let mut coin_polls = 0;
+        let mut start_polls = 0;
+        for poll in 0..sequence_polls + 16 {
+            let buttons = enter.buttons(true, poll == 0);
+            coin_polls += u32::from(buttons.coin);
+            start_polls += u32::from(buttons.start);
+        }
+
+        assert_eq!(
+            coin_polls,
+            u32::from(super::NATIVE_PLAY_COIN_START_COIN_POLLS)
+        );
+        assert_eq!(
+            start_polls,
+            u32::from(super::NATIVE_PLAY_COIN_START_START_POLLS)
+        );
+        assert!(!enter.is_empty());
+        assert_eq!(enter.buttons(false, false), ActionButtons::default());
+        assert!(enter.is_empty());
+        assert_eq!(enter.buttons(true, true), Action::Coin.buttons());
+    }
+
+    #[test]
     fn native_gui_input_trace_emits_for_source_or_guest_activity_changes() {
         let trace = NativeGuiInputTrace::enabled(NativeInputActivity::default());
         let sample = NativeWindowButtonSample {
@@ -27996,6 +28971,18 @@ mod tests {
                 ..NativeInputActivity::default()
             },
         ));
+
+        let mut trace = NativeGuiInputTrace::enabled(NativeInputActivity::default());
+        trace.last_activity_active = true;
+        assert!(!trace.should_emit(
+            NativeWindowButtonSample::default(),
+            ActionButtons::default(),
+            ActionButtons::default(),
+            NativeInputActivity {
+                p1_punch_active_reads: 1,
+                ..NativeInputActivity::default()
+            },
+        ));
     }
 
     #[test]
@@ -28007,6 +28994,57 @@ mod tests {
             ActionButtons::default(),
             NativeInputActivity::default(),
         ));
+    }
+
+    #[test]
+    fn native_gui_input_trace_ignores_quartz_sampling_cadence_without_state_changes() {
+        let mut trace = NativeGuiInputTrace::enabled(NativeInputActivity::default());
+        trace.last_sample = NativeWindowButtonSample {
+            window_visible: true,
+            quartz_sampled: false,
+            quartz_fallback_active: true,
+            ..NativeWindowButtonSample::default()
+        };
+        let sampled = NativeWindowButtonSample {
+            window_visible: true,
+            quartz_sampled: true,
+            quartz_fallback_active: true,
+            ..NativeWindowButtonSample::default()
+        };
+
+        assert!(!trace.should_emit(
+            sampled,
+            ActionButtons::default(),
+            ActionButtons::default(),
+            NativeInputActivity::default(),
+        ));
+    }
+
+    #[test]
+    fn native_window_button_sample_reuses_platform_context_between_quartz_polls() {
+        let cached = NativeWindowButtonSample {
+            window_is_key_or_main: true,
+            application_active: true,
+            window_visible: true,
+            quartz_sampled: true,
+            quartz_fallback_active: true,
+            ..NativeWindowButtonSample::default()
+        };
+        let current = NativeWindowButtonSample {
+            minifb: Action::Punch.buttons(),
+            merged: Action::Punch.buttons(),
+            ..NativeWindowButtonSample::default()
+        };
+
+        let resolved =
+            super::native_window_button_sample_with_cached_platform_context(current, Some(cached));
+
+        assert!(resolved.window_is_key_or_main);
+        assert!(resolved.application_active);
+        assert!(resolved.window_visible);
+        assert!(resolved.quartz_fallback_active);
+        assert!(!resolved.quartz_sampled);
+        assert_eq!(resolved.merged, Action::Punch.buttons());
     }
 
     #[test]
@@ -28029,6 +29067,7 @@ mod tests {
     fn native_play_gui_idle_fast_path_allows_only_quiet_uninstrumented_frames() {
         let mut input_latch = NativeInputLatch::default();
         let mut physical_latch = NativeInputLatch::default();
+        let physical_enter = super::NativePhysicalEnterSequencer::default();
         let trace = NativeGuiInputTrace::disabled(NativeInputActivity::default());
         let script = NativeGuiTestInputScript::default();
         let sample = NativeWindowButtonSample::default();
@@ -28037,6 +29076,7 @@ mod tests {
             None,
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &trace,
             &script,
             false,
@@ -28048,6 +29088,7 @@ mod tests {
             None,
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &enabled_trace,
             &script,
             false,
@@ -28062,6 +29103,7 @@ mod tests {
             None,
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &trace,
             &scripted,
             false,
@@ -28072,6 +29114,7 @@ mod tests {
             Some(Action::Noop),
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &trace,
             &script,
             false,
@@ -28082,6 +29125,7 @@ mod tests {
             None,
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &trace,
             &script,
             true,
@@ -28097,6 +29141,7 @@ mod tests {
             None,
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &trace,
             &script,
             false,
@@ -28108,6 +29153,7 @@ mod tests {
             None,
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &trace,
             &script,
             false,
@@ -28120,6 +29166,7 @@ mod tests {
             None,
             &input_latch,
             &physical_latch,
+            &physical_enter,
             &trace,
             &script,
             false,
@@ -28226,8 +29273,11 @@ mod tests {
             window_active: true,
             minifb: Action::Left.buttons(),
             platform: ActionButtons::default(),
+            physical_enter_down: false,
+            physical_enter_pressed: false,
             test_sidecar: ActionButtons::default(),
             merged: Action::Left.buttons(),
+            ..NativeWindowButtonSample::default()
         };
         let sample = native_window_button_sample_with_test_sidecar(
             production_sample,
@@ -28258,17 +29308,22 @@ mod tests {
             window_active: true,
             minifb: ActionButtons::default(),
             platform: ActionButtons::default(),
+            physical_enter_down: false,
+            physical_enter_pressed: false,
             test_sidecar: ActionButtons::default(),
             merged: ActionButtons::default(),
+            ..NativeWindowButtonSample::default()
         };
         let sample =
             native_window_button_sample_with_test_sidecar(production_sample, true, sidecar_buttons);
         let mut latch = NativeInputLatch::default();
         let mut physical_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
 
         let resolved = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut physical_enter,
             sample,
             Some(Action::Start),
             true,
@@ -28304,18 +29359,23 @@ mod tests {
                 window_active: true,
                 minifb: physical_buttons,
                 platform: ActionButtons::default(),
+                physical_enter_down: false,
+                physical_enter_pressed: false,
                 test_sidecar: ActionButtons::default(),
                 merged: physical_buttons,
+                ..NativeWindowButtonSample::default()
             },
             true,
             Action::Punch.buttons(),
         );
         let mut latch = NativeInputLatch::default();
         let mut physical_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
 
         let resolved = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut physical_enter,
             sample,
             Some(Action::Start),
             true,
@@ -28332,6 +29392,94 @@ mod tests {
                 ..ActionButtons::default()
             }
         );
+    }
+
+    #[test]
+    fn native_physical_enter_resolves_as_coin_then_gap_then_start() {
+        let mut latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
+        let enter_sample = NativeWindowButtonSample {
+            raw_window_active: true,
+            window_active: true,
+            physical_enter_down: true,
+            physical_enter_pressed: true,
+            ..NativeWindowButtonSample::default()
+        };
+
+        let first = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut physical_enter,
+            enter_sample,
+            None,
+            true,
+        );
+        assert_eq!(first.raw_buttons, Action::CoinStart.buttons());
+        assert_eq!(first.latched_buttons, Action::Coin.buttons());
+        assert_eq!(first.physical_buttons, Action::Coin.buttons());
+        assert!(first.raw_manual_override);
+        assert!(first.manual_override);
+
+        for _ in 1..super::NATIVE_PLAY_COIN_START_COIN_POLLS {
+            let resolved = native_play_resolve_input_poll(
+                &mut latch,
+                &mut physical_latch,
+                &mut physical_enter,
+                NativeWindowButtonSample::default(),
+                None,
+                true,
+            );
+            assert_eq!(resolved.latched_buttons, Action::Coin.buttons());
+        }
+        for _ in 0..super::NATIVE_PLAY_COIN_START_GAP_POLLS {
+            let resolved = native_play_resolve_input_poll(
+                &mut latch,
+                &mut physical_latch,
+                &mut physical_enter,
+                NativeWindowButtonSample::default(),
+                None,
+                true,
+            );
+            assert_eq!(resolved.latched_buttons, ActionButtons::default());
+        }
+        let start = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut physical_enter,
+            NativeWindowButtonSample::default(),
+            None,
+            true,
+        );
+        assert_eq!(start.latched_buttons, Action::Start.buttons());
+        assert_eq!(start.physical_buttons, Action::Start.buttons());
+    }
+
+    #[test]
+    fn native_api_coin_start_remains_simultaneous_without_physical_enter() {
+        let mut latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
+        let buttons = Action::CoinStart.buttons();
+        let sample = NativeWindowButtonSample {
+            test_sidecar: buttons,
+            merged: buttons,
+            ..NativeWindowButtonSample::default()
+        };
+
+        let resolved = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut physical_enter,
+            sample,
+            None,
+            true,
+        );
+
+        assert_eq!(resolved.latched_buttons, buttons);
+        assert_eq!(resolved.effective_buttons, buttons);
+        assert_eq!(resolved.physical_buttons, ActionButtons::default());
+        assert!(resolved.test_input_override);
     }
 
     #[test]
@@ -28375,6 +29523,112 @@ mod tests {
     }
 
     #[test]
+    fn native_physical_enter_projection_counts_as_guest_coin_start() {
+        let observed = super::native_guest_observed_buttons_for_input_activity(
+            Action::CoinStart.buttons(),
+            NativeInputActivity {
+                coin_insert_edges: 1,
+                legacy_system_start_latch_edges: 1,
+                native_credit_adapter_writes: 1,
+                native_credit_adapter_edges: 1,
+                ..NativeInputActivity::default()
+            },
+        );
+
+        assert!(observed.coin);
+        assert!(observed.start);
+        assert!(!observed.punch);
+    }
+
+    #[test]
+    fn native_physical_play_keys_require_direct_guest_activity() {
+        let requested = ActionButtons {
+            coin: true,
+            start: true,
+            up: true,
+            down: true,
+            left: true,
+            right: true,
+            punch: true,
+            kick: true,
+            beast: true,
+            guard: true,
+            ..ActionButtons::default()
+        };
+        let direct = super::native_guest_observed_buttons_for_input_activity(
+            requested,
+            NativeInputActivity {
+                p1_up_active_reads: 1,
+                p1_down_active_reads: 1,
+                p1_left_active_reads: 1,
+                p1_right_active_reads: 1,
+                p1_start_active_reads: 1,
+                p1_punch_active_reads: 1,
+                p1_kick_active_reads: 1,
+                p1_beast_active_reads: 1,
+                p3_guard_active_reads: 1,
+                system_coin_active_reads: 1,
+                system_start_active_reads: 1,
+                ..NativeInputActivity::default()
+            },
+        );
+
+        assert!(super::action_buttons_have_direction_coverage(direct));
+        assert!(super::action_buttons_have_play_control_coverage(direct));
+
+        let projected = super::native_guest_observed_buttons_for_input_activity(
+            requested,
+            NativeInputActivity {
+                native_credit_adapter_writes: 1,
+                ..NativeInputActivity::default()
+            },
+        );
+
+        assert_eq!(projected, ActionButtons::default());
+        assert!(!super::action_buttons_have_direction_coverage(projected));
+        assert!(!super::action_buttons_have_play_control_coverage(projected));
+    }
+
+    #[test]
+    fn native_physical_guest_projection_is_scoped_to_same_poll_buttons() {
+        let mut observed = ActionButtons::default();
+        observed = super::merge_action_buttons(
+            observed,
+            super::native_guest_observed_buttons_for_input_activity(
+                Action::Left.buttons(),
+                NativeInputActivity {
+                    native_credit_adapter_writes: 1,
+                    ..NativeInputActivity::default()
+                },
+            ),
+        );
+        observed = super::merge_action_buttons(
+            observed,
+            super::native_guest_observed_buttons_for_input_activity(
+                ActionButtons {
+                    coin: true,
+                    start: true,
+                    punch: true,
+                    kick: true,
+                    beast: true,
+                    guard: true,
+                    ..ActionButtons::default()
+                },
+                NativeInputActivity::default(),
+            ),
+        );
+
+        assert!(!observed.left);
+        assert!(!observed.coin);
+        assert!(!observed.start);
+        assert!(!observed.punch);
+        assert!(!observed.kick);
+        assert!(!observed.beast);
+        assert!(!observed.guard);
+        assert!(!super::action_buttons_have_play_control_coverage(observed));
+    }
+
+    #[test]
     fn native_romless_set_input_guest_read_filters_to_physical_activity_only() {
         let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
         let physical_buttons = Action::Left.buttons();
@@ -28412,7 +29666,7 @@ mod tests {
     }
 
     #[test]
-    fn native_input_latch_drops_stale_edge_before_late_direction() {
+    fn native_input_latch_preserves_system_edge_across_late_direction() {
         let mut latch = NativeInputLatch::default();
         let start = ActionButtons {
             start: true,
@@ -28427,8 +29681,14 @@ mod tests {
         assert_eq!(latch.buttons(ActionButtons::default()), start);
 
         let buttons = latch.buttons(right);
-        assert_eq!(buttons, right);
-        assert!(!buttons.start);
+        assert_eq!(
+            buttons,
+            ActionButtons {
+                start: true,
+                right: true,
+                ..ActionButtons::default()
+            }
+        );
     }
 
     #[test]
@@ -28771,6 +30031,20 @@ mod tests {
     }
 
     #[test]
+    fn native_window_key_sample_keeps_physical_enter_out_of_generic_buttons() {
+        let enter = super::native_keys_to_window_key_sample([Key::Enter]);
+        assert!(enter.enter);
+        assert_eq!(enter.buttons, ActionButtons::default());
+
+        let direct_coin_start =
+            super::native_keys_to_window_key_sample([Key::C, Key::P, Key::Left]);
+        assert!(!direct_coin_start.enter);
+        assert!(direct_coin_start.buttons.coin);
+        assert!(direct_coin_start.buttons.start);
+        assert!(direct_coin_start.buttons.left);
+    }
+
+    #[test]
     fn physical_input_coverage_requires_every_direction_and_play_control() {
         let full = ActionButtons {
             start: true,
@@ -28802,6 +30076,53 @@ mod tests {
     }
 
     #[test]
+    fn gui_test_input_coverage_requires_only_requested_controls() {
+        let requested = ActionButtons {
+            up: true,
+            down: true,
+            left: true,
+            right: true,
+            punch: true,
+            kick: true,
+            beast: true,
+            guard: true,
+            ..ActionButtons::default()
+        };
+
+        assert!(super::action_buttons_have_combat_control_coverage(
+            requested
+        ));
+        assert!(super::action_buttons_cover(requested, requested));
+
+        let mut missing_guard = requested;
+        missing_guard.guard = false;
+        assert!(!super::action_buttons_cover(missing_guard, requested));
+        assert!(super::action_buttons_cover(
+            requested,
+            Action::Punch.buttons()
+        ));
+    }
+
+    #[test]
+    fn native_play_gui_session_keeps_verified_gameplay_when_final_classifier_flickers() {
+        assert!(super::native_play_gui_session_playable(
+            true, true, true, true
+        ));
+        assert!(!super::native_play_gui_session_playable(
+            false, true, true, true
+        ));
+        assert!(!super::native_play_gui_session_playable(
+            true, false, true, true
+        ));
+        assert!(!super::native_play_gui_session_playable(
+            true, true, false, true
+        ));
+        assert!(!super::native_play_gui_session_playable(
+            true, true, true, false
+        ));
+    }
+
+    #[test]
     fn native_macos_key_state_fallback_maps_physical_key_codes() {
         let pressed = [0u16, 6, 36];
         let buttons = super::native_macos_key_states_to_buttons(|key| pressed.contains(&key));
@@ -28814,9 +30135,56 @@ mod tests {
     }
 
     #[test]
+    fn native_macos_enter_keycode_uses_physical_sequence_channel() {
+        let pressed = [0u16, 6, 36];
+        let sample =
+            super::native_macos_key_states_to_window_key_sample(|key| pressed.contains(&key));
+
+        assert!(sample.enter);
+        assert!(sample.buttons.left);
+        assert!(sample.buttons.punch);
+        assert!(!sample.buttons.coin);
+        assert!(!sample.buttons.start);
+    }
+
+    #[test]
+    fn native_macos_quartz_input_ignores_synthetic_state_by_default() {
+        assert!(!super::native_macos_quartz_key_active(false, true, false));
+        assert!(super::native_macos_quartz_key_active(true, false, false));
+        assert!(super::native_macos_quartz_key_active(false, true, true));
+    }
+
+    #[test]
+    fn native_macos_synthetic_input_requires_explicit_foreground_qa() {
+        assert!(!super::native_macos_synthetic_input_allowed(false, false));
+        assert!(!super::native_macos_synthetic_input_allowed(true, false));
+        assert!(!super::native_macos_synthetic_input_allowed(false, true));
+        assert!(super::native_macos_synthetic_input_allowed(true, true));
+    }
+
+    #[test]
     fn native_macos_minifb_active_flag_is_uninverted() {
         assert!(super::native_macos_minifb_window_active(false));
         assert!(!super::native_macos_minifb_window_active(true));
+    }
+
+    #[test]
+    fn native_macos_quartz_fallback_accepts_foreground_application_state() {
+        assert!(super::native_macos_quartz_fallback_active(
+            false, false, true, false
+        ));
+        assert!(super::native_macos_quartz_fallback_active(
+            false, true, false, false
+        ));
+        assert!(super::native_macos_quartz_fallback_active(
+            true, false, false, false
+        ));
+        assert!(super::native_macos_quartz_fallback_active(
+            false, false, false, true
+        ));
+        assert!(!super::native_macos_quartz_fallback_active(
+            false, false, false, false
+        ));
     }
 
     #[test]

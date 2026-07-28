@@ -677,6 +677,10 @@ impl NativeEmulator {
         self.bus.br2_native_credit_hle_accepted_seen()
     }
 
+    pub fn br2_native_credit_hle_game_start_accepted_seen(&self) -> bool {
+        self.bus.br2_native_credit_hle_game_start_accepted_seen()
+    }
+
     pub fn br2_native_credit_hle_json(&self) -> String {
         self.bus.br2_native_credit_hle_json()
     }

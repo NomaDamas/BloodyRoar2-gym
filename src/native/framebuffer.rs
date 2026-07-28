@@ -4240,6 +4240,7 @@ fn br2_texture_descriptor_alias(texture_page: u16, clut: u16) -> (u16, u16) {
     if texture_page_polygon_descriptor(texture_page) == 0x0039 && clut == 0x7859 {
         (0x001c, 0x7850)
     } else if texture_page_polygon_descriptor(texture_page) == 0x001c
+        && !(texture_page == 0x021c && clut == 0x79d4)
         && (0x11..=0x17).contains(&(clut & 0x3f))
         && (480..=490).contains(&clut_y(clut))
     {
@@ -7628,6 +7629,24 @@ mod tests {
                 "live stage material CLUTs must use the populated x=256 palette alias"
             );
         }
+    }
+
+    #[test]
+    fn framebuffer_texture_descriptor_keeps_fighter_material_clut_page() {
+        assert_eq!(
+            br2_texture_descriptor_alias(0x021c, 0x79d4),
+            (0x021c, 0x79d4),
+            "fighter page 0x0200 must not inherit the stage x=256 palette alias"
+        );
+    }
+
+    #[test]
+    fn framebuffer_texture_descriptor_aliases_live_stage_packet_state() {
+        assert_eq!(
+            br2_texture_descriptor_alias(0x061c, 0x7954),
+            (0x061c, 0x7950),
+            "stage packet state bits must not suppress the live palette alias"
+        );
     }
 
     #[test]

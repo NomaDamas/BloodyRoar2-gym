@@ -72,6 +72,21 @@ impl Action {
         if normalized == "none" || normalized == "no+op" {
             return Some(Action::Noop);
         }
+        if normalized == "enter" {
+            return Some(Action::CoinStart);
+        }
+        if matches!(normalized.as_str(), "z" | "space" | "j" | "f") {
+            return Some(Action::Punch);
+        }
+        if matches!(normalized.as_str(), "x" | "k" | "h") {
+            return Some(Action::Kick);
+        }
+        if matches!(normalized.as_str(), "q" | "l" | "b") {
+            return Some(Action::Beast);
+        }
+        if matches!(normalized.as_str(), "e" | "i" | "g") {
+            return Some(Action::Guard);
+        }
 
         ACTION_SPACE
             .iter()
@@ -239,6 +254,11 @@ mod tests {
         assert_eq!(Action::from_name("no-op"), Some(Action::Noop));
         assert_eq!(Action::from_name("coin+start"), Some(Action::CoinStart));
         assert_eq!(Action::from_name("coin_start"), Some(Action::CoinStart));
+        assert_eq!(Action::from_name("enter"), Some(Action::CoinStart));
+        assert_eq!(Action::from_name("space"), Some(Action::Punch));
+        assert_eq!(Action::from_name("x"), Some(Action::Kick));
+        assert_eq!(Action::from_name("q"), Some(Action::Beast));
+        assert_eq!(Action::from_name("e"), Some(Action::Guard));
         assert_eq!(Action::from_name("service"), Some(Action::Service));
         assert_eq!(Action::from_name("BEAST-KICK"), Some(Action::BeastKick));
         assert_eq!(Action::from_name("invalid"), None);

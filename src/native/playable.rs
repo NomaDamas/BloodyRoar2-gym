@@ -40,6 +40,10 @@ pub fn native_playable_match_entry_script() -> Vec<NativePlayableSegment> {
         segment(Action::Coin, 12),
         segment(Action::Noop, 24),
         segment(Action::Start, 18),
+        segment(Action::Noop, 24),
+        segment(Action::Coin, 12),
+        segment(Action::Noop, 24),
+        segment(Action::Start, 18),
         segment(Action::Noop, 120),
         segment(Action::Punch, 30),
         segment(Action::Noop, 120),
@@ -108,7 +112,7 @@ pub fn prepare_native_playable_emulator(
         frames = frames.saturating_add(1);
     }
     emulator.capture_vblank_presented_frame();
-    if emulator.native_playable_candidate() {
+    if native_player_session_ready(emulator) {
         return finish_playable_startup(emulator, frames);
     }
 
@@ -117,15 +121,21 @@ pub fn prepare_native_playable_emulator(
         frames = frames.saturating_add(1);
         if frames.is_multiple_of(PLAYABLE_EXTRA_WAIT_SAMPLE_FRAMES) {
             emulator.capture_vblank_presented_frame();
-            if emulator.native_playable_candidate() {
+            if native_player_session_ready(emulator) {
                 return finish_playable_startup(emulator, frames);
             }
         }
     }
 
     Err(BackendError::new(format!(
-        "native playable startup completed {frames} frames without reaching a playable rendered state"
+        "native playable startup completed {frames} frames without reaching a credited player session: {}",
+        emulator.br2_native_credit_hle_json()
     )))
+}
+
+fn native_player_session_ready(emulator: &NativeEmulator) -> bool {
+    emulator.br2_native_credit_hle_game_start_accepted_seen()
+        && emulator.native_playable_candidate()
 }
 
 fn segment(action: Action, frames: u64) -> NativePlayableSegment {
@@ -220,7 +230,7 @@ mod tests {
         let script = native_playable_match_entry_script();
         let total_frames = script.iter().map(|segment| segment.frames).sum::<u64>();
 
-        assert_eq!(total_frames, 1_476);
+        assert_eq!(total_frames, 1_554);
         for action in [
             Action::Coin,
             Action::Start,
@@ -254,12 +264,18 @@ mod tests {
             .sum::<u64>();
 
         assert_eq!(boot_frames, 666);
-        assert_eq!(tail_frames, 810);
+        assert_eq!(tail_frames, 888);
         assert!(
             script[..first_credit]
                 .iter()
                 .all(|segment| !native_playable_segment_is_credit_attempt(*segment))
         );
         assert_eq!(script[first_credit].action, Action::Coin);
+        assert_eq!(script[first_credit + 1].action, Action::Noop);
+        assert_eq!(script[first_credit + 2].action, Action::Start);
+        assert_eq!(script[first_credit + 3].action, Action::Noop);
+        assert_eq!(script[first_credit + 4].action, Action::Coin);
+        assert_eq!(script[first_credit + 5].action, Action::Noop);
+        assert_eq!(script[first_credit + 6].action, Action::Start);
     }
 }

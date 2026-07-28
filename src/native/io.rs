@@ -21030,6 +21030,16 @@ impl Dma {
         self.mark_channel_complete(channel);
     }
 
+    pub fn finish_channel_data_phase(&mut self, channel: usize, post_madr: Option<u32>) {
+        let Some(channel) = self.channels.get_mut(channel) else {
+            return;
+        };
+        if let Some(post_madr) = post_madr {
+            channel.madr = post_madr & 0x00ff_ffff;
+        }
+        channel.chcr &= !(1 << 24);
+    }
+
     fn mark_channel_complete(&mut self, channel: usize) {
         let channel_bit = 1 << (16 + channel);
         if self.interrupt & channel_bit != 0 {

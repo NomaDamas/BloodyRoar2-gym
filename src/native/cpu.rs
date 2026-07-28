@@ -2923,6 +2923,8 @@ fn br2_native_hle_disabled(feature: &str) -> bool {
             "runtime_invalid_list_insert" => 1 << 38,
             "runtime_invalid_model_unlink" => 1 << 39,
             "runtime_control_callback_cycle" => 1 << 40,
+            "bitstream_decode" => 1 << 41,
+            "byte_copy" => 1 << 42,
             _ => 0,
         }
     }
@@ -4226,7 +4228,8 @@ impl Cpu {
         cycles_before: u64,
         bus: &mut Bus,
     ) -> Option<StepReport> {
-        if self.pc != BR2_BYTE_COPY_LOOP_START
+        if br2_native_hle_disabled("byte_copy")
+            || self.pc != BR2_BYTE_COPY_LOOP_START
             || self.next_pc != self.pc.wrapping_add(4)
             || self.delay_slot_branch_pc.is_some()
             || self.pending_load.is_some()
@@ -6658,10 +6661,12 @@ impl Cpu {
         cycles_before: u64,
         bus: &mut Bus,
     ) -> Option<StepReport> {
-        if !matches!(
-            self.pc,
-            BR2_BITSTREAM_DECODE_LOOP_START | BR2_BITSTREAM_DECODE_DIRECT_START
-        ) || self.next_pc != self.pc.wrapping_add(4)
+        if br2_native_hle_disabled("bitstream_decode")
+            || !matches!(
+                self.pc,
+                BR2_BITSTREAM_DECODE_LOOP_START | BR2_BITSTREAM_DECODE_DIRECT_START
+            )
+            || self.next_pc != self.pc.wrapping_add(4)
             || self.delay_slot_branch_pc.is_some()
             || self.pending_load.is_some()
         {
