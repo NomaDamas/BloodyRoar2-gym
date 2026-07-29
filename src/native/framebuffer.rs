@@ -5030,9 +5030,20 @@ fn br2_gameplay_4bpp_texture_origin(
     let descriptor = texture_page_without_dither(texture_page);
     let clut_x = ((clut & 0x3f) as i32) * 16;
     let clut_y = clut_y(clut);
+    if descriptor == 0x000d && clut == 0x7c1d {
+        // The left character-select portrait is uploaded to the paired high
+        // VRAM bank, while recovered packets retain the low-bank descriptor.
+        return Some((page_x, PSX_VRAM_HEIGHT as i32 / 2));
+    }
     if descriptor == 0x003f && matches!(clut, 0x7818 | 0x7958) {
         // These live match descriptors reuse the title page bits after the
         // stage atlas has moved to the paired high VRAM bank.
+        return Some((page_x, PSX_VRAM_HEIGHT as i32 / 2));
+    }
+    if descriptor == 0x0039 && clut == 0x785a {
+        // Recovered Beast effect quads retain the title-page descriptor. The
+        // y=0 atlas is opaque character art, while the live effect upload and
+        // its transparent texels are in the paired high VRAM bank.
         return Some((page_x, PSX_VRAM_HEIGHT as i32 / 2));
     }
     if matches!(descriptor, 0x000c | 0x000d) && clut_x == 64 && (480..=486).contains(&clut_y) {
@@ -6489,6 +6500,44 @@ mod tests {
                 "model CLUT 0x{clut:04x} must sample the high-bank model upload"
             );
         }
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_br2_beast_effect_y256_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x0039;
+        let clut = 0x785a;
+        let page_x = 576;
+        let alias_y = PSX_VRAM_HEIGHT as i32 / 2;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        assert_eq!(texture_page_origin(texture_page), (page_x, 0));
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page, clut),
+            (page_x, alias_y)
+        );
+        assert_eq!(
+            texture_page_origin_for_clut(0x0039, 0x7859),
+            (page_x, 0),
+            "the adjacent stage descriptor must remain on the low VRAM bank"
+        );
+
+        framebuffer.set_raw_pixel(page_x + 40, 224, 0x1111);
+        framebuffer.set_raw_pixel(page_x + 40, alias_y + 224, 0x0001);
+        framebuffer.set_raw_pixel(clut_x, clut_y, 0);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x03e0);
+
+        let sample = framebuffer.sample_texture_sample_from(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            160,
+            224,
+            TextureSamplingPolicy::new(false, true),
+        );
+        assert_eq!(sample.color, 0x03e0);
+        assert!(sample.texture_nonzero);
     }
 
     #[test]
@@ -9596,6 +9645,48 @@ mod tests {
         let sample = framebuffer.sample_texture_sample_from(
             &framebuffer.raw_pixels,
             texture_page | 0x0200,
+            clut,
+            0,
+            0,
+            TextureSamplingPolicy::new(true, true),
+        );
+        assert_eq!(sample.color, 0x03e0);
+        assert!(sample.texture_nonzero);
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_uses_br2_left_select_portrait_y256_alias() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020d;
+        let clut = 0x7c1d;
+        let page_x = 832;
+        let alias_y = PSX_VRAM_HEIGHT as i32 / 2;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        assert_eq!(texture_page_origin(texture_page), (page_x, 0));
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page, clut),
+            (page_x, alias_y)
+        );
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page & !0x0200, clut),
+            (page_x, alias_y)
+        );
+        assert_eq!(
+            texture_page_origin_for_clut(0x020c, 0x7d18),
+            (768, 0),
+            "normal character-select background strips must keep their low-bank origin"
+        );
+
+        framebuffer.set_raw_pixel(page_x, 0, 0x1111);
+        framebuffer.set_raw_pixel(page_x, alias_y, 0x2222);
+        framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+        framebuffer.set_raw_pixel(clut_x + 2, clut_y, 0x03e0);
+
+        let sample = framebuffer.sample_texture_sample_from(
+            &framebuffer.raw_pixels,
+            texture_page,
             clut,
             0,
             0,

@@ -8487,7 +8487,7 @@ impl Cpu {
         let mut pending_coin_edges = 0;
 
         if !freeplay {
-            pending_coin_edges = bus.consume_br2_native_credit_hle_coin_edges();
+            pending_coin_edges = bus.consume_br2_native_credit_hle_coin_edges(player);
             if pending_coin_edges > 0 {
                 let coin_value = u64::from(effective_required);
                 let inserted_value = pending_coin_edges.saturating_mul(coin_value).min(0xff) as u8;
@@ -10469,11 +10469,11 @@ impl Cpu {
                 callback_branch_control: self.br2_matrix_callback_branch_control,
                 a0: self.regs[4],
                 a1: self.regs[5],
-                output: self.regs[4],
+                output: self.regs[3],
                 saved: [self.regs[16], self.regs[17], self.regs[18], self.regs[19]],
                 global_matrix_pointer,
                 rotation: br2_read_matrix(bus, global_matrix_pointer),
-                source: br2_read_matrix(bus, self.regs[4]),
+                source: br2_read_matrix(bus, self.regs[5]),
                 result: [[0; 3]; 3],
                 saturated: false,
             });
@@ -13894,7 +13894,7 @@ mod tests {
             bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
             1
         );
-        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(0), 0);
 
         cpu.pc = BR2_CREDIT_CHECK_ENTRY;
         cpu.next_pc = BR2_CREDIT_CHECK_ENTRY + 4;
@@ -21633,7 +21633,7 @@ mod tests {
     }
 
     #[test]
-    fn br2_matrix_multiply_diagnostic_tracks_in_place_a0_matrix() {
+    fn br2_matrix_multiply_diagnostic_tracks_a1_source_and_v1_output() {
         fn write_matrix(bus: &mut Bus, address: u32, matrix: [[i16; 3]; 3]) {
             for (row_index, row) in matrix.iter().enumerate() {
                 for (column_index, value) in row.iter().enumerate() {
@@ -21647,6 +21647,7 @@ mod tests {
         let callback_object = 0x8038_a808;
         let callback_data = 0x8038_a824;
         let rotation = 0x8038_b000;
+        let output = 0x1f80_03e0;
         let source = [
             [0x0100, 0x0200, 0x0300],
             [0x0400, 0x0500, 0x0600],
@@ -21666,7 +21667,7 @@ mod tests {
 
         let mut cpu = Cpu::default();
         cpu.pc = super::BR2_MATRIX_MULTIPLY_ENTRY_PC;
-        cpu.regs[3] = 0x1f80_03e0;
+        cpu.regs[3] = output;
         cpu.regs[4] = callback_data;
         cpu.regs[5] = callback_data;
         cpu.br2_matrix_callback_target = 0x8035_71b0;
@@ -21680,7 +21681,7 @@ mod tests {
         assert_eq!(sample.callback_data, callback_data);
         assert_eq!(sample.a0, callback_data);
         assert_eq!(sample.a1, callback_data);
-        assert_eq!(sample.output, callback_data);
+        assert_eq!(sample.output, output);
         assert_ne!(sample.a1, sample.callback_object);
         assert_eq!(sample.source, source);
     }

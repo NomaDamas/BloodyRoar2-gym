@@ -138,14 +138,13 @@ ZiNc input mirroring for diagnostics.
 
 Window controls:
 
-- Arrows or `WASD`: move.
-- `Z`, `Space`, `J`, or `F`: confirm/punch.
-- `X`, `K`, or `H`: kick.
-- `Q`, `L`, or `B`: beast.
-- `E`, `I`, or `G`: guard.
-- `C`: coin.
+- P1: arrows move; `Z` or `Space` punch/confirm; `X` kick; `Q` beast; `E` guard.
+- P2: `WASD` move; `J` punch/confirm; `K` kick; `U` beast; `I` guard.
+- P1 `C`: coin. P1 `P`: start.
+- P2 `N`: coin. P2 `O`: start.
 - `V`: service credit.
-- `Enter`: coin+start for one-key title entry. `P`: start only.
+- `Enter`: feedback-driven P1 title entry. Press once to insert credit, then
+  press again after credit is accepted to start.
 - `Esc`: quit.
 
 For automated smoke tests, use autoplay, a headless snapshot, or explicit GUI
@@ -169,6 +168,20 @@ for example `native-play assets/local-romset.zip 240000 1 600`.
 `--gui-test-input` is an opt-in QA path that traverses the same GUI input latch
 and guest registers while keeping its result separate from physical-keyboard
 verification. The final JSON reports `native_play_test_input_verified`.
+Targeted GUI renderer captures can be armed after a specific GUI frame:
+
+```sh
+cargo run --release -- native-play assets/roms 240000 1 900 \
+  --gui-test-input coin:18 noop:18 start:24 noop:840 \
+  --draw-capture-predicate texture_page=0x0039,clut=0x785a,min_area=1000 \
+  --draw-capture-arm-gui-frame 600 \
+  --draw-capture-output tmp/native-validation/beast-effect/draw
+```
+
+The capture writes `<prefix>.manifest.json` plus the GUI, bounded draw, decoded
+texture, raw texture, palette, and provenance images. Use
+`native-cache-prepare <archive.zip>` once and pass the directory printed by
+`native-cache-path` to subsequent commands to avoid reopening the ZIP.
 `native-enter-probe` boots the real title state and injects one Enter edge
 through the same feedback-driven coin/start sequencer used by the GUI. It fails
 unless credit, game start, and a clean non-title transition are all observed.

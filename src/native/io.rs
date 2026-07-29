@@ -120,6 +120,7 @@ const GP0_FIELD_COMPOSED_CAPTURE_DRAW_INTERVAL: u64 = 8;
 // polygon vertex, including the sprite direction bits at 0x1000/0x2000.
 const GP0_POLYGON_TEXPAGE_MASK: u16 = 0x39ff;
 const STALE_PRESENTATION_CAPTURE_GRACE: u64 = 8;
+const STALE_PRESENTATION_DRAW_GRACE: u64 = 8;
 const DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS: u64 = 16;
 const DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS: u64 = 512;
 const DISPLAY_RESOLVE_MIN_3D_TRIANGLE_COMMANDS: u64 = 128;
@@ -1412,6 +1413,7 @@ pub struct Gpu {
     presented_frame_width: usize,
     presented_frame_height: usize,
     presented_frame_capture_index: u64,
+    presented_frame_draw_sequence: u64,
     presentation_captures: u64,
     field_composed_display_png: Option<Vec<u8>>,
     field_composed_display_rgb: Option<Vec<u32>>,
@@ -1520,6 +1522,7 @@ impl Default for Gpu {
             presented_frame_width: 0,
             presented_frame_height: 0,
             presented_frame_capture_index: 0,
+            presented_frame_draw_sequence: 0,
             presentation_captures: 0,
             field_composed_display_png: None,
             field_composed_display_rgb: None,
@@ -3722,6 +3725,7 @@ impl Gpu {
             presented_frame_width: self.presented_frame_width,
             presented_frame_height: self.presented_frame_height,
             presented_frame_capture_index: self.presented_frame_capture_index,
+            presented_frame_draw_sequence: self.presented_frame_draw_sequence,
             presentation_captures: self.presentation_captures,
             field_composed_display_window: self.field_composed_display_window,
             field_composed_display_width: self.field_composed_display_width,
@@ -3789,6 +3793,7 @@ impl Gpu {
             presented_frame_width: self.presented_frame_width,
             presented_frame_height: self.presented_frame_height,
             presented_frame_capture_index: self.presented_frame_capture_index,
+            presented_frame_draw_sequence: self.presented_frame_draw_sequence,
             presentation_captures: self.presentation_captures,
             field_composed_display_window: self.field_composed_display_window,
             field_composed_display_width: self.field_composed_display_width,
@@ -4582,6 +4587,7 @@ impl Gpu {
             && cached.width == width
             && cached.height == field_height.saturating_mul(2)
             && self.cached_field_composed_output_matches_active_field_pair(cached, field_height)
+            && self.should_use_cached_field_composed_output(cached)
             && let Some(rgb) = self.field_composed_display_rgb.as_ref()
             && rgb.len() == cached.width.saturating_mul(cached.height)
         {
@@ -8546,6 +8552,7 @@ impl Gpu {
             }
         }
         self.presented_frame_capture_index = self.presentation_captures;
+        self.presented_frame_draw_sequence = self.draw_sequence;
         if self.field_composed_display_window == Some(window) {
             self.field_composed_display_capture_index = self.presentation_captures;
         }
@@ -8573,6 +8580,7 @@ impl Gpu {
         self.presented_frame_width = 0;
         self.presented_frame_height = 0;
         self.presented_frame_capture_index = 0;
+        self.presented_frame_draw_sequence = 0;
 
         self.invalidate_field_composed_display_cache();
         *self.display_resolve_cache.borrow_mut() = None;
@@ -10621,9 +10629,15 @@ impl Gpu {
     }
 
     fn presented_frame_is_fresh(&self) -> bool {
-        self.presentation_captures
-            .saturating_sub(self.presented_frame_capture_index)
-            < STALE_PRESENTATION_CAPTURE_GRACE
+        self.presented_frame_window.is_some()
+            && self
+                .draw_sequence
+                .saturating_sub(self.presented_frame_draw_sequence)
+                < STALE_PRESENTATION_DRAW_GRACE
+            && self
+                .presentation_captures
+                .saturating_sub(self.presented_frame_capture_index)
+                < STALE_PRESENTATION_CAPTURE_GRACE
     }
 
     pub fn screenshot_window(&self) -> FrameBufferWindow {
@@ -13488,6 +13502,7 @@ impl Gpu {
                 && current.stats.checksum == candidate.stats.checksum
         }) {
             self.presented_frame_capture_index = self.presentation_captures;
+            self.presented_frame_draw_sequence = self.draw_sequence;
             return;
         }
 
@@ -13503,6 +13518,7 @@ impl Gpu {
         self.presented_frame_width = display_width;
         self.presented_frame_height = display_height;
         self.presented_frame_capture_index = self.presentation_captures;
+        self.presented_frame_draw_sequence = self.draw_sequence;
     }
 
     fn capture_current_field_composed_display(&mut self) {
@@ -18810,6 +18826,7 @@ struct VisiblePresentationCacheKey {
     presented_frame_width: usize,
     presented_frame_height: usize,
     presented_frame_capture_index: u64,
+    presented_frame_draw_sequence: u64,
     presentation_captures: u64,
     field_composed_display_window: Option<FrameBufferWindow>,
     field_composed_display_width: usize,
@@ -18866,6 +18883,7 @@ struct StableDisplayFrameCacheKey {
     presented_frame_width: usize,
     presented_frame_height: usize,
     presented_frame_capture_index: u64,
+    presented_frame_draw_sequence: u64,
     presentation_captures: u64,
     field_composed_display_window: Option<FrameBufferWindow>,
     field_composed_display_width: usize,
@@ -23175,12 +23193,12 @@ mod tests {
         IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io, IoAccess, IoDevice, MDEC_COMMAND, MDEC_STATUS,
         NativeGpuDrawCapturePredicate, PSX_VRAM_HEIGHT, SIO_CONTROL, SIO_DATA,
         SIO_STATUS_IRQ_REQUEST, SPU_REGION_START, STALE_PRESENTATION_CAPTURE_GRACE,
-        drawing_area_clip, has_native_full_scene_detail, has_native_playfield_density,
-        image_transfer_dimensions, io_register, io_register_range, is_detailed_observation,
-        is_io_register_address, is_likely_texture_page_candidate, is_sparse_display,
-        minimum_live_draw_overlap_area_for_dimensions, presented_frame_has_live_scene,
-        resolved_display_candidate_has_scene_signal, rgb_framebuffer_stats,
-        screen_observation_score, screen_observation_worth_saving,
+        STALE_PRESENTATION_DRAW_GRACE, drawing_area_clip, has_native_full_scene_detail,
+        has_native_playfield_density, image_transfer_dimensions, io_register, io_register_range,
+        is_detailed_observation, is_io_register_address, is_likely_texture_page_candidate,
+        is_sparse_display, minimum_live_draw_overlap_area_for_dimensions,
+        presented_frame_has_live_scene, resolved_display_candidate_has_scene_signal,
+        rgb_framebuffer_stats, screen_observation_score, screen_observation_worth_saving,
         should_preserve_br2_populated_palette_on_blank_copy_with_policy,
         texture_page_origin_for_clut_for_diagnostics, vram_copy_dimensions,
     };
@@ -35944,6 +35962,30 @@ mod tests {
     }
 
     #[test]
+    fn presented_frame_expires_after_draw_grace_is_exhausted() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+
+        io.gpu.capture_vblank_presented_frame();
+        assert!(io.gpu.presented_frame_is_fresh());
+        assert_eq!(io.gpu.presented_frame_draw_sequence, io.gpu.draw_sequence);
+
+        io.gpu.draw_sequence = io
+            .gpu
+            .draw_sequence
+            .saturating_add(STALE_PRESENTATION_DRAW_GRACE.saturating_sub(1));
+        assert!(io.gpu.presented_frame_is_fresh());
+
+        io.gpu.draw_sequence = io.gpu.draw_sequence.saturating_add(1);
+        assert!(!io.gpu.presented_frame_is_fresh());
+
+        io.gpu.capture_vblank_presented_frame();
+        assert!(io.gpu.presented_frame_is_fresh());
+        assert_eq!(io.gpu.presented_frame_draw_sequence, io.gpu.draw_sequence);
+    }
+
+    #[test]
     fn gpu_gui_deinterlaces_high_vertical_active_field_before_presented_fallback() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
@@ -37435,10 +37477,17 @@ mod tests {
         }
 
         let (frame_width, frame_height, frame) = io.gpu.display_rgb_frame();
+        let (fast_width, fast_height, fast_frame) = io.gpu.fast_gameplay_display_rgb_frame();
         let playability = io.gpu.native_playability_json();
 
         assert_eq!((frame_width, frame_height), (width, display_height));
+        assert_eq!((fast_width, fast_height), (width, display_height));
         assert_ne!(frame, cached_frame);
+        assert_ne!(
+            fast_frame, cached_frame,
+            "fast gameplay output reused a stale field-composed frame"
+        );
+        assert_eq!(fast_frame, frame);
         assert!(
             playability.contains("\"actual_display_source\":\"gp1_display_area\""),
             "{playability}"
@@ -38359,6 +38408,95 @@ mod tests {
         assert!(last.stats.palette_fallback_samples > 0, "{}", last.json());
         assert!(io.gpu.textured_draw_stats.palette_fallback_samples > 0);
         assert_ne!(io.gpu.framebuffer.raw_pixel(64, 160) & 0x7fff, 0);
+    }
+
+    #[test]
+    fn gpu_gp0_textured_quad_recovers_br2_left_select_portrait_bank() {
+        let mut io = Io::default();
+        let texture_page = 0x020d_u32;
+        let clut = 0x7c1d_u32;
+        let page_x = 832;
+        let alias_y = PSX_VRAM_HEIGHT as i32 / 2;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+        for y in 0..80 {
+            for x in 0..24 {
+                io.gpu
+                    .framebuffer
+                    .set_raw_pixel(page_x + x, alias_y + y, 0x1111);
+            }
+        }
+        io.gpu.framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x03e0);
+
+        io.write_u32(GPU_GP0, 0xe100_020d);
+        for word in [
+            0x2c80_8080,
+            0x00d8_0001,
+            clut << 16,
+            0x00d8_0060,
+            (texture_page << 16) | 0x005f,
+            0x0128_0001,
+            0x0000_5000,
+            0x0128_0060,
+            0x0000_505f,
+        ] {
+            io.write_u32(GPU_GP0, word);
+        }
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        let last = io.gpu.recent_draw_commands.last().expect("recent draw");
+        assert_eq!(last.texture_page, Some(texture_page as u16));
+        assert_eq!(last.clut, Some(clut as u16));
+        assert!(last.stats.written_pixels >= 7_000, "{}", last.json());
+        assert_ne!(io.gpu.framebuffer.raw_pixel(1, 216) & 0x7fff, 0);
+    }
+
+    #[test]
+    fn gpu_gp0_recovered_br2_beast_effect_avoids_opaque_title_atlas() {
+        let mut io = Io::default();
+        let texture_page = 0x0039_u32;
+        let clut = 0x785a_u32;
+        let page_x = 576;
+        let clut_x = ((clut & 0x3f) as i32) * 16;
+        let clut_y = ((clut >> 6) & 0x03ff) as i32;
+        let destination = (250, 170);
+
+        for y in 0..256 {
+            for x in 0..64 {
+                io.gpu.framebuffer.set_raw_pixel(page_x + x, y, 0x1111);
+            }
+        }
+        io.gpu.framebuffer.set_raw_pixel(clut_x, clut_y, 0);
+        io.gpu.framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x03e0);
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(destination.0, destination.1, 0x4210);
+
+        for word in [
+            0x2e60_6060,
+            0x00d1_00f1,
+            0x785a_e0a0,
+            0x0099_0118,
+            0x0039_e0bf,
+            0x00f9_012a,
+            0x8039_ffa0,
+            0x00c1_0151,
+            0x8036_ffbf,
+        ] {
+            io.write_u32(GPU_GP0, word);
+        }
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        let last = io.gpu.recent_draw_commands.last().expect("recent draw");
+        assert_eq!(last.texture_page, Some(texture_page as u16));
+        assert_eq!(last.clut, Some(clut as u16));
+        assert_eq!(last.stats.written_pixels, 0, "{}", last.json());
+        assert!(last.stats.transparent_pixels > 0, "{}", last.json());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(destination.0, destination.1),
+            0x4210
+        );
     }
 
     #[test]

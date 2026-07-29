@@ -72,6 +72,8 @@ const BR2_CHARACTER_MODEL_RECOVERY_BODY_FRESHNESS_SLACK: u64 =
 // remained below roughly 150x200.
 const BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_WIDTH: i32 = 320;
 const BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_HEIGHT: i32 = 360;
+const BR2_CHARACTER_MODEL_RECOVERY_COMPONENT_GAP: i32 = 48;
+const BR2_CHARACTER_MODEL_RECOVERY_ADDRESS_COMPONENT_GAP: u32 = 0x300;
 const BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_DRAWS: usize = 10;
 const BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_WIDTH: i32 = 160;
 const BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_HEIGHT: i32 = 200;
@@ -123,8 +125,9 @@ const DMA_ACTIVITY_RECENT_LIMIT: usize = 64;
 const MDEC_DMA_ACTIVITY_RECENT_LIMIT: usize = 128;
 const DMA_OTC_RECENT_RANGE_LIMIT: usize = 8;
 const DMA_GPU_RECENT_REGISTER_WRITE_LIMIT: usize = 8;
-const ZN_BOARD_INPUT_READ_PORTS: [u32; 5] = [
+const ZN_BOARD_INPUT_READ_PORTS: [u32; 6] = [
     0x1fa0_0000,
+    0x1fa0_0100,
     0x1fa0_0200,
     0x1fa0_0300,
     0x1fa1_0000,
@@ -193,6 +196,16 @@ const BR2_NATIVE_P1_PUNCH_INPUT_BIT: u32 = 0x0000_1000;
 const BR2_NATIVE_P1_KICK_INPUT_BIT: u32 = 0x0000_2000;
 const BR2_NATIVE_P1_BEAST_INPUT_BIT: u32 = 0x0000_4000;
 const BR2_NATIVE_P1_GUARD_INPUT_BIT: u32 = 0x0000_8000;
+const BR2_NATIVE_P2_UP_INPUT_BIT: u32 = 0x0001_0000;
+const BR2_NATIVE_P2_DOWN_INPUT_BIT: u32 = 0x0002_0000;
+const BR2_NATIVE_P2_LEFT_INPUT_BIT: u32 = 0x0004_0000;
+const BR2_NATIVE_P2_RIGHT_INPUT_BIT: u32 = 0x0008_0000;
+const BR2_NATIVE_P2_PUNCH_INPUT_BIT: u32 = 0x0010_0000;
+const BR2_NATIVE_P2_KICK_INPUT_BIT: u32 = 0x0020_0000;
+const BR2_NATIVE_P2_BEAST_INPUT_BIT: u32 = 0x0040_0000;
+const BR2_NATIVE_P2_GUARD_INPUT_BIT: u32 = 0x0080_0000;
+const BR2_NATIVE_P2_START_INPUT_BIT: u32 = 0x0000_0002;
+const BR2_NATIVE_P2_CREDIT_INPUT_BIT: u32 = 0x0000_0010;
 const BR2_NATIVE_CREDIT_INPUT_BIT_ENV: &str = "BLOODYROAR2_NATIVE_CREDIT_INPUT_BIT";
 const BR2_NATIVE_CREDIT_PROJECTION_ENV: &str = "BLOODYROAR2_NATIVE_CREDIT_PROJECTION";
 const BR2_NATIVE_CREDIT_PROJECTION_INPUTS_ENV: &str = "BLOODYROAR2_NATIVE_CREDIT_PROJECTION_INPUTS";
@@ -611,16 +624,28 @@ pub struct NativeInputActivity {
     pub p1_punch_active_reads: u64,
     pub p1_kick_active_reads: u64,
     pub p1_beast_active_reads: u64,
+    pub p2_input_reads: u64,
+    pub p2_up_active_reads: u64,
+    pub p2_down_active_reads: u64,
+    pub p2_left_active_reads: u64,
+    pub p2_right_active_reads: u64,
+    pub p2_punch_active_reads: u64,
+    pub p2_kick_active_reads: u64,
+    pub p2_beast_active_reads: u64,
     pub p3_input_reads: u64,
     pub p3_guard_active_reads: u64,
+    pub p2_guard_active_reads: u64,
     pub system_input_reads: u64,
     pub system_coin_active_reads: u64,
     pub system_service_active_reads: u64,
     pub system_start_active_reads: u64,
+    pub system_p2_coin_active_reads: u64,
+    pub system_p2_start_active_reads: u64,
     pub coin_register_reads: u64,
     pub coin_register_active_reads: u64,
     pub coin_register_writes: u64,
     pub coin_insert_edges: u64,
+    pub p2_coin_insert_edges: u64,
     pub coin_counter_0_edges: u64,
     pub coin_counter_1_edges: u64,
     pub legacy_system_coin_latch_edges: u64,
@@ -733,6 +758,10 @@ impl NativeInputActivity {
             || self.p1_down_active_reads > 0
             || self.p1_left_active_reads > 0
             || self.p1_right_active_reads > 0
+            || self.p2_up_active_reads > 0
+            || self.p2_down_active_reads > 0
+            || self.p2_left_active_reads > 0
+            || self.p2_right_active_reads > 0
     }
 
     pub fn has_any_attack_activity(self) -> bool {
@@ -740,6 +769,10 @@ impl NativeInputActivity {
             || self.p1_kick_active_reads > 0
             || self.p1_beast_active_reads > 0
             || self.p3_guard_active_reads > 0
+            || self.p2_punch_active_reads > 0
+            || self.p2_kick_active_reads > 0
+            || self.p2_beast_active_reads > 0
+            || self.p2_guard_active_reads > 0
     }
 
     pub fn has_any_play_control_activity(self) -> bool {
@@ -747,6 +780,8 @@ impl NativeInputActivity {
             || self.system_coin_active_reads > 0
             || self.system_start_active_reads > 0
             || self.p1_start_active_reads > 0
+            || self.system_p2_coin_active_reads > 0
+            || self.system_p2_start_active_reads > 0
     }
 
     pub fn has_service_activity(self) -> bool {
@@ -764,22 +799,28 @@ impl NativeInputActivity {
     }
 
     pub fn has_coin_edge_activity(self) -> bool {
-        self.coin_insert_edges > 0 || self.legacy_system_coin_latch_edges > 0
+        self.coin_insert_edges > 0
+            || self.p2_coin_insert_edges > 0
+            || self.legacy_system_coin_latch_edges > 0
     }
 
     pub fn has_start_edge_activity(self) -> bool {
         self.legacy_system_start_latch_edges > 0
             || self.system_start_active_reads > 0
             || self.p1_start_active_reads > 0
+            || self.system_p2_start_active_reads > 0
     }
 
     pub fn has_coin_probe_activity(self) -> bool {
-        self.has_coin_edge_activity() && self.system_coin_active_reads > 0
+        self.has_coin_edge_activity()
+            && (self.system_coin_active_reads > 0 || self.system_p2_coin_active_reads > 0)
     }
 
     pub fn has_start_probe_activity(self) -> bool {
         self.has_start_edge_activity()
-            && (self.system_start_active_reads > 0 || self.p1_start_active_reads > 0)
+            && (self.system_start_active_reads > 0
+                || self.p1_start_active_reads > 0
+                || self.system_p2_start_active_reads > 0)
     }
 
     pub fn has_credit_probe_activity(self) -> bool {
@@ -821,10 +862,35 @@ impl NativeInputActivity {
             p1_beast_active_reads: self
                 .p1_beast_active_reads
                 .saturating_add(other.p1_beast_active_reads),
+            p2_input_reads: self.p2_input_reads.saturating_add(other.p2_input_reads),
+            p2_up_active_reads: self
+                .p2_up_active_reads
+                .saturating_add(other.p2_up_active_reads),
+            p2_down_active_reads: self
+                .p2_down_active_reads
+                .saturating_add(other.p2_down_active_reads),
+            p2_left_active_reads: self
+                .p2_left_active_reads
+                .saturating_add(other.p2_left_active_reads),
+            p2_right_active_reads: self
+                .p2_right_active_reads
+                .saturating_add(other.p2_right_active_reads),
+            p2_punch_active_reads: self
+                .p2_punch_active_reads
+                .saturating_add(other.p2_punch_active_reads),
+            p2_kick_active_reads: self
+                .p2_kick_active_reads
+                .saturating_add(other.p2_kick_active_reads),
+            p2_beast_active_reads: self
+                .p2_beast_active_reads
+                .saturating_add(other.p2_beast_active_reads),
             p3_input_reads: self.p3_input_reads.saturating_add(other.p3_input_reads),
             p3_guard_active_reads: self
                 .p3_guard_active_reads
                 .saturating_add(other.p3_guard_active_reads),
+            p2_guard_active_reads: self
+                .p2_guard_active_reads
+                .saturating_add(other.p2_guard_active_reads),
             system_input_reads: self
                 .system_input_reads
                 .saturating_add(other.system_input_reads),
@@ -837,6 +903,12 @@ impl NativeInputActivity {
             system_start_active_reads: self
                 .system_start_active_reads
                 .saturating_add(other.system_start_active_reads),
+            system_p2_coin_active_reads: self
+                .system_p2_coin_active_reads
+                .saturating_add(other.system_p2_coin_active_reads),
+            system_p2_start_active_reads: self
+                .system_p2_start_active_reads
+                .saturating_add(other.system_p2_start_active_reads),
             coin_register_reads: self
                 .coin_register_reads
                 .saturating_add(other.coin_register_reads),
@@ -849,6 +921,9 @@ impl NativeInputActivity {
             coin_insert_edges: self
                 .coin_insert_edges
                 .saturating_add(other.coin_insert_edges),
+            p2_coin_insert_edges: self
+                .p2_coin_insert_edges
+                .saturating_add(other.p2_coin_insert_edges),
             coin_counter_0_edges: self
                 .coin_counter_0_edges
                 .saturating_add(other.coin_counter_0_edges),
@@ -907,10 +982,35 @@ impl NativeInputActivity {
             p1_beast_active_reads: self
                 .p1_beast_active_reads
                 .saturating_sub(baseline.p1_beast_active_reads),
+            p2_input_reads: self.p2_input_reads.saturating_sub(baseline.p2_input_reads),
+            p2_up_active_reads: self
+                .p2_up_active_reads
+                .saturating_sub(baseline.p2_up_active_reads),
+            p2_down_active_reads: self
+                .p2_down_active_reads
+                .saturating_sub(baseline.p2_down_active_reads),
+            p2_left_active_reads: self
+                .p2_left_active_reads
+                .saturating_sub(baseline.p2_left_active_reads),
+            p2_right_active_reads: self
+                .p2_right_active_reads
+                .saturating_sub(baseline.p2_right_active_reads),
+            p2_punch_active_reads: self
+                .p2_punch_active_reads
+                .saturating_sub(baseline.p2_punch_active_reads),
+            p2_kick_active_reads: self
+                .p2_kick_active_reads
+                .saturating_sub(baseline.p2_kick_active_reads),
+            p2_beast_active_reads: self
+                .p2_beast_active_reads
+                .saturating_sub(baseline.p2_beast_active_reads),
             p3_input_reads: self.p3_input_reads.saturating_sub(baseline.p3_input_reads),
             p3_guard_active_reads: self
                 .p3_guard_active_reads
                 .saturating_sub(baseline.p3_guard_active_reads),
+            p2_guard_active_reads: self
+                .p2_guard_active_reads
+                .saturating_sub(baseline.p2_guard_active_reads),
             system_input_reads: self
                 .system_input_reads
                 .saturating_sub(baseline.system_input_reads),
@@ -923,6 +1023,12 @@ impl NativeInputActivity {
             system_start_active_reads: self
                 .system_start_active_reads
                 .saturating_sub(baseline.system_start_active_reads),
+            system_p2_coin_active_reads: self
+                .system_p2_coin_active_reads
+                .saturating_sub(baseline.system_p2_coin_active_reads),
+            system_p2_start_active_reads: self
+                .system_p2_start_active_reads
+                .saturating_sub(baseline.system_p2_start_active_reads),
             coin_register_reads: self
                 .coin_register_reads
                 .saturating_sub(baseline.coin_register_reads),
@@ -935,6 +1041,9 @@ impl NativeInputActivity {
             coin_insert_edges: self
                 .coin_insert_edges
                 .saturating_sub(baseline.coin_insert_edges),
+            p2_coin_insert_edges: self
+                .p2_coin_insert_edges
+                .saturating_sub(baseline.p2_coin_insert_edges),
             coin_counter_0_edges: self
                 .coin_counter_0_edges
                 .saturating_sub(baseline.coin_counter_0_edges),
@@ -959,53 +1068,120 @@ impl NativeInputActivity {
     }
 
     pub fn json(self) -> String {
-        format!(
-            "{{\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p3_input_reads\":{},\"p3_guard_active_reads\":{},\"system_input_reads\":{},\"system_coin_active_reads\":{},\"system_service_active_reads\":{},\"system_start_active_reads\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"coin_register_writes\":{},\"coin_insert_edges\":{},\"coin_counter_0_edges\":{},\"coin_counter_1_edges\":{},\"legacy_system_coin_latch_edges\":{},\"legacy_system_start_latch_edges\":{},\"native_credit_adapter_writes\":{},\"native_credit_adapter_edges\":{},\"last_system_input\":{},\"last_system_input_hex\":\"0x{:08x}\",\"last_coin_register\":{},\"last_coin_register_hex\":\"0x{:08x}\",\"has_direction_activity\":{},\"has_play_control_activity\":{},\"has_full_control_activity\":{},\"has_any_direction_activity\":{},\"has_any_attack_activity\":{},\"has_any_play_control_activity\":{},\"has_service_activity\":{},\"has_any_control_activity\":{},\"has_coin_edge_activity\":{},\"has_start_edge_activity\":{},\"has_coin_probe_activity\":{},\"has_start_probe_activity\":{},\"has_credit_probe_activity\":{},\"has_coin_register_active_activity\":{},\"has_native_credit_adapter_activity\":{}}}",
-            self.p1_input_reads,
-            self.p1_up_active_reads,
-            self.p1_down_active_reads,
-            self.p1_left_active_reads,
-            self.p1_right_active_reads,
-            self.p1_start_active_reads,
-            self.p1_punch_active_reads,
-            self.p1_kick_active_reads,
-            self.p1_beast_active_reads,
-            self.p3_input_reads,
-            self.p3_guard_active_reads,
-            self.system_input_reads,
-            self.system_coin_active_reads,
-            self.system_service_active_reads,
-            self.system_start_active_reads,
-            self.coin_register_reads,
-            self.coin_register_active_reads,
-            self.coin_register_writes,
-            self.coin_insert_edges,
-            self.coin_counter_0_edges,
-            self.coin_counter_1_edges,
-            self.legacy_system_coin_latch_edges,
-            self.legacy_system_start_latch_edges,
-            self.native_credit_adapter_writes,
-            self.native_credit_adapter_edges,
-            self.last_system_input,
-            self.last_system_input,
-            self.last_coin_register,
-            self.last_coin_register,
-            self.has_direction_activity(),
-            self.has_play_control_activity(),
-            self.has_full_control_activity(),
-            self.has_any_direction_activity(),
-            self.has_any_attack_activity(),
-            self.has_any_play_control_activity(),
-            self.has_service_activity(),
-            self.has_any_control_activity(),
-            self.has_coin_edge_activity(),
-            self.has_start_edge_activity(),
-            self.has_coin_probe_activity(),
-            self.has_start_probe_activity(),
-            self.has_credit_probe_activity(),
-            self.has_coin_register_active_activity(),
+        let mut value = serde_json::Map::new();
+        macro_rules! field {
+            ($name:literal, $field:expr) => {
+                value.insert($name.to_string(), serde_json::Value::from($field));
+            };
+        }
+        field!("p1_input_reads", self.p1_input_reads);
+        field!("p1_up_active_reads", self.p1_up_active_reads);
+        field!("p1_down_active_reads", self.p1_down_active_reads);
+        field!("p1_left_active_reads", self.p1_left_active_reads);
+        field!("p1_right_active_reads", self.p1_right_active_reads);
+        field!("p1_start_active_reads", self.p1_start_active_reads);
+        field!("p1_punch_active_reads", self.p1_punch_active_reads);
+        field!("p1_kick_active_reads", self.p1_kick_active_reads);
+        field!("p1_beast_active_reads", self.p1_beast_active_reads);
+        field!("p2_input_reads", self.p2_input_reads);
+        field!("p2_up_active_reads", self.p2_up_active_reads);
+        field!("p2_down_active_reads", self.p2_down_active_reads);
+        field!("p2_left_active_reads", self.p2_left_active_reads);
+        field!("p2_right_active_reads", self.p2_right_active_reads);
+        field!("p2_punch_active_reads", self.p2_punch_active_reads);
+        field!("p2_kick_active_reads", self.p2_kick_active_reads);
+        field!("p2_beast_active_reads", self.p2_beast_active_reads);
+        field!("p3_input_reads", self.p3_input_reads);
+        field!("p3_guard_active_reads", self.p3_guard_active_reads);
+        field!("p2_guard_active_reads", self.p2_guard_active_reads);
+        field!("system_input_reads", self.system_input_reads);
+        field!("system_coin_active_reads", self.system_coin_active_reads);
+        field!(
+            "system_service_active_reads",
+            self.system_service_active_reads
+        );
+        field!("system_start_active_reads", self.system_start_active_reads);
+        field!(
+            "system_p2_coin_active_reads",
+            self.system_p2_coin_active_reads
+        );
+        field!(
+            "system_p2_start_active_reads",
+            self.system_p2_start_active_reads
+        );
+        field!("coin_register_reads", self.coin_register_reads);
+        field!(
+            "coin_register_active_reads",
+            self.coin_register_active_reads
+        );
+        field!("coin_register_writes", self.coin_register_writes);
+        field!("coin_insert_edges", self.coin_insert_edges);
+        field!("p2_coin_insert_edges", self.p2_coin_insert_edges);
+        field!("coin_counter_0_edges", self.coin_counter_0_edges);
+        field!("coin_counter_1_edges", self.coin_counter_1_edges);
+        field!(
+            "legacy_system_coin_latch_edges",
+            self.legacy_system_coin_latch_edges
+        );
+        field!(
+            "legacy_system_start_latch_edges",
+            self.legacy_system_start_latch_edges
+        );
+        field!(
+            "native_credit_adapter_writes",
+            self.native_credit_adapter_writes
+        );
+        field!(
+            "native_credit_adapter_edges",
+            self.native_credit_adapter_edges
+        );
+        field!("last_system_input", self.last_system_input);
+        field!(
+            "last_system_input_hex",
+            format!("0x{:08x}", self.last_system_input)
+        );
+        field!("last_coin_register", self.last_coin_register);
+        field!(
+            "last_coin_register_hex",
+            format!("0x{:08x}", self.last_coin_register)
+        );
+        field!("has_direction_activity", self.has_direction_activity());
+        field!(
+            "has_play_control_activity",
+            self.has_play_control_activity()
+        );
+        field!(
+            "has_full_control_activity",
+            self.has_full_control_activity()
+        );
+        field!(
+            "has_any_direction_activity",
+            self.has_any_direction_activity()
+        );
+        field!("has_any_attack_activity", self.has_any_attack_activity());
+        field!(
+            "has_any_play_control_activity",
+            self.has_any_play_control_activity()
+        );
+        field!("has_service_activity", self.has_service_activity());
+        field!("has_any_control_activity", self.has_any_control_activity());
+        field!("has_coin_edge_activity", self.has_coin_edge_activity());
+        field!("has_start_edge_activity", self.has_start_edge_activity());
+        field!("has_coin_probe_activity", self.has_coin_probe_activity());
+        field!("has_start_probe_activity", self.has_start_probe_activity());
+        field!(
+            "has_credit_probe_activity",
+            self.has_credit_probe_activity()
+        );
+        field!(
+            "has_coin_register_active_activity",
+            self.has_coin_register_active_activity()
+        );
+        field!(
+            "has_native_credit_adapter_activity",
             self.has_native_credit_adapter_activity()
-        )
+        );
+        serde_json::Value::Object(value).to_string()
     }
 }
 
@@ -1206,6 +1382,14 @@ struct NativeOtcDmaRecoveryStats {
     last_chain_draw_reject_reasons: [u32; Gp0ReplayDrawRejectReason::COUNT],
     last_chain_reject_samples: Vec<GpuDmaRangeFilterSample>,
     last_chain_submitted_samples: Vec<GpuDmaRangeFilterSample>,
+    last_chain_model_texture_draws: u32,
+    last_chain_model_bounded_draws: u32,
+    last_chain_model_fresh_draws: u32,
+    last_chain_model_unique_packets: u32,
+    last_chain_model_peak_generation_packets: u32,
+    last_chain_model_draw_samples: Vec<Br2ChainModelDrawSample>,
+    last_chain_model_generation: u64,
+    last_chain_model_packets: u32,
     last_model_roots: u32,
     last_model_packets: u32,
     last_model_words: u32,
@@ -1269,6 +1453,12 @@ impl NativeOtcDmaRecoveryStats {
             .map(Br2CharacterModelRecoverySample::json)
             .collect::<Vec<_>>()
             .join(",");
+        let chain_model_draw_samples = self
+            .last_chain_model_draw_samples
+            .iter()
+            .map(Br2ChainModelDrawSample::json)
+            .collect::<Vec<_>>()
+            .join(",");
         let stage_selected_packets = self
             .last_stage_selected_packets
             .iter()
@@ -1297,7 +1487,7 @@ impl NativeOtcDmaRecoveryStats {
             .last_chain_fingerprint
             .map(|fingerprint| fingerprint.newest_packet_vblank);
         format!(
-            "{{\"active\":{},\"armed_after_guest_resume\":{},\"attempts\":{},\"submissions\":{},\"rejected\":{},\"last_reason\":\"{}\",\"last_guest_linked_list_vblank\":{},\"last_guest_resume_gap_vblanks\":{},\"last_otc\":{},\"last_start\":{},\"last_start_hex\":{},\"last_detached_root\":{},\"last_nodes\":{},\"last_nonempty_nodes\":{},\"last_commands\":{},\"last_stage_tracked_headers\":{},\"last_stage_region_candidates\":{},\"last_stage_sampled_candidates\":{},\"last_stage_unlinked_candidates\":{},\"last_stage_playfield_candidates\":{},\"last_stage_safe_range_candidates\":{},\"last_stage_model_texture_candidates\":{},\"last_stage_safe_non_model_candidates\":{},\"last_stage_candidates\":{},\"last_stage_components\":{},\"last_stage_direct_otc_candidates\":{},\"last_stage_direct_generation_candidates\":{},\"last_stage_direct_generation_textured\":{},\"last_stage_newest_freshness\":{},\"last_stage_roots\":{},\"last_stage_packets\":{},\"last_stage_words\":{},\"last_stage_candidate_packets\":[{}],\"last_stage_selected_packets\":[{}],\"last_recovered_chain_words\":{},\"duplicate_chain_replay_skips\":{},\"last_chain_fingerprint\":{},\"last_chain_fingerprint_hex\":{},\"last_replayed_chain_fingerprint\":{},\"last_replayed_chain_fingerprint_hex\":{},\"last_chain_fingerprint_nodes\":{},\"last_chain_fingerprint_words\":{},\"last_chain_fingerprint_newest_packet_vblank\":{},\"last_chain_ranges\":{},\"last_chain_submitted_ranges\":{},\"last_chain_embedded_payload_rejections\":{},\"last_chain_stale_body_rejections\":{},\"last_chain_unsafe_draw_rejections\":{},\"last_chain_blocking_artifact_rejections\":{},\"last_chain_vram_transfer_rejections\":{},\"last_chain_draw_reject_reasons\":{{{}}},\"last_chain_reject_samples\":[{}],\"last_chain_submitted_samples\":[{}],\"last_model_roots\":{},\"last_model_packets\":{},\"last_model_words\":{},\"last_model_newest_generation\":{},\"last_model_generation_start\":{},\"last_model_selected_packets\":[{}]}}",
+            "{{\"active\":{},\"armed_after_guest_resume\":{},\"attempts\":{},\"submissions\":{},\"rejected\":{},\"last_reason\":\"{}\",\"last_guest_linked_list_vblank\":{},\"last_guest_resume_gap_vblanks\":{},\"last_otc\":{},\"last_start\":{},\"last_start_hex\":{},\"last_detached_root\":{},\"last_nodes\":{},\"last_nonempty_nodes\":{},\"last_commands\":{},\"last_stage_tracked_headers\":{},\"last_stage_region_candidates\":{},\"last_stage_sampled_candidates\":{},\"last_stage_unlinked_candidates\":{},\"last_stage_playfield_candidates\":{},\"last_stage_safe_range_candidates\":{},\"last_stage_model_texture_candidates\":{},\"last_stage_safe_non_model_candidates\":{},\"last_stage_candidates\":{},\"last_stage_components\":{},\"last_stage_direct_otc_candidates\":{},\"last_stage_direct_generation_candidates\":{},\"last_stage_direct_generation_textured\":{},\"last_stage_newest_freshness\":{},\"last_stage_roots\":{},\"last_stage_packets\":{},\"last_stage_words\":{},\"last_stage_candidate_packets\":[{}],\"last_stage_selected_packets\":[{}],\"last_recovered_chain_words\":{},\"duplicate_chain_replay_skips\":{},\"last_chain_fingerprint\":{},\"last_chain_fingerprint_hex\":{},\"last_replayed_chain_fingerprint\":{},\"last_replayed_chain_fingerprint_hex\":{},\"last_chain_fingerprint_nodes\":{},\"last_chain_fingerprint_words\":{},\"last_chain_fingerprint_newest_packet_vblank\":{},\"last_chain_ranges\":{},\"last_chain_submitted_ranges\":{},\"last_chain_embedded_payload_rejections\":{},\"last_chain_stale_body_rejections\":{},\"last_chain_unsafe_draw_rejections\":{},\"last_chain_blocking_artifact_rejections\":{},\"last_chain_vram_transfer_rejections\":{},\"last_chain_draw_reject_reasons\":{{{}}},\"last_chain_reject_samples\":[{}],\"last_chain_submitted_samples\":[{}],\"last_chain_model_texture_draws\":{},\"last_chain_model_bounded_draws\":{},\"last_chain_model_fresh_draws\":{},\"last_chain_model_unique_packets\":{},\"last_chain_model_peak_generation_packets\":{},\"last_chain_model_draw_samples\":[{}],\"last_chain_model_generation\":{},\"last_chain_model_packets\":{},\"last_model_roots\":{},\"last_model_packets\":{},\"last_model_words\":{},\"last_model_newest_generation\":{},\"last_model_generation_start\":{},\"last_model_selected_packets\":[{}]}}",
             self.active,
             self.armed_after_guest_resume,
             self.attempts,
@@ -1351,6 +1541,14 @@ impl NativeOtcDmaRecoveryStats {
             chain_draw_reject_reasons,
             chain_reject_samples,
             chain_submitted_samples,
+            self.last_chain_model_texture_draws,
+            self.last_chain_model_bounded_draws,
+            self.last_chain_model_fresh_draws,
+            self.last_chain_model_unique_packets,
+            self.last_chain_model_peak_generation_packets,
+            chain_model_draw_samples,
+            self.last_chain_model_generation,
+            self.last_chain_model_packets,
             self.last_model_roots,
             self.last_model_packets,
             self.last_model_words,
@@ -1369,6 +1567,34 @@ struct GpuDmaRangeFilterSample {
     command_words: Vec<u32>,
     reason: &'static str,
     detail: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Br2ChainModelDrawSample {
+    packet_address: u32,
+    command_address: u32,
+    generation: u64,
+    texture_page: u16,
+    clut: u16,
+    bounds: Gp0DrawBounds,
+}
+
+impl Br2ChainModelDrawSample {
+    fn json(&self) -> String {
+        format!(
+            "{{\"packet_address\":{},\"packet_address_hex\":\"0x{:08x}\",\"command_address\":{},\"command_address_hex\":\"0x{:08x}\",\"generation\":{},\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"bounds\":{}}}",
+            self.packet_address,
+            self.packet_address,
+            self.command_address,
+            self.command_address,
+            self.generation,
+            self.texture_page,
+            self.texture_page,
+            self.clut,
+            self.clut,
+            self.bounds.json()
+        )
+    }
 }
 
 impl GpuDmaRangeFilterSample {
@@ -2285,6 +2511,10 @@ impl UnlinkedPrimitiveReplayDiagnostics {
                 self.reject_br2_stage_transition_atlas =
                     self.reject_br2_stage_transition_atlas.saturating_add(1);
             }
+            Gp0ReplayDrawRejectReason::ModelPrefilter
+            | Gp0ReplayDrawRejectReason::KnownRecoveryAtlas
+            | Gp0ReplayDrawRejectReason::UnsafeBr2785a
+            | Gp0ReplayDrawRejectReason::CorruptBr2CharacterModel => {}
         }
     }
 
@@ -3045,7 +3275,7 @@ pub struct Bus {
     br2_code_patch_snapshot_valid: [bool; BR2_CODE_PATCH_SNAPSHOT_LEN],
     br2_code_patch_snapshot_frozen: bool,
     zn_board: ZnBoard,
-    br2_native_credit_hle_consumed_coin_edges: u64,
+    br2_native_credit_hle_consumed_coin_edges: [u64; 2],
     br2_native_credit_hle: Br2NativeCreditHleStats,
     cache_control: u32,
     cache_isolated: bool,
@@ -3137,7 +3367,7 @@ impl Bus {
             br2_code_patch_snapshot_valid: [false; BR2_CODE_PATCH_SNAPSHOT_LEN],
             br2_code_patch_snapshot_frozen: false,
             zn_board: ZnBoard::with_board_assets(&board_assets),
-            br2_native_credit_hle_consumed_coin_edges: 0,
+            br2_native_credit_hle_consumed_coin_edges: [0; 2],
             br2_native_credit_hle: Br2NativeCreditHleStats::default(),
             cache_control: 0,
             cache_isolated: false,
@@ -4778,6 +5008,7 @@ impl Bus {
         let mut region_textured_packet_count = 0u64;
         let mut descriptor_counts = HashMap::<(u16, u16), (u64, u64)>::new();
         let mut recent_textured_samples = Vec::<(u64, u32, String)>::new();
+        let mut beast_candidate_samples = Vec::<(u64, u32, String)>::new();
         let mut packet_count = 0u64;
         let mut linked_packet_count = 0u64;
         let mut newest_header_vblank = None;
@@ -4832,32 +5063,34 @@ impl Bus {
                     .command_write_vblank
                     .or(packet.header_write_vblank)
                     .unwrap_or(0);
-                recent_textured_samples.push((
-                    freshness,
+                let sample_json = format!(
+                    "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"linked\":{},\"word_count\":{},\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"header_write_vblank\":{},\"command_write_vblank\":{},\"bounds\":{},\"next\":{},\"next_hex\":\"0x{:06x}\",\"words\":[{}],\"word_writes\":[{}]}}",
                     packet.address,
-                    format!(
-                        "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"linked\":{},\"word_count\":{},\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"header_write_vblank\":{},\"command_write_vblank\":{},\"bounds\":{},\"next\":{},\"next_hex\":\"0x{:06x}\",\"word_writes\":[{}]}}",
-                        packet.address,
-                        packet.address,
-                        packet.linked,
-                        packet.word_count,
-                        command[0] >> 24,
-                        command[0] >> 24,
-                        texture_page,
-                        texture_page,
-                        clut,
-                        clut,
-                        optional_u64_json(packet.header_write_vblank),
-                        optional_u64_json(packet.command_write_vblank),
-                        bounds.map_or_else(|| "null".to_string(), Gp0DrawBounds::json),
-                        packet.next,
-                        packet.next,
-                        self.primitive_packet_word_writes_json(
-                            packet.address,
-                            packet.word_count
-                        )
-                    ),
-                ));
+                    packet.address,
+                    packet.linked,
+                    packet.word_count,
+                    command[0] >> 24,
+                    command[0] >> 24,
+                    texture_page,
+                    texture_page,
+                    clut,
+                    clut,
+                    optional_u64_json(packet.header_write_vblank),
+                    optional_u64_json(packet.command_write_vblank),
+                    bounds.map_or_else(|| "null".to_string(), Gp0DrawBounds::json),
+                    packet.next,
+                    packet.next,
+                    words
+                        .iter()
+                        .map(|word| format!("\"0x{word:08x}\""))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    self.primitive_packet_word_writes_json(packet.address, packet.word_count)
+                );
+                recent_textured_samples.push((freshness, packet.address, sample_json.clone()));
+                if br2_beast_character_model_candidate_descriptor((texture_page, clut)) {
+                    beast_candidate_samples.push((freshness, packet.address, sample_json));
+                }
             }
 
             let Some((texture_page, clut, command)) = matched else {
@@ -4942,8 +5175,17 @@ impl Bus {
             .map(|(_, _, json)| json)
             .collect::<Vec<_>>()
             .join(",");
+        beast_candidate_samples.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
+        });
+        let beast_candidate_samples = beast_candidate_samples
+            .into_iter()
+            .take(BR2_CHARACTER_MODEL_PACKET_SAMPLE_LIMIT * 4)
+            .map(|(_, _, json)| json)
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{{\"range_start\":\"0x{:08x}\",\"range_end\":\"0x{:08x}\",\"texture_page\":\"0x{:04x}\",\"cluts\":[\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\"],\"current_vblank\":{},\"region_packets\":{},\"region_linked_packets\":{},\"region_unlinked_packets\":{},\"region_draw_packets\":{},\"region_textured_packets\":{},\"descriptor_counts\":[{}],\"recent_textured_samples\":[{}],\"packets\":{},\"linked_packets\":{},\"unlinked_packets\":{},\"min_address\":{},\"min_address_hex\":{},\"max_address\":{},\"max_address_hex\":{},\"newest_header_vblank\":{},\"newest_command_vblank\":{},\"samples\":[{}]}}",
+            "{{\"range_start\":\"0x{:08x}\",\"range_end\":\"0x{:08x}\",\"texture_page\":\"0x{:04x}\",\"cluts\":[\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\"],\"current_vblank\":{},\"region_packets\":{},\"region_linked_packets\":{},\"region_unlinked_packets\":{},\"region_draw_packets\":{},\"region_textured_packets\":{},\"descriptor_counts\":[{}],\"recent_textured_samples\":[{}],\"beast_candidate_samples\":[{}],\"packets\":{},\"linked_packets\":{},\"unlinked_packets\":{},\"min_address\":{},\"min_address_hex\":{},\"max_address\":{},\"max_address_hex\":{},\"newest_header_vblank\":{},\"newest_command_vblank\":{},\"samples\":[{}]}}",
             BR2_CHARACTER_MODEL_PACKET_START,
             BR2_CHARACTER_MODEL_PACKET_END,
             BR2_CHARACTER_MODEL_TEXTURE_PAGE,
@@ -4959,6 +5201,7 @@ impl Bus {
             region_textured_packet_count,
             descriptor_counts,
             recent_textured_samples,
+            beast_candidate_samples,
             packet_count,
             linked_packet_count,
             packet_count.saturating_sub(linked_packet_count),
@@ -5353,49 +5596,71 @@ impl Bus {
             })
     }
 
-    pub fn consume_br2_native_credit_hle_coin_edges(&mut self) -> u64 {
-        let edges = self.zn_board.coin_insert_edges;
-        let pending = edges.saturating_sub(self.br2_native_credit_hle_consumed_coin_edges);
-        self.br2_native_credit_hle_consumed_coin_edges = edges;
+    pub fn consume_br2_native_credit_hle_coin_edges(&mut self, player: u32) -> u64 {
+        let player = player.min(1) as usize;
+        let edges = if player == 0 {
+            self.zn_board.coin_insert_edges
+        } else {
+            self.zn_board.p2_coin_insert_edges
+        };
+        let pending = edges.saturating_sub(self.br2_native_credit_hle_consumed_coin_edges[player]);
+        self.br2_native_credit_hle_consumed_coin_edges[player] = edges;
         pending
     }
 
     fn inject_br2_native_credit_from_coin_edges(&mut self) {
-        let edges = self.zn_board.coin_insert_edges;
-        let pending = edges.saturating_sub(self.br2_native_credit_hle_consumed_coin_edges);
-        if pending == 0 || !self.br2_native_credit_state_is_ready() {
+        if !self.br2_native_credit_state_is_ready() {
             return;
         }
 
-        let player = 0;
-        let freeplay = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_FREEPLAY_FLAG_OFFSET) != 0;
-        let required = self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET);
-        let effective_required = required.max(1);
-        let credit_slot = self.br2_credit_slot_address(player);
-        let credit_before = self.read_u8(credit_slot);
-        let inserted = pending
-            .saturating_mul(u64::from(effective_required))
-            .min(0xff) as u8;
-        let credit_after = if freeplay {
-            credit_before
-        } else {
-            credit_before.saturating_add(inserted)
-        };
-        if !freeplay {
-            self.write_u8(credit_slot, credit_after);
+        for player in 0..=1u32 {
+            let index = player as usize;
+            let edges = if player == 0 {
+                self.zn_board.coin_insert_edges
+            } else {
+                self.zn_board.p2_coin_insert_edges
+            };
+            let pending =
+                edges.saturating_sub(self.br2_native_credit_hle_consumed_coin_edges[index]);
+            if pending == 0 {
+                continue;
+            }
+
+            let freeplay =
+                self.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_FREEPLAY_FLAG_OFFSET) != 0;
+            let required_offset = if player == 0 {
+                BR2_CREDIT_REQUIRED_P1_OFFSET
+            } else {
+                BR2_CREDIT_REQUIRED_P2_OFFSET
+            };
+            let required = self.read_u8(BR2_CREDIT_STATE_BASE + required_offset);
+            let effective_required = required.max(1);
+            let credit_slot = self.br2_credit_slot_address(player);
+            let credit_before = self.read_u8(credit_slot);
+            let inserted = pending
+                .saturating_mul(u64::from(effective_required))
+                .min(0xff) as u8;
+            let credit_after = if freeplay {
+                credit_before
+            } else {
+                credit_before.saturating_add(inserted)
+            };
+            if !freeplay {
+                self.write_u8(credit_slot, credit_after);
+            }
+            self.br2_native_credit_hle_consumed_coin_edges[index] = edges;
+            self.br2_native_credit_hle.record(Br2NativeCreditHleCheck {
+                source: "bus_coin_edge_injection",
+                player,
+                freeplay,
+                required,
+                credit_slot,
+                credit_before,
+                credit_after,
+                pending_coin_edges: pending,
+                result: u32::from(credit_after),
+            });
         }
-        self.br2_native_credit_hle_consumed_coin_edges = edges;
-        self.br2_native_credit_hle.record(Br2NativeCreditHleCheck {
-            source: "bus_coin_edge_injection",
-            player,
-            freeplay,
-            required,
-            credit_slot,
-            credit_before,
-            credit_after,
-            pending_coin_edges: pending,
-            result: u32::from(credit_after),
-        });
     }
 
     fn br2_native_credit_state_is_ready(&self) -> bool {
@@ -6147,6 +6412,34 @@ impl Bus {
             .any(|offset| gp0_command_has_playfield_draw_bounds_with_offset(words, offset))
     }
 
+    fn gpu_current_br2_character_model_draw_bounds(
+        &self,
+        packet_address: u32,
+        words: &[u32],
+    ) -> Option<Gp0DrawBounds> {
+        self.gpu_current_br2_character_model_draw_evaluation(packet_address, words)
+            .ok()
+    }
+
+    fn gpu_current_br2_character_model_draw_evaluation(
+        &self,
+        packet_address: u32,
+        words: &[u32],
+    ) -> Result<Gp0DrawBounds, Gp0ReplayDrawRejectReason> {
+        let mut last_reason = Gp0ReplayDrawRejectReason::ModelPrefilter;
+        for drawing_offset in self.gpu_replay_validation_offsets() {
+            match gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
+                packet_address,
+                words,
+                drawing_offset,
+            ) {
+                Ok(bounds) => return Ok(bounds),
+                Err(reason) => last_reason = reason,
+            }
+        }
+        Err(last_reason)
+    }
+
     #[cfg(test)]
     fn process_gpu_linked_list_dma_with_policy_and_shared_nodes(
         &mut self,
@@ -6327,7 +6620,16 @@ impl Bus {
         if rejected_model_draws
             .is_some_and(|addresses| addresses.contains(&(*range_start_address & 0x00ff_fffc)))
         {
-            self.record_native_otc_chain_filter_rejection(commands, range, "unsafe_otc_draw");
+            let detail = self
+                .gpu_current_br2_character_model_draw_evaluation(*range_start_address, &range_words)
+                .err()
+                .or(Some(Gp0ReplayDrawRejectReason::ModelPrefilter));
+            self.record_native_otc_chain_filter_rejection_with_detail(
+                commands,
+                range,
+                "unsafe_otc_draw",
+                detail,
+            );
             return 0;
         }
         if recovered_gp0_command_is_vram_transfer(&range_words) {
@@ -6339,9 +6641,16 @@ impl Bus {
             return 0;
         }
         if gp0_command_sequence_has_known_recovery_atlas_corruption(&range_words) {
-            self.record_native_otc_chain_filter_rejection(commands, range, "unsafe_otc_draw");
+            self.record_native_otc_chain_filter_rejection_with_detail(
+                commands,
+                range,
+                "unsafe_otc_draw",
+                Some(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas),
+            );
             return 0;
         }
+        let current_model_bounds =
+            self.gpu_current_br2_character_model_draw_bounds(*range_start_address, &range_words);
         if self.gpu_recovery_command_range_is_stale_atlas_artifact(
             commands,
             range.clone(),
@@ -6365,14 +6674,25 @@ impl Bus {
         }
         let (drawing_offset, safe_draw_ranges) = self.gpu_otc_replay_safe_draw_ranges(&range_words);
         if gp0_command_is_unsafe_br2_785a_recovery_draw(&range_words, drawing_offset) {
-            self.record_native_otc_chain_filter_rejection(commands, range, "unsafe_otc_draw");
+            self.record_native_otc_chain_filter_rejection_with_detail(
+                commands,
+                range,
+                "unsafe_otc_draw",
+                Some(Gp0ReplayDrawRejectReason::UnsafeBr2785a),
+            );
             return 0;
         }
         if gp0_command_is_corrupt_br2_character_model_draw_for_packet(
             *range_start_address,
             &range_words,
-        ) {
-            self.record_native_otc_chain_filter_rejection(commands, range, "unsafe_otc_draw");
+        ) && current_model_bounds.is_none()
+        {
+            self.record_native_otc_chain_filter_rejection_with_detail(
+                commands,
+                range,
+                "unsafe_otc_draw",
+                Some(Gp0ReplayDrawRejectReason::CorruptBr2CharacterModel),
+            );
             return 0;
         }
         if gp0_command_sequence_has_draw(&range_words) {
@@ -6392,6 +6712,7 @@ impl Bus {
             if safe_draw_ranges.is_empty()
                 && model_draw_ranges.is_empty()
                 && !ignored_uv_padding_pointer
+                && current_model_bounds.is_none()
             {
                 self.record_native_otc_chain_filter_rejection_with_detail(
                     commands,
@@ -7348,6 +7669,17 @@ impl Bus {
         self.native_otc_dma_recovery
             .last_chain_submitted_samples
             .clear();
+        self.native_otc_dma_recovery.last_chain_model_texture_draws = 0;
+        self.native_otc_dma_recovery.last_chain_model_bounded_draws = 0;
+        self.native_otc_dma_recovery.last_chain_model_fresh_draws = 0;
+        self.native_otc_dma_recovery.last_chain_model_unique_packets = 0;
+        self.native_otc_dma_recovery
+            .last_chain_model_peak_generation_packets = 0;
+        self.native_otc_dma_recovery
+            .last_chain_model_draw_samples
+            .clear();
+        self.native_otc_dma_recovery.last_chain_model_generation = 0;
+        self.native_otc_dma_recovery.last_chain_model_packets = 0;
         self.native_otc_dma_recovery.last_model_roots = 0;
         self.native_otc_dma_recovery.last_model_packets = 0;
         self.native_otc_dma_recovery.last_model_words = 0;
@@ -7399,10 +7731,23 @@ impl Bus {
         self.io.gpu.begin_recovered_draw_page_tracking();
         let recovered_chain_nodes =
             self.native_otc_dma_recovery_chain_nodes(chains.iter().map(|chain| chain.0));
-        let rejected_chain_model_draws =
-            self.native_otc_dma_recovery_spatially_incoherent_model_draws(&recovered_chain_nodes);
-        let (stage_roots, stage_packets, stage_words) =
-            self.replay_recent_br2_stage_packets_for_otc(key, &recovered_chain_nodes);
+        let trusted_current_otc_chain = chains.len() == 1
+            && !detached_root
+            && chains
+                .first()
+                .is_some_and(|(start, _, validation)| *start == key.high && validation.terminated);
+        let mut rejected_chain_model_draws =
+            self.native_otc_dma_recovery_invalid_model_draws(&recovered_chain_nodes);
+        // A complete current OTC chain is the authoritative guest frame. Mixing
+        // separately discovered stage/model generations into it duplicates
+        // transient HUD and Beast-transition draws, then poisons the stable
+        // scene snapshot. Standalone reconstruction is only needed for detached
+        // or incomplete recovery roots.
+        let (stage_roots, stage_packets, stage_words) = if trusted_current_otc_chain {
+            (0, 0, 0)
+        } else {
+            self.replay_recent_br2_stage_packets_for_otc(key, &recovered_chain_nodes)
+        };
         self.native_otc_dma_recovery.last_stage_roots = stage_roots.min(u32::MAX as usize) as u32;
         self.native_otc_dma_recovery.last_stage_packets =
             stage_packets.min(u32::MAX as usize) as u32;
@@ -7414,11 +7759,22 @@ impl Bus {
                 &recovered_chain_nodes,
                 stage_generation,
             );
-        let (model_roots, model_packets, model_words) = self
-            .replay_recent_br2_character_model_packets_for_scene(
+        self.native_otc_dma_recovery.last_chain_model_generation =
+            chain_model_generation.unwrap_or_default();
+        self.native_otc_dma_recovery.last_chain_model_packets =
+            chain_model_packets.min(u32::MAX as usize) as u32;
+        // The current OTC chain already carries live fighter animation. Replaying
+        // an independently discovered model generation without a matching stage
+        // generation can overlay unrelated pose fragments and eventually replace
+        // textured gameplay with flat-shaded geometry.
+        let (model_roots, model_packets, model_words) = if stage_generation.is_some() {
+            self.replay_recent_br2_character_model_packets_for_scene(
                 &recovered_chain_nodes,
                 stage_generation,
-            );
+            )
+        } else {
+            (0, 0, 0)
+        };
         self.native_otc_dma_recovery.last_model_roots = model_roots.min(u32::MAX as usize) as u32;
         self.native_otc_dma_recovery.last_model_packets =
             model_packets.min(u32::MAX as usize) as u32;
@@ -7472,6 +7828,21 @@ impl Bus {
             && selected_stage_generation_coherent
             && selected_model_generation_coherent;
         let replacement_scene = reconstructed_scene && scene_generations_coherent;
+        if !trusted_current_otc_chain
+            && !replacement_scene
+            && !chain_has_complete_model_generation
+            && self.native_otc_dma_recovery.last_chain_model_texture_draws > 0
+        {
+            // Detached or incomplete recovery roots are submitted after
+            // restoring the stable scene. Do not let a partially assembled
+            // fighter generation overwrite that snapshot limb by limb.
+            // A trusted current OTC chain is authoritative guest output, so
+            // its individually validated pose and Beast-transition polygons
+            // must remain live even when fewer than four model packets changed.
+            rejected_chain_model_draws.extend(
+                self.native_otc_dma_recovery_incomplete_model_overlay_draws(&recovered_chain_nodes),
+            );
+        }
         let scene_generation_conflict =
             stage_generation.is_some() && model_generation.is_some() && !generation_pair_coherent;
         let overlay_recovered_scene_fragments =
@@ -7537,11 +7908,6 @@ impl Bus {
         let mut recovered_chain_words = 0usize;
         let mut submitted_chain_nodes = HashSet::new();
         self.native_otc_dma_recovery.record_chain_filter_stats = true;
-        let trusted_current_otc_chain = chains.len() == 1
-            && !detached_root
-            && chains
-                .first()
-                .is_some_and(|(start, _, validation)| *start == key.high && validation.terminated);
         let recovered_chain_has_provenance = native_otc_recovered_chain_has_provenance(
             chains.len(),
             detached_root,
@@ -7678,17 +8044,22 @@ impl Bus {
     }
 
     fn native_otc_dma_recovery_chain_model_generation(
-        &self,
+        &mut self,
         chain_nodes: &HashSet<u32>,
         scene_generation: Option<u64>,
     ) -> (Option<u64>, usize) {
-        let mut draws_by_generation =
-            HashMap::<u64, HashMap<(u16, u16), Vec<(u32, Gp0DrawBounds)>>>::new();
+        let mut observed_draws = Vec::<(u64, (u16, u16), u32, Gp0DrawBounds)>::new();
+        let trace_chain_models =
+            std::env::var_os("BR2_NATIVE_TRACE_CHAIN_MODELS").is_some_and(|_| {
+                let min_vblank = std::env::var("BR2_NATIVE_TRACE_CHAIN_MODELS_MIN_VBLANK")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_default();
+                self.vblank_count >= min_vblank
+            });
 
         for address in chain_nodes.iter().copied() {
-            if !(BR2_CHARACTER_MODEL_PACKET_START..BR2_CHARACTER_MODEL_PACKET_END)
-                .contains(&address)
-            {
+            if !br2_character_model_packet_address(address) {
                 continue;
             }
             let Some(header) = self.read_ram_u32_physical(address) else {
@@ -7727,49 +8098,158 @@ impl Bus {
                     .iter()
                     .map(|(_, command)| *command)
                     .collect::<Vec<_>>();
-                if !gp0_command_is_valid_br2_character_model_draw(&words) {
-                    continue;
-                }
-
-                let mut body_generations =
-                    commands[range].iter().filter_map(|(command_address, _)| {
-                        self.primitive_ram_writes
-                            .word_write_vblank(*command_address)
-                    });
-                let Some(first_body_generation) = body_generations.next() else {
-                    continue;
-                };
-                let (oldest_body_generation, newest_body_generation) = body_generations.fold(
-                    (first_body_generation, first_body_generation),
-                    |(oldest, newest), generation| (oldest.min(generation), newest.max(generation)),
-                );
-                if header_generation.abs_diff(oldest_body_generation)
-                    > BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK
-                    || header_generation.abs_diff(newest_body_generation)
-                        > BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK
-                {
-                    continue;
-                }
-
                 let Some(descriptor) = gp0_command_texture_descriptor(&words) else {
                     continue;
                 };
-                let Some(bounds) = gp0_command_draw_bounds(&words) else {
+                if !br2_character_model_texture(descriptor)
+                    && !br2_low_ram_character_model_descriptor(address, descriptor)
+                {
+                    continue;
+                }
+                self.native_otc_dma_recovery.last_chain_model_texture_draws = self
+                    .native_otc_dma_recovery
+                    .last_chain_model_texture_draws
+                    .saturating_add(1);
+                let bounds = match self
+                    .gpu_current_br2_character_model_draw_evaluation(address, &words)
+                {
+                    Ok(bounds) => bounds,
+                    Err(reason) => {
+                        if trace_chain_models {
+                            eprintln!(
+                                "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} header_generation={} scene_generation={:?} outcome=bounds_rejected reason={}",
+                                self.vblank_count,
+                                commands[range.start].0,
+                                descriptor.0,
+                                descriptor.1,
+                                header_generation,
+                                scene_generation,
+                                reason.as_str(),
+                            );
+                        }
+                        continue;
+                    }
+                };
+                if trace_chain_models {
+                    eprintln!(
+                        "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} header_generation={} scene_generation={:?} outcome=bounds_accepted bounds={}",
+                        self.vblank_count,
+                        commands[range.start].0,
+                        descriptor.0,
+                        descriptor.1,
+                        header_generation,
+                        scene_generation,
+                        bounds.json(),
+                    );
+                };
+                self.native_otc_dma_recovery.last_chain_model_bounded_draws = self
+                    .native_otc_dma_recovery
+                    .last_chain_model_bounded_draws
+                    .saturating_add(1);
+
+                let command_freshness = commands[range.clone()]
+                    .iter()
+                    .map(|(command_address, _)| {
+                        self.primitive_ram_writes
+                            .word_write_vblank(*command_address)
+                    })
+                    .collect::<Vec<_>>();
+                let Some(pose_generation) =
+                    br2_character_model_command_pose_generation(&words, &command_freshness)
+                else {
+                    if trace_chain_models {
+                        eprintln!(
+                            "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome=pose_rejected word_generations={:?}",
+                            self.vblank_count,
+                            commands[range.start].0,
+                            descriptor.0,
+                            descriptor.1,
+                            command_freshness,
+                        );
+                    }
                     continue;
                 };
-                draws_by_generation
-                    .entry(header_generation)
-                    .or_default()
-                    .entry(descriptor)
-                    .or_default()
-                    .push((address, bounds));
+                if header_generation.abs_diff(pose_generation)
+                    > BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK
+                {
+                    if trace_chain_models {
+                        eprintln!(
+                            "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome=header_pose_rejected header_generation={} pose_generation={} word_generations={:?}",
+                            self.vblank_count,
+                            commands[range.start].0,
+                            descriptor.0,
+                            descriptor.1,
+                            header_generation,
+                            pose_generation,
+                            command_freshness,
+                        );
+                    }
+                    continue;
+                }
+                if trace_chain_models {
+                    eprintln!(
+                        "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome=accepted header_generation={} pose_generation={}",
+                        self.vblank_count,
+                        commands[range.start].0,
+                        descriptor.0,
+                        descriptor.1,
+                        header_generation,
+                        pose_generation,
+                    );
+                }
+                self.native_otc_dma_recovery.last_chain_model_fresh_draws = self
+                    .native_otc_dma_recovery
+                    .last_chain_model_fresh_draws
+                    .saturating_add(1);
+                if self
+                    .native_otc_dma_recovery
+                    .last_chain_model_draw_samples
+                    .len()
+                    < BR2_CHARACTER_MODEL_PACKET_SAMPLE_LIMIT
+                {
+                    self.native_otc_dma_recovery
+                        .last_chain_model_draw_samples
+                        .push(Br2ChainModelDrawSample {
+                            packet_address: address,
+                            command_address: commands[range.start].0,
+                            generation: pose_generation,
+                            texture_page: descriptor.0,
+                            clut: descriptor.1,
+                            bounds,
+                        });
+                }
+                observed_draws.push((pose_generation, descriptor, address, bounds));
             }
         }
 
-        draws_by_generation
+        self.native_otc_dma_recovery.last_chain_model_unique_packets = observed_draws
+            .iter()
+            .map(|(_, _, address, _)| *address)
+            .collect::<HashSet<_>>()
+            .len()
+            .min(u32::MAX as usize)
+            as u32;
+        let mut generations = observed_draws
+            .iter()
+            .map(|(generation, _, _, _)| *generation)
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        generations.dedup();
+        generations
             .into_iter()
-            .filter_map(|(generation, draws_by_texture)| {
-                let rejected = br2_character_model_rejected_draw_addresses(&draws_by_texture);
+            .filter_map(|generation| {
+                let generation_start =
+                    generation.saturating_sub(BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK);
+                let mut draws_by_texture = HashMap::<(u16, u16), Vec<(u32, Gp0DrawBounds)>>::new();
+                for (draw_generation, descriptor, address, bounds) in &observed_draws {
+                    if (generation_start..=generation).contains(draw_generation) {
+                        draws_by_texture
+                            .entry(*descriptor)
+                            .or_default()
+                            .push((*address, *bounds));
+                    }
+                }
+                let rejected = br2_character_model_rejected_draw_addresses(&draws_by_texture, true);
                 let accepted = draws_by_texture
                     .into_values()
                     .flatten()
@@ -7779,13 +8259,13 @@ impl Bus {
                     .iter()
                     .map(|(address, _)| *address)
                     .collect::<HashSet<_>>();
-                let bounds = accepted
-                    .iter()
-                    .map(|(_, bounds)| *bounds)
-                    .reduce(gp0_draw_bounds_union);
-                (packets.len() >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS
-                    && bounds.is_some_and(br2_character_model_generation_bounds_are_coherent))
-                .then_some((generation, packets.len()))
+                self.native_otc_dma_recovery
+                    .last_chain_model_peak_generation_packets = self
+                    .native_otc_dma_recovery
+                    .last_chain_model_peak_generation_packets
+                    .max(packets.len().min(u32::MAX as usize) as u32);
+                (packets.len() >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+                    .then_some((generation, packets.len()))
             })
             .max_by_key(|(generation, _)| *generation)
             .map_or((None, 0), |(generation, packets)| {
@@ -7793,12 +8273,11 @@ impl Bus {
             })
     }
 
-    fn native_otc_dma_recovery_spatially_incoherent_model_draws(
+    fn native_otc_dma_recovery_invalid_model_draws(
         &self,
         chain_nodes: &HashSet<u32>,
     ) -> HashSet<u32> {
-        let mut draws_by_generation =
-            HashMap::<u64, HashMap<(u16, u16), Vec<(u32, Gp0DrawBounds)>>>::new();
+        let mut rejected = HashSet::new();
 
         for packet_address in chain_nodes.iter().copied() {
             let Some(header) = self.read_ram_u32_physical(packet_address) else {
@@ -7808,12 +8287,6 @@ impl Bus {
             if word_count == 0 || word_count > PRIMITIVE_PACKET_MAX_WORDS {
                 continue;
             }
-            let Some(generation) = self
-                .primitive_ram_writes
-                .header_write_vblank(packet_address)
-            else {
-                continue;
-            };
             let commands = (0..word_count)
                 .filter_map(|index| {
                     let address = packet_address + 4 + index * 4;
@@ -7841,23 +8314,81 @@ impl Bus {
                 {
                     continue;
                 }
-                let Some(bounds) = gp0_command_draw_bounds(&words) else {
+                if self
+                    .gpu_current_br2_character_model_draw_bounds(packet_address, &words)
+                    .is_none()
+                    && !gp0_command_is_degenerate_br2_character_model_draw_for_packet(
+                        packet_address,
+                        &words,
+                    )
+                {
+                    rejected.insert(*range_start_address & 0x00ff_fffc);
+                }
+            }
+        }
+
+        rejected
+    }
+
+    fn native_otc_dma_recovery_incomplete_model_overlay_draws(
+        &self,
+        chain_nodes: &HashSet<u32>,
+    ) -> HashSet<u32> {
+        let mut draws_by_texture = HashMap::<(u16, u16), Vec<(u32, Gp0DrawBounds)>>::new();
+
+        for packet_address in chain_nodes.iter().copied() {
+            let Some(header) = self.read_ram_u32_physical(packet_address) else {
+                continue;
+            };
+            let word_count = header >> 24;
+            if word_count == 0 || word_count > PRIMITIVE_PACKET_MAX_WORDS {
+                continue;
+            }
+            let commands = (0..word_count)
+                .filter_map(|index| {
+                    let address = packet_address + 4 + index * 4;
+                    self.read_ram_u32_physical(address)
+                        .map(|command| (address, command))
+                })
+                .collect::<Vec<_>>();
+            if commands.len() != word_count as usize {
+                continue;
+            }
+
+            for range in gpu_linked_list_command_ranges(&commands) {
+                let Some((range_start_address, _)) = commands.get(range.start) else {
                     continue;
                 };
-                draws_by_generation
-                    .entry(generation)
-                    .or_default()
+                let words = commands[range]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                let Some(descriptor) = gp0_command_texture_descriptor(&words) else {
+                    continue;
+                };
+                if !br2_character_model_texture(descriptor)
+                    && !br2_low_ram_character_model_descriptor(packet_address, descriptor)
+                {
+                    continue;
+                }
+                let Some(bounds) =
+                    self.gpu_current_br2_character_model_draw_bounds(packet_address, &words)
+                else {
+                    continue;
+                };
+                draws_by_texture
                     .entry(descriptor)
                     .or_default()
                     .push((*range_start_address & 0x00ff_fffc, bounds));
             }
         }
 
-        draws_by_generation
-            .into_values()
-            .flat_map(|draws_by_texture| {
-                br2_character_model_rejected_draw_addresses(&draws_by_texture)
+        draws_by_texture
+            .into_iter()
+            .filter(|(descriptor, draws)| {
+                !br2_character_model_draw_group_is_annular_effect(*descriptor, draws)
             })
+            .flat_map(|(_, draws)| draws.into_iter().map(|(address, _)| address))
             .collect()
     }
 
@@ -8402,7 +8933,8 @@ impl Bus {
                         })
                         .collect::<Vec<_>>();
                     let coherent_model_texture =
-                        br2_character_model_command_body_freshness_is_coherent(&command_freshness);
+                        br2_character_model_command_pose_generation(command, &command_freshness)
+                            .is_some();
                     let valid_model_texture = coherent_model_texture
                         && gp0_command_is_valid_br2_character_model_draw_for_packet(
                             address, command,
@@ -11517,45 +12049,51 @@ impl ZnBoardInputPortReadStats {
             self.last_active_value = Some(event.value);
         }
 
-        self.record_button(event.observed_input.start, &mut |stats| {
-            stats.start_active_reads = stats.start_active_reads.saturating_add(1);
-            stats.last_start_active_vblank = Some(event.vblank);
-            stats.last_start_active_value = Some(event.value);
-        });
-        self.record_button(event.observed_input.coin, &mut |stats| {
-            stats.coin_active_reads = stats.coin_active_reads.saturating_add(1);
-            stats.last_coin_active_vblank = Some(event.vblank);
-            stats.last_coin_active_value = Some(event.value);
-        });
+        self.record_button(
+            event.observed_input.start || event.observed_input.p2_start,
+            &mut |stats| {
+                stats.start_active_reads = stats.start_active_reads.saturating_add(1);
+                stats.last_start_active_vblank = Some(event.vblank);
+                stats.last_start_active_value = Some(event.value);
+            },
+        );
+        self.record_button(
+            event.observed_input.coin || event.observed_input.p2_coin,
+            &mut |stats| {
+                stats.coin_active_reads = stats.coin_active_reads.saturating_add(1);
+                stats.last_coin_active_vblank = Some(event.vblank);
+                stats.last_coin_active_value = Some(event.value);
+            },
+        );
         self.record_button(event.observed_input.service, &mut |stats| {
             stats.service_active_reads = stats.service_active_reads.saturating_add(1);
             stats.last_service_active_vblank = Some(event.vblank);
             stats.last_service_active_value = Some(event.value);
         });
-        self.up_active_reads = self
-            .up_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.up));
-        self.down_active_reads = self
-            .down_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.down));
-        self.left_active_reads = self
-            .left_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.left));
-        self.right_active_reads = self
-            .right_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.right));
-        self.punch_active_reads = self
-            .punch_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.punch));
-        self.kick_active_reads = self
-            .kick_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.kick));
-        self.beast_active_reads = self
-            .beast_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.beast));
-        self.guard_active_reads = self
-            .guard_active_reads
-            .saturating_add(u64_from_bool(event.observed_input.guard));
+        self.up_active_reads = self.up_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.up || event.observed_input.p2_up,
+        ));
+        self.down_active_reads = self.down_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.down || event.observed_input.p2_down,
+        ));
+        self.left_active_reads = self.left_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.left || event.observed_input.p2_left,
+        ));
+        self.right_active_reads = self.right_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.right || event.observed_input.p2_right,
+        ));
+        self.punch_active_reads = self.punch_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.punch || event.observed_input.p2_punch,
+        ));
+        self.kick_active_reads = self.kick_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.kick || event.observed_input.p2_kick,
+        ));
+        self.beast_active_reads = self.beast_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.beast || event.observed_input.p2_beast,
+        ));
+        self.guard_active_reads = self.guard_active_reads.saturating_add(u64_from_bool(
+            event.observed_input.guard || event.observed_input.p2_guard,
+        ));
     }
 
     fn record_button<F>(&mut self, active: bool, update: &mut F)
@@ -11653,6 +12191,7 @@ fn zn_input_port_index(address: u32) -> Option<usize> {
 fn zn_input_port_label(address: u32) -> &'static str {
     match physical_address(address) & !0x03 {
         0x1fa0_0000 => "p1",
+        0x1fa0_0100 => "p2",
         0x1fa0_0200 => "service",
         0x1fa0_0300 => "system",
         0x1fa1_0000 => "p3",
@@ -11673,6 +12212,16 @@ fn action_buttons_have_any_input(buttons: ActionButtons) -> bool {
         || buttons.kick
         || buttons.beast
         || buttons.guard
+        || buttons.p2_start
+        || buttons.p2_coin
+        || buttons.p2_up
+        || buttons.p2_down
+        || buttons.p2_left
+        || buttons.p2_right
+        || buttons.p2_punch
+        || buttons.p2_kick
+        || buttons.p2_beast
+        || buttons.p2_guard
 }
 
 fn observed_zn_input_buttons(address: u32, value: u32, requested: ActionButtons) -> ActionButtons {
@@ -11690,18 +12239,31 @@ fn observed_zn_input_buttons(address: u32, value: u32, requested: ActionButtons)
             start: requested.start && active_low(0x80),
             ..ActionButtons::default()
         },
+        0x1fa0_0100 => ActionButtons {
+            p2_up: requested.p2_up && active_low(0x01),
+            p2_down: requested.p2_down && active_low(0x02),
+            p2_left: requested.p2_left && active_low(0x04),
+            p2_right: requested.p2_right && active_low(0x08),
+            p2_punch: requested.p2_punch && active_low(0x10),
+            p2_kick: requested.p2_kick && active_low(0x20),
+            p2_beast: requested.p2_beast && active_low(0x40),
+            ..ActionButtons::default()
+        },
         0x1fa0_0200 => ActionButtons {
             service: requested.service && (active_low(0x01) || active_low(0x02)),
             coin: requested.coin && (active_low(0x01) || active_low(0x02) || active_low(0x10)),
             ..ActionButtons::default()
         },
         0x1fa0_0300 => ActionButtons {
-            start: requested.start && (active_low(0x01) || active_low(0x02)),
-            coin: requested.coin && (active_low(0x10) || active_low(0x20)),
+            start: requested.start && active_low(0x01),
+            p2_start: requested.p2_start && active_low(0x02),
+            coin: requested.coin && active_low(0x10),
+            p2_coin: requested.p2_coin && active_low(0x20),
             ..ActionButtons::default()
         },
         0x1fa1_0000 => ActionButtons {
             guard: requested.guard && active_low(0x10),
+            p2_guard: requested.p2_guard && active_low(0x20),
             ..ActionButtons::default()
         },
         0x1fa2_0000 => ActionButtons {
@@ -11967,10 +12529,14 @@ enum Gp0ReplayDrawRejectReason {
     LinkedListArtifact,
     TitleOverlayAtlas,
     Br2StageTransitionAtlas,
+    ModelPrefilter,
+    KnownRecoveryAtlas,
+    UnsafeBr2785a,
+    CorruptBr2CharacterModel,
 }
 
 impl Gp0ReplayDrawRejectReason {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 13] = [
         Self::NoBounds,
         Self::NonPlayfieldBounds,
         Self::UnsafeBounds,
@@ -11980,6 +12546,10 @@ impl Gp0ReplayDrawRejectReason {
         Self::LinkedListArtifact,
         Self::TitleOverlayAtlas,
         Self::Br2StageTransitionAtlas,
+        Self::ModelPrefilter,
+        Self::KnownRecoveryAtlas,
+        Self::UnsafeBr2785a,
+        Self::CorruptBr2CharacterModel,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -11998,6 +12568,10 @@ impl Gp0ReplayDrawRejectReason {
             Self::LinkedListArtifact => "linked_list_artifact",
             Self::TitleOverlayAtlas => "title_overlay_atlas",
             Self::Br2StageTransitionAtlas => "br2_stage_transition_atlas",
+            Self::ModelPrefilter => "model_prefilter",
+            Self::KnownRecoveryAtlas => "known_recovery_atlas",
+            Self::UnsafeBr2785a => "unsafe_br2_785a",
+            Self::CorruptBr2CharacterModel => "corrupt_br2_character_model",
         }
     }
 }
@@ -13242,6 +13816,13 @@ fn br2_character_model_texture((texture_page, clut): (u16, u16)) -> bool {
         && BR2_CHARACTER_MODEL_CLUT_ROWS.contains(&gp0_clut_row(clut))
 }
 
+fn br2_beast_character_model_candidate_descriptor((texture_page, clut): (u16, u16)) -> bool {
+    matches!(
+        (texture_page & !0x0200, clut & 0x003f),
+        (0x000e, 0x001e) | (0x001b, 0x001b)
+    ) && (480..=490).contains(&gp0_clut_row(clut))
+}
+
 fn br2_reused_texture_page_matches(texture_page: u16, expected_page: u16) -> bool {
     texture_page & !0x0200 == expected_page
 }
@@ -13254,6 +13835,7 @@ fn gp0_command_is_br2_character_model_for_packet(packet_address: u32, words: &[u
         || br2_low_ram_character_model_texture(packet_address, descriptor, words)
 }
 
+#[cfg(test)]
 fn gp0_command_is_valid_br2_character_model_draw(words: &[u32]) -> bool {
     gp0_command_is_valid_br2_character_model_draw_for_packet(0, words)
 }
@@ -13280,29 +13862,127 @@ fn gp0_command_is_valid_br2_character_model_draw_for_packet(
     })
 }
 
-fn br2_character_model_command_body_freshness_is_coherent(word_freshness: &[Option<u64>]) -> bool {
-    let Some(payload_freshness) = word_freshness.get(1..) else {
-        return false;
-    };
-    if payload_freshness.is_empty() || word_freshness[0].is_none() {
-        return false;
+#[cfg(test)]
+fn gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+    packet_address: u32,
+    words: &[u32],
+    drawing_offset: (i32, i32),
+) -> Option<Gp0DrawBounds> {
+    gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
+        packet_address,
+        words,
+        drawing_offset,
+    )
+    .ok()
+}
+
+fn gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
+    packet_address: u32,
+    words: &[u32],
+    drawing_offset: (i32, i32),
+) -> Result<Gp0DrawBounds, Gp0ReplayDrawRejectReason> {
+    let descriptor =
+        gp0_command_texture_descriptor(words).ok_or(Gp0ReplayDrawRejectReason::ModelPrefilter)?;
+    if !br2_character_model_texture(descriptor)
+        && !br2_low_ram_character_model_descriptor(packet_address, descriptor)
+    {
+        return Err(Gp0ReplayDrawRejectReason::ModelPrefilter);
+    }
+    if gp0_command_sequence_has_known_recovery_atlas_corruption(words) {
+        return Err(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas);
+    }
+    if gp0_command_is_linked_list_dma_blocking_artifact(words) {
+        return Err(Gp0ReplayDrawRejectReason::LinkedListArtifact);
+    }
+    if gp0_command_is_unsafe_br2_785a_recovery_draw(words, drawing_offset) {
+        return Err(Gp0ReplayDrawRejectReason::UnsafeBr2785a);
     }
 
+    let high_ram_current_model = (BR2_CHARACTER_MODEL_PACKET_START..BR2_CHARACTER_MODEL_PACKET_END)
+        .contains(&(packet_address & 0x00ff_fffc));
+    if !high_ram_current_model
+        && gp0_command_is_corrupt_br2_character_model_draw_for_packet(packet_address, words)
+    {
+        return Err(Gp0ReplayDrawRejectReason::CorruptBr2CharacterModel);
+    }
+    if words
+        .iter()
+        .skip(1)
+        .any(|word| looks_like_mapped_ram_pointer_word(*word))
+        && !gp0_br2_character_model_pointer_contamination_is_uv_padding_only_for_packet(
+            packet_address,
+            words,
+        )
+    {
+        return Err(Gp0ReplayDrawRejectReason::PrimitivePointerContamination);
+    }
+
+    let bounds = gp0_command_draw_bounds_with_offset(words, drawing_offset)
+        .ok_or(Gp0ReplayDrawRejectReason::NoBounds)?;
+    if bounds.width() <= 1
+        || bounds.height() <= 1
+        || bounds.width() > BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_WIDTH
+        || bounds.height() > BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_HEIGHT
+        || bounds.zero_vertices > 1
+    {
+        return Err(Gp0ReplayDrawRejectReason::UnsafeBounds);
+    }
+    if !bounds.has_visible_x
+        || bounds.min_x > 639
+        || bounds.max_x < -64
+        || bounds.min_y > 423
+        || bounds.max_y < 64
+    {
+        return Err(Gp0ReplayDrawRejectReason::NonPlayfieldBounds);
+    }
+    Ok(bounds)
+}
+
+fn gp0_command_vertex_word_indices(words: &[u32]) -> Option<&'static [usize]> {
+    let opcode = (*words.first()? >> 24) as u8;
+    let indices: &'static [usize] = match opcode {
+        0x20..=0x23 => &[1, 2, 3],
+        0x24..=0x27 => &[1, 3, 5],
+        0x28..=0x2b => &[1, 2, 3, 4],
+        0x2c..=0x2f => &[1, 3, 5, 7],
+        0x30..=0x33 => &[1, 3, 5],
+        0x34..=0x37 => &[1, 4, 7],
+        0x38..=0x3b => &[1, 3, 5, 7],
+        0x3c..=0x3f => &[1, 4, 7, 10],
+        0x40..=0x47 => &[1, 2],
+        0x50..=0x57 => &[1, 3],
+        0x60..=0x7f => &[1],
+        _ => return None,
+    };
+    indices
+        .iter()
+        .all(|index| *index < words.len())
+        .then_some(indices)
+}
+
+fn br2_character_model_command_pose_generation(
+    words: &[u32],
+    word_freshness: &[Option<u64>],
+) -> Option<u64> {
+    if words.len() != word_freshness.len() {
+        return None;
+    }
+
+    let vertex_indices = gp0_command_vertex_word_indices(words)?;
     let mut oldest = u64::MAX;
     let mut newest = 0u64;
-    for freshness in payload_freshness {
-        let Some(freshness) = freshness else {
-            return false;
-        };
-        oldest = oldest.min(*freshness);
-        newest = newest.max(*freshness);
+    for index in vertex_indices {
+        let freshness = word_freshness.get(*index).copied().flatten()?;
+        oldest = oldest.min(freshness);
+        newest = newest.max(freshness);
     }
 
-    // BR2 sometimes refreshes only the opcode while intentionally reusing a
-    // complete older pose. That is safe; a partially overwritten payload is
-    // not, because it combines vertices and texture descriptors from
-    // different model generations.
-    newest.saturating_sub(oldest) <= BR2_CHARACTER_MODEL_RECOVERY_BODY_FRESHNESS_SLACK
+    // BR2 updates polygon vertices every pose while intentionally reusing the
+    // opcode, CLUT, texture page, and UV words for many frames. Only the vertex
+    // coordinates define pose freshness; mixing vertex generations still
+    // indicates a partially overwritten model packet.
+    (newest.saturating_sub(oldest) <= BR2_CHARACTER_MODEL_RECOVERY_BODY_FRESHNESS_SLACK)
+        .then_some(newest)
 }
 
 fn gp0_command_is_degenerate_br2_character_model_draw_for_packet(
@@ -13446,28 +14126,90 @@ fn br2_character_model_generation_bounds_are_coherent(bounds: Gp0DrawBounds) -> 
 
 fn br2_character_model_rejected_draw_addresses(
     draws_by_texture: &HashMap<(u16, u16), Vec<(u32, Gp0DrawBounds)>>,
+    reject_annular_effects: bool,
 ) -> HashSet<u32> {
     let mut rejected = HashSet::new();
     for (descriptor, draws) in draws_by_texture {
-        let generation_bounds = draws
-            .iter()
-            .map(|(_, bounds)| *bounds)
-            .reduce(gp0_draw_bounds_union);
-        let incoherent_bounds = generation_bounds
-            .is_some_and(|bounds| !br2_character_model_generation_bounds_are_coherent(bounds));
-        // Low-RAM fighter descriptors are shared by both players and by several
-        // independently positioned limbs. Their combined bounds can exceed a
-        // single-model envelope even when every primitive is valid. Keep the
-        // aggregate guard for canonical model pages, while individual low-RAM
-        // draws remain protected by the per-command bounds/outlier checks.
-        let reject_incoherent_group = br2_character_model_texture(*descriptor) && incoherent_bounds;
-        if reject_incoherent_group
-            || br2_character_model_draw_group_is_annular_effect(*descriptor, draws)
-        {
-            rejected.extend(draws.iter().map(|(address, _)| *address));
+        if !br2_character_model_texture(*descriptor) {
+            continue;
+        }
+
+        // BR2 allocates each fighter's packet run separately, but both fighters
+        // reuse the same texture descriptor and can overlap during attacks.
+        // Split allocation runs first so screen-space overlap cannot merge two
+        // valid models into one oversized component.
+        for address_component in br2_character_model_address_components(draws) {
+            if br2_character_model_draw_group_is_annular_effect(*descriptor, &address_component) {
+                if reject_annular_effects {
+                    rejected.extend(address_component.iter().map(|(address, _)| *address));
+                }
+                continue;
+            }
+            for spatial_component in br2_character_model_spatial_components(&address_component) {
+                let bounds = spatial_component
+                    .iter()
+                    .map(|(_, bounds)| *bounds)
+                    .reduce(gp0_draw_bounds_union);
+                if bounds.is_some_and(|bounds| {
+                    !br2_character_model_generation_bounds_are_coherent(bounds)
+                }) {
+                    rejected.extend(spatial_component.into_iter().map(|(address, _)| address));
+                }
+            }
         }
     }
     rejected
+}
+
+fn br2_character_model_address_components(
+    draws: &[(u32, Gp0DrawBounds)],
+) -> Vec<Vec<(u32, Gp0DrawBounds)>> {
+    let mut sorted = draws.to_vec();
+    sorted.sort_unstable_by_key(|(address, _)| *address);
+
+    let mut components = Vec::<Vec<(u32, Gp0DrawBounds)>>::new();
+    let mut previous_address = None::<u32>;
+    for draw in sorted {
+        let starts_new_component = previous_address.is_some_and(|previous| {
+            draw.0.saturating_sub(previous) > BR2_CHARACTER_MODEL_RECOVERY_ADDRESS_COMPONENT_GAP
+        });
+        if starts_new_component || components.is_empty() {
+            components.push(Vec::new());
+        }
+        previous_address = Some(draw.0);
+        components
+            .last_mut()
+            .expect("character model address component must exist")
+            .push(draw);
+    }
+    components
+}
+
+fn br2_character_model_spatial_components(
+    draws: &[(u32, Gp0DrawBounds)],
+) -> Vec<Vec<(u32, Gp0DrawBounds)>> {
+    let mut sorted = draws.to_vec();
+    sorted.sort_unstable_by_key(|(address, bounds)| (bounds.min_x, bounds.max_x, *address));
+
+    let mut components = Vec::<Vec<(u32, Gp0DrawBounds)>>::new();
+    let mut component_max_x = i32::MIN;
+    for draw in sorted {
+        let starts_new_component = components.last().is_some()
+            && draw.1.min_x
+                > component_max_x.saturating_add(BR2_CHARACTER_MODEL_RECOVERY_COMPONENT_GAP);
+        if starts_new_component {
+            components.push(Vec::new());
+            component_max_x = i32::MIN;
+        } else if components.is_empty() {
+            components.push(Vec::new());
+        }
+        component_max_x = component_max_x.max(draw.1.max_x);
+        components
+            .last_mut()
+            .expect("character model component must exist")
+            .push(draw);
+    }
+    components
 }
 
 fn br2_character_model_draw_group_is_annular_effect(
@@ -13912,7 +14654,9 @@ struct ZnBoard {
     recent_coin_register_write_count: usize,
     recent_coin_register_write_cursor: usize,
     coin_input_latched: bool,
+    p2_coin_input_latched: bool,
     coin_insert_edges: u64,
+    p2_coin_insert_edges: u64,
     coin_counter_0: bool,
     coin_counter_1: bool,
     coin_counter_0_edges: u64,
@@ -13960,15 +14704,27 @@ struct ZnBoard {
     p1_punch_active_reads: Cell<u64>,
     p1_kick_active_reads: Cell<u64>,
     p1_beast_active_reads: Cell<u64>,
+    p2_input_reads: Cell<u64>,
+    p2_up_active_reads: Cell<u64>,
+    p2_down_active_reads: Cell<u64>,
+    p2_left_active_reads: Cell<u64>,
+    p2_right_active_reads: Cell<u64>,
+    p2_punch_active_reads: Cell<u64>,
+    p2_kick_active_reads: Cell<u64>,
+    p2_beast_active_reads: Cell<u64>,
     p3_input_reads: Cell<u64>,
     p3_guard_active_reads: Cell<u64>,
+    p2_guard_active_reads: Cell<u64>,
     system_input_reads: Cell<u64>,
     system_coin_active_reads: Cell<u64>,
     system_service_active_reads: Cell<u64>,
     system_start_active_reads: Cell<u64>,
+    system_p2_coin_active_reads: Cell<u64>,
+    system_p2_start_active_reads: Cell<u64>,
     coin_register_reads: Cell<u64>,
     coin_register_active_reads: Cell<u64>,
     last_p1_input: Cell<u32>,
+    last_p2_input: Cell<u32>,
     last_p3_input: Cell<u32>,
     last_system_input: Cell<u32>,
     last_coin_register: Cell<u32>,
@@ -14012,7 +14768,9 @@ impl ZnBoard {
             recent_coin_register_write_count: 0,
             recent_coin_register_write_cursor: 0,
             coin_input_latched: false,
+            p2_coin_input_latched: false,
             coin_insert_edges: 0,
+            p2_coin_insert_edges: 0,
             coin_counter_0: false,
             coin_counter_1: false,
             coin_counter_0_edges: 0,
@@ -14060,15 +14818,27 @@ impl ZnBoard {
             p1_punch_active_reads: Cell::new(0),
             p1_kick_active_reads: Cell::new(0),
             p1_beast_active_reads: Cell::new(0),
+            p2_input_reads: Cell::new(0),
+            p2_up_active_reads: Cell::new(0),
+            p2_down_active_reads: Cell::new(0),
+            p2_left_active_reads: Cell::new(0),
+            p2_right_active_reads: Cell::new(0),
+            p2_punch_active_reads: Cell::new(0),
+            p2_kick_active_reads: Cell::new(0),
+            p2_beast_active_reads: Cell::new(0),
             p3_input_reads: Cell::new(0),
             p3_guard_active_reads: Cell::new(0),
+            p2_guard_active_reads: Cell::new(0),
             system_input_reads: Cell::new(0),
             system_coin_active_reads: Cell::new(0),
             system_service_active_reads: Cell::new(0),
             system_start_active_reads: Cell::new(0),
+            system_p2_coin_active_reads: Cell::new(0),
+            system_p2_start_active_reads: Cell::new(0),
             coin_register_reads: Cell::new(0),
             coin_register_active_reads: Cell::new(0),
             last_p1_input: Cell::new(0xffff_ffff),
+            last_p2_input: Cell::new(0xffff_ffff),
             last_p3_input: Cell::new(0xffff_ffff),
             last_system_input: Cell::new(0xffff_ffff),
             last_coin_register: Cell::new(0),
@@ -14109,7 +14879,7 @@ impl ZnBoard {
         let physical = physical_address(address);
         match physical {
             0x1fa0_0000 => self.read_player1_input(),
-            0x1fa0_0100 => mirrored_input_port(active_low_player2_input()),
+            0x1fa0_0100 => self.read_player2_input(),
             0x1fa0_0200 => self.read_service_input(),
             0x1fa0_0300 => self.read_system_input(),
             0x1fa1_0000 => self.read_player3_input(),
@@ -14140,7 +14910,7 @@ impl ZnBoard {
                 self.input,
                 self.legacy_input_compat_active(),
             )),
-            0x1fa0_0100 => mirrored_input_port(active_low_player2_input()),
+            0x1fa0_0100 => mirrored_input_port(active_low_player2_input(self.input)),
             0x1fa0_0200 => mirrored_input_port(active_low_service_input(
                 self.input,
                 self.coin_input_mapping,
@@ -14465,7 +15235,7 @@ impl ZnBoard {
         }
         if input.coin && !self.coin_input_latched {
             self.coin_insert_edges = self.coin_insert_edges.saturating_add(1);
-            self.record_input_coin_counter_pulse();
+            self.record_input_coin_counter_pulse(0);
             if self.legacy_input_compat_active() {
                 self.legacy_coin_read_latch
                     .set(self.legacy_coin_read_latch.get() | 0x01);
@@ -14475,6 +15245,10 @@ impl ZnBoard {
                     self.legacy_system_coin_latch_edges.saturating_add(1);
             }
         }
+        if input.p2_coin && !self.p2_coin_input_latched {
+            self.p2_coin_insert_edges = self.p2_coin_insert_edges.saturating_add(1);
+            self.record_input_coin_counter_pulse(1);
+        }
         if input.start && !self.input.start && self.legacy_input_compat_active() {
             self.legacy_system_start_latch_reads
                 .set(LEGACY_ZINC_SYSTEM_EDGE_LATCH_READS);
@@ -14482,14 +15256,15 @@ impl ZnBoard {
                 self.legacy_system_start_latch_edges.saturating_add(1);
         }
         self.coin_input_latched = input.coin;
+        self.p2_coin_input_latched = input.p2_coin;
         self.input = input;
     }
 
-    fn record_input_coin_counter_pulse(&mut self) {
-        if !self.coin_lockout_0 {
+    fn record_input_coin_counter_pulse(&mut self, player: usize) {
+        if player == 0 && !self.coin_lockout_0 {
             self.coin_counter_0_edges = self.coin_counter_0_edges.saturating_add(1);
         }
-        if !self.coin_lockout_1 {
+        if player == 1 && !self.coin_lockout_1 {
             self.coin_counter_1_edges = self.coin_counter_1_edges.saturating_add(1);
         }
     }
@@ -14505,16 +15280,28 @@ impl ZnBoard {
             p1_punch_active_reads: self.p1_punch_active_reads.get(),
             p1_kick_active_reads: self.p1_kick_active_reads.get(),
             p1_beast_active_reads: self.p1_beast_active_reads.get(),
+            p2_input_reads: self.p2_input_reads.get(),
+            p2_up_active_reads: self.p2_up_active_reads.get(),
+            p2_down_active_reads: self.p2_down_active_reads.get(),
+            p2_left_active_reads: self.p2_left_active_reads.get(),
+            p2_right_active_reads: self.p2_right_active_reads.get(),
+            p2_punch_active_reads: self.p2_punch_active_reads.get(),
+            p2_kick_active_reads: self.p2_kick_active_reads.get(),
+            p2_beast_active_reads: self.p2_beast_active_reads.get(),
             p3_input_reads: self.p3_input_reads.get(),
             p3_guard_active_reads: self.p3_guard_active_reads.get(),
+            p2_guard_active_reads: self.p2_guard_active_reads.get(),
             system_input_reads: self.system_input_reads.get(),
             system_coin_active_reads: self.system_coin_active_reads.get(),
             system_service_active_reads: self.system_service_active_reads.get(),
             system_start_active_reads: self.system_start_active_reads.get(),
+            system_p2_coin_active_reads: self.system_p2_coin_active_reads.get(),
+            system_p2_start_active_reads: self.system_p2_start_active_reads.get(),
             coin_register_reads: self.coin_register_reads.get(),
             coin_register_active_reads: self.coin_register_active_reads.get(),
             coin_register_writes: self.coin_register_writes,
             coin_insert_edges: self.coin_insert_edges,
+            p2_coin_insert_edges: self.p2_coin_insert_edges,
             coin_counter_0_edges: self.coin_counter_0_edges,
             coin_counter_1_edges: self.coin_counter_1_edges,
             legacy_system_coin_latch_edges: self.legacy_system_coin_latch_edges,
@@ -14575,12 +15362,29 @@ impl ZnBoard {
         increment_if(&self.p1_beast_active_reads, input.beast);
     }
 
+    fn read_player2_input(&self) -> u32 {
+        let value = active_low_player2_input(self.input);
+        self.arm_native_input_projection_if_polled(self.input);
+        self.p2_input_reads
+            .set(self.p2_input_reads.get().saturating_add(1));
+        increment_if(&self.p2_up_active_reads, self.input.p2_up);
+        increment_if(&self.p2_down_active_reads, self.input.p2_down);
+        increment_if(&self.p2_left_active_reads, self.input.p2_left);
+        increment_if(&self.p2_right_active_reads, self.input.p2_right);
+        increment_if(&self.p2_punch_active_reads, self.input.p2_punch);
+        increment_if(&self.p2_kick_active_reads, self.input.p2_kick);
+        increment_if(&self.p2_beast_active_reads, self.input.p2_beast);
+        self.last_p2_input.set(value);
+        mirrored_input_port(value)
+    }
+
     fn read_player3_input(&self) -> u32 {
         let value = active_low_player3_input(self.input);
         self.arm_native_input_projection_if_polled(self.input);
         self.p3_input_reads
             .set(self.p3_input_reads.get().saturating_add(1));
         increment_if(&self.p3_guard_active_reads, self.input.guard);
+        increment_if(&self.p2_guard_active_reads, self.input.p2_guard);
         self.last_p3_input.set(value);
         mirrored_input_port(value)
     }
@@ -14615,6 +15419,14 @@ impl ZnBoard {
         if input.start {
             self.system_start_active_reads
                 .set(self.system_start_active_reads.get().saturating_add(1));
+        }
+        if input.p2_coin {
+            self.system_p2_coin_active_reads
+                .set(self.system_p2_coin_active_reads.get().saturating_add(1));
+        }
+        if input.p2_start {
+            self.system_p2_start_active_reads
+                .set(self.system_p2_start_active_reads.get().saturating_add(1));
         }
         self.last_system_input.set(value);
         self.decay_legacy_coin_latch_after_read();
@@ -14809,6 +15621,16 @@ fn br2_native_default_input_projection_mask(coin_bit: u32) -> u32 {
         | BR2_NATIVE_P1_KICK_INPUT_BIT
         | BR2_NATIVE_P1_BEAST_INPUT_BIT
         | BR2_NATIVE_P1_GUARD_INPUT_BIT
+        | BR2_NATIVE_P2_START_INPUT_BIT
+        | BR2_NATIVE_P2_CREDIT_INPUT_BIT
+        | BR2_NATIVE_P2_UP_INPUT_BIT
+        | BR2_NATIVE_P2_DOWN_INPUT_BIT
+        | BR2_NATIVE_P2_LEFT_INPUT_BIT
+        | BR2_NATIVE_P2_RIGHT_INPUT_BIT
+        | BR2_NATIVE_P2_PUNCH_INPUT_BIT
+        | BR2_NATIVE_P2_KICK_INPUT_BIT
+        | BR2_NATIVE_P2_BEAST_INPUT_BIT
+        | BR2_NATIVE_P2_GUARD_INPUT_BIT
 }
 
 fn parse_native_credit_projection_input_mask(value: &str, coin_bit: u32) -> Option<u32> {
@@ -14856,6 +15678,40 @@ fn parse_native_credit_projection_input_token(token: &str, coin_bit: u32) -> Opt
         "kick" => Some(BR2_NATIVE_P1_KICK_INPUT_BIT),
         "beast" => Some(BR2_NATIVE_P1_BEAST_INPUT_BIT),
         "guard" => Some(BR2_NATIVE_P1_GUARD_INPUT_BIT),
+        "p2start" | "start2" => Some(BR2_NATIVE_P2_START_INPUT_BIT),
+        "p2coin" | "coin2" | "p2credit" => Some(BR2_NATIVE_P2_CREDIT_INPUT_BIT),
+        "p2up" => Some(BR2_NATIVE_P2_UP_INPUT_BIT),
+        "p2down" => Some(BR2_NATIVE_P2_DOWN_INPUT_BIT),
+        "p2left" => Some(BR2_NATIVE_P2_LEFT_INPUT_BIT),
+        "p2right" => Some(BR2_NATIVE_P2_RIGHT_INPUT_BIT),
+        "p2direction" | "p2directions" | "p2move" | "p2movement" => Some(
+            BR2_NATIVE_P2_UP_INPUT_BIT
+                | BR2_NATIVE_P2_DOWN_INPUT_BIT
+                | BR2_NATIVE_P2_LEFT_INPUT_BIT
+                | BR2_NATIVE_P2_RIGHT_INPUT_BIT,
+        ),
+        "p2punch" => Some(BR2_NATIVE_P2_PUNCH_INPUT_BIT),
+        "p2kick" => Some(BR2_NATIVE_P2_KICK_INPUT_BIT),
+        "p2beast" => Some(BR2_NATIVE_P2_BEAST_INPUT_BIT),
+        "p2guard" => Some(BR2_NATIVE_P2_GUARD_INPUT_BIT),
+        "p2attack" | "p2attacks" | "p2button" | "p2buttons" => Some(
+            BR2_NATIVE_P2_PUNCH_INPUT_BIT
+                | BR2_NATIVE_P2_KICK_INPUT_BIT
+                | BR2_NATIVE_P2_BEAST_INPUT_BIT
+                | BR2_NATIVE_P2_GUARD_INPUT_BIT,
+        ),
+        "p2" | "player2" | "p2control" | "p2controls" => Some(
+            BR2_NATIVE_P2_START_INPUT_BIT
+                | BR2_NATIVE_P2_CREDIT_INPUT_BIT
+                | BR2_NATIVE_P2_UP_INPUT_BIT
+                | BR2_NATIVE_P2_DOWN_INPUT_BIT
+                | BR2_NATIVE_P2_LEFT_INPUT_BIT
+                | BR2_NATIVE_P2_RIGHT_INPUT_BIT
+                | BR2_NATIVE_P2_PUNCH_INPUT_BIT
+                | BR2_NATIVE_P2_KICK_INPUT_BIT
+                | BR2_NATIVE_P2_BEAST_INPUT_BIT
+                | BR2_NATIVE_P2_GUARD_INPUT_BIT,
+        ),
         "attack" | "attacks" | "button" | "buttons" => Some(
             BR2_NATIVE_P1_PUNCH_INPUT_BIT
                 | BR2_NATIVE_P1_KICK_INPUT_BIT
@@ -14872,7 +15728,17 @@ fn parse_native_credit_projection_input_token(token: &str, coin_bit: u32) -> Opt
                 | BR2_NATIVE_P1_PUNCH_INPUT_BIT
                 | BR2_NATIVE_P1_KICK_INPUT_BIT
                 | BR2_NATIVE_P1_BEAST_INPUT_BIT
-                | BR2_NATIVE_P1_GUARD_INPUT_BIT,
+                | BR2_NATIVE_P1_GUARD_INPUT_BIT
+                | BR2_NATIVE_P2_START_INPUT_BIT
+                | BR2_NATIVE_P2_CREDIT_INPUT_BIT
+                | BR2_NATIVE_P2_UP_INPUT_BIT
+                | BR2_NATIVE_P2_DOWN_INPUT_BIT
+                | BR2_NATIVE_P2_LEFT_INPUT_BIT
+                | BR2_NATIVE_P2_RIGHT_INPUT_BIT
+                | BR2_NATIVE_P2_PUNCH_INPUT_BIT
+                | BR2_NATIVE_P2_KICK_INPUT_BIT
+                | BR2_NATIVE_P2_BEAST_INPUT_BIT
+                | BR2_NATIVE_P2_GUARD_INPUT_BIT,
         ),
         "all" | "wide" => Some(
             coin_bit
@@ -14916,6 +15782,16 @@ fn br2_native_input_projection_mask(
     set_bit_if(&mut value, BR2_NATIVE_P1_KICK_INPUT_BIT, input.kick);
     set_bit_if(&mut value, BR2_NATIVE_P1_BEAST_INPUT_BIT, input.beast);
     set_bit_if(&mut value, BR2_NATIVE_P1_GUARD_INPUT_BIT, input.guard);
+    set_bit_if(&mut value, BR2_NATIVE_P2_START_INPUT_BIT, input.p2_start);
+    set_bit_if(&mut value, BR2_NATIVE_P2_CREDIT_INPUT_BIT, input.p2_coin);
+    set_bit_if(&mut value, BR2_NATIVE_P2_UP_INPUT_BIT, input.p2_up);
+    set_bit_if(&mut value, BR2_NATIVE_P2_DOWN_INPUT_BIT, input.p2_down);
+    set_bit_if(&mut value, BR2_NATIVE_P2_LEFT_INPUT_BIT, input.p2_left);
+    set_bit_if(&mut value, BR2_NATIVE_P2_RIGHT_INPUT_BIT, input.p2_right);
+    set_bit_if(&mut value, BR2_NATIVE_P2_PUNCH_INPUT_BIT, input.p2_punch);
+    set_bit_if(&mut value, BR2_NATIVE_P2_KICK_INPUT_BIT, input.p2_kick);
+    set_bit_if(&mut value, BR2_NATIVE_P2_BEAST_INPUT_BIT, input.p2_beast);
+    set_bit_if(&mut value, BR2_NATIVE_P2_GUARD_INPUT_BIT, input.p2_guard);
     value &= projection_button_mask;
     value
 }
@@ -14956,14 +15832,23 @@ fn active_low_player1_input(input: ActionButtons, legacy_zinc_input_compat: bool
     value
 }
 
-fn active_low_player2_input() -> u32 {
-    0xffff_ffff
+fn active_low_player2_input(input: ActionButtons) -> u32 {
+    let mut value = 0xffff_ffff;
+    clear_bit_if(&mut value, 0x0000_0001, input.p2_up);
+    clear_bit_if(&mut value, 0x0000_0002, input.p2_down);
+    clear_bit_if(&mut value, 0x0000_0004, input.p2_left);
+    clear_bit_if(&mut value, 0x0000_0008, input.p2_right);
+    clear_bit_if(&mut value, 0x0000_0010, input.p2_punch);
+    clear_bit_if(&mut value, 0x0000_0020, input.p2_kick);
+    clear_bit_if(&mut value, 0x0000_0040, input.p2_beast);
+    value
 }
 
 fn active_low_player3_input(input: ActionButtons) -> u32 {
     let mut value = 0xffff_ffff;
     // Bloody Roar 2 maps P3 bit 0x10 as P1 button 4; bit 0x20 is P2 button 4.
     clear_bit_if(&mut value, 0x0000_0010, input.guard);
+    clear_bit_if(&mut value, 0x0000_0020, input.p2_guard);
     value
 }
 
@@ -15003,7 +15888,7 @@ fn active_low_system_input(
     clear_bit_if(
         &mut value,
         0x0000_0002,
-        input.start && legacy_zinc_input_compat,
+        input.p2_start || (input.start && legacy_zinc_input_compat),
     );
     clear_bit_if(
         &mut value,
@@ -15013,7 +15898,7 @@ fn active_low_system_input(
     clear_bit_if(
         &mut value,
         0x0000_0020,
-        input.coin && coin_mapping.clears_system_20(),
+        input.p2_coin || (input.coin && coin_mapping.clears_system_20()),
     );
     value
 }
@@ -15315,11 +16200,11 @@ fn br2_low_ram_character_model_bounds_are_coherent(bounds: Gp0DrawBounds) -> boo
         && bounds.has_visible_x
         && bounds.min_x <= 639
         && bounds.max_x >= 0
-        && bounds.min_y >= 64
-        // Captured lower-leg and foot packets reach y=419. HUD geometry
-        // begins at y=424, leaving a stable boundary between gameplay models
-        // and the bottom status strip.
-        && bounds.max_y <= 423
+        // Perspective-clipped head packets reach y=47 while valid feet reach
+        // y=428. Texture descriptor checks and the bounded model dimensions
+        // keep HUD aliases out without dropping those live fighter fragments.
+        && bounds.min_y >= 32
+        && bounds.max_y <= 431
 }
 
 fn br2_low_ram_character_model_descriptor(
@@ -15778,6 +16663,52 @@ mod tests {
     }
 
     #[test]
+    fn bus_maps_player_two_buttons_to_board_inputs_and_activity() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        bus.set_input(ActionButtons {
+            p2_start: true,
+            p2_coin: true,
+            p2_up: true,
+            p2_down: true,
+            p2_left: true,
+            p2_right: true,
+            p2_punch: true,
+            p2_kick: true,
+            p2_beast: true,
+            p2_guard: true,
+            ..ActionButtons::default()
+        });
+
+        let p2 = bus.read_u8(0x1fa0_0100);
+        assert_eq!(p2 & 0x7f, 0);
+        let system = bus.read_u8(0x1fa0_0300);
+        assert_eq!(system & 0x02, 0);
+        assert_eq!(system & 0x20, 0);
+        let p3 = bus.read_u8(0x1fa1_0000);
+        assert_eq!(p3 & 0x20, 0);
+
+        let activity = bus.input_activity();
+        assert_eq!(activity.p2_input_reads, 1);
+        assert_eq!(activity.p2_up_active_reads, 1);
+        assert_eq!(activity.p2_down_active_reads, 1);
+        assert_eq!(activity.p2_left_active_reads, 1);
+        assert_eq!(activity.p2_right_active_reads, 1);
+        assert_eq!(activity.p2_punch_active_reads, 1);
+        assert_eq!(activity.p2_kick_active_reads, 1);
+        assert_eq!(activity.p2_beast_active_reads, 1);
+        assert_eq!(activity.p2_guard_active_reads, 1);
+        assert_eq!(activity.system_p2_start_active_reads, 1);
+        assert_eq!(activity.system_p2_coin_active_reads, 1);
+
+        let activity_json = activity.json();
+        assert!(activity_json.contains("\"p2_input_reads\":1"));
+        assert!(activity_json.contains("\"p2_guard_active_reads\":1"));
+        assert!(activity_json.contains("\"system_p2_start_active_reads\":1"));
+        assert!(activity_json.contains("\"system_p2_coin_active_reads\":1"));
+    }
+
+    #[test]
     fn bus_initializes_controller_security_selects_from_board_lines() {
         let bus = Bus::with_board_assets(
             Vec::new(),
@@ -15976,9 +16907,42 @@ mod tests {
             bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
             1
         );
-        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(0), 0);
         assert!(bus.br2_native_credit_hle_accepted_seen());
         assert!(!bus.br2_native_credit_hle_game_start_accepted_seen());
+    }
+
+    #[test]
+    fn bus_injects_player_two_credit_into_the_player_two_slot() {
+        let mut bus = Bus::with_board_assets(
+            Vec::new(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            NativeBoardAssets::default(),
+        );
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_PLAYER_MODE_OFFSET, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P1_OFFSET, 1);
+        bus.write_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_REQUIRED_P2_OFFSET, 2);
+
+        bus.set_input(ActionButtons {
+            p2_coin: true,
+            ..ActionButtons::default()
+        });
+
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
+            0
+        );
+        assert_eq!(
+            bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET + 2),
+            2
+        );
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(0), 0);
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(1), 0);
+        assert_eq!(bus.input_activity().p2_coin_insert_edges, 1);
+        let hle_json = bus.br2_native_credit_hle_json();
+        assert!(hle_json.contains("\"player\":1"), "{hle_json}");
+        assert!(hle_json.contains("\"pending_coin_edges\":1"), "{hle_json}");
     }
 
     #[test]
@@ -16049,7 +17013,7 @@ mod tests {
             bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
             1
         );
-        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(0), 0);
         assert!(bus.br2_native_credit_hle_accepted_seen());
     }
 
@@ -16076,7 +17040,7 @@ mod tests {
             bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
             1
         );
-        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(0), 0);
         assert!(bus.br2_native_credit_hle_accepted_seen());
     }
 
@@ -16111,7 +17075,7 @@ mod tests {
             bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
             1
         );
-        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 0);
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(0), 0);
         assert!(bus.br2_native_credit_hle_accepted_seen());
         assert_eq!(bus.input_activity().native_credit_adapter_writes, 1);
     }
@@ -16135,7 +17099,7 @@ mod tests {
             bus.read_u8(BR2_CREDIT_STATE_BASE + BR2_CREDIT_SHARED_SLOT_OFFSET),
             0
         );
-        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(), 1);
+        assert_eq!(bus.consume_br2_native_credit_hle_coin_edges(0), 1);
         assert!(!bus.br2_native_credit_hle_accepted_seen());
     }
 
@@ -16347,8 +17311,27 @@ mod tests {
         assert!(board_json.contains("\"coin_insert_edges\":2"));
         let activity = bus.input_activity();
         assert_eq!(activity.coin_counter_0_edges, 1);
-        assert_eq!(activity.coin_counter_1_edges, 1);
+        assert_eq!(activity.coin_counter_1_edges, 0);
         assert_eq!(activity.coin_register_active_reads, 3);
+    }
+
+    #[test]
+    fn board_player_two_coin_updates_coin_two_and_second_counter_only() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        bus.set_input(ActionButtons {
+            p2_coin: true,
+            ..ActionButtons::default()
+        });
+
+        assert_eq!(bus.read_u8(0x1fa0_0300) & 0x10, 0x10);
+        assert_eq!(bus.read_u8(0x1fa0_0300) & 0x20, 0);
+        let activity = bus.input_activity();
+        assert_eq!(activity.coin_insert_edges, 0);
+        assert_eq!(activity.p2_coin_insert_edges, 1);
+        assert_eq!(activity.coin_counter_0_edges, 0);
+        assert_eq!(activity.coin_counter_1_edges, 1);
+        assert_eq!(activity.system_p2_coin_active_reads, 2);
     }
 
     #[test]
@@ -19284,7 +20267,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_gpu_dma_chain_model_generation_replaces_instead_of_accumulating() {
+    fn stale_gpu_dma_trusted_current_chain_does_not_mix_standalone_scene_recovery() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.set_unlinked_primitive_replay_enabled(false);
         let otc_high = 0x003a_213c;
@@ -19380,26 +20363,107 @@ mod tests {
 
         assert!(bus.process_vblank_native_otc_dma_recovery());
 
-        assert!(bus.native_otc_dma_recovery.last_stage_packets > 0);
-        assert_eq!(
-            bus.native_otc_dma_recovery.last_stage_newest_freshness,
-            bus.vblank_count
-        );
+        assert_eq!(bus.native_otc_dma_recovery.last_stage_newest_freshness, 0);
         assert_eq!(
             bus.native_otc_dma_recovery.last_model_packets, 0,
-            "chain-resident model packets must stay excluded from unlinked model recovery"
+            "trusted current OTC frames must not mix standalone model recovery"
         );
         assert_eq!(
-            bus.native_otc_dma_recovery.last_reason,
-            "submitted_chain_model_replacement"
+            bus.native_otc_dma_recovery.last_stage_packets, 0,
+            "trusted current OTC frames must not mix standalone stage recovery"
         );
+        assert_eq!(bus.native_otc_dma_recovery.last_reason, "submitted");
         assert!(bus.native_otc_dma_recovery.last_recovered_chain_words > 0);
         let (width, _, frame) = bus.io.display_rgb_frame();
-        assert_eq!(
+        assert_ne!(
             frame[16 * width + 16],
             0,
-            "a complete current chain model generation must replace the prior frame"
+            "the trusted current chain must overlay rather than erase the preserved scene"
         );
+    }
+
+    #[test]
+    fn stale_gpu_dma_trusted_current_chain_keeps_partial_live_model_pose() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let model_packets = [
+            BR2_CHARACTER_MODEL_PACKET_START + 0x1800,
+            BR2_CHARACTER_MODEL_PACKET_START + 0x1828,
+            BR2_CHARACTER_MODEL_PACKET_START + 0x1850,
+        ];
+
+        for word in [0x0200_00ff, 0x0010_0010, 0x0008_0008] {
+            bus.io.gpu.write_gp0(word);
+        }
+        let commands_before = bus.io.gpu.commands_seen;
+
+        bus.vblank_count = 3_255;
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 176 + index as u32 * 18;
+            let y = 128 + index as u32 * 20;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+        bus.write_u32(otc_high, model_packets[0]);
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(
+                &chain_nodes,
+                Some(bus.vblank_count)
+            ),
+            (None, 0),
+            "three changed model packets are a live pose delta, not a complete replacement"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_incomplete_model_overlay_draws(&chain_nodes),
+            model_packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>()
+        );
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert_eq!(bus.native_otc_dma_recovery.last_chain_model_packets, 0);
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_draw_reject_reasons
+                [Gp0ReplayDrawRejectReason::ModelPrefilter.index()],
+            0,
+            "trusted current OTC pose deltas must not be relabeled as invalid model overlays"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
+        );
+        assert!(bus.native_otc_dma_recovery.last_recovered_chain_words >= 27);
+        assert!(bus.io.gpu.commands_seen >= commands_before + 27);
     }
 
     #[test]
@@ -19470,11 +20534,64 @@ mod tests {
             (None, 0),
             "a screen-spanning 0x799a ring is an effect chain, not a complete fighter model"
         );
-        let rejected = bus.native_otc_dma_recovery_spatially_incoherent_model_draws(&chain_nodes);
+        let rejected = bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes);
+        assert!(
+            rejected.is_empty(),
+            "a current annular transformation effect must render even though it is not a complete fighter model"
+        );
+        assert!(
+            bus.native_otc_dma_recovery_incomplete_model_overlay_draws(&chain_nodes)
+                .is_empty(),
+            "an annular transformation effect must remain eligible over a preserved scene"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_blocks_partial_character_model_overlay() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let generation = 701;
+        let packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS - 1)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x1800 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        bus.vblank_count = generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 176 + index as u32 * 18;
+            let y = 128 + index as u32 * 20;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
         assert_eq!(
-            rejected.len(),
-            packets.len(),
-            "every draw in the spatially incoherent effect generation must be rejected"
+            bus.native_otc_dma_recovery_chain_model_generation(&chain_nodes, Some(generation),),
+            (None, 0),
+            "three packets are not a complete atomic fighter generation"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_incomplete_model_overlay_draws(&chain_nodes),
+            packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>(),
+            "every partial fighter draw must be excluded from the stable-scene overlay"
         );
     }
 
@@ -19523,7 +20640,7 @@ mod tests {
         }
 
         let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
-        let rejected = bus.native_otc_dma_recovery_spatially_incoherent_model_draws(&chain_nodes);
+        let rejected = bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes);
         assert!(
             rejected.is_empty(),
             "a compact fighter generation must remain eligible for replay"
@@ -19531,12 +20648,128 @@ mod tests {
     }
 
     #[test]
+    fn native_otc_chain_keeps_separated_canonical_fighter_draws() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let generation = 700;
+        let packets = (0..8)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x2400 + index * 0x28)
+            .collect::<Vec<_>>();
+        let positions = [
+            (64_u32, 120_u32),
+            (88, 144),
+            (112, 168),
+            (136, 192),
+            (400, 128),
+            (424, 152),
+            (448, 176),
+            (472, 200),
+        ];
+
+        bus.vblank_count = generation;
+        for (index, (address, (x, y))) in packets.iter().copied().zip(positions).enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        let rejected = bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes);
+        assert!(
+            rejected.is_empty(),
+            "two distant fighters sharing 0x799a must be validated as independent components"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(&chain_nodes, Some(generation),),
+            (Some(generation), packets.len())
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_keeps_address_separated_overlapping_fighters() {
+        let descriptor = (BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a);
+        let bounds = |min_x, max_x, min_y, max_y| super::Gp0DrawBounds {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            has_visible_x: true,
+            zero_vertices: 0,
+            zero_texture_words: 0,
+            command_like_texture_words: 0,
+            primitive_pointer_words: 0,
+        };
+        let draws = [
+            (0x0038_ed00, bounds(-100, 180, 96, 180)),
+            (0x0038_ed40, bounds(-80, 200, 160, 260)),
+            (0x0038_f680, bounds(120, 400, 88, 176)),
+            (0x0038_f6c0, bounds(140, 420, 152, 264)),
+        ];
+        let draws_by_texture = HashMap::from([(descriptor, draws.to_vec())]);
+
+        assert!(
+            super::br2_character_model_rejected_draw_addresses(&draws_by_texture, true).is_empty(),
+            "overlapping fighters from separate packet allocations must remain independent"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_rejects_single_oversized_address_component() {
+        let descriptor = (BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a);
+        let bounds = |min_x, max_x, min_y, max_y| super::Gp0DrawBounds {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            has_visible_x: true,
+            zero_vertices: 0,
+            zero_texture_words: 0,
+            command_like_texture_words: 0,
+            primitive_pointer_words: 0,
+        };
+        let draws = [
+            (0x0038_ed00, bounds(-100, 180, 96, 180)),
+            (0x0038_ed40, bounds(140, 420, 152, 264)),
+        ];
+        let draws_by_texture = HashMap::from([(descriptor, draws.to_vec())]);
+        let rejected = super::br2_character_model_rejected_draw_addresses(&draws_by_texture, true);
+
+        assert_eq!(
+            rejected,
+            draws.iter().map(|(address, _)| *address).collect(),
+            "one oversized packet allocation must not be split into valid fragments"
+        );
+    }
+
+    #[test]
     fn native_otc_chain_keeps_separated_low_ram_fighter_draws() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
-        let packets = [0x0005_1d80, 0x0005_2290];
-        let positions = [(80_u32, 160_u32), (500_u32, 180_u32)];
+        let generation = 700;
+        let packets = [0x0005_1d80, 0x0005_1dc0, 0x0005_2290, 0x0005_22d0];
+        let positions = [
+            (80_u32, 160_u32),
+            (104, 184),
+            (440_u32, 180_u32),
+            (464, 204),
+        ];
 
         for (index, (address, (x, y))) in packets.iter().copied().zip(positions).enumerate() {
+            bus.vblank_count = generation + index as u64;
             let next = packets
                 .get(index + 1)
                 .copied()
@@ -19559,10 +20792,18 @@ mod tests {
         }
 
         let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
-        let rejected = bus.native_otc_dma_recovery_spatially_incoherent_model_draws(&chain_nodes);
+        let rejected = bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes);
         assert!(
             rejected.is_empty(),
             "shared low-RAM fighter material must not reject two valid distant limbs as one oversized model"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(
+                &chain_nodes,
+                Some(generation + packets.len() as u64 - 1),
+            ),
+            (Some(generation + packets.len() as u64 - 1), packets.len()),
+            "split-pass low-RAM fighter updates must count as one complete replacement scene"
         );
     }
 
@@ -19617,7 +20858,81 @@ mod tests {
     }
 
     #[test]
-    fn stale_gpu_dma_recovery_preserves_scene_for_mismatched_generations() {
+    fn stale_gpu_dma_does_not_overlay_model_generation_without_stage_generation() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let hud_packet = 0x0038_c000;
+        let model_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        bus.vblank_count = 700;
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let y = 120 + index as u32 * 8;
+            let words = [
+                0x2c7f_7f7f,
+                (y << 16) | 160,
+                0x799a_0000,
+                (y << 16) | 176,
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 16) << 16) | 160,
+                0,
+                ((y + 16) << 16) | 176,
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count = 701;
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        let next = bus.read_u32(otc_high);
+        for (index, word) in [
+            0x2800_ff00,
+            0x0050_0050,
+            0x0050_0060,
+            0x0060_0050,
+            0x0060_0060,
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        {
+            bus.write_u32(hud_packet + 4 + index as u32 * 4, word);
+        }
+        bus.write_u32(hud_packet, (5 << 24) | (next & 0x00ff_ffff));
+        bus.write_u32(otc_high, hud_packet);
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
+
+        assert_eq!(bus.native_otc_dma_recovery.last_stage_packets, 0);
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_model_packets, 0,
+            "standalone model generations must not overlay the current OTC scene"
+        );
+        assert!(
+            bus.native_otc_dma_recovery
+                .last_model_selected_packets
+                .is_empty()
+        );
+        assert!(bus.native_otc_dma_recovery.last_recovered_chain_words > 0);
+    }
+
+    #[test]
+    fn stale_gpu_dma_trusted_current_chain_skips_even_coherent_standalone_generations() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.set_unlinked_primitive_replay_enabled(false);
         let otc_high = 0x003a_213c;
@@ -19718,16 +21033,10 @@ mod tests {
 
         assert!(bus.process_vblank_native_otc_dma_recovery());
 
-        assert_eq!(
-            bus.native_otc_dma_recovery.last_stage_newest_freshness,
-            3_255
-        );
-        assert_eq!(
-            bus.native_otc_dma_recovery.last_model_newest_generation,
-            3_255
-        );
-        assert!(bus.native_otc_dma_recovery.last_stage_packets > 0);
-        assert!(bus.native_otc_dma_recovery.last_model_packets > 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_stage_newest_freshness, 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_model_newest_generation, 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_stage_packets, 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_model_packets, 0);
         assert!(bus.native_otc_dma_recovery.last_recovered_chain_words > 0);
         let (width, _, frame) = bus.io.display_rgb_frame();
         assert_eq!(
@@ -19743,7 +21052,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_gpu_dma_recovery_skips_overlay_for_stage_model_pair_mismatch() {
+    fn stale_gpu_dma_trusted_current_chain_skips_mismatched_standalone_generations() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.set_unlinked_primitive_replay_enabled(false);
         let otc_high = 0x003a_213c;
@@ -19827,15 +21136,9 @@ mod tests {
 
         assert!(bus.process_vblank_native_otc_dma_recovery());
 
-        assert_eq!(
-            bus.native_otc_dma_recovery.last_stage_newest_freshness,
-            3_255
-        );
-        assert_eq!(
-            bus.native_otc_dma_recovery.last_model_newest_generation,
-            stale_model_generation
-        );
-        assert!(bus.native_otc_dma_recovery.last_stage_packets > 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_stage_newest_freshness, 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_model_newest_generation, 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_stage_packets, 0);
         assert_eq!(bus.native_otc_dma_recovery.last_model_packets, 0);
         assert!(bus.native_otc_dma_recovery.last_recovered_chain_words > 0);
         let (width, _, frame) = bus.io.display_rgb_frame();
@@ -24220,6 +25523,41 @@ mod tests {
     }
 
     #[test]
+    fn native_otc_recovery_accepts_captured_p2_beast_low_ram_strip() {
+        let packet = 0x0003_5608;
+        let captured_model = [
+            0x2c80_8080,
+            0x00d4_0199,
+            0x7ad1_3fbf,
+            0x00d4_01cc,
+            0x021c_3f80,
+            0x00db_01a8,
+            0xffff_00bf,
+            0x00db_01e1,
+            0xe3e2_0080,
+        ];
+        let descriptor = super::gp0_command_texture_descriptor(&captured_model)
+            .expect("captured model texture descriptor");
+
+        assert!(super::br2_low_ram_character_model_descriptor(
+            packet, descriptor,
+        ));
+        assert!(super::gp0_command_is_br2_character_model_for_packet(
+            packet,
+            &captured_model,
+        ));
+        assert!(
+            super::gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+                packet,
+                &captured_model,
+                (0, 0),
+            )
+            .is_some(),
+            "captured Beast body strip must pass the bounded low-RAM model classifier"
+        );
+    }
+
+    #[test]
     fn native_otc_recovery_rejects_trusted_model_vertex_pointer_contamination() {
         let packet = 0x0006_0000;
         let corrupt_model = [
@@ -24336,6 +25674,70 @@ mod tests {
         assert!(!super::gp0_command_is_corrupt_br2_character_model_draw(
             &valid_model
         ));
+    }
+
+    #[test]
+    fn native_model_pose_freshness_allows_static_texture_metadata() {
+        let model = [
+            0x2e80_8080,
+            0x00b2_00c7,
+            0x799a_d0df,
+            0x0083_00d7,
+            0x0039_dfdd,
+            0x00ba_0025,
+            0x0000_d0c0,
+            0x0082_0045,
+            0x8038_dec2,
+        ];
+        let freshness = [
+            Some(3_164),
+            Some(3_264),
+            Some(3_164),
+            Some(3_264),
+            Some(3_164),
+            Some(3_264),
+            Some(3_164),
+            Some(3_264),
+            Some(3_164),
+        ];
+
+        assert_eq!(
+            super::br2_character_model_command_pose_generation(&model, &freshness),
+            Some(3_264),
+            "BR2 reuses opcode and texture metadata while refreshing pose vertices"
+        );
+    }
+
+    #[test]
+    fn native_model_pose_freshness_rejects_torn_vertex_generation() {
+        let model = [
+            0x2e80_8080,
+            0x00b2_00c7,
+            0x799a_d0df,
+            0x0083_00d7,
+            0x0039_dfdd,
+            0x00ba_0025,
+            0x0000_d0c0,
+            0x0082_0045,
+            0x8038_dec2,
+        ];
+        let freshness = [
+            Some(3_164),
+            Some(3_264),
+            Some(3_164),
+            Some(3_264),
+            Some(3_164),
+            Some(3_240),
+            Some(3_164),
+            Some(3_264),
+            Some(3_164),
+        ];
+
+        assert_eq!(
+            super::br2_character_model_command_pose_generation(&model, &freshness),
+            None,
+            "vertices from different pose generations must not be combined"
+        );
     }
 
     #[test]
@@ -24890,6 +26292,162 @@ mod tests {
         assert_eq!(
             gp0_br2_character_model_replay_command_ranges(&captured_model),
             vec![0..captured_model.len()]
+        );
+    }
+
+    #[test]
+    fn trusted_otc_accepts_captured_p2_beast_model_component() {
+        let packet = 0x0038_fa2c;
+        let captured_model = [
+            0x2e50_5050,
+            0x00b0_0161,
+            0x799a_d0c0,
+            0x00b2_00c7,
+            0x0039_d0df,
+            0x00d2_0164,
+            0x8038_dec2,
+            0x00e5_00d8,
+            0x0000_dfdd,
+        ];
+        let commands = captured_model
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (packet + 4 + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        for (address, word) in &commands {
+            bus.write_u32(*address, *word);
+        }
+        bus.write_u32(packet, (captured_model.len() as u32) << 24 | 0x00ff_ffff);
+
+        assert!(
+            super::gp0_command_is_valid_br2_character_model_draw_for_packet(
+                packet,
+                &captured_model,
+            )
+        );
+        assert!(
+            bus.native_otc_dma_recovery_invalid_model_draws(&HashSet::from([packet]))
+                .is_empty(),
+            "the live OTC prefilter must preserve a valid P2 Beast model component"
+        );
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range(&commands, 0..commands.len(),),
+            commands.len(),
+            "P2 Beast UV padding must not be treated as vertex pointer corruption"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
+        );
+    }
+
+    #[test]
+    fn trusted_otc_accepts_captured_clipped_p2_beast_triangle() {
+        let packet = 0x0038_edd8;
+        let captured_model = [
+            0x261e_1e1e,
+            0x00f8_027f,
+            0x799a_d0df,
+            0x00eb_026b,
+            0x0039_dfdd,
+            0x00e5_01bd,
+            0x0000_d0c0,
+        ];
+        let commands = captured_model
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (packet + 4 + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        for (address, word) in &commands {
+            bus.write_u32(*address, *word);
+        }
+        bus.write_u32(packet, (captured_model.len() as u32) << 24 | 0x00ff_ffff);
+
+        assert!(
+            super::gp0_command_is_corrupt_br2_character_model_draw_for_packet(
+                packet,
+                &captured_model,
+            ),
+            "the legacy compact-outlier heuristic reproduces the false positive"
+        );
+        assert!(
+            super::gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+                packet,
+                &captured_model,
+                (0, 0),
+            )
+            .is_some(),
+            "current OTC geometry must use bounded clipping-aware validation"
+        );
+        assert!(
+            bus.native_otc_dma_recovery_invalid_model_draws(&HashSet::from([packet]))
+                .is_empty()
+        );
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range(&commands, 0..commands.len()),
+            commands.len()
+        );
+    }
+
+    #[test]
+    fn trusted_otc_rejects_oversized_p2_beast_effect_polygon() {
+        let packet = 0x0038_f98c;
+        let oversized_effect = [
+            0x2e50_5050,
+            0x00d1_ff5f,
+            0x799a_d0c0,
+            0x0113_fe36,
+            0x0039_d0df,
+            0x0122_ffae,
+            0x8038_dec2,
+            0x0160_ff07,
+            0x0000_dfdd,
+        ];
+        let commands = oversized_effect
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (packet + 4 + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        for (address, word) in &commands {
+            bus.write_u32(*address, *word);
+        }
+        bus.write_u32(packet, (oversized_effect.len() as u32) << 24 | 0x00ff_ffff);
+
+        assert!(
+            super::gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+                packet,
+                &oversized_effect,
+                (0, 0),
+            )
+            .is_none()
+        );
+        assert!(
+            bus.native_otc_dma_recovery_invalid_model_draws(&HashSet::from([packet]))
+                .contains(&(packet + 4))
+        );
+        let rejected = HashSet::from([packet + 4]);
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                Some(&rejected),
+            ),
+            0
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_draw_reject_reasons
+                [Gp0ReplayDrawRejectReason::UnsafeBounds.index()],
+            1
         );
     }
 

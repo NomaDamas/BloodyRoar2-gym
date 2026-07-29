@@ -294,14 +294,13 @@ explicitly testing legacy ZiNc input mirroring for diagnostics.
 
 Controls:
 
-- Arrows or `WASD`: move.
-- `Z`, `Space`, `J`, or `F`: punch/confirm.
-- `X`, `K`, or `H`: kick.
-- `Q`, `L`, or `B`: beast.
-- `E`, `I`, or `G`: guard.
-- `C`: coin.
+- P1: arrows move; `Z` or `Space` punch/confirm; `X` kick; `Q` beast; `E` guard.
+- P2: `WASD` move; `J` punch/confirm; `K` kick; `U` beast; `I` guard.
+- P1 `C`: coin. P1 `P`: start.
+- P2 `N`: coin. P2 `O`: start.
 - `V`: service credit.
-- `Enter`: coin+start for one-key title entry. `P`: start only.
+- `Enter`: feedback-driven P1 title entry. Press once to insert credit, then
+  press again after credit is accepted to start.
 - `Esc`: quit.
 
 For non-interactive smoke validation, use autoplay, a headless snapshot, or
@@ -320,6 +319,28 @@ cargo run --release -- native-play assets/roms 500000 fit 150 \
 The third `native-play` argument is the window scale. For example,
 `native-play assets/BloodRoar2-combined.zip 240000 1` uses scale `1` and has no
 frame limit; add a fourth argument such as `600` for bounded smoke validation.
+For repeated runs, materialize an archive once and reuse the resulting ROM
+directory:
+
+```sh
+cargo run --release -- native-cache-prepare assets/BloodRoar2-combined.zip
+cargo run --release -- native-cache-path
+```
+
+`native-play` also supports frame-gated draw capture without changing the input
+or renderer path:
+
+```sh
+cargo run --release -- native-play assets/roms 240000 1 900 \
+  --gui-test-input coin:18 noop:18 start:24 noop:840 \
+  --draw-capture-predicate texture_page=0x0039,clut=0x785a,min_area=1000 \
+  --draw-capture-arm-gui-frame 600 \
+  --draw-capture-output tmp/native-validation/beast-effect/draw
+```
+
+The generated manifest records each captured GP0 command, bounds, texture
+origin, transparency statistics, VRAM transfer provenance, and associated
+display/texture/palette image paths.
 `native-enter-probe` uses the real title boot state and the same physical Enter
 coin/release/start sequencer as the GUI, then requires both guest acceptance
 counters and a clean transition away from the title.

@@ -262,7 +262,8 @@ fn parse_action_buttons(value: &serde_json::Value) -> Result<ActionButtons, Stri
         .ok_or_else(|| "buttons must be a JSON object".to_string())?;
     let allowed = [
         "start", "coin", "service", "up", "down", "left", "right", "punch", "kick", "beast",
-        "guard",
+        "guard", "p2_start", "p2_coin", "p2_up", "p2_down", "p2_left", "p2_right", "p2_punch",
+        "p2_kick", "p2_beast", "p2_guard",
     ];
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("unknown buttons field: {key}"));
@@ -290,6 +291,16 @@ fn parse_action_buttons(value: &serde_json::Value) -> Result<ActionButtons, Stri
         kick: read("kick")?,
         beast: read("beast")?,
         guard: read("guard")?,
+        p2_start: read("p2_start")?,
+        p2_coin: read("p2_coin")?,
+        p2_up: read("p2_up")?,
+        p2_down: read("p2_down")?,
+        p2_left: read("p2_left")?,
+        p2_right: read("p2_right")?,
+        p2_punch: read("p2_punch")?,
+        p2_kick: read("p2_kick")?,
+        p2_beast: read("p2_beast")?,
+        p2_guard: read("p2_guard")?,
     })
 }
 
@@ -437,6 +448,22 @@ mod tests {
                     ..ActionButtons::default()
                 }),
                 2,
+                false
+            ))
+        );
+        assert_eq!(
+            parse_step_request(
+                r#"{"buttons":{"p2_coin":true,"p2_start":true,"p2_left":true,"p2_guard":true}}"#
+            ),
+            Ok((
+                StepControl::Buttons(ActionButtons {
+                    p2_coin: true,
+                    p2_start: true,
+                    p2_left: true,
+                    p2_guard: true,
+                    ..ActionButtons::default()
+                }),
+                1,
                 false
             ))
         );
