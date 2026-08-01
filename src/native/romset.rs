@@ -16,7 +16,7 @@ const CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD: u16 = 0x0001;
 const ZIP_STORED_METHOD: u16 = 0;
 const ZIP_DEFLATED_METHOD: u16 = 8;
-const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v11";
+const NATIVE_ROM_CACHE_VERSION: &str = "native-rom-cache-v12";
 const NATIVE_ROM_CACHE_ENV: &str = "BLOODYROAR2_NATIVE_ROM_CACHE_DIR";
 const DEFAULT_NATIVE_ROM_CACHE_ROOT: &str = ".runtime-cache/native-rom-cache";
 const NATIVE_ROM_CACHE_LATEST_FILE: &str = "LATEST_ROM_DIR";
@@ -1025,6 +1025,24 @@ impl NativeRomSet {
         self.load_manifest_region("bankedroms")
     }
 
+    pub fn load_audio_cpu_rom_interleaved(&self) -> Result<Vec<u8>, BackendError> {
+        let even = self.load_manifest_asset("br2_u049.049")?;
+        let odd = self.load_manifest_asset("br2_u0412.412")?;
+        let pair_count = even.len().max(odd.len());
+        let mut image = vec![0xff; pair_count.saturating_mul(2)];
+        for (index, byte) in even.iter().copied().enumerate() {
+            image[index * 2] = byte;
+        }
+        for (index, byte) in odd.iter().copied().enumerate() {
+            image[index * 2 + 1] = byte;
+        }
+        Ok(image)
+    }
+
+    pub fn load_ymf_sample_rom(&self) -> Result<Vec<u8>, BackendError> {
+        self.load_manifest_asset("rom-3.336")
+    }
+
     pub fn load_board_assets(&self) -> NativeBoardAssets {
         let legacy_zinc_input_compat_env = env::var("BLOODYROAR2_NATIVE_LEGACY_ZINC_INPUT").ok();
         let canonical_at28c16 = self.load_exact_canonical_asset("at28c16_world", 2048);
@@ -1045,6 +1063,8 @@ impl NativeRomSet {
                 legacy_zinc_input_compat_env.as_deref(),
                 at28c16_from_zinc_cfg,
             ),
+            audio_cpu_rom: self.load_audio_cpu_rom_interleaved().ok(),
+            ymf_sample_rom: self.load_ymf_sample_rom().ok(),
         };
 
         if assets.cat702_1.is_some() && assets.cat702_2.is_some() && assets.at28c16.is_some() {

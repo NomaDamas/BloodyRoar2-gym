@@ -610,6 +610,41 @@ const BR2_POST_VS_PACKED_VERTEX_COLOR_STORE_INSTRUCTIONS: [(u32, u32); 3] = [
     (0x8035_94b8, 0xa10b_0002), // sb t3, 2(t0), branch delay slot
 ];
 const BR2_RUNTIME_UNALIGNED_WORD_LOAD_PC: u32 = 0x802e_2ca4;
+const BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_PC: u32 = 0x8035_a488;
+const BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN: u32 = 0x8035_d25c;
+const BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE: [(u32, u32); 5] = [
+    (0x8035_a480, 0x0002_1080),
+    (0x8035_a484, 0x0046_1021),
+    (0x8035_a488, 0x8c42_0000),
+    (0x8035_a48c, 0x0065_1821),
+    (0x8035_a490, 0xac62_0000),
+];
+const BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_SIGNATURE: [(u32, u32); 5] = [
+    (0x8035_d254, 0x0040_f809),
+    (0x8035_d258, 0x0243_9021),
+    (0x8035_d25c, 0x080d_7473),
+    (0x8035_d260, 0x0000_0000),
+    (0x8035_d264, 0x0005_1403),
+];
+const BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_PC: u32 = 0x8035_a0d0;
+const BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_SIGNATURE: [(u32, u32); 5] = [
+    (0x8035_a0c8, 0x0002_1040),
+    (0x8035_a0cc, 0x0046_1021),
+    (0x8035_a0d0, 0x9442_0000),
+    (0x8035_a0d4, 0x0065_1821),
+    (0x8035_a0d8, 0x03e0_0008),
+];
+const BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_PC: u32 = 0x802e_60d0;
+const BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN: u32 = 0x802e_60c8;
+const BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE: [(u32, u32); 7] = [
+    (0x802e_60c0, 0x0c0d_1173),
+    (0x802e_60c4, 0x0220_3021),
+    (0x802e_60c8, 0x8e02_0004),
+    (0x802e_60cc, 0x2604_0050),
+    (0x802e_60d0, 0x8c46_0000),
+    (0x802e_60d4, 0x080b_9842),
+    (0x802e_60d8, 0x0220_2821),
+];
 const BR2_RUNTIME_INVALID_MODEL_TRAVERSAL_SIGNATURE: [(u32, u32); 13] = [
     (0x802e_2ca0, 0x8e22_0000),
     (0x802e_2ca4, 0x8cb0_0000),
@@ -808,6 +843,7 @@ const BR2_RUNTIME_INVALID_PACKED_PRIMITIVE_CHILD_SIGNATURE: [(u32, u32); 15] = [
 ];
 const BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOAD_PC: u32 = 0x8035_9990;
 const BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_CALLER_RETURN: u32 = 0x8035_99c0;
+const BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_RETURN: u32 = 0x8035_99d8;
 const BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_TAIL_PC: u32 = 0x8035_99dc;
 const BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_SIGNATURE: [(u32, u32); 15] = [
     (0x8035_9978, 0x27bd_ffe0),
@@ -825,6 +861,15 @@ const BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_SIGNATURE: [(u32, u32); 15]
     (0x8035_99a8, 0x80a2_0018),
     (0x8035_99ac, 0x0000_0000),
     (0x8035_99b0, 0x1040_0005),
+];
+const BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_SIGNATURE: [(u32, u32); 7] = [
+    (0x8035_99c8, 0x8ca2_0008),
+    (0x8035_99cc, 0x8ca4_0010),
+    (0x8035_99d0, 0x0040_f809),
+    (0x8035_99d4, 0x0000_0000),
+    (0x8035_99d8, 0x0200_2821),
+    (0x8035_99dc, 0x1600_ffeb),
+    (0x8035_99e0, 0x0000_0000),
 ];
 const BR2_RUNTIME_UNALIGNED_PACKED_PRIMITIVE_SIGNATURE: [(u32, u32); 12] = [
     (0x8035_cf74, 0x0000_4021),
@@ -1449,6 +1494,14 @@ const BR2_RUNTIME_MODEL_CLEANUP_LOOP_CALLER_SIGNATURE: [(u32, u32); 8] = [
     (0x8035_84c0, 0x0000_0000),
     (0x8035_84c4, 0x080d_6138),
     (0x8035_84c8, 0x0200_2821),
+];
+const BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_RETURN: u32 = 0x8035_99c0;
+const BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_SIGNATURE: [(u32, u32); 5] = [
+    (0x8035_99b8, 0x0c0d_42f5),
+    (0x8035_99bc, 0x0000_0000),
+    (0x8035_99c0, 0x080d_6677),
+    (0x8035_99c4, 0x0200_2821),
+    (0x8035_99c8, 0x8ca2_0008),
 ];
 const BR2_RUNTIME_MODEL_CLEANUP_ENTRY_SIGNATURE: [(u32, u32); 4] = [
     (0x8035_0c20, 0x8e02_000c),
@@ -2493,14 +2546,21 @@ struct Br2MatrixMultiplySample {
     global_matrix_pointer: u32,
     rotation: [[i16; 3]; 3],
     source: [[i16; 3]; 3],
+    expected_result: [[i16; 3]; 3],
     result: [[i16; 3]; 3],
+    expected_saturated: bool,
     saturated: bool,
+    result_matches_expected: bool,
 }
 
 impl Br2MatrixMultiplySample {
     fn json(&self) -> String {
+        let rotation = br2_matrix_json(&self.rotation);
+        let source = br2_matrix_json(&self.source);
+        let expected_result = br2_matrix_json(&self.expected_result);
+        let result = br2_matrix_json(&self.result);
         format!(
-            "{{\"cycles\":{},\"vblank\":{},\"return_address_hex\":\"0x{:08x}\",\"callback_target_hex\":\"0x{:08x}\",\"callback_object_hex\":\"0x{:08x}\",\"callback_data_hex\":\"0x{:08x}\",\"callback_data_control_hex\":[\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\"],\"callback_branch_v0_hex\":\"0x{:08x}\",\"callback_branch_control_hex\":\"0x{:08x}\",\"a0_hex\":\"0x{:08x}\",\"a1_hex\":\"0x{:08x}\",\"output_hex\":\"0x{:08x}\",\"saved_hex\":[\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\"],\"global_matrix_pointer_hex\":\"0x{:08x}\",\"rotation\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"source\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"result\":[[{},{},{}],[{},{},{}],[{},{},{}]],\"saturated\":{}}}",
+            "{{\"cycles\":{},\"vblank\":{},\"return_address_hex\":\"0x{:08x}\",\"callback_target_hex\":\"0x{:08x}\",\"callback_object_hex\":\"0x{:08x}\",\"callback_data_hex\":\"0x{:08x}\",\"callback_data_control_hex\":[\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\"],\"callback_branch_v0_hex\":\"0x{:08x}\",\"callback_branch_control_hex\":\"0x{:08x}\",\"a0_hex\":\"0x{:08x}\",\"a1_hex\":\"0x{:08x}\",\"output_hex\":\"0x{:08x}\",\"saved_hex\":[\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\",\"0x{:08x}\"],\"global_matrix_pointer_hex\":\"0x{:08x}\",\"rotation\":{},\"source\":{},\"expected_result\":{},\"result\":{},\"expected_saturated\":{},\"saturated\":{},\"result_matches_expected\":{}}}",
             self.cycles,
             self.vblank,
             self.return_address,
@@ -2520,34 +2580,13 @@ impl Br2MatrixMultiplySample {
             self.saved[2],
             self.saved[3],
             self.global_matrix_pointer,
-            self.rotation[0][0],
-            self.rotation[0][1],
-            self.rotation[0][2],
-            self.rotation[1][0],
-            self.rotation[1][1],
-            self.rotation[1][2],
-            self.rotation[2][0],
-            self.rotation[2][1],
-            self.rotation[2][2],
-            self.source[0][0],
-            self.source[0][1],
-            self.source[0][2],
-            self.source[1][0],
-            self.source[1][1],
-            self.source[1][2],
-            self.source[2][0],
-            self.source[2][1],
-            self.source[2][2],
-            self.result[0][0],
-            self.result[0][1],
-            self.result[0][2],
-            self.result[1][0],
-            self.result[1][1],
-            self.result[1][2],
-            self.result[2][0],
-            self.result[2][1],
-            self.result[2][2],
+            rotation,
+            source,
+            expected_result,
+            result,
+            self.expected_saturated,
             self.saturated,
+            self.result_matches_expected,
         )
     }
 }
@@ -2964,7 +3003,180 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> StepOutcome {
-        self.step_report(bus).outcome
+        self.step_untracked(bus).0
+    }
+
+    pub fn step_untracked(&mut self, bus: &mut Bus) -> (StepOutcome, u64) {
+        if self.halted {
+            return (StepOutcome::Halted, 0);
+        }
+
+        let start_pc = self.pc;
+        let cycles_before = self.cycles;
+        bus.set_trace_context(start_pc, cycles_before);
+        if let Some(report) = self.try_hle_br2_bios_b0_dispatch(start_pc, cycles_before, bus) {
+            return self.finish_step_untracked(report.outcome, report.cycles_elapsed, bus);
+        }
+        if self.try_hle_br2_bios_irq_return(bus) {
+            self.cycles += 1;
+            self.regs[0] = 0;
+            return self.finish_step_untracked(
+                StepOutcome::Continue,
+                self.cycles.saturating_sub(cycles_before),
+                bus,
+            );
+        }
+        if let Some(report) = self.try_hle_br2_bios_b0_wait_event(start_pc, cycles_before, bus) {
+            return self.finish_step_untracked(report.outcome, report.cycles_elapsed, bus);
+        }
+        if let Some(report) = self.try_hle_br2_bios_b0_test_event(start_pc, cycles_before, bus) {
+            return self.finish_step_untracked(report.outcome, report.cycles_elapsed, bus);
+        }
+        self.refresh_interrupts(bus);
+        if self.delay_slot_branch_pc.is_none() && self.interrupt_pending() {
+            if self.try_hle_blank_bios_irq_handler(bus) {
+                self.cycles += 1;
+                self.regs[0] = 0;
+                return self.finish_step_untracked(
+                    StepOutcome::Continue,
+                    self.cycles.saturating_sub(cycles_before),
+                    bus,
+                );
+            }
+            self.cycles += 1;
+            let outcome = self.raise_exception(self.pc, None, Exception::Interrupt);
+            self.regs[0] = 0;
+            return self.finish_step_untracked(
+                outcome,
+                self.cycles.saturating_sub(cycles_before),
+                bus,
+            );
+        }
+
+        if self.pc == BR2_POST_VS_PACKED_VERTEX_CALLER_START {
+            self.br2_packed_vertex_helper.record_caller(
+                bus.vblank_count(),
+                self.cycles,
+                &self.regs,
+                bus,
+            );
+            let caller_record = self.regs[2];
+            let caller_s0 = self.regs[16];
+            let caller_gp = self.regs[28];
+            let caller_record_words = br2_read_words(bus, caller_record);
+            let caller_s0_words = br2_read_words(bus, caller_s0);
+            let diagnostics = &mut self.br2_packed_vertex_helper;
+            diagnostics.pending_caller_record = caller_record;
+            diagnostics.pending_caller_s0 = caller_s0;
+            diagnostics.pending_caller_s1 = self.regs[17];
+            diagnostics.pending_caller_gp = caller_gp;
+            diagnostics.pending_caller_sp = self.regs[29];
+            diagnostics.pending_caller_gp_28 =
+                bus.read_u32_fast_no_trace(caller_gp.wrapping_add(0x28));
+            diagnostics.pending_caller_record_words = caller_record_words;
+            diagnostics.pending_caller_s0_words = caller_s0_words;
+        }
+
+        if self.pc == BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_CALLER_SIGNATURE[0].0 {
+            self.br2_packed_pointer_table_caller
+                .record_entry(bus.vblank_count());
+        }
+        if self.pc == BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_CALLER_SIGNATURE[14].0 {
+            self.br2_packed_pointer_table_caller
+                .record_dispatch(bus.vblank_count(), &self.regs);
+        }
+
+        if matches!(
+            self.pc,
+            BR2_MATRIX_CALLBACK_CALL_PC
+                | BR2_MATRIX_CALLBACK_CONTROL_BRANCH_PC
+                | BR2_MATRIX_MULTIPLY_ENTRY_PC
+                | BR2_MATRIX_MULTIPLY_RESULT_PC
+        ) {
+            self.record_br2_matrix_multiply_boundary(bus);
+        }
+        if self.pc == BR2_RUNTIME_CONTROL_CALLBACK_CONTINUATION_PC {
+            self.try_hle_br2_runtime_control_callback_cycle(bus);
+        }
+
+        if self.pc == BR2_CREDIT_CHECK_ENTRY
+            && let Some(report) = self.try_hle_br2_credit_check(start_pc, cycles_before, bus)
+        {
+            return self.finish_step_untracked(report.outcome, report.cycles_elapsed, bus);
+        }
+
+        if self.pc == BR2_RUNTIME_INVALID_CALLBACK_ENTRY
+            && let Some(report) =
+                self.try_hle_br2_runtime_invalid_scene_callback(start_pc, cycles_before, bus)
+        {
+            return self.finish_step_untracked(report.outcome, report.cycles_elapsed, bus);
+        }
+
+        if self.pc == BR2_RENDER_SUBMIT_GATE_BRANCH_PC {
+            self.try_hle_br2_render_submit_gate(start_pc, bus);
+        }
+
+        let runtime_recovery_report = match self.pc {
+            BR2_RUNTIME_INVALID_CALLBACK_OBJECT_ENTRY => {
+                self.try_hle_br2_runtime_invalid_callback_object(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_RELATION_CALLBACK_ENTRY => {
+                self.try_hle_br2_runtime_invalid_relation_callback(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_INVALID_CALLBACK_DISPATCH_PC => {
+                self.try_hle_br2_runtime_invalid_callback_dispatch(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_INDEXED_PACKED_TRANSFORM_ENTRY => self
+                .try_hle_br2_runtime_invalid_indexed_packed_transform(start_pc, cycles_before, bus),
+            BR2_POST_VS_PACKED_VERTEX_HELPER_START => self
+                .try_hle_br2_post_vs_packed_vertex_helper(start_pc, cycles_before, bus)
+                .or_else(|| {
+                    self.try_hle_br2_runtime_invalid_packed_transform(start_pc, cycles_before, bus)
+                }),
+            BR2_RUNTIME_INVALID_MODEL_RELATION_ENTRY => {
+                self.try_hle_br2_runtime_invalid_model_relation(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_INVALID_VERTEX_PACK_ENTRY => {
+                self.try_hle_br2_runtime_invalid_vertex_pack(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_LINK_SPLICE_ENTRY => {
+                self.try_hle_br2_runtime_invalid_link_splice(start_pc, cycles_before, bus)
+            }
+            BR2_RUNTIME_MODEL_CLEANUP_ENTRY => {
+                self.try_hle_br2_runtime_invalid_model_cleanup(start_pc, cycles_before, bus)
+            }
+            _ => None,
+        };
+        if let Some(report) = runtime_recovery_report {
+            return self.finish_step_untracked(report.outcome, report.cycles_elapsed, bus);
+        }
+
+        if let Some(report) = self.try_fast_forward_known_loop(start_pc, cycles_before, bus) {
+            return self.finish_step_untracked(report.outcome, report.cycles_elapsed, bus);
+        }
+
+        let delay_slot_branch_pc = self.delay_slot_branch_pc.take();
+        let instruction = bus.read_u32(self.pc);
+        let current_pc = self.pc;
+        self.pc = self.next_pc;
+        self.next_pc = self.next_pc.wrapping_add(4);
+        self.cycles += 1;
+        bus.set_trace_context(current_pc, self.cycles);
+
+        let delayed_load = self.pending_load.take();
+        self.load_commit_register = delayed_load.map(|(register, _)| register);
+        self.load_commit_value = delayed_load.map(|(_, value)| value);
+        self.load_commit_cancelled = false;
+
+        let outcome = self.execute(instruction, current_pc, delay_slot_branch_pc, bus);
+        self.debug_br2_gpu_linked_list_submit(current_pc, instruction, bus);
+        self.commit_delayed_load(delayed_load);
+        self.cycles += fixed_cycle_cost(Some(instruction), outcome).saturating_sub(1);
+        self.regs[0] = 0;
+        self.load_commit_register = None;
+        self.load_commit_value = None;
+        self.load_commit_cancelled = false;
+        self.finish_step_untracked(outcome, self.cycles.saturating_sub(cycles_before), bus)
     }
 
     pub fn step_report(&mut self, bus: &mut Bus) -> StepReport {
@@ -3052,10 +3264,22 @@ impl Cpu {
                 .record_dispatch(bus.vblank_count(), &self.regs);
         }
 
-        self.record_br2_matrix_multiply_boundary(bus);
-        self.try_hle_br2_runtime_control_callback_cycle(bus);
+        if matches!(
+            self.pc,
+            BR2_MATRIX_CALLBACK_CALL_PC
+                | BR2_MATRIX_CALLBACK_CONTROL_BRANCH_PC
+                | BR2_MATRIX_MULTIPLY_ENTRY_PC
+                | BR2_MATRIX_MULTIPLY_RESULT_PC
+        ) {
+            self.record_br2_matrix_multiply_boundary(bus);
+        }
+        if self.pc == BR2_RUNTIME_CONTROL_CALLBACK_CONTINUATION_PC {
+            self.try_hle_br2_runtime_control_callback_cycle(bus);
+        }
 
-        if let Some(report) = self.try_hle_br2_credit_check(start_pc, cycles_before, bus) {
+        if self.pc == BR2_CREDIT_CHECK_ENTRY
+            && let Some(report) = self.try_hle_br2_credit_check(start_pc, cycles_before, bus)
+        {
             bus.tick(report.cycles_elapsed);
             bus.clear_trace_context();
             return report;
@@ -3070,7 +3294,9 @@ impl Cpu {
             return report;
         }
 
-        self.try_hle_br2_render_submit_gate(start_pc, bus);
+        if self.pc == BR2_RENDER_SUBMIT_GATE_BRANCH_PC {
+            self.try_hle_br2_render_submit_gate(start_pc, bus);
+        }
 
         // Runtime recovery hooks are sparse fixed-PC entry points. Dispatch by
         // PC so normal guest instructions do not pay for every hook's argument
@@ -3112,214 +3338,7 @@ impl Cpu {
             return report;
         }
 
-        if let Some(report) = self.try_fast_forward_bios_delay_loop(start_pc, cycles_before, bus) {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_bios_delay_prologue_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_bios_byte_copy_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_bios_init_zero_fill_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_draw_sync_wait_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_status_pointer_scan(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_status_halfword_wait_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_frame_counter_wait_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_irq_poll_timeout_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) = self.try_fast_forward_br2_byte_copy_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_banked_halfword_copy_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_table_group_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_table_select_group_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_null_link_scan_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_stack_link_scan_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_stack_packet_scan_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_record_copy_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_vertex_record_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) = self.try_fast_forward_br2_post_vs_strided_pointer_copy_loop(
-            start_pc,
-            cycles_before,
-            bus,
-        ) {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) = self.try_fast_forward_br2_post_vs_alt_strided_pointer_copy_loop(
-            start_pc,
-            cycles_before,
-            bus,
-        ) {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_post_vs_table_accum_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_reverse_mismatch_scan_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_reverse_pointer_scan_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_small_byte_copy_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) =
-            self.try_fast_forward_br2_bitstream_decode_loop(start_pc, cycles_before, bus)
-        {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) = self.try_fast_forward_word_copy_loop(start_pc, cycles_before, bus) {
-            bus.tick(report.cycles_elapsed);
-            bus.clear_trace_context();
-            return report;
-        }
-
-        if let Some(report) = self.try_fast_forward_zero_fill_loop(start_pc, cycles_before, bus) {
+        if let Some(report) = self.try_fast_forward_known_loop(start_pc, cycles_before, bus) {
             bus.tick(report.cycles_elapsed);
             bus.clear_trace_context();
             return report;
@@ -3350,6 +3369,17 @@ impl Cpu {
         bus.tick(report.cycles_elapsed);
         bus.clear_trace_context();
         report
+    }
+
+    fn finish_step_untracked(
+        &mut self,
+        outcome: StepOutcome,
+        cycles_elapsed: u64,
+        bus: &mut Bus,
+    ) -> (StepOutcome, u64) {
+        bus.tick(cycles_elapsed);
+        bus.clear_trace_context();
+        (outcome, cycles_elapsed)
     }
 
     pub fn json(&self) -> String {
@@ -3404,6 +3434,49 @@ impl Cpu {
                     register, value, value
                 )
             },
+        )
+    }
+
+    pub fn bios_irq_probe_json(&self, bus: &Bus) -> String {
+        let context_base = bios_exception_context_base_physical(bus);
+        let context_sp =
+            context_base.and_then(|base| bus.read_ram_u32_physical(base.wrapping_add(0x74)));
+        let context_ra = context_base.and_then(|base| {
+            bus.read_ram_u32_physical(base.wrapping_add(BIOS_EXCEPTION_CONTEXT_RA_OFFSET))
+        });
+        let irq_pending = bus.io.irq.status & bus.io.irq.mask;
+        format!(
+            "{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"status\":{},\"status_hex\":\"0x{:08x}\",\"cause\":{},\"cause_hex\":\"0x{:08x}\",\"excode\":{},\"epc\":{},\"epc_hex\":\"0x{:08x}\",\"badvaddr\":{},\"badvaddr_hex\":\"0x{:08x}\",\"sp\":{},\"sp_hex\":\"0x{:08x}\",\"ra\":{},\"ra_hex\":\"0x{:08x}\",\"hi\":{},\"lo\":{},\"pending_load\":{},\"delay_slot_branch_pc\":{},\"irq_status\":{},\"irq_mask\":{},\"irq_pending\":{},\"ip2_pending\":{},\"dispatch_signature\":{},\"context_base\":{},\"context_sp\":{},\"context_ra\":{},\"context_guest_runtime\":{}}}",
+            self.pc,
+            self.pc,
+            self.next_pc,
+            self.next_pc,
+            self.cp0[CP0_STATUS],
+            self.cp0[CP0_STATUS],
+            self.cp0[CP0_CAUSE],
+            self.cp0[CP0_CAUSE],
+            self.cause_excode(),
+            self.cp0[CP0_EPC],
+            self.cp0[CP0_EPC],
+            self.cp0[CP0_BADVADDR],
+            self.cp0[CP0_BADVADDR],
+            self.regs[29],
+            self.regs[29],
+            self.regs[31],
+            self.regs[31],
+            self.hi,
+            self.lo,
+            self.pending_load_json(),
+            optional_u32_json(self.delay_slot_branch_pc),
+            bus.io.irq.status,
+            bus.io.irq.mask,
+            irq_pending,
+            self.cp0[CP0_CAUSE] & CAUSE_IP2 != 0,
+            bios_irq_dispatch_loop_has_signature(bus),
+            optional_u32_json(context_base),
+            optional_u32_json(context_sp),
+            optional_u32_json(context_ra),
+            bios_exception_context_has_guest_runtime(bus),
         )
     }
 
@@ -3607,6 +3680,38 @@ impl Cpu {
             cycles_after: self.cycles,
             cycles_elapsed: self.cycles.saturating_sub(cycles_before),
             outcome,
+        }
+    }
+
+    fn try_fast_forward_known_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        match self.pc {
+            BIOS_DELAY_LOOP_START
+            | BIOS_DELAY_LOOP_KSEG1_START
+            | BIOS_SHORT_DELAY_LOOP_START
+            | BIOS_SHORT_DELAY_LOOP_KSEG1_START => {
+                self.try_fast_forward_bios_delay_loop(start_pc, cycles_before, bus)
+            }
+            BIOS_DELAY_PROLOGUE_LOOP_START | BIOS_DELAY_PROLOGUE_LOOP_KSEG1_START => {
+                self.try_fast_forward_bios_delay_prologue_loop(start_pc, cycles_before, bus)
+            }
+            BIOS_BYTE_COPY_LOOP_START | 0xbfc0_4cd4 => {
+                self.try_fast_forward_bios_byte_copy_loop(start_pc, cycles_before, bus)
+            }
+            BIOS_INIT_ZERO_FILL_LOOP_START => {
+                self.try_fast_forward_bios_init_zero_fill_loop(start_pc, cycles_before, bus)
+            }
+            BR2_BOOT_WORD_COPY_LOOP_START => {
+                self.try_fast_forward_word_copy_loop(start_pc, cycles_before, bus)
+            }
+            BR2_BOOT_ZERO_FILL_LOOP_START => {
+                self.try_fast_forward_zero_fill_loop(start_pc, cycles_before, bus)
+            }
+            _ => self.try_fast_forward_br2_runtime_loop(start_pc, cycles_before, bus),
         }
     }
 
@@ -3830,6 +3935,110 @@ impl Cpu {
             cycles_before,
             StepOutcome::Continue,
         ))
+    }
+
+    fn try_fast_forward_br2_runtime_loop(
+        &mut self,
+        start_pc: u32,
+        cycles_before: u64,
+        bus: &mut Bus,
+    ) -> Option<StepReport> {
+        match self.pc {
+            BR2_DRAW_SYNC_WAIT_LOOP_START => {
+                self.try_fast_forward_br2_draw_sync_wait_loop(start_pc, cycles_before, bus)
+            }
+            BR2_STATUS_POINTER_SCAN_START => {
+                self.try_fast_forward_br2_status_pointer_scan(start_pc, cycles_before, bus)
+            }
+            BR2_STATUS_HALFWORD_WAIT_LOOP_START | BR2_STATUS_HALFWORD_WAIT_LOOP_TAIL_LOAD => {
+                self.try_fast_forward_br2_status_halfword_wait_loop(start_pc, cycles_before, bus)
+            }
+            BR2_FRAME_COUNTER_WAIT_LOOP_START => {
+                self.try_fast_forward_br2_frame_counter_wait_loop(start_pc, cycles_before, bus)
+            }
+            BR2_IRQ_POLL_TIMEOUT_INITIAL_DECREMENT | BR2_IRQ_POLL_TIMEOUT_LOOP_START => {
+                self.try_fast_forward_br2_irq_poll_timeout_loop(start_pc, cycles_before, bus)
+            }
+            BR2_BYTE_COPY_LOOP_START => {
+                self.try_fast_forward_br2_byte_copy_loop(start_pc, cycles_before, bus)
+            }
+            BR2_BANKED_HALFWORD_COPY_LOOP_START => {
+                self.try_fast_forward_br2_banked_halfword_copy_loop(start_pc, cycles_before, bus)
+            }
+            BR2_POST_VS_TABLE_GROUP_LOOP_START => {
+                self.try_fast_forward_br2_post_vs_table_group_loop(start_pc, cycles_before, bus)
+            }
+            BR2_POST_VS_TABLE_SELECT_GROUP_LOOP_START
+            | BR2_POST_VS_TABLE_SELECT_GROUP_COMPARE_DELAY
+            | BR2_POST_VS_TABLE_SELECT_GROUP_COMPARE_BRANCH
+            | BR2_POST_VS_TABLE_SELECT_GROUP_TAIL_LOAD
+            | BR2_POST_VS_TABLE_SELECT_GROUP_TAIL_INCREMENT => self
+                .try_fast_forward_br2_post_vs_table_select_group_loop(start_pc, cycles_before, bus),
+            BR2_POST_VS_NULL_LINK_SCAN_LOOP_START
+            | BR2_POST_VS_NULL_LINK_SCAN_TAIL_LOAD
+            | BR2_POST_VS_NULL_LINK_SCAN_TAIL_DELAY
+            | BR2_POST_VS_NULL_LINK_SCAN_TAIL_BRANCH => {
+                self.try_fast_forward_br2_post_vs_null_link_scan_loop(start_pc, cycles_before, bus)
+            }
+            BR2_POST_VS_STACK_LINK_SCAN_LOOP_START
+            | BR2_POST_VS_STACK_LINK_SCAN_RELOAD
+            | BR2_POST_VS_STACK_LINK_SCAN_RELOAD_DELAY
+            | BR2_POST_VS_STACK_LINK_SCAN_NEXT_LOAD
+            | BR2_POST_VS_STACK_LINK_SCAN_COMPARE
+            | BR2_POST_VS_STACK_LINK_SCAN_TAIL_BRANCH
+            | BR2_POST_VS_STACK_LINK_SCAN_TAIL_STORE => {
+                self.try_fast_forward_br2_post_vs_stack_link_scan_loop(start_pc, cycles_before, bus)
+            }
+            BR2_POST_VS_STACK_PACKET_SCAN_LOOP_START
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_LENGTH_LOAD
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_INDEX_LOAD
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_LIMIT_LOAD
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_SHIFT
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_CURSOR_ADD
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_INDEX_ADD
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_COMPARE
+            | BR2_POST_VS_STACK_PACKET_SCAN_TAIL_BRANCH => self
+                .try_fast_forward_br2_post_vs_stack_packet_scan_loop(start_pc, cycles_before, bus),
+            pc if br2_post_vs_stack_packet_scan_body_fast_forward_pc(pc) => self
+                .try_fast_forward_br2_post_vs_stack_packet_scan_loop(start_pc, cycles_before, bus),
+            pc if (BR2_POST_VS_RECORD_COPY_LOOP_START..BR2_POST_VS_RECORD_COPY_LOOP_EXIT)
+                .contains(&pc)
+                && (pc - BR2_POST_VS_RECORD_COPY_LOOP_START).is_multiple_of(4) =>
+            {
+                self.try_fast_forward_br2_post_vs_record_copy_loop(start_pc, cycles_before, bus)
+            }
+            BR2_POST_VS_VERTEX_RECORD_LOOP_START => {
+                self.try_fast_forward_br2_post_vs_vertex_record_loop(start_pc, cycles_before, bus)
+            }
+            BR2_POST_VS_STRIDED_POINTER_COPY_LOOP_START => self
+                .try_fast_forward_br2_post_vs_strided_pointer_copy_loop(
+                    start_pc,
+                    cycles_before,
+                    bus,
+                ),
+            BR2_POST_VS_ALT_STRIDED_POINTER_COPY_LOOP_START => self
+                .try_fast_forward_br2_post_vs_alt_strided_pointer_copy_loop(
+                    start_pc,
+                    cycles_before,
+                    bus,
+                ),
+            BR2_POST_VS_TABLE_ACCUM_LOOP_START | BR2_POST_VS_TABLE_ACCUM_LOOP_TAIL_INCREMENT => {
+                self.try_fast_forward_br2_post_vs_table_accum_loop(start_pc, cycles_before, bus)
+            }
+            BR2_REVERSE_MISMATCH_SCAN_LOOP_START => {
+                self.try_fast_forward_br2_reverse_mismatch_scan_loop(start_pc, cycles_before, bus)
+            }
+            BR2_REVERSE_POINTER_SCAN_LOOP_START => {
+                self.try_fast_forward_br2_reverse_pointer_scan_loop(start_pc, cycles_before, bus)
+            }
+            BR2_SMALL_BYTE_COPY_LOOP_START => {
+                self.try_fast_forward_br2_small_byte_copy_loop(start_pc, cycles_before, bus)
+            }
+            BR2_BITSTREAM_DECODE_LOOP_START | BR2_BITSTREAM_DECODE_DIRECT_START => {
+                self.try_fast_forward_br2_bitstream_decode_loop(start_pc, cycles_before, bus)
+            }
+            _ => None,
+        }
     }
 
     fn try_fast_forward_br2_draw_sync_wait_loop(
@@ -7378,6 +7587,7 @@ impl Cpu {
                 ) {
                     return StepOutcome::Continue;
                 }
+                self.debug_br2_alt_child_owner_store(current_pc, instruction, address, bus);
                 bus.write_u32(address, self.regs[rt(instruction)]);
                 StepOutcome::Continue
             }
@@ -7616,17 +7826,82 @@ impl Cpu {
         );
     }
 
-    fn debug_br2_gpu_linked_list_submit(&self, current_pc: u32, instruction: u32, bus: &Bus) {
-        if current_pc != BR2_GPU_LINKED_LIST_CHCR_STORE_PC
-            || instruction != 0xac43_0000
-            || std::env::var_os("BR2_NATIVE_DEBUG_GPU_SUBMIT").is_none()
+    fn debug_br2_alt_child_owner_store(
+        &self,
+        current_pc: u32,
+        instruction: u32,
+        address: u32,
+        bus: &Bus,
+    ) {
+        let owner = self.regs[5];
+        if std::env::var_os("BR2_NATIVE_DEBUG_ALT_CHILD_STORE").is_none()
+            || current_pc != BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_SIGNATURE[7].0
+            || instruction != BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_SIGNATURE[7].1
+            || owner & 0x03 == 0
         {
             return;
         }
-        let min_vblank = std::env::var("BR2_NATIVE_DEBUG_GPU_SUBMIT_MIN_VBLANK")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
+
+        let pending_load = self
+            .pending_load
+            .map(|(register, value)| format!("r{register}=0x{value:08x}"))
+            .unwrap_or_else(|| "none".to_string());
+        let load_commit = self
+            .load_commit_register
+            .zip(self.load_commit_value)
+            .map(|(register, value)| format!("r{register}=0x{value:08x}"))
+            .unwrap_or_else(|| "none".to_string());
+        let memory_bytes = |base: u32| {
+            (0..32)
+                .map(|offset| format!("{:02x}", bus.read_u8(base.wrapping_add(offset))))
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        let loop_tail = (0..=8)
+            .map(|index| {
+                let pc = 0x8035_99c8u32.wrapping_add(index * 4);
+                format!("0x{pc:08x}:0x{:08x}", bus.read_u32_executable_no_trace(pc))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        eprintln!(
+            "BR2 alt-child owner-store: vblank={} cycles={} pc=0x{current_pc:08x} address=0x{address:08x} value=0x{:08x} a0=0x{:08x} a1=0x{:08x} s0=0x{:08x} s1=0x{:08x} sp=0x{:08x} ra=0x{:08x} pending_load={} load_commit={} load_commit_cancelled={} a1_bytes@0x{:08x}={} s0_bytes@0x{:08x}={} loop_tail=[{}]",
+            bus.vblank_count(),
+            self.cycles,
+            self.regs[rt(instruction)],
+            self.regs[4],
+            owner,
+            self.regs[16],
+            self.regs[17],
+            self.regs[29],
+            self.regs[31],
+            pending_load,
+            load_commit,
+            self.load_commit_cancelled,
+            owner.wrapping_sub(8),
+            memory_bytes(owner.wrapping_sub(8)),
+            self.regs[16].wrapping_sub(8),
+            memory_bytes(self.regs[16].wrapping_sub(8)),
+            loop_tail,
+        );
+    }
+
+    fn debug_br2_gpu_linked_list_submit(&self, current_pc: u32, instruction: u32, bus: &Bus) {
+        if current_pc != BR2_GPU_LINKED_LIST_CHCR_STORE_PC || instruction != 0xac43_0000 {
+            return;
+        }
+        static SETTINGS: OnceLock<Option<u64>> = OnceLock::new();
+        let Some(min_vblank) = *SETTINGS.get_or_init(|| {
+            std::env::var_os("BR2_NATIVE_DEBUG_GPU_SUBMIT").map(|_| {
+                std::env::var("BR2_NATIVE_DEBUG_GPU_SUBMIT_MIN_VBLANK")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+            })
+        }) else {
+            return;
+        };
         if bus.vblank_count() < min_vblank {
             return;
         }
@@ -8371,7 +8646,13 @@ impl Cpu {
                 bus,
                 &BR2_RUNTIME_MODEL_CLEANUP_LOOP_CALLER_SIGNATURE,
             );
-        let expected_caller = low_caller || game_caller || relocated_game_caller || loop_caller;
+        let beast_loop_caller = self.regs[31] == BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_RETURN
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_SIGNATURE,
+            );
+        let expected_caller =
+            low_caller || game_caller || relocated_game_caller || loop_caller || beast_loop_caller;
         let entry_signature =
             br2_instruction_signature_matches(bus, &BR2_RUNTIME_MODEL_CLEANUP_ENTRY_SIGNATURE);
         let callback_signature =
@@ -8389,7 +8670,7 @@ impl Cpu {
             return None;
         }
 
-        if game_caller || relocated_game_caller || loop_caller {
+        if game_caller || relocated_game_caller || loop_caller || beast_loop_caller {
             let owner = self.regs[17];
             let slot = owner.wrapping_add(0x40);
             if br2_writable_byte_range(slot, 4, bus) && bus.read_u32_fast_no_trace(slot) == model {
@@ -8405,7 +8686,11 @@ impl Cpu {
         let saved_s0 = bus.read_u32_fast_no_trace(stack.wrapping_add(0x10));
         let saved_s1 = bus.read_u32_fast_no_trace(stack.wrapping_add(0x14));
         let saved_ra = bus.read_u32_fast_no_trace(stack.wrapping_add(0x18));
-        self.regs[16] = if loop_caller { 0 } else { saved_s0 };
+        self.regs[16] = if loop_caller || beast_loop_caller {
+            0
+        } else {
+            saved_s0
+        };
         self.regs[17] = saved_s1;
         self.regs[31] = saved_ra;
         self.regs[29] = stack.wrapping_add(0x20);
@@ -9041,12 +9326,36 @@ impl Cpu {
                 &BR2_RUNTIME_UNALIGNED_SCENE_CALLBACK_SIGNATURE,
             )
             && br2_runtime_scene_callback_caller_signature_matches(bus);
+        let beast_model_load = current_pc == BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_PC
+            && instruction == BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE[2].1
+            && self.regs[31] == BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE,
+            )
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_SIGNATURE,
+            );
+        let vertex_pack_model_load = current_pc
+            == BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_PC
+            && instruction == BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE[4].1
+            && self.regs[31] == BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN
+            && self.regs[4] == self.regs[16].wrapping_add(0x50)
+            && br2_readable_byte_range(self.regs[16].wrapping_add(4), 4, bus)
+            && bus.read_u32_fast_no_trace(self.regs[16].wrapping_add(4)) == address
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE,
+            );
         if !(current_pc == BR2_RUNTIME_UNALIGNED_WORD_LOAD_PC
             || invalid_model_traversal_load
             || packed_vertex_load
             || packed_pointer_table_add_load
             || link_splice_prefix_load
             || scene_callback_load
+            || beast_model_load
+            || vertex_pack_model_load
             || (BR2_RUNTIME_UNALIGNED_RENDER_ACCUM_WORD_LOAD_PC
                 ..=BR2_RUNTIME_UNALIGNED_RENDER_ACCUM_WORD_LOAD_END_PC)
                 .contains(&current_pc)
@@ -9154,7 +9463,13 @@ impl Cpu {
         let alt_packed_primitive_child = current_pc
             == BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOAD_PC
             && instruction == BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_SIGNATURE[6].1
-            && self.regs[31] == BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_CALLER_RETURN
+            && (self.regs[31] == BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_CALLER_RETURN
+                || (self.regs[31]
+                    == BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_RETURN
+                    && br2_instruction_signature_matches(
+                        bus,
+                        &BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_SIGNATURE,
+                    )))
             && br2_instruction_signature_matches(
                 bus,
                 &BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_SIGNATURE,
@@ -9357,6 +9672,18 @@ impl Cpu {
                 bus,
                 &BR2_RUNTIME_PACKED_TABLE_ARITHMETIC_CALLER_SIGNATURE,
             );
+        let beast_model_load = current_pc == BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_PC
+            && !signed
+            && instruction == BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_SIGNATURE[2].1
+            && self.regs[31] == BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_SIGNATURE,
+            )
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_SIGNATURE,
+            );
         if (!(BR2_RUNTIME_UNALIGNED_VERTEX_HALFWORD_LOAD_PC
             ..=BR2_RUNTIME_UNALIGNED_VERTEX_HALFWORD_LOAD_END_PC)
             .contains(&current_pc)
@@ -9364,7 +9691,8 @@ impl Cpu {
             && !packed_vertex_load
             && !packed_scene_record_load
             && !packed_pointer_table_halfword_copy_load
-            && !packed_pointer_table_halfword_add_load)
+            && !packed_pointer_table_halfword_add_load
+            && !beast_model_load)
             || delay_slot_branch_pc.is_some()
             || address & 0x01 == 0
         {
@@ -9730,7 +10058,6 @@ impl Cpu {
         let expected_destination = self.regs[5].wrapping_add(destination_index);
         let source = self.regs[6].wrapping_add(source_index);
         address == expected_destination
-            && br2_writable_byte_range(address, 4, bus)
             && source & 0x03 == 0
             && br2_readable_byte_range(source, 4, bus)
             && self.regs[2] == bus.read_u32(source)
@@ -9979,11 +10306,13 @@ impl Cpu {
             BR2_BIOS_KERNEL_SYSCALL_ENTER_CRITICAL_SECTION => {
                 self.regs[2] = u32::from(self.cp0[CP0_STATUS] & STATUS_IE != 0);
                 self.cp0[CP0_STATUS] &= !STATUS_IE;
+                self.cp0[CP0_CAUSE] &= !CAUSE_EXCODE_MASK;
                 true
             }
             BR2_BIOS_KERNEL_SYSCALL_EXIT_CRITICAL_SECTION => {
                 self.regs[2] = 1;
                 self.cp0[CP0_STATUS] |= STATUS_IE;
+                self.cp0[CP0_CAUSE] &= !CAUSE_EXCODE_MASK;
                 true
             }
             _ => false,
@@ -10453,6 +10782,9 @@ impl Cpu {
 
         if self.pc == BR2_MATRIX_MULTIPLY_ENTRY_PC {
             let global_matrix_pointer = bus.read_u32(BR2_MATRIX_MULTIPLY_GLOBAL_POINTER);
+            let rotation = br2_read_matrix(bus, global_matrix_pointer);
+            let source = br2_read_matrix(bus, self.regs[5]);
+            let expected_result = br2_matrix_multiply_expected(rotation, source);
             self.br2_matrix_multiply_pending = Some(Br2MatrixMultiplySample {
                 cycles: self.cycles,
                 vblank: bus.vblank_count(),
@@ -10472,10 +10804,13 @@ impl Cpu {
                 output: self.regs[3],
                 saved: [self.regs[16], self.regs[17], self.regs[18], self.regs[19]],
                 global_matrix_pointer,
-                rotation: br2_read_matrix(bus, global_matrix_pointer),
-                source: br2_read_matrix(bus, self.regs[5]),
+                rotation,
+                source,
+                expected_result,
                 result: [[0; 3]; 3],
+                expected_saturated: br2_matrix_has_i16_saturation(&expected_result),
                 saturated: false,
+                result_matches_expected: false,
             });
             return;
         }
@@ -10489,11 +10824,8 @@ impl Cpu {
 
         self.br2_matrix_multiply_calls = self.br2_matrix_multiply_calls.saturating_add(1);
         sample.result = br2_read_matrix(bus, sample.output);
-        sample.saturated = sample
-            .result
-            .iter()
-            .flatten()
-            .any(|value| *value == i16::MIN || *value == i16::MAX);
+        sample.saturated = br2_matrix_has_i16_saturation(&sample.result);
+        sample.result_matches_expected = sample.result == sample.expected_result;
 
         let should_sample = if sample.saturated {
             self.br2_matrix_multiply_saturated_calls =
@@ -11080,13 +11412,24 @@ impl Cpu {
         if self.br2_bios_b0_dispatch_call() {
             return false;
         }
+        // This HLE only replaces the BIOS interrupt return path. Address and
+        // other synchronous exceptions can enter the same BIOS dispatcher,
+        // but resuming their EPC would immediately repeat the fault.
+        if self.cause_excode() != Exception::Interrupt as u32 {
+            return false;
+        }
         let ip2_pending = self.cp0[CP0_CAUSE] & CAUSE_IP2 != 0;
+        let irq_dispatch_return =
+            (BIOS_IRQ_DISPATCH_LOOP_HLE_START..=BIOS_IRQ_DISPATCH_LOOP_HLE_END).contains(&self.pc)
+                && br2_game_runtime_pc(self.cp0[CP0_EPC])
+                && bios_irq_dispatch_loop_has_signature(bus)
+                && bios_exception_context_has_guest_runtime(bus);
         let late_low_bios_irq_return = !ip2_pending
             && br2_low_bios_irq_context_restore_required(self.pc)
             && br2_game_runtime_pc(self.cp0[CP0_EPC])
             && br2_low_bios_irq_stack_pointer(self.regs[29])
             && bios_exception_context_has_guest_runtime(bus);
-        if !ip2_pending && !late_low_bios_irq_return {
+        if !ip2_pending && !late_low_bios_irq_return && !irq_dispatch_return {
             return false;
         }
         let low_bios_irq_return =
@@ -11106,10 +11449,6 @@ impl Cpu {
             .contains(&self.pc)
             && br2_runtime_ram_pc(self.cp0[CP0_EPC])
             && bios_exception_vector_points_to_blank_c80_handler(bus);
-        let irq_dispatch_return =
-            (BIOS_IRQ_DISPATCH_LOOP_HLE_START..=BIOS_IRQ_DISPATCH_LOOP_HLE_END).contains(&self.pc)
-                && br2_game_runtime_pc(self.cp0[CP0_EPC])
-                && bios_irq_dispatch_loop_has_signature(bus);
         if !post_vs_c80_return
             && !draw_sync_c80_return
             && !blank_c80_return
@@ -12784,6 +13123,63 @@ fn br2_read_matrix(bus: &Bus, address: u32) -> [[i16; 3]; 3] {
     ]
 }
 
+fn br2_matrix_multiply_expected(rotation: [[i16; 3]; 3], source: [[i16; 3]; 3]) -> [[i16; 3]; 3] {
+    [
+        [
+            br2_matrix_multiply_component(rotation[0], br2_matrix_column(source, 0)),
+            br2_matrix_multiply_component(rotation[0], br2_matrix_column(source, 1)),
+            br2_matrix_multiply_component(rotation[0], br2_matrix_column(source, 2)),
+        ],
+        [
+            br2_matrix_multiply_component(rotation[1], br2_matrix_column(source, 0)),
+            br2_matrix_multiply_component(rotation[1], br2_matrix_column(source, 1)),
+            br2_matrix_multiply_component(rotation[1], br2_matrix_column(source, 2)),
+        ],
+        [
+            br2_matrix_multiply_component(rotation[2], br2_matrix_column(source, 0)),
+            br2_matrix_multiply_component(rotation[2], br2_matrix_column(source, 1)),
+            br2_matrix_multiply_component(rotation[2], br2_matrix_column(source, 2)),
+        ],
+    ]
+}
+
+fn br2_matrix_multiply_component(rotation_row: [i16; 3], source_column: [i16; 3]) -> i16 {
+    let value = rotation_row[0] as i64 * source_column[0] as i64
+        + rotation_row[1] as i64 * source_column[1] as i64
+        + rotation_row[2] as i64 * source_column[2] as i64;
+    br2_clamp_i16(value >> GTE_FRACTIONAL_BITS)
+}
+
+fn br2_matrix_column(matrix: [[i16; 3]; 3], column: usize) -> [i16; 3] {
+    [matrix[0][column], matrix[1][column], matrix[2][column]]
+}
+
+fn br2_clamp_i16(value: i64) -> i16 {
+    value.clamp(i16::MIN as i64, i16::MAX as i64) as i16
+}
+
+fn br2_matrix_has_i16_saturation(matrix: &[[i16; 3]; 3]) -> bool {
+    matrix
+        .iter()
+        .flatten()
+        .any(|value| *value == i16::MIN || *value == i16::MAX)
+}
+
+fn br2_matrix_json(matrix: &[[i16; 3]; 3]) -> String {
+    format!(
+        "[[{},{},{}],[{},{},{}],[{},{},{}]]",
+        matrix[0][0],
+        matrix[0][1],
+        matrix[0][2],
+        matrix[1][0],
+        matrix[1][1],
+        matrix[1][2],
+        matrix[2][0],
+        matrix[2][1],
+        matrix[2][2],
+    )
+}
+
 fn br2_read_i16(bus: &Bus, address: u32) -> i16 {
     bus.read_u16(address) as i16
 }
@@ -13234,7 +13630,8 @@ mod tests {
         BR2_RUNTIME_INVALID_VERTEX_TRANSFORM_STORE_PC, BR2_RUNTIME_LINK_SPLICE_ENTRY,
         BR2_RUNTIME_LINK_SPLICE_PREFIX_SIGNATURE, BR2_RUNTIME_LINK_SPLICE_RETURN,
         BR2_RUNTIME_LINK_SPLICE_SIGNATURE, BR2_RUNTIME_MODEL_CALLBACK_JALR_PC,
-        BR2_RUNTIME_MODEL_CALLBACK_SIGNATURE, BR2_RUNTIME_MODEL_CLEANUP_ENTRY,
+        BR2_RUNTIME_MODEL_CALLBACK_SIGNATURE, BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_RETURN,
+        BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_SIGNATURE, BR2_RUNTIME_MODEL_CLEANUP_ENTRY,
         BR2_RUNTIME_MODEL_CLEANUP_ENTRY_SIGNATURE, BR2_RUNTIME_MODEL_CLEANUP_GAME_CALLER_RETURN,
         BR2_RUNTIME_MODEL_CLEANUP_GAME_CALLER_SIGNATURE, BR2_RUNTIME_MODEL_CLEANUP_HLE_CYCLES,
         BR2_RUNTIME_MODEL_CLEANUP_LOOP_CALLER_RETURN,
@@ -13312,6 +13709,15 @@ mod tests {
     use crate::action::ActionButtons;
     use crate::native::bus::Bus;
     use crate::native::io::{DMA_INTERRUPT, DMA_SPU_CHCR};
+
+    fn write_br2_matrix(bus: &mut Bus, address: u32, matrix: [[i16; 3]; 3]) {
+        for (row_index, row) in matrix.iter().enumerate() {
+            for (column_index, value) in row.iter().enumerate() {
+                let offset = ((row_index * 3 + column_index) * 2) as u32;
+                bus.write_u16(address.wrapping_add(offset), *value as u16);
+            }
+        }
+    }
 
     fn install_br2_credit_check(bus: &mut Bus) {
         for (address, instruction) in BR2_CREDIT_CHECK_ENTRY_SIGNATURE
@@ -13466,6 +13872,7 @@ mod tests {
             .chain(BR2_RUNTIME_MODEL_CLEANUP_GAME_CALLER_SIGNATURE)
             .chain(BR2_RUNTIME_RELOCATED_INVALID_MODEL_TRAVERSAL_SIGNATURE)
             .chain(BR2_RUNTIME_MODEL_CLEANUP_LOOP_CALLER_SIGNATURE)
+            .chain(BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_SIGNATURE)
             .chain(BR2_RUNTIME_UNALIGNED_SCENE_CALLBACK_LOW_CALLER_SIGNATURE)
         {
             bus.write_u32(address, instruction);
@@ -13507,6 +13914,8 @@ mod tests {
     fn install_br2_runtime_invalid_alt_packed_primitive_child(bus: &mut Bus) {
         for (address, instruction) in
             super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_SIGNATURE
+                .into_iter()
+                .chain(super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_SIGNATURE)
         {
             bus.write_u32(address, instruction);
         }
@@ -19686,6 +20095,86 @@ mod tests {
     }
 
     #[test]
+    fn hle_returns_from_br2_bios_irq_dispatch_loop_after_ip2_clear() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_bios_irq_dispatch_loop_signature(&mut bus);
+        install_bios_exception_context(&mut bus, 0x803f_fef0, 0x8035_dbec);
+        bus.io.irq.status = 0;
+        bus.io.irq.mask = 1;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_1be8;
+        cpu.next_pc = 0x0000_1bec;
+        cpu.regs[16] = 0x0000_1234;
+        cpu.regs[18] = 0x0000_5678;
+        cpu.regs[29] = 0x0000_8b30;
+        cpu.regs[31] = 0x0000_18d0;
+        cpu.hi = 0xaaaa_aaaa;
+        cpu.lo = 0xbbbb_bbbb;
+        cpu.cp0[CP0_STATUS] = 0x4000_0404;
+        cpu.cp0[CP0_CAUSE] = 0;
+        cpu.cp0[CP0_EPC] = 0x8035_db48;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_1be8);
+        assert_eq!(report.instruction, None);
+        assert_eq!(report.cycles_elapsed, 1);
+        assert_eq!(cpu.pc, 0x8035_db48);
+        assert_eq!(cpu.next_pc, 0x8035_db4c);
+        assert_eq!(cpu.cp0[CP0_STATUS], 0x4000_0401);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, 0);
+        assert_eq!(cpu.regs[16], 0x1111_0000);
+        assert_eq!(cpu.regs[18], 0x2222_0000);
+        assert_eq!(cpu.regs[29], 0x803f_fef0);
+        assert_eq!(cpu.regs[31], 0x8035_dbec);
+        assert_eq!(cpu.lo, 0x3333_0000);
+        assert_eq!(cpu.hi, 0x4444_0000);
+    }
+
+    #[test]
+    fn hle_does_not_return_address_store_from_bios_irq_dispatch_loop() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_bios_irq_dispatch_loop_signature(&mut bus);
+        install_bios_exception_context(&mut bus, 0x803f_fef0, 0x8035_d25c);
+        bus.io.irq.status = 0;
+        bus.io.irq.mask = 1;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = 0x0000_1be8;
+        cpu.next_pc = 0x0000_1bec;
+        cpu.regs[16] = 0x0000_1234;
+        cpu.regs[18] = 0x0000_5678;
+        cpu.regs[29] = 0x0000_8b30;
+        cpu.regs[31] = 0x0000_18d0;
+        cpu.hi = 0xaaaa_aaaa;
+        cpu.lo = 0xbbbb_bbbb;
+        cpu.cp0[CP0_STATUS] = 0x4000_0404;
+        cpu.cp0[CP0_CAUSE] = CAUSE_BD | ((super::Exception::AddressStore as u32) << 2);
+        cpu.cp0[CP0_EPC] = super::BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_BRANCH_PC;
+        cpu.cp0[CP0_BADVADDR] = 0x8040_0001;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.start_pc, 0x0000_1be8);
+        assert_eq!(report.instruction, Some(bus.read_u32(0x0000_1be8)));
+        assert_eq!(cpu.pc, 0x0000_1bec);
+        assert_eq!(cpu.next_pc, 0x0000_1bf0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], CAUSE_BD | (5 << 2));
+        assert_eq!(
+            cpu.cp0[CP0_EPC],
+            super::BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_BRANCH_PC
+        );
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0x8040_0001);
+        assert_eq!(cpu.regs[16], 0x0000_1234);
+        assert_eq!(cpu.regs[18], 0x0000_5678);
+        assert_eq!(cpu.regs[29], 0x0000_8b30);
+        assert_eq!(cpu.regs[31], 0x0000_18d0);
+        assert_eq!(cpu.hi, 0xaaaa_aaaa);
+        assert_eq!(cpu.lo, 0xbbbb_bbbb);
+    }
+
+    #[test]
     fn hle_does_not_return_from_bios_irq_dispatch_loop_to_low_bios_alias() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_bios_irq_dispatch_loop_signature(&mut bus);
@@ -21687,6 +22176,87 @@ mod tests {
     }
 
     #[test]
+    fn br2_matrix_multiply_expected_matches_signed_fixed_point_sample() {
+        let rotation = [[5829, 0, -2992], [-522, 8112, -1016], [1852, 570, 3608]];
+        let source = [[2941, -1537, 0], [1467, 3379, 0], [-1742, 253, 0]];
+
+        assert_eq!(
+            super::br2_matrix_multiply_expected(rotation, source),
+            [[5457, -2373, 0], [2962, 6825, 0], [-1, -2, 0]]
+        );
+    }
+
+    #[test]
+    fn br2_matrix_multiply_expected_clamps_signed_fixed_point_overflow() {
+        let rotation = [[5829, 0, -2992], [-522, 8112, -1016], [1852, 570, 3608]];
+        let positive_overflow_source = [[-2923, 0, 21531], [0, 4096, 0], [-21532, 0, -2923]];
+        let negative_overflow_source =
+            [[1464, -32714, 1428], [-32714, 1460, -32714], [0, 0, -21968]];
+
+        assert_eq!(
+            super::br2_matrix_multiply_expected(rotation, positive_overflow_source),
+            [[11568, 0, 32767], [5713, 8112, -2019], [-20289, 570, 7160]]
+        );
+        assert_eq!(
+            super::br2_matrix_multiply_expected(rotation, negative_overflow_source),
+            [
+                [2083, -32768, 18079],
+                [-32768, 7060, -32768],
+                [-3891, -14589, -23258],
+            ]
+        );
+    }
+
+    #[test]
+    fn br2_matrix_multiply_diagnostic_separates_expected_clamp_from_mismatch() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let rotation_address = 0x8038_b000;
+        let source_address = 0x8038_b4ac;
+        let output = 0x1f80_03e0;
+        let rotation = [[5829, 0, -2992], [-522, 8112, -1016], [1852, 570, 3608]];
+        let source = [[-2923, 0, 21531], [0, 4096, 0], [-21532, 0, -2923]];
+        let expected = super::br2_matrix_multiply_expected(rotation, source);
+        bus.write_u32(super::BR2_MATRIX_MULTIPLY_GLOBAL_POINTER, rotation_address);
+        write_br2_matrix(&mut bus, rotation_address, rotation);
+        write_br2_matrix(&mut bus, source_address, source);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_MATRIX_MULTIPLY_ENTRY_PC;
+        cpu.regs[3] = output;
+        cpu.regs[5] = source_address;
+        cpu.record_br2_matrix_multiply_boundary(&bus);
+
+        write_br2_matrix(&mut bus, output, expected);
+        cpu.pc = super::BR2_MATRIX_MULTIPLY_RESULT_PC;
+        cpu.record_br2_matrix_multiply_boundary(&bus);
+
+        let sample = cpu.br2_matrix_multiply_samples.last().unwrap();
+        assert!(sample.saturated);
+        assert!(sample.expected_saturated);
+        assert!(sample.result_matches_expected);
+        assert_eq!(sample.result, expected);
+        assert!(sample.json().contains("\"result_matches_expected\":true"));
+
+        let mut mismatched = expected;
+        mismatched[0][2] = 32766;
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_MATRIX_MULTIPLY_ENTRY_PC;
+        cpu.regs[3] = output;
+        cpu.regs[5] = source_address;
+        cpu.record_br2_matrix_multiply_boundary(&bus);
+
+        write_br2_matrix(&mut bus, output, mismatched);
+        cpu.pc = super::BR2_MATRIX_MULTIPLY_RESULT_PC;
+        cpu.record_br2_matrix_multiply_boundary(&bus);
+
+        let sample = cpu.br2_matrix_multiply_samples.last().unwrap();
+        assert!(!sample.saturated);
+        assert!(sample.expected_saturated);
+        assert!(!sample.result_matches_expected);
+        assert!(sample.json().contains("\"result_matches_expected\":false"));
+    }
+
+    #[test]
     fn executes_regimm_link_branch_with_delay_slot() {
         let rom = program(&[
             i_type(0x09, 0, 8, -1),   // addiu t0, zero, -1
@@ -21815,6 +22385,216 @@ mod tests {
         assert_eq!(cpu.regs[8], 0x4433_2211);
         assert_eq!(cpu.pc, BR2_RUNTIME_UNALIGNED_WORD_LOAD_PC + 8);
         assert_eq!(cpu.next_pc, BR2_RUNTIME_UNALIGNED_WORD_LOAD_PC + 12);
+    }
+
+    #[test]
+    fn hle_br2_runtime_beast_unaligned_model_word_load_reads_ram_without_exception() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (address, instruction) in super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE
+            .into_iter()
+            .chain(super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_SIGNATURE)
+        {
+            bus.write_u32(address, instruction);
+        }
+        let source = 0x8039_dfbf;
+        bus.write_u8(source, 0x11);
+        bus.write_u8(source + 1, 0x22);
+        bus.write_u8(source + 2, 0x33);
+        bus.write_u8(source + 3, 0x44);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = source;
+        cpu.regs[31] = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN;
+
+        let load = cpu.step_report(&mut bus);
+        assert_eq!(load.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(cpu.regs[2], source);
+
+        let delay = cpu.step_report(&mut bus);
+        assert_eq!(delay.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.regs[2], 0x4433_2211);
+        assert_eq!(
+            cpu.pc,
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_PC + 8
+        );
+    }
+
+    #[test]
+    fn beast_unaligned_model_word_load_with_bad_caller_signature_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (address, instruction) in super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE
+            .into_iter()
+            .chain(super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_SIGNATURE)
+        {
+            bus.write_u32(address, instruction);
+        }
+        bus.write_u32(
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN - 8,
+            0xffff_ffff,
+        );
+        let source = 0x8039_dfbf;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = source;
+        cpu.regs[31] = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN;
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], source);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(
+            cpu.cp0[CP0_EPC],
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_PC
+        );
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+    }
+
+    #[test]
+    fn hle_br2_runtime_beast_unaligned_model_halfword_load_reads_ram_without_exception() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (address, instruction) in
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_SIGNATURE
+                .into_iter()
+                .chain(super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_SIGNATURE)
+        {
+            bus.write_u32(address, instruction);
+        }
+        let source = 0x8039_dfbf;
+        bus.write_u8(source, 0x34);
+        bus.write_u8(source + 1, 0x12);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = source;
+        cpu.regs[31] = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN;
+
+        let load = cpu.step_report(&mut bus);
+        assert_eq!(load.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(cpu.regs[2], source);
+
+        let delay = cpu.step_report(&mut bus);
+        assert_eq!(delay.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.regs[2], 0x1234);
+        assert_eq!(
+            cpu.pc,
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_PC + 8
+        );
+    }
+
+    #[test]
+    fn beast_unaligned_model_halfword_load_with_bad_signature_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (address, instruction) in
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_SIGNATURE
+                .into_iter()
+                .chain(super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_SIGNATURE)
+        {
+            bus.write_u32(address, instruction);
+        }
+        bus.write_u32(
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_PC - 4,
+            0xffff_ffff,
+        );
+        let source = 0x8039_dfbf;
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = source;
+        cpu.regs[31] = super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN;
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], source);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(
+            cpu.cp0[CP0_EPC],
+            super::BR2_RUNTIME_BEAST_UNALIGNED_MODEL_HALFWORD_LOAD_PC
+        );
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+    }
+
+    #[test]
+    fn hle_br2_runtime_vertex_pack_unaligned_model_word_load_reads_ram_without_exception() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (address, instruction) in
+            super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE
+        {
+            bus.write_u32(address, instruction);
+        }
+        let model = 0x8038_c97c;
+        let source = 0x8010_0012;
+        bus.write_u32(model + 4, source);
+        bus.write_u8(source, 0x11);
+        bus.write_u8(source + 1, 0x22);
+        bus.write_u8(source + 2, 0x33);
+        bus.write_u8(source + 3, 0x44);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = source;
+        cpu.regs[4] = model + 0x50;
+        cpu.regs[16] = model;
+        cpu.regs[31] = super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN;
+
+        let load = cpu.step_report(&mut bus);
+        assert_eq!(load.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(cpu.regs[6], 0);
+
+        let jump = cpu.step_report(&mut bus);
+        assert_eq!(jump.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.regs[6], 0x4433_2211);
+        assert_eq!(
+            cpu.pc,
+            super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_PC + 8
+        );
+    }
+
+    #[test]
+    fn vertex_pack_unaligned_model_word_load_with_bad_signature_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        for (address, instruction) in
+            super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_SIGNATURE
+        {
+            bus.write_u32(address, instruction);
+        }
+        bus.write_u32(
+            super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_PC - 4,
+            0xffff_ffff,
+        );
+        let model = 0x8038_c97c;
+        let source = 0x8010_0012;
+        bus.write_u32(model + 4, source);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = source;
+        cpu.regs[4] = model + 0x50;
+        cpu.regs[16] = model;
+        cpu.regs[31] = super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_CALLER_RETURN;
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], source);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(
+            cpu.cp0[CP0_EPC],
+            super::BR2_RUNTIME_VERTEX_PACK_UNALIGNED_MODEL_WORD_LOAD_PC
+        );
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
     }
 
     #[test]
@@ -24111,6 +24891,43 @@ mod tests {
     }
 
     #[test]
+    fn hle_br2_runtime_packed_pointer_table_store_noops_expansion_gap_destination() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_packed_pointer_table_store(&mut bus);
+        let record = 0x8001_6cf2;
+        let destination_base = 0x80df_bffe;
+        let destination = 0x80df_c002;
+        let source_base = 0x1f80_01e4;
+        let value = 0x8039_d2e8;
+        bus.write_u16(record + 2, 1);
+        bus.write_u16(record + 6, 0);
+        bus.write_u32(source_base, value);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_PC;
+        cpu.next_pc = super::BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_CALLER_RETURN;
+        cpu.delay_slot_branch_pc = Some(super::BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_BRANCH_PC);
+        cpu.regs[2] = value;
+        cpu.regs[3] = destination;
+        cpu.regs[4] = record;
+        cpu.regs[5] = destination_base;
+        cpu.regs[6] = source_base;
+        cpu.regs[31] = super::BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_CALLER_RETURN;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(
+            cpu.pc,
+            super::BR2_RUNTIME_PACKED_POINTER_TABLE_STORE_CALLER_RETURN
+        );
+        assert_eq!(cpu.next_pc, cpu.pc + 4);
+    }
+
+    #[test]
     fn packed_pointer_table_store_with_bad_caller_signature_traps() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_runtime_packed_pointer_table_store(&mut bus);
@@ -24678,6 +25495,54 @@ mod tests {
     }
 
     #[test]
+    fn hle_br2_runtime_invalid_alt_packed_primitive_child_after_callback_skips_corrupt_link() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_invalid_alt_packed_primitive_child(&mut bus);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[5] = 0x8039_0039;
+        cpu.regs[16] = 0x8039_0039;
+        cpu.regs[31] = super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_RETURN;
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.regs[16], 0);
+        assert_eq!(
+            cpu.pc,
+            super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_TAIL_PC
+        );
+        assert_eq!(
+            cpu.next_pc,
+            super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_TAIL_PC + 4
+        );
+    }
+
+    #[test]
+    fn hle_br2_runtime_invalid_alt_packed_primitive_child_after_bad_callback_signature_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_invalid_alt_packed_primitive_child(&mut bus);
+        bus.write_u32(
+            super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_RETURN - 8,
+            0xffff_ffff,
+        );
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[5] = 0x8039_0039;
+        cpu.regs[16] = 0x8039_0039;
+        cpu.regs[31] = super::BR2_RUNTIME_INVALID_ALT_PACKED_PRIMITIVE_CHILD_LOOP_CALLER_RETURN;
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0x8039_0039);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+    }
+
+    #[test]
     fn preserves_br2_runtime_alt_packed_primitive_child_with_valid_link() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         install_br2_runtime_invalid_alt_packed_primitive_child(&mut bus);
@@ -24971,6 +25836,63 @@ mod tests {
         assert_eq!(cpu.regs[29], 0x8002_0020);
         assert_eq!(cpu.cp0[CP0_CAUSE], 0);
         assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+    }
+
+    #[test]
+    fn hle_br2_runtime_invalid_model_cleanup_from_beast_loop_caller() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_model_cleanup(&mut bus);
+        let invalid_model: u32 = 0x8039_0039;
+        let owner = 0x803b_da28;
+        let owner_slot = owner + 0x40;
+        bus.write_u32(owner_slot, invalid_model);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_RUNTIME_MODEL_CLEANUP_ENTRY;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[16] = invalid_model;
+        cpu.regs[17] = owner;
+        cpu.regs[31] = BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_RETURN;
+        install_br2_runtime_model_cleanup_stack(&mut bus, &mut cpu, 0, 0x803f_ff30);
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.pc, BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_RETURN);
+        assert_eq!(cpu.next_pc, cpu.pc + 4);
+        assert_eq!(bus.read_u32(owner_slot), 0);
+        assert_eq!(cpu.regs[16], 0);
+        assert_eq!(cpu.regs[17], 0x803f_ff30);
+        assert_eq!(cpu.regs[29], 0x8002_0020);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+    }
+
+    #[test]
+    fn beast_loop_invalid_model_cleanup_with_bad_caller_signature_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_model_cleanup(&mut bus);
+        bus.write_u32(
+            BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_RETURN - 8,
+            0xffff_ffff,
+        );
+        let invalid_model: u32 = 0x8039_0039;
+        let owner = 0x803b_da28;
+        let owner_slot = owner + 0x40;
+        bus.write_u32(owner_slot, invalid_model);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = BR2_RUNTIME_MODEL_CLEANUP_ENTRY;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[16] = invalid_model;
+        cpu.regs[17] = owner;
+        cpu.regs[31] = BR2_RUNTIME_MODEL_CLEANUP_BEAST_LOOP_CALLER_RETURN;
+        install_br2_runtime_model_cleanup_stack(&mut bus, &mut cpu, 0, 0x803f_ff30);
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], invalid_model + 0x0c);
+        assert_eq!(cpu.cp0[CP0_EPC], BR2_RUNTIME_MODEL_CLEANUP_ENTRY);
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+        assert_eq!(bus.read_u32(owner_slot), invalid_model);
     }
 
     #[test]
@@ -27643,6 +28565,25 @@ mod tests {
         assert_eq!(cpu.cp0[CP0_STATUS] & STATUS_IE, STATUS_IE);
         assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_EXCODE_MASK, 0);
         assert_eq!(cpu.cp0[CP0_EPC], 0);
+    }
+
+    #[test]
+    fn handled_runtime_kernel_syscall_clears_stale_excode_and_preserves_ip2() {
+        let mut cpu = Cpu::default();
+        cpu.regs[4] = BR2_BIOS_KERNEL_SYSCALL_ENTER_CRITICAL_SECTION;
+        cpu.cp0[CP0_STATUS] = STATUS_IE | CAUSE_IP2;
+        cpu.cp0[CP0_CAUSE] = CAUSE_IP2 | (8 << 2);
+
+        assert!(cpu.try_hle_br2_bios_kernel_syscall(0x8033_d650, None));
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_EXCODE_MASK, 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, CAUSE_IP2);
+
+        cpu.regs[4] = BR2_BIOS_KERNEL_SYSCALL_EXIT_CRITICAL_SECTION;
+        cpu.cp0[CP0_CAUSE] |= 8 << 2;
+
+        assert!(cpu.try_hle_br2_bios_kernel_syscall(0x8033_d650, None));
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_EXCODE_MASK, 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE] & CAUSE_IP2, CAUSE_IP2);
     }
 
     #[test]

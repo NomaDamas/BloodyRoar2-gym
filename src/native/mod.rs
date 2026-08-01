@@ -7,6 +7,7 @@ pub mod io;
 pub mod platform;
 pub mod playable;
 pub mod romset;
+pub mod sound;
 
 pub use backend::NativeBackend;
 pub use bus::NativeInputActivity;
@@ -29,3 +30,4 @@ pub use romset::{
     NativeRomCachedScan, NativeRomCompatibilityReport, NativeRomDuplicateAsset, NativeRomEntry,
     NativeRomManifest, NativeRomManifestEntry, NativeRomSet, bloody_roar_2_manifest,
 };
+pub use sound::{StereoSample, YMF271_SAMPLE_RATE_HZ};

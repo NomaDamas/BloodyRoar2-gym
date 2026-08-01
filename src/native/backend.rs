@@ -6,10 +6,12 @@ use crate::native::emulator::{NativeDisplayFrame, NativeEmulator};
 use crate::native::playable::{NativePlayableStartup, prepare_native_playable_emulator};
 
 const NATIVE_BACKEND_VBLANK_CAPTURE_INTERVAL: u64 = 6_000;
-const NATIVE_BACKEND_OTC_RECOVERY_INTERVAL: u64 = 4;
+const NATIVE_BACKEND_OTC_RECOVERY_INTERVAL: u64 = 1;
 const NATIVE_BACKEND_MIN_VBLANK_INSTRUCTION_BUDGET: u64 = 2_000_000;
 const NATIVE_HUD_WIDTH: usize = 512;
 const NATIVE_HUD_HEIGHT: usize = 480;
+const NATIVE_OBSERVATION_SCREENSHOT_WIDTH: usize = 640;
+const NATIVE_OBSERVATION_SCREENSHOT_HEIGHT: usize = 480;
 const NATIVE_P1_HEALTH_X: std::ops::Range<usize> = 35..230;
 const NATIVE_P2_HEALTH_X: std::ops::Range<usize> = 282..477;
 const NATIVE_HEALTH_Y: std::ops::Range<usize> = 42..51;
@@ -59,11 +61,13 @@ impl NativeBackend {
         requested_buttons: ActionButtons,
         activity_baseline: crate::native::NativeInputActivity,
     ) -> Observation {
-        self.update_hud_observation();
+        let native_playable_candidate = self.emulator.native_playable_candidate();
+        self.update_hud_observation(native_playable_candidate);
         let input_activity = self.emulator.input_activity();
         let input_delta = input_activity.saturating_subtracted(activity_baseline);
-        let screenshot_frame = self.emulator.display_gui_frame();
-        let native_playable_candidate = self.emulator.native_playable_candidate();
+        let screenshot_b64 = self
+            .include_screenshot
+            .then(|| self.emulator.display_gui_png_base64());
         Observation {
             frame: self.frame,
             player_health: self.player_health,
@@ -73,11 +77,9 @@ impl NativeBackend {
             terminal: self.emulator.is_terminal()
                 || self.player_health <= f32::EPSILON
                 || self.opponent_health <= f32::EPSILON,
-            screenshot_b64: self
-                .include_screenshot
-                .then(|| self.emulator.display_gui_png_base64()),
+            screenshot_b64,
             info_json: format!(
-                "{{\"requested_buttons\":{},\"input_activity\":{},\"input_activity_delta\":{},\"native_playable_candidate\":{},\"startup\":{{\"mode\":\"playable_checkpoint\",\"frames\":{},\"playable\":{}}},\"screenshot\":{{\"included\":{},\"width\":{},\"height\":{},\"source\":\"native_gui_aspect_corrected\"}},\"guest_input_proof\":{{\"any\":{},\"play_controls\":{},\"full_controls\":{}}}}}",
+                "{{\"requested_buttons\":{},\"input_activity\":{},\"input_activity_delta\":{},\"native_playable_candidate\":{},\"startup\":{{\"mode\":\"playable_checkpoint\",\"frames\":{},\"playable\":{}}},\"screenshot\":{{\"included\":{},\"width\":{},\"height\":{},\"source\":\"native_gui_aspect_corrected\"}},\"guest_input_proof\":{{\"any\":{},\"play_controls\":{},\"full_controls\":{},\"p1_any\":{},\"p1_play_controls\":{},\"p1_full_controls\":{},\"p2_any\":{},\"p2_play_controls\":{},\"p2_full_controls\":{},\"combined_any\":{},\"combined_full_controls\":{}}}}}",
                 requested_buttons.json(),
                 input_activity.json(),
                 input_delta.json(),
@@ -85,17 +87,25 @@ impl NativeBackend {
                 self.startup.frames,
                 self.startup.playable,
                 self.include_screenshot,
-                screenshot_frame.width,
-                screenshot_frame.height,
+                NATIVE_OBSERVATION_SCREENSHOT_WIDTH,
+                NATIVE_OBSERVATION_SCREENSHOT_HEIGHT,
                 input_delta.has_any_control_activity(),
                 input_delta.has_play_control_activity(),
                 input_delta.has_full_control_activity(),
+                input_delta.has_p1_any_control_activity(),
+                input_delta.has_p1_play_control_activity(),
+                input_delta.has_p1_full_control_activity(),
+                input_delta.has_p2_any_control_activity(),
+                input_delta.has_p2_play_control_activity(),
+                input_delta.has_p2_full_control_activity(),
+                input_delta.has_any_control_activity(),
+                input_delta.has_combined_full_control_activity(),
             ),
         }
     }
 
-    fn update_hud_observation(&mut self) {
-        if !self.emulator.native_playable_candidate() {
+    fn update_hud_observation(&mut self, native_playable_candidate: bool) {
+        if !native_playable_candidate {
             return;
         }
         let frame = self.emulator.display_frame();
@@ -123,7 +133,9 @@ impl NativeBackend {
         {
             let remaining = instruction_budget.saturating_sub(executed);
             let batch = self.instructions_per_frame.min(remaining).max(1);
-            let batch_executed = self.emulator.step_until_next_vblank(batch);
+            let batch_executed = self
+                .emulator
+                .step_instructions_until_vblank_untracked(batch);
             executed = executed.saturating_add(batch_executed);
             if batch_executed == 0 {
                 break;

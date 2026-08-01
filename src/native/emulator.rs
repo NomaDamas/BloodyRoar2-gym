@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
@@ -10,6 +11,7 @@ use crate::native::framebuffer::{bytes_base64, png_from_rgb888_pixels};
 use crate::native::io::{NativeGpuDisplayCandidate, NativeGpuDrawCapture};
 use crate::native::platform::native_platform_json;
 use crate::native::romset::{NativeRomCacheReport, NativeRomCompatibilityReport, NativeRomSet};
+use crate::native::sound::{AudioHealth, CoreAudioOutput, StereoSample};
 
 const NATIVE_AT28C16_MODE_ENV: &str = "BLOODYROAR2_NATIVE_AT28C16_MODE";
 const NATIVE_COIN_MAPPING_ENV: &str = "BLOODYROAR2_NATIVE_COIN_MAPPING";
@@ -35,7 +37,7 @@ fn insert_bounded_unique<T: Ord>(values: &mut Vec<T>, value: T, limit: usize) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NativeEmulator {
     pub cpu: Cpu,
     bus: Bus,
@@ -43,6 +45,99 @@ pub struct NativeEmulator {
     last_outcome: StepOutcome,
     executed_steps: u64,
     last_step: Option<StepReport>,
+    frame_cache: RefCell<NativeFrameCache>,
+}
+
+impl Clone for NativeEmulator {
+    fn clone(&self) -> Self {
+        Self {
+            cpu: self.cpu.clone(),
+            bus: self.bus.clone(),
+            rom_compatibility: self.rom_compatibility.clone(),
+            last_outcome: self.last_outcome,
+            executed_steps: self.executed_steps,
+            last_step: self.last_step,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFrameCacheKey {
+    executed_steps: u64,
+    vblank_count: u64,
+    draw_sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedNativeDisplayFrame {
+    key: NativeFrameCacheKey,
+    frame: NativeDisplayFrame,
+}
+
+#[derive(Clone, Debug)]
+struct CachedNativeDisplayFrameWithChecksum {
+    key: NativeFrameCacheKey,
+    frame: NativeDisplayFrame,
+    checksum: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePlayabilityCacheKey {
+    frame: NativeFrameCacheKey,
+    gpu_playable_candidate: bool,
+    gpu_rendered_scene_candidate: bool,
+    gte_gameplay_signal: bool,
+    force_display_analysis: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CachedNativePlayabilityAnalysis {
+    key: NativePlayabilityCacheKey,
+    analysis: NativePlayabilityAnalysis,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NativeFrameCache {
+    display: Option<CachedNativeDisplayFrame>,
+    display_window: Option<CachedNativeDisplayFrame>,
+    display_gui: Option<CachedNativeDisplayFrame>,
+    actual_display: Option<CachedNativeDisplayFrame>,
+    raw_actual_display: Option<CachedNativeDisplayFrame>,
+    fast_gameplay_display: Option<CachedNativeDisplayFrameWithChecksum>,
+    fast_gameplay_window: Option<CachedNativeDisplayFrameWithChecksum>,
+    playability: Option<CachedNativePlayabilityAnalysis>,
+    frame_hits: u64,
+    frame_misses: u64,
+    playability_hits: u64,
+    playability_misses: u64,
+}
+
+impl NativeFrameCache {
+    fn clear_frames(&mut self) {
+        self.display = None;
+        self.display_window = None;
+        self.display_gui = None;
+        self.actual_display = None;
+        self.raw_actual_display = None;
+        self.fast_gameplay_display = None;
+        self.fast_gameplay_window = None;
+        self.playability = None;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NativePlayabilityAnalysis {
+    playable_candidate: bool,
+    classification: &'static str,
+    gpu_playable_candidate: bool,
+    gpu_rendered_scene_candidate: bool,
+    gte_gameplay_signal: bool,
+    native_3d_gameplay_candidate: bool,
+    display_frame_guard: bool,
+    stable_frame_guard: bool,
+    actual_frame_guard: bool,
+    display_frame_periodic_ghosting: bool,
 }
 
 impl NativeEmulator {
@@ -76,6 +171,7 @@ impl NativeEmulator {
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
         })
     }
 
@@ -106,9 +202,9 @@ impl NativeEmulator {
             return;
         }
 
-        let cycles_before = self.cpu.cycles;
-        self.last_outcome = self.cpu.step(&mut self.bus);
-        if self.cpu.cycles > cycles_before {
+        let (outcome, cycles_elapsed) = self.cpu.step_untracked(&mut self.bus);
+        self.last_outcome = outcome;
+        if cycles_elapsed > 0 {
             self.executed_steps = self.executed_steps.saturating_add(1);
         }
     }
@@ -149,10 +245,12 @@ impl NativeEmulator {
 
     pub fn set_vblank_presentation_capture_interval(&mut self, interval: Option<u64>) {
         self.bus.set_vblank_presentation_capture_interval(interval);
+        self.invalidate_native_frame_cache();
     }
 
     pub fn set_native_otc_dma_recovery_suppressed(&mut self, suppressed: bool) {
         self.bus.set_native_otc_dma_recovery_suppressed(suppressed);
+        self.invalidate_native_frame_cache();
     }
 
     pub fn native_otc_dma_recovery_suppressed(&self) -> bool {
@@ -161,6 +259,7 @@ impl NativeEmulator {
 
     pub fn set_native_otc_dma_recovery_interval(&mut self, interval: u64) {
         self.bus.set_native_otc_dma_recovery_interval(interval);
+        self.invalidate_native_frame_cache();
     }
 
     pub fn native_otc_dma_recovery_interval(&self) -> u64 {
@@ -169,6 +268,7 @@ impl NativeEmulator {
 
     pub fn capture_vblank_presented_frame(&mut self) {
         self.bus.capture_vblank_presented_frame();
+        self.invalidate_native_frame_cache();
     }
 
     pub fn unlinked_primitive_replay_interval(&self) -> Option<u64> {
@@ -177,10 +277,12 @@ impl NativeEmulator {
 
     pub fn set_unlinked_primitive_replay_interval(&mut self, interval: Option<u64>) {
         self.bus.set_unlinked_primitive_replay_interval(interval);
+        self.invalidate_native_frame_cache();
     }
 
     pub fn set_unlinked_primitive_replay_enabled(&mut self, enabled: bool) {
         self.bus.set_unlinked_primitive_replay_enabled(enabled);
+        self.invalidate_native_frame_cache();
     }
 
     pub fn unlinked_primitive_replay_enabled(&self) -> bool {
@@ -548,6 +650,132 @@ impl NativeEmulator {
         self.executed_steps
     }
 
+    fn native_frame_cache_key(&self) -> NativeFrameCacheKey {
+        NativeFrameCacheKey {
+            executed_steps: self.executed_steps,
+            vblank_count: self.bus.vblank_count(),
+            draw_sequence: self.bus.gpu_draw_sequence(),
+        }
+    }
+
+    fn invalidate_native_frame_cache(&self) {
+        self.frame_cache.borrow_mut().clear_frames();
+    }
+
+    fn cached_native_display_frame<G, S, F>(
+        &self,
+        getter: G,
+        setter: S,
+        compute: F,
+    ) -> NativeDisplayFrame
+    where
+        G: Fn(&NativeFrameCache) -> Option<&CachedNativeDisplayFrame>,
+        S: Fn(&mut NativeFrameCache, CachedNativeDisplayFrame),
+        F: FnOnce(&Self) -> NativeDisplayFrame,
+    {
+        let key = self.native_frame_cache_key();
+        {
+            let mut cache = self.frame_cache.borrow_mut();
+            let cached_frame = getter(&cache)
+                .filter(|cached| cached.key == key)
+                .map(|cached| cached.frame.clone());
+            if let Some(frame) = cached_frame {
+                cache.frame_hits = cache.frame_hits.saturating_add(1);
+                return frame;
+            }
+            cache.frame_misses = cache.frame_misses.saturating_add(1);
+        }
+
+        let frame = compute(self);
+        let mut cache = self.frame_cache.borrow_mut();
+        setter(
+            &mut cache,
+            CachedNativeDisplayFrame {
+                key,
+                frame: frame.clone(),
+            },
+        );
+        frame
+    }
+
+    fn cached_native_display_frame_with_checksum<G, S, F>(
+        &self,
+        getter: G,
+        setter: S,
+        compute: F,
+    ) -> (NativeDisplayFrame, u32)
+    where
+        G: Fn(&NativeFrameCache) -> Option<&CachedNativeDisplayFrameWithChecksum>,
+        S: Fn(&mut NativeFrameCache, CachedNativeDisplayFrameWithChecksum),
+        F: FnOnce(&Self) -> (NativeDisplayFrame, u32),
+    {
+        let key = self.native_frame_cache_key();
+        {
+            let mut cache = self.frame_cache.borrow_mut();
+            let cached_frame = getter(&cache)
+                .filter(|cached| cached.key == key)
+                .map(|cached| (cached.frame.clone(), cached.checksum));
+            if let Some(frame) = cached_frame {
+                cache.frame_hits = cache.frame_hits.saturating_add(1);
+                return frame;
+            }
+            cache.frame_misses = cache.frame_misses.saturating_add(1);
+        }
+
+        let (frame, checksum) = compute(self);
+        let mut cache = self.frame_cache.borrow_mut();
+        setter(
+            &mut cache,
+            CachedNativeDisplayFrameWithChecksum {
+                key,
+                frame: frame.clone(),
+                checksum,
+            },
+        );
+        (frame, checksum)
+    }
+
+    fn cached_native_playability_analysis<F>(
+        &self,
+        key: NativePlayabilityCacheKey,
+        compute: F,
+    ) -> NativePlayabilityAnalysis
+    where
+        F: FnOnce(&Self) -> NativePlayabilityAnalysis,
+    {
+        {
+            let mut cache = self.frame_cache.borrow_mut();
+            let cached_analysis = cache
+                .playability
+                .as_ref()
+                .filter(|cached| cached.key == key)
+                .map(|cached| cached.analysis.clone());
+            if let Some(analysis) = cached_analysis {
+                cache.playability_hits = cache.playability_hits.saturating_add(1);
+                return analysis;
+            }
+            cache.playability_misses = cache.playability_misses.saturating_add(1);
+        }
+
+        let analysis = compute(self);
+        self.frame_cache.borrow_mut().playability = Some(CachedNativePlayabilityAnalysis {
+            key,
+            analysis: analysis.clone(),
+        });
+        analysis
+    }
+
+    #[cfg(test)]
+    fn native_frame_cache_counts_for_test(&self) -> (u64, u64, u64, u64) {
+        let cache = self.frame_cache.borrow();
+        (
+            cache.frame_hits,
+            cache.frame_misses,
+            cache.playability_hits,
+            cache.playability_misses,
+        )
+    }
+
     pub fn screenshot_png_base64(&self) -> String {
         self.bus.io.gpu.screenshot_png_base64()
     }
@@ -570,16 +798,26 @@ impl NativeEmulator {
     }
 
     pub fn display_frame(&self) -> NativeDisplayFrame {
-        let (width, height, pixels) = self.bus.io.gpu.display_rgb_frame();
-        NativeDisplayFrame {
-            width,
-            height,
-            pixels,
-        }
+        self.cached_native_display_frame(
+            |cache| cache.display.as_ref(),
+            |cache, frame| cache.display = Some(frame),
+            |emulator| {
+                let (width, height, pixels) = emulator.bus.io.gpu.display_rgb_frame();
+                NativeDisplayFrame {
+                    width,
+                    height,
+                    pixels,
+                }
+            },
+        )
     }
 
     pub fn display_window_frame(&self) -> NativeDisplayFrame {
-        native_window_frame_from_display(&self.display_frame())
+        self.cached_native_display_frame(
+            |cache| cache.display_window.as_ref(),
+            |cache, frame| cache.display_window = Some(frame),
+            |emulator| native_window_frame_from_display(&emulator.display_frame()),
+        )
     }
 
     pub fn display_window_png(&self) -> Vec<u8> {
@@ -592,7 +830,11 @@ impl NativeEmulator {
     }
 
     pub fn display_gui_frame(&self) -> NativeDisplayFrame {
-        native_aspect_corrected_gui_frame(&self.display_window_frame())
+        self.cached_native_display_frame(
+            |cache| cache.display_gui.as_ref(),
+            |cache, frame| cache.display_gui = Some(frame),
+            |emulator| native_aspect_corrected_gui_frame(&emulator.display_window_frame()),
+        )
     }
 
     pub fn display_gui_png(&self) -> Vec<u8> {
@@ -605,30 +847,68 @@ impl NativeEmulator {
     }
 
     pub fn actual_display_frame(&self) -> NativeDisplayFrame {
-        let (width, height, pixels) = self.bus.io.gpu.actual_display_rgb_frame();
-        NativeDisplayFrame {
-            width,
-            height,
-            pixels,
-        }
+        self.cached_native_display_frame(
+            |cache| cache.actual_display.as_ref(),
+            |cache, frame| cache.actual_display = Some(frame),
+            |emulator| {
+                let (width, height, pixels) = emulator.bus.io.gpu.actual_display_rgb_frame();
+                NativeDisplayFrame {
+                    width,
+                    height,
+                    pixels,
+                }
+            },
+        )
     }
 
     pub fn raw_actual_display_frame(&self) -> NativeDisplayFrame {
-        let (width, height, pixels) = self.bus.io.gpu.raw_actual_display_rgb_frame();
-        NativeDisplayFrame {
-            width,
-            height,
-            pixels,
-        }
+        self.cached_native_display_frame(
+            |cache| cache.raw_actual_display.as_ref(),
+            |cache, frame| cache.raw_actual_display = Some(frame),
+            |emulator| {
+                let (width, height, pixels) = emulator.bus.io.gpu.raw_actual_display_rgb_frame();
+                NativeDisplayFrame {
+                    width,
+                    height,
+                    pixels,
+                }
+            },
+        )
     }
 
     pub fn fast_gameplay_display_frame(&self) -> NativeDisplayFrame {
-        let (width, height, pixels) = self.bus.fast_gameplay_display_rgb_frame();
-        NativeDisplayFrame {
-            width,
-            height,
-            pixels,
-        }
+        let (frame, _) = self.fast_gameplay_display_frame_with_checksum();
+        frame
+    }
+
+    pub fn fast_gameplay_display_frame_with_checksum(&self) -> (NativeDisplayFrame, u32) {
+        self.cached_native_display_frame_with_checksum(
+            |cache| cache.fast_gameplay_display.as_ref(),
+            |cache, frame| cache.fast_gameplay_display = Some(frame),
+            |emulator| {
+                let (width, height, pixels, checksum) =
+                    emulator.bus.fast_gameplay_display_rgb_frame_with_checksum();
+                (
+                    NativeDisplayFrame {
+                        width,
+                        height,
+                        pixels,
+                    },
+                    checksum,
+                )
+            },
+        )
+    }
+
+    pub fn fast_gameplay_window_frame_with_checksum(&self) -> (NativeDisplayFrame, u32) {
+        self.cached_native_display_frame_with_checksum(
+            |cache| cache.fast_gameplay_window.as_ref(),
+            |cache, frame| cache.fast_gameplay_window = Some(frame),
+            |emulator| {
+                let (frame, checksum) = emulator.fast_gameplay_display_frame_with_checksum();
+                native_normalized_window_frame_with_checksum(frame, checksum)
+            },
+        )
     }
 
     pub fn actual_display_png(&self) -> Vec<u8> {
@@ -672,6 +952,26 @@ impl NativeEmulator {
 
     pub fn gpu_diagnostic_json(&self) -> String {
         self.bus.io_compact_json()
+    }
+
+    pub fn audio_stats_json(&self) -> String {
+        self.bus.audio_stats_json()
+    }
+
+    pub fn audio_health(&self) -> Option<AudioHealth> {
+        self.bus.audio_health()
+    }
+
+    pub fn audio_realtime_playback_needs_game_time(&self) -> bool {
+        self.bus.audio_realtime_playback_needs_game_time()
+    }
+
+    pub fn start_coreaudio_output(&mut self) -> Result<Option<CoreAudioOutput>, String> {
+        self.bus.start_coreaudio_output()
+    }
+
+    pub fn audio_pcm_snapshot(&self, max_frames: usize) -> Option<Vec<StereoSample>> {
+        self.bus.audio_pcm_snapshot(max_frames)
     }
 
     pub fn input_activity(&self) -> NativeInputActivity {
@@ -743,13 +1043,13 @@ impl NativeEmulator {
         if !gpu_playable_candidate && !native_3d_gameplay_candidate {
             return false;
         }
-        let display_frame_guard = self
-            .native_display_frame_supports_playable_candidate_with_context(
-                gpu_playable_candidate,
-                gpu_rendered_scene_candidate,
-                gte_gameplay_signal,
-            );
-        display_frame_guard && (gpu_playable_candidate || native_3d_gameplay_candidate)
+        self.native_playability_analysis_with_render_context(
+            gpu_playable_candidate,
+            gpu_rendered_scene_candidate,
+            gte_gameplay_signal,
+            false,
+        )
+        .playable_candidate
     }
 
     pub fn gpu_native_playable_candidate(&self) -> bool {
@@ -793,80 +1093,97 @@ impl NativeEmulator {
         )
     }
 
-    fn native_display_frame_supports_playable_candidate_with_context(
+    fn native_playability_analysis_with_render_context(
         &self,
         gpu_playable_candidate: bool,
         gpu_rendered_scene_candidate: bool,
         gte_gameplay_signal: bool,
-    ) -> bool {
-        let render_context_allows_periodic =
-            gpu_playable_candidate || (gpu_rendered_scene_candidate && gte_gameplay_signal);
-        let frame = self.display_frame();
-        if native_display_frame_or_window_supports_playable_candidate_with_render_context(
-            &frame,
-            render_context_allows_periodic,
-        ) {
-            return true;
-        }
+        force_display_analysis: bool,
+    ) -> NativePlayabilityAnalysis {
+        let key = NativePlayabilityCacheKey {
+            frame: self.native_frame_cache_key(),
+            gpu_playable_candidate,
+            gpu_rendered_scene_candidate,
+            gte_gameplay_signal,
+            force_display_analysis,
+        };
 
-        let actual = self.actual_display_frame();
-        native_display_frame_or_window_supports_playable_candidate_with_render_context(
-            &actual,
-            render_context_allows_periodic,
-        )
-    }
-
-    fn native_playability_json(&self) -> String {
-        let gpu_playable_candidate = self.gpu_native_playable_candidate();
-        let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
-        let gte_gameplay_signal = self.native_3d_gameplay_signal();
-        let display_frame_guard = self
-            .native_display_frame_supports_playable_candidate_with_context(
+        self.cached_native_playability_analysis(key, |emulator| {
+            emulator.compute_native_playability_analysis_with_render_context(
                 gpu_playable_candidate,
                 gpu_rendered_scene_candidate,
                 gte_gameplay_signal,
-            );
+                force_display_analysis,
+            )
+        })
+    }
+
+    fn compute_native_playability_analysis_with_render_context(
+        &self,
+        gpu_playable_candidate: bool,
+        gpu_rendered_scene_candidate: bool,
+        gte_gameplay_signal: bool,
+        force_display_analysis: bool,
+    ) -> NativePlayabilityAnalysis {
         let render_context_allows_periodic =
             gpu_playable_candidate || (gpu_rendered_scene_candidate && gte_gameplay_signal);
-        let stable_frame = self.display_frame();
-        let actual_frame = self.actual_display_frame();
-        let stable_frame_guard =
-            native_display_frame_or_window_supports_playable_candidate_with_render_context(
-                &stable_frame,
-                render_context_allows_periodic,
-            );
-        let actual_frame_guard =
-            native_display_frame_or_window_supports_playable_candidate_with_render_context(
-                &actual_frame,
-                render_context_allows_periodic,
-            );
-        let display_frame_periodic_ghosting =
-            native_display_frame_has_periodic_horizontal_ghosting(&stable_frame)
-                && !actual_frame_guard;
+        let native_3d_gameplay_candidate_without_guard =
+            gpu_rendered_scene_candidate && gte_gameplay_signal;
+        let needs_display_analysis = force_display_analysis
+            || gpu_playable_candidate
+            || native_3d_gameplay_candidate_without_guard;
+        let (
+            display_frame_guard,
+            stable_frame_guard,
+            actual_frame_guard,
+            display_frame_periodic_ghosting,
+        ) = if needs_display_analysis {
+            let stable_frame = self.display_frame();
+            let stable_frame_guard =
+                native_display_frame_or_window_supports_playable_candidate_with_render_context(
+                    &stable_frame,
+                    render_context_allows_periodic,
+                );
+            let (actual_frame_guard, display_frame_periodic_ghosting) =
+                if force_display_analysis || !stable_frame_guard {
+                    let actual_frame = self.actual_display_frame();
+                    let actual_frame_guard =
+                    native_display_frame_or_window_supports_playable_candidate_with_render_context(
+                        &actual_frame,
+                        render_context_allows_periodic,
+                    );
+                    (
+                        actual_frame_guard,
+                        native_display_frame_has_periodic_horizontal_ghosting(&stable_frame)
+                            && !actual_frame_guard,
+                    )
+                } else {
+                    (false, false)
+                };
+
+            (
+                stable_frame_guard || actual_frame_guard,
+                stable_frame_guard,
+                actual_frame_guard,
+                display_frame_periodic_ghosting,
+            )
+        } else {
+            (false, false, false, false)
+        };
         let native_3d_gameplay_candidate =
             display_frame_guard && gpu_rendered_scene_candidate && gte_gameplay_signal;
         let playable_candidate =
             display_frame_guard && (gpu_playable_candidate || native_3d_gameplay_candidate);
-        let classification = if playable_candidate && native_3d_gameplay_candidate {
-            "native_3d_gameplay_candidate"
-        } else if playable_candidate {
-            "native_playable_candidate"
-        } else if gpu_playable_candidate && display_frame_periodic_ghosting {
-            "gpu_candidate_rejected_periodic_display"
-        } else if gpu_playable_candidate && !display_frame_guard {
-            "gpu_candidate_rejected_display_frame"
-        } else if display_frame_periodic_ghosting {
-            "display_frame_periodic_ghosting"
-        } else if !display_frame_guard {
-            "display_frame_not_gameplay"
-        } else if !gpu_rendered_scene_candidate {
-            "gpu_scene_not_rendered"
-        } else {
-            "missing_native_3d_gte_signal"
-        };
+        let classification = native_playability_classification(
+            playable_candidate,
+            native_3d_gameplay_candidate,
+            gpu_playable_candidate,
+            gpu_rendered_scene_candidate,
+            display_frame_guard,
+            display_frame_periodic_ghosting,
+        );
 
-        format!(
-            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"native_3d_gameplay_candidate\":{},\"display_frame_guard\":{},\"stable_frame_guard\":{},\"actual_frame_guard\":{},\"display_frame_periodic_ghosting\":{},\"projected_vertices\":{},\"gpu\":{}}}",
+        NativePlayabilityAnalysis {
             playable_candidate,
             classification,
             gpu_playable_candidate,
@@ -877,6 +1194,32 @@ impl NativeEmulator {
             stable_frame_guard,
             actual_frame_guard,
             display_frame_periodic_ghosting,
+        }
+    }
+
+    fn native_playability_json(&self) -> String {
+        let gpu_playable_candidate = self.gpu_native_playable_candidate();
+        let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
+        let gte_gameplay_signal = self.native_3d_gameplay_signal();
+        let analysis = self.native_playability_analysis_with_render_context(
+            gpu_playable_candidate,
+            gpu_rendered_scene_candidate,
+            gte_gameplay_signal,
+            true,
+        );
+
+        format!(
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"native_3d_gameplay_candidate\":{},\"display_frame_guard\":{},\"stable_frame_guard\":{},\"actual_frame_guard\":{},\"display_frame_periodic_ghosting\":{},\"projected_vertices\":{},\"gpu\":{}}}",
+            analysis.playable_candidate,
+            analysis.classification,
+            analysis.gpu_playable_candidate,
+            analysis.gpu_rendered_scene_candidate,
+            analysis.gte_gameplay_signal,
+            analysis.native_3d_gameplay_candidate,
+            analysis.display_frame_guard,
+            analysis.stable_frame_guard,
+            analysis.actual_frame_guard,
+            analysis.display_frame_periodic_ghosting,
             self.cpu.gte_projected_vertices(),
             self.bus.native_playability_json()
         )
@@ -886,63 +1229,25 @@ impl NativeEmulator {
         let gpu_playable_candidate = self.gpu_native_playable_candidate();
         let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
         let gte_gameplay_signal = self.native_3d_gameplay_signal();
-        let display_frame_guard = self
-            .native_display_frame_supports_playable_candidate_with_context(
-                gpu_playable_candidate,
-                gpu_rendered_scene_candidate,
-                gte_gameplay_signal,
-            );
-        let render_context_allows_periodic =
-            gpu_playable_candidate || (gpu_rendered_scene_candidate && gte_gameplay_signal);
-        let stable_frame = self.display_frame();
-        let actual_frame = self.actual_display_frame();
-        let stable_frame_guard =
-            native_display_frame_or_window_supports_playable_candidate_with_render_context(
-                &stable_frame,
-                render_context_allows_periodic,
-            );
-        let actual_frame_guard =
-            native_display_frame_or_window_supports_playable_candidate_with_render_context(
-                &actual_frame,
-                render_context_allows_periodic,
-            );
-        let display_frame_periodic_ghosting =
-            native_display_frame_has_periodic_horizontal_ghosting(&stable_frame)
-                && !actual_frame_guard;
-        let native_3d_gameplay_candidate =
-            display_frame_guard && gpu_rendered_scene_candidate && gte_gameplay_signal;
-        let playable_candidate =
-            display_frame_guard && (gpu_playable_candidate || native_3d_gameplay_candidate);
-        let classification = if playable_candidate && native_3d_gameplay_candidate {
-            "native_3d_gameplay_candidate"
-        } else if playable_candidate {
-            "native_playable_candidate"
-        } else if gpu_playable_candidate && display_frame_periodic_ghosting {
-            "gpu_candidate_rejected_periodic_display"
-        } else if gpu_playable_candidate && !display_frame_guard {
-            "gpu_candidate_rejected_display_frame"
-        } else if display_frame_periodic_ghosting {
-            "display_frame_periodic_ghosting"
-        } else if !display_frame_guard {
-            "display_frame_not_gameplay"
-        } else if !gpu_rendered_scene_candidate {
-            "gpu_scene_not_rendered"
-        } else {
-            "missing_native_3d_gte_signal"
-        };
-
-        format!(
-            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"native_3d_gameplay_candidate\":{},\"display_frame_guard\":{},\"stable_frame_guard\":{},\"actual_frame_guard\":{},\"display_frame_periodic_ghosting\":{},\"projected_vertices\":{},\"gpu\":{}}}",
-            playable_candidate,
-            classification,
+        let analysis = self.native_playability_analysis_with_render_context(
             gpu_playable_candidate,
             gpu_rendered_scene_candidate,
             gte_gameplay_signal,
-            native_3d_gameplay_candidate,
-            display_frame_guard,
-            stable_frame_guard,
-            actual_frame_guard,
-            display_frame_periodic_ghosting,
+            true,
+        );
+
+        format!(
+            "{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"native_3d_gameplay_candidate\":{},\"display_frame_guard\":{},\"stable_frame_guard\":{},\"actual_frame_guard\":{},\"display_frame_periodic_ghosting\":{},\"projected_vertices\":{},\"gpu\":{}}}",
+            analysis.playable_candidate,
+            analysis.classification,
+            analysis.gpu_playable_candidate,
+            analysis.gpu_rendered_scene_candidate,
+            analysis.gte_gameplay_signal,
+            analysis.native_3d_gameplay_candidate,
+            analysis.display_frame_guard,
+            analysis.stable_frame_guard,
+            analysis.actual_frame_guard,
+            analysis.display_frame_periodic_ghosting,
             self.cpu.gte_projected_vertices(),
             self.bus.native_playability_compact_json()
         )
@@ -951,11 +1256,12 @@ impl NativeEmulator {
     pub fn json(&self) -> String {
         let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"audio\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
             self.cpu.gte_json(),
             self.bus.io_json(),
             self.bus.zn_board_json(),
+            self.bus.audio_stats_json(),
             self.bus.native_sync_json(),
             self.bus.write_watch_json(),
             self.native_playability_json(),
@@ -977,11 +1283,12 @@ impl NativeEmulator {
     pub fn diagnostic_json(&self) -> String {
         let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"audio\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
             self.cpu.gte_json(),
             self.bus.io_compact_json(),
             self.bus.zn_board_json(),
+            self.bus.audio_stats_json(),
             self.bus.native_sync_json(),
             self.bus.write_watch_json(),
             self.native_playability_json(),
@@ -1134,16 +1441,17 @@ impl NativeEmulator {
 
     pub fn gui_runtime_probe_json(&self) -> String {
         format!(
-            "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{}}},\"vblank_count\":{},\"input_activity\":{},\"br2_credit_hle\":{},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"development_stage\":\"native_gui_runtime\"}}",
-            self.cpu.pc,
-            self.cpu.pc,
-            self.cpu.next_pc,
-            self.cpu.next_pc,
+            "{{\"cpu\":{},\"cycles\":{},\"halted\":{},\"vblank_count\":{},\"input_activity\":{},\"br2_credit_hle\":{},\"br2_invalid_model\":{},\"render_submit_gate\":{},\"io\":{},\"write_watch\":[{}],\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\",\"development_stage\":\"native_gui_runtime\"}}",
+            self.cpu.bios_irq_probe_json(&self.bus),
             self.cpu.cycles,
             self.cpu.halted,
             self.vblank_count(),
             self.bus.input_activity().json(),
             self.bus.br2_native_credit_hle_json(),
+            self.cpu.br2_invalid_model_diagnostics_json(),
+            self.cpu.br2_render_submit_gate_diagnostics_json(),
+            self.bus.runtime_compact_probe_json(),
+            self.bus.write_watch_json(),
             self.rom_compatibility.summary_json(),
             self.executed_steps,
             self.last_outcome,
@@ -1154,50 +1462,12 @@ impl NativeEmulator {
         let gpu_playable_candidate = self.gpu_native_playable_candidate();
         let gpu_rendered_scene_candidate = self.gpu_native_rendered_scene_candidate();
         let gte_gameplay_signal = self.native_3d_gameplay_signal();
-        let display_frame_guard = self
-            .native_display_frame_supports_playable_candidate_with_context(
-                gpu_playable_candidate,
-                gpu_rendered_scene_candidate,
-                gte_gameplay_signal,
-            );
-        let render_context_allows_periodic =
-            gpu_playable_candidate || (gpu_rendered_scene_candidate && gte_gameplay_signal);
-        let stable_frame = self.display_frame();
-        let actual_frame = self.actual_display_frame();
-        let stable_frame_guard =
-            native_display_frame_or_window_supports_playable_candidate_with_render_context(
-                &stable_frame,
-                render_context_allows_periodic,
-            );
-        let actual_frame_guard =
-            native_display_frame_or_window_supports_playable_candidate_with_render_context(
-                &actual_frame,
-                render_context_allows_periodic,
-            );
-        let display_frame_periodic_ghosting =
-            native_display_frame_has_periodic_horizontal_ghosting(&stable_frame)
-                && !actual_frame_guard;
-        let native_3d_gameplay_candidate =
-            display_frame_guard && gpu_rendered_scene_candidate && gte_gameplay_signal;
-        let playable_candidate =
-            display_frame_guard && (gpu_playable_candidate || native_3d_gameplay_candidate);
-        let classification = if playable_candidate && native_3d_gameplay_candidate {
-            "native_3d_gameplay_candidate"
-        } else if playable_candidate {
-            "native_playable_candidate"
-        } else if gpu_playable_candidate && display_frame_periodic_ghosting {
-            "gpu_candidate_rejected_periodic_display"
-        } else if gpu_playable_candidate && !display_frame_guard {
-            "gpu_candidate_rejected_display_frame"
-        } else if display_frame_periodic_ghosting {
-            "display_frame_periodic_ghosting"
-        } else if !display_frame_guard {
-            "display_frame_not_gameplay"
-        } else if !gpu_rendered_scene_candidate {
-            "gpu_scene_not_rendered"
-        } else {
-            "missing_native_3d_gte_signal"
-        };
+        let analysis = self.native_playability_analysis_with_render_context(
+            gpu_playable_candidate,
+            gpu_rendered_scene_candidate,
+            gte_gameplay_signal,
+            true,
+        );
 
         format!(
             "{{\"cpu\":{{\"pc\":{},\"pc_hex\":\"0x{:08x}\",\"next_pc\":{},\"next_pc_hex\":\"0x{:08x}\",\"cycles\":{},\"halted\":{},\"r10\":{},\"r10_hex\":\"0x{:08x}\",\"r15\":{},\"r15_hex\":\"0x{:08x}\"}},\"vblank_count\":{},\"gte\":{{\"projected_vertices\":{},\"gameplay_signal\":{},\"command_counts\":[{}]}},\"runtime\":{},\"input_activity\":{},\"playability\":{{\"playable_candidate\":{},\"classification\":\"{}\",\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"display_frame_guard\":{},\"stable_frame_guard\":{},\"actual_frame_guard\":{},\"display_frame_periodic_ghosting\":{}}},\"rom_compatibility\":{},\"executed_steps\":{},\"last_outcome\":\"{:?}\"}}",
@@ -1213,19 +1483,19 @@ impl NativeEmulator {
             self.cpu.regs[15],
             self.vblank_count(),
             self.cpu.gte_projected_vertices(),
-            gte_gameplay_signal,
+            analysis.gte_gameplay_signal,
             self.cpu.gte_command_counts_summary_json(),
             self.bus.input_compact_probe_json(),
             self.bus.input_activity().json(),
-            playable_candidate,
-            classification,
-            gpu_playable_candidate,
-            gpu_rendered_scene_candidate,
-            gte_gameplay_signal,
-            display_frame_guard,
-            stable_frame_guard,
-            actual_frame_guard,
-            display_frame_periodic_ghosting,
+            analysis.playable_candidate,
+            analysis.classification,
+            analysis.gpu_playable_candidate,
+            analysis.gpu_rendered_scene_candidate,
+            analysis.gte_gameplay_signal,
+            analysis.display_frame_guard,
+            analysis.stable_frame_guard,
+            analysis.actual_frame_guard,
+            analysis.display_frame_periodic_ghosting,
             self.rom_compatibility.summary_json(),
             self.executed_steps,
             self.last_outcome
@@ -1315,6 +1585,10 @@ impl NativeEmulator {
     pub fn native_sync_compact_json(&self) -> String {
         self.bus.native_sync_compact_json()
     }
+
+    pub fn native_sync_timeline_summary_json(&self) -> String {
+        self.bus.native_sync_timeline_summary_json()
+    }
 }
 
 pub fn native_window_frame_from_display(frame: &NativeDisplayFrame) -> NativeDisplayFrame {
@@ -1401,6 +1675,82 @@ pub fn native_aspect_corrected_gui_frame(frame: &NativeDisplayFrame) -> NativeDi
     output
 }
 
+fn native_normalized_window_frame_with_checksum(
+    frame: NativeDisplayFrame,
+    checksum: u32,
+) -> (NativeDisplayFrame, u32) {
+    if matches!(
+        frame.width,
+        NATIVE_WINDOW_FRAME_WIDTH | NATIVE_GUI_FRAME_WIDTH
+    ) && frame.height == NATIVE_WINDOW_FRAME_HEIGHT
+    {
+        return (frame, checksum);
+    }
+
+    let width = NATIVE_WINDOW_FRAME_WIDTH;
+    let height = NATIVE_WINDOW_FRAME_HEIGHT;
+    let mut pixels = vec![0; width.saturating_mul(height)];
+    let mut normalized_checksum = native_display_frame_checksum_seed(width, height);
+    if frame.width == 0
+        || frame.height == 0
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        for &pixel in &pixels {
+            normalized_checksum = native_display_frame_checksum_pixel(normalized_checksum, pixel);
+        }
+        return (
+            NativeDisplayFrame {
+                width,
+                height,
+                pixels,
+            },
+            normalized_checksum,
+        );
+    }
+
+    for y in 0..height {
+        let source_y = y
+            .saturating_mul(frame.height)
+            .checked_div(height)
+            .unwrap_or_default()
+            .min(frame.height.saturating_sub(1));
+        let source_row = source_y.saturating_mul(frame.width);
+        let target_row = y.saturating_mul(width);
+        for x in 0..width {
+            let source_x = x
+                .saturating_mul(frame.width)
+                .checked_div(width)
+                .unwrap_or_default()
+                .min(frame.width.saturating_sub(1));
+            let pixel = frame.pixels[source_row + source_x];
+            pixels[target_row + x] = pixel;
+            normalized_checksum = native_display_frame_checksum_pixel(normalized_checksum, pixel);
+        }
+    }
+
+    (
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        },
+        normalized_checksum,
+    )
+}
+
+fn native_display_frame_checksum_seed(width: usize, height: usize) -> u32 {
+    let mut checksum = 0x811c_9dc5_u32;
+    checksum ^= width as u32;
+    checksum = checksum.wrapping_mul(16_777_619);
+    checksum ^= height as u32;
+    checksum.wrapping_mul(16_777_619)
+}
+
+fn native_display_frame_checksum_pixel(mut checksum: u32, pixel: u32) -> u32 {
+    checksum ^= pixel & 0x00ff_ffff;
+    checksum.wrapping_mul(16_777_619)
+}
+
 pub fn native_update_aspect_corrected_gui_frame(
     frame: &NativeDisplayFrame,
     output: &mut NativeDisplayFrame,
@@ -1426,20 +1776,18 @@ pub fn native_update_aspect_corrected_gui_frame(
     }
 
     if frame.width == 512 && frame.height == 480 {
-        for (source_row, target_row) in frame
-            .pixels
-            .chunks_exact(512)
-            .zip(output.pixels.chunks_exact_mut(640))
-        {
-            for (source, target) in source_row
-                .chunks_exact(4)
-                .zip(target_row.chunks_exact_mut(5))
-            {
-                target[0] = source[0];
-                target[1] = source[0];
-                target[2] = source[1];
-                target[3] = source[2];
-                target[4] = source[3];
+        for y in 0..480 {
+            let mut source = y * 512;
+            let mut target = y * 640;
+            for _ in 0..128 {
+                let p0 = frame.pixels[source];
+                output.pixels[target] = p0;
+                output.pixels[target + 1] = p0;
+                output.pixels[target + 2] = frame.pixels[source + 1];
+                output.pixels[target + 3] = frame.pixels[source + 2];
+                output.pixels[target + 4] = frame.pixels[source + 3];
+                source += 4;
+                target += 5;
             }
         }
         return;
@@ -2214,6 +2562,33 @@ fn optional_step_json(report: Option<StepReport>) -> String {
     report.map_or_else(|| "null".to_string(), |report| report.json())
 }
 
+fn native_playability_classification(
+    playable_candidate: bool,
+    native_3d_gameplay_candidate: bool,
+    gpu_playable_candidate: bool,
+    gpu_rendered_scene_candidate: bool,
+    display_frame_guard: bool,
+    display_frame_periodic_ghosting: bool,
+) -> &'static str {
+    if playable_candidate && native_3d_gameplay_candidate {
+        "native_3d_gameplay_candidate"
+    } else if playable_candidate {
+        "native_playable_candidate"
+    } else if gpu_playable_candidate && display_frame_periodic_ghosting {
+        "gpu_candidate_rejected_periodic_display"
+    } else if gpu_playable_candidate && !display_frame_guard {
+        "gpu_candidate_rejected_display_frame"
+    } else if display_frame_periodic_ghosting {
+        "display_frame_periodic_ghosting"
+    } else if !display_frame_guard {
+        "display_frame_not_gameplay"
+    } else if !gpu_rendered_scene_candidate {
+        "gpu_scene_not_rendered"
+    } else {
+        "missing_native_3d_gte_signal"
+    }
+}
+
 fn native_display_frame_has_visible_detail(frame: &NativeDisplayFrame) -> bool {
     if frame.width == 0
         || frame.height == 0
@@ -2964,8 +3339,9 @@ fn native_display_frame_has_periodic_horizontal_ghosting(frame: &NativeDisplayFr
 #[cfg(test)]
 mod tests {
     use super::{
-        Bus, Cpu, NativeDisplayFrame, NativeEmulator, StepOutcome, apply_at28c16_mode_override,
-        native_at28c16_mode_is_blank, native_display_frame_has_context_full_live_scene,
+        Bus, Cpu, NativeDisplayFrame, NativeEmulator, NativeFrameCache, StepOutcome,
+        apply_at28c16_mode_override, native_at28c16_mode_is_blank,
+        native_display_frame_has_context_full_live_scene,
         native_display_frame_has_context_stage_letterbox,
         native_display_frame_has_periodic_horizontal_ghosting,
         native_display_frame_has_saturated_logo_transition,
@@ -2973,9 +3349,11 @@ mod tests {
         native_display_frame_has_title_logo_overlay, native_display_frame_has_visible_detail,
         native_display_frame_supports_playable_candidate_with_render_context,
     };
+    use crate::action::ActionButtons;
     use crate::native::bus::NativeBoardAssets;
     use crate::native::io::GPU_GP0;
     use crate::native::romset::{NativeRomAssetMismatch, NativeRomCompatibilityReport};
+    use std::cell::RefCell;
 
     fn program(instructions: &[u32]) -> Vec<u8> {
         instructions
@@ -3006,6 +3384,7 @@ mod tests {
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
         }
     }
 
@@ -3019,7 +3398,74 @@ mod tests {
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
         }
+    }
+
+    #[test]
+    fn set_input_reaches_all_br2_zn_ports_and_activity_counters() {
+        let mut emulator = test_emulator();
+        assert!(emulator.set_coin_input_mapping_name("mame"));
+        emulator.set_input(ActionButtons {
+            start: true,
+            coin: true,
+            service: true,
+            up: true,
+            down: true,
+            left: true,
+            right: true,
+            punch: true,
+            kick: true,
+            beast: true,
+            guard: true,
+            p2_start: true,
+            p2_coin: true,
+            p2_up: true,
+            p2_down: true,
+            p2_left: true,
+            p2_right: true,
+            p2_punch: true,
+            p2_kick: true,
+            p2_beast: true,
+            p2_guard: true,
+        });
+
+        assert_eq!(emulator.debug_read_u32(0x1fa0_0000) & 0xff, 0x80);
+        assert_eq!(emulator.debug_read_u32(0x1fa0_0100) & 0xff, 0x80);
+        assert_eq!(emulator.debug_read_u32(0x1fa0_0200) & 0xff, 0xfc);
+        assert_eq!(emulator.debug_read_u32(0x1fa0_0300) & 0xff, 0xcc);
+        assert_eq!(emulator.debug_read_u32(0x1fa1_0000) & 0xff, 0xcf);
+
+        let activity = emulator.input_activity();
+        assert_eq!(activity.p1_input_reads, 1);
+        assert_eq!(activity.p1_up_active_reads, 1);
+        assert_eq!(activity.p1_down_active_reads, 1);
+        assert_eq!(activity.p1_left_active_reads, 1);
+        assert_eq!(activity.p1_right_active_reads, 1);
+        assert_eq!(activity.p1_start_active_reads, 1);
+        assert_eq!(activity.p1_punch_active_reads, 1);
+        assert_eq!(activity.p1_kick_active_reads, 1);
+        assert_eq!(activity.p1_beast_active_reads, 1);
+        assert_eq!(activity.p2_input_reads, 1);
+        assert_eq!(activity.p2_up_active_reads, 1);
+        assert_eq!(activity.p2_down_active_reads, 1);
+        assert_eq!(activity.p2_left_active_reads, 1);
+        assert_eq!(activity.p2_right_active_reads, 1);
+        assert_eq!(activity.p2_punch_active_reads, 1);
+        assert_eq!(activity.p2_kick_active_reads, 1);
+        assert_eq!(activity.p2_beast_active_reads, 1);
+        assert_eq!(activity.p3_input_reads, 1);
+        assert_eq!(activity.p3_guard_active_reads, 1);
+        assert_eq!(activity.p2_guard_active_reads, 1);
+        assert_eq!(activity.system_input_reads, 1);
+        assert_eq!(activity.system_coin_active_reads, 1);
+        assert_eq!(activity.system_service_active_reads, 1);
+        assert_eq!(activity.system_start_active_reads, 1);
+        assert_eq!(activity.system_p2_coin_active_reads, 1);
+        assert_eq!(activity.system_p2_start_active_reads, 1);
+        assert_eq!(activity.coin_insert_edges, 1);
+        assert_eq!(activity.p2_coin_insert_edges, 1);
+        assert!(activity.has_any_control_activity());
     }
 
     #[test]
@@ -3119,6 +3565,7 @@ mod tests {
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
         };
 
         let executed = emulator.step_instructions(10);
@@ -3150,6 +3597,7 @@ mod tests {
             last_outcome: StepOutcome::Continue,
             executed_steps: 0,
             last_step: None,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
         };
 
         let first_report = emulator.step_instruction();
@@ -3163,6 +3611,74 @@ mod tests {
         assert_eq!(emulator.cpu.cycles, 3);
         assert_eq!(emulator.last_outcome, StepOutcome::Halted);
         assert_eq!(emulator.last_step, tracked_boundary);
+    }
+
+    #[test]
+    fn fast_gameplay_window_frame_with_checksum_matches_normalized_display_frame() {
+        let mut emulator = test_emulator();
+        let (width, height) = emulator.bus.io.gpu.display_dimensions();
+        gp0_fill_rect(
+            &mut emulator,
+            0x0012_3456,
+            0,
+            0,
+            width as u32,
+            height as u32,
+        );
+        gp0_fill_rect(&mut emulator, 0x00fe_dcba, 8, 16, 24, 12);
+
+        let (display, display_checksum) = emulator.fast_gameplay_display_frame_with_checksum();
+        let expected =
+            super::native_normalized_window_frame_with_checksum(display, display_checksum);
+        let actual = emulator.fast_gameplay_window_frame_with_checksum();
+
+        assert_eq!(actual, expected);
+        assert_eq!((actual.0.width, actual.0.height), (512, 480));
+    }
+
+    #[test]
+    fn display_frame_reuses_native_frame_cache_for_same_runtime_tick() {
+        let mut emulator = test_emulator();
+        let (width, height) = emulator.bus.io.gpu.display_dimensions();
+        gp0_fill_rect(
+            &mut emulator,
+            0x0040_8040,
+            0,
+            0,
+            width as u32,
+            height as u32,
+        );
+
+        let first = emulator.display_frame();
+        let second = emulator.display_frame();
+        let (frame_hits, frame_misses, _, _) = emulator.native_frame_cache_counts_for_test();
+
+        assert_eq!(first, second);
+        assert_eq!(frame_misses, 1);
+        assert_eq!(frame_hits, 1);
+    }
+
+    #[test]
+    fn playability_analysis_reuses_cached_frame_classification() {
+        let mut emulator = test_emulator();
+        let (width, height) = emulator.bus.io.gpu.display_dimensions();
+        gp0_fill_rect(
+            &mut emulator,
+            0x0020_6040,
+            0,
+            0,
+            width as u32,
+            height as u32,
+        );
+
+        let first = emulator.native_playable_candidate_with_render_context(true, true, true);
+        let second = emulator.native_playable_candidate_with_render_context(true, true, true);
+        let (_, _, playability_hits, playability_misses) =
+            emulator.native_frame_cache_counts_for_test();
+
+        assert_eq!(first, second);
+        assert_eq!(playability_misses, 1);
+        assert_eq!(playability_hits, 1);
     }
 
     #[test]

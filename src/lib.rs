@@ -17,10 +17,11 @@ pub use native::{
     NativePlatformInfo, NativePlayableSegment, NativePlayableStartup, NativeRomAssetExpectation,
     NativeRomAssetMatch, NativeRomAssetMismatch, NativeRomCacheReport, NativeRomCachedScan,
     NativeRomCompatibilityReport, NativeRomDuplicateAsset, NativeRomEntry, NativeRomSet,
-    NativeTraceConfig, native_aspect_corrected_gui_frame, native_platform_json,
-    native_playable_match_entry_script, native_update_aspect_corrected_gui_frame,
-    native_window_frame_from_display, native_window_prefers_stronger_stacked_field,
-    png_from_rgb888_pixels, preferred_platform_info, prepare_native_playable_emulator,
+    NativeTraceConfig, StereoSample, YMF271_SAMPLE_RATE_HZ, native_aspect_corrected_gui_frame,
+    native_platform_json, native_playable_match_entry_script,
+    native_update_aspect_corrected_gui_frame, native_window_frame_from_display,
+    native_window_prefers_stronger_stacked_field, png_from_rgb888_pixels, preferred_platform_info,
+    prepare_native_playable_emulator,
 };
 pub use protocol::{action_space_json, api_index_json, observation_space_json};
 pub use zinc::{ZincConfig, ZincRuntime};

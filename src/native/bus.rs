@@ -5,13 +5,14 @@ use std::sync::OnceLock;
 
 use crate::action::ActionButtons;
 use crate::native::io::{
-    DMA_GPU_BCR, DMA_GPU_CHCR, DMA_GPU_MADR, DMA_MDEC_IN_BCR, DMA_MDEC_IN_CHCR, DMA_MDEC_IN_MADR,
-    DMA_MDEC_OUT_BCR, DMA_MDEC_OUT_CHCR, DMA_MDEC_OUT_MADR, DMA_OTC_BCR, DMA_OTC_CHCR,
-    DMA_OTC_MADR, DMA_REGION_END, DMA_REGION_START, GPU_GP0, GPU_GP1, GpuCommandSource,
-    IO_REGION_END, IO_REGION_START, IRQ_STATUS, Io, NativeGpuDisplayCandidate,
+    DMA_GPU_BCR, DMA_GPU_CHCR, DMA_GPU_MADR, DMA_INTERRUPT, DMA_MDEC_IN_BCR, DMA_MDEC_IN_CHCR,
+    DMA_MDEC_IN_MADR, DMA_MDEC_OUT_BCR, DMA_MDEC_OUT_CHCR, DMA_MDEC_OUT_MADR, DMA_OTC_BCR,
+    DMA_OTC_CHCR, DMA_OTC_MADR, DMA_REGION_END, DMA_REGION_START, GPU_GP0, GPU_GP1,
+    GpuCommandSource, IO_REGION_END, IO_REGION_START, IRQ_STATUS, Io, NativeGpuDisplayCandidate,
     NativeGpuDrawCapture, NativeGpuDrawCapturePredicate, gp0_command_word_count, io_access_for,
 };
 use crate::native::platform::{NativePlatformOps, PreferredNativePlatform};
+use crate::native::sound::{AudioHealth, CoreAudioOutput, Ps9805SoundBoard, StereoSample};
 
 const DMA_CHANNEL_COUNT: usize = 7;
 const DMA_MDEC_IN_CHANNEL: usize = 0;
@@ -41,6 +42,8 @@ const BR2_PRIMITIVE_RAM_END: u32 = 0x003c_0000;
 // the high primitive arena used by stage recovery.
 const BR2_CHARACTER_MODEL_LOW_RAM_START: u32 = 0x0003_0000;
 const BR2_CHARACTER_MODEL_LOW_RAM_END: u32 = 0x0010_0000;
+const BR2_RECOVERY_FIGHTER_MATERIAL_START: u32 = 0x0003_d000;
+const BR2_RECOVERY_FIGHTER_MATERIAL_END: u32 = 0x0003_e400;
 const BR2_TRACKED_PRIMITIVE_RAM_RANGES: [(u32, u32); 2] = [
     (
         BR2_CHARACTER_MODEL_LOW_RAM_START,
@@ -52,8 +55,8 @@ const BR2_NATIVE_RAM_END: u32 = 0x0040_0000;
 const BR2_CHARACTER_MODEL_PACKET_START: u32 = 0x0038_a000;
 const BR2_CHARACTER_MODEL_PACKET_END: u32 = 0x0039_4000;
 const BR2_CHARACTER_MODEL_TEXTURE_PAGE: u16 = 0x0039;
-const BR2_CHARACTER_MODEL_CLUTS: [u16; 4] = [0x799a, 0x79d9, 0x7a5a, 0x7a9a];
-const BR2_CHARACTER_MODEL_CLUT_ROWS: [u16; 4] = [486, 487, 489, 490];
+const BR2_CHARACTER_MODEL_CLUTS: [u16; 5] = [0x781e, 0x799a, 0x79d9, 0x7a5a, 0x7a9a];
+const BR2_CHARACTER_MODEL_CLUT_ROWS: [u16; 5] = [480, 486, 487, 489, 490];
 const BR2_STAGE_TEXTURE_CLUTS: [u16; 2] = [0x7859, 0x7959];
 const BR2_CHARACTER_MODEL_PACKET_SAMPLE_LIMIT: usize = 64;
 const BR2_CHARACTER_MODEL_RECOVERY_VBLANK_WINDOW: u64 = 768;
@@ -72,11 +75,39 @@ const BR2_CHARACTER_MODEL_RECOVERY_BODY_FRESHNESS_SLACK: u64 =
 // remained below roughly 150x200.
 const BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_WIDTH: i32 = 320;
 const BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_HEIGHT: i32 = 360;
+const BR2_CHARACTER_MODEL_RECOVERY_CLIPPED_COMPONENT_MAX_WIDTH: i32 = 512;
+const BR2_CHARACTER_MODEL_RECOVERY_CLIPPED_COMPONENT_MAX_AREA: i32 = 120_000;
 const BR2_CHARACTER_MODEL_RECOVERY_COMPONENT_GAP: i32 = 48;
 const BR2_CHARACTER_MODEL_RECOVERY_ADDRESS_COMPONENT_GAP: u32 = 0x300;
 const BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_DRAWS: usize = 10;
 const BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_WIDTH: i32 = 160;
 const BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_HEIGHT: i32 = 200;
+const BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_DRAWS: usize = 6;
+const BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MAX_DRAWS: usize =
+    BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_DRAWS - 1;
+const BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_WIDTH: i32 = 700;
+const BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_HEIGHT: i32 = 200;
+const BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_DRAW_WIDTH: i32 = 128;
+const BR2_CHARACTER_MODEL_ANNULAR_CONTINUATION_MAX_DRAWS: usize = 4;
+const BR2_CHARACTER_MODEL_ANNULAR_CONTINUATION_MAX_HEIGHT: i32 = 96;
+const BR2_RECOVERY_STAGE_MODEL_ALIAS_MIN_DRAW_WIDTH: i32 = 256;
+const BR2_RECOVERY_STAGE_MODEL_ALIAS_MIN_DRAW_HEIGHT: i32 = 256;
+const BR2_RECOVERY_STAGE_MODEL_ALIAS_MIN_DRAW_AREA: i32 = 65_536;
+const BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS: usize = 8;
+// Beast transformation and ground-impact rings are transient foreground
+// effects. OTC headers can keep pointing at their old payload indefinitely
+// after guest DMA stalls, so expire them from body-write age alone.
+const BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS: u64 = 45;
+const BR2_TRANSIENT_FOREGROUND_EFFECT_MAX_AGE_VBLANKS: u64 =
+    BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS;
+// Once guest DMA stalls, the current OTC can keep a complete idle pose while
+// reusing vertex payload written much earlier. A substantial bounded draw set
+// is required before stale body words may be trusted as that current pose.
+const BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS: usize = 12;
+const BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES: [u32; 2] =
+    [0x0039_105c, 0x0039_10ac];
+#[cfg(test)]
+const BR2_CHARACTER_SELECT_LEFT_LARGE_PORTRAIT_COMMAND_ADDRESS: u32 = 0x0039_10fc;
 const BR2_RECOVERY_785A_MAX_DRAW_WIDTH: i32 = 240;
 const BR2_RECOVERY_785A_MAX_DRAW_HEIGHT: i32 = 200;
 const BR2_RECOVERY_785A_MAX_DRAW_AREA: i32 = 24_000;
@@ -91,6 +122,7 @@ const BR2_STAGE_REPLACEMENT_GENERATION_SLACK: u64 = 1;
 const BR2_RECOVERED_SCENE_GENERATION_SLACK: u64 = BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS;
 const BR2_STAGE_RECOVERY_MIN_PACKETS: usize = 2;
 const BR2_STAGE_RECOVERY_CHAIN_PACKET_LIMIT: usize = 512;
+const BR2_NATIVE_OTC_PACKET_DECISION_SAMPLE_LIMIT: usize = 32;
 
 fn recovered_scene_generations_coherent(
     stage_generation: Option<u64>,
@@ -122,6 +154,7 @@ const PRIMITIVE_RECENT_HEADER_RELATION_LIMIT: usize = 24;
 const PRIMITIVE_PACKET_SCAN_SAMPLE_LIMIT: usize = 24;
 const PRIMITIVE_PACKET_MAX_WORDS: u32 = 64;
 const DMA_ACTIVITY_RECENT_LIMIT: usize = 64;
+const DMA_INTERRUPT_ACTIVITY_RECENT_LIMIT: usize = 128;
 const MDEC_DMA_ACTIVITY_RECENT_LIMIT: usize = 128;
 const DMA_OTC_RECENT_RANGE_LIMIT: usize = 8;
 const DMA_GPU_RECENT_REGISTER_WRITE_LIMIT: usize = 8;
@@ -735,7 +768,7 @@ impl Br2NativeCreditHleStats {
 }
 
 impl NativeInputActivity {
-    pub fn has_play_control_activity(self) -> bool {
+    pub fn has_p1_play_control_activity(self) -> bool {
         let guard_observed_or_not_polled =
             self.p3_guard_active_reads > 0 || self.p3_input_reads == 0;
         self.p1_punch_active_reads > 0
@@ -746,11 +779,74 @@ impl NativeInputActivity {
             && self.system_start_active_reads > 0
     }
 
-    pub fn has_direction_activity(self) -> bool {
+    pub fn has_p1_direction_activity(self) -> bool {
         self.p1_up_active_reads > 0
             && self.p1_down_active_reads > 0
             && self.p1_left_active_reads > 0
             && self.p1_right_active_reads > 0
+    }
+
+    pub fn has_p1_any_control_activity(self) -> bool {
+        self.p1_up_active_reads > 0
+            || self.p1_down_active_reads > 0
+            || self.p1_left_active_reads > 0
+            || self.p1_right_active_reads > 0
+            || self.p1_punch_active_reads > 0
+            || self.p1_kick_active_reads > 0
+            || self.p1_beast_active_reads > 0
+            || self.p3_guard_active_reads > 0
+            || self.system_coin_active_reads > 0
+            || self.system_start_active_reads > 0
+            || self.p1_start_active_reads > 0
+            || self.system_service_active_reads > 0
+    }
+
+    pub fn has_p1_full_control_activity(self) -> bool {
+        self.has_p1_direction_activity() && self.has_p1_play_control_activity()
+    }
+
+    pub fn has_p2_direction_activity(self) -> bool {
+        self.p2_up_active_reads > 0
+            && self.p2_down_active_reads > 0
+            && self.p2_left_active_reads > 0
+            && self.p2_right_active_reads > 0
+    }
+
+    pub fn has_p2_play_control_activity(self) -> bool {
+        let coin_observed = self.system_p2_coin_active_reads > 0
+            || self.p2_coin_insert_edges > 0
+            || self.coin_counter_1_edges > 0;
+        self.p2_punch_active_reads > 0
+            && self.p2_kick_active_reads > 0
+            && self.p2_beast_active_reads > 0
+            && self.p2_guard_active_reads > 0
+            && coin_observed
+            && self.system_p2_start_active_reads > 0
+    }
+
+    pub fn has_p2_any_control_activity(self) -> bool {
+        self.p2_up_active_reads > 0
+            || self.p2_down_active_reads > 0
+            || self.p2_left_active_reads > 0
+            || self.p2_right_active_reads > 0
+            || self.p2_punch_active_reads > 0
+            || self.p2_kick_active_reads > 0
+            || self.p2_beast_active_reads > 0
+            || self.p2_guard_active_reads > 0
+            || self.system_p2_coin_active_reads > 0
+            || self.system_p2_start_active_reads > 0
+    }
+
+    pub fn has_p2_full_control_activity(self) -> bool {
+        self.has_p2_direction_activity() && self.has_p2_play_control_activity()
+    }
+
+    pub fn has_play_control_activity(self) -> bool {
+        self.has_p1_play_control_activity()
+    }
+
+    pub fn has_direction_activity(self) -> bool {
+        self.has_p1_direction_activity()
     }
 
     pub fn has_any_direction_activity(self) -> bool {
@@ -795,7 +891,11 @@ impl NativeInputActivity {
     }
 
     pub fn has_full_control_activity(self) -> bool {
-        self.has_direction_activity() && self.has_play_control_activity()
+        self.has_p1_full_control_activity()
+    }
+
+    pub fn has_combined_full_control_activity(self) -> bool {
+        self.has_p1_full_control_activity() && self.has_p2_full_control_activity()
     }
 
     pub fn has_coin_edge_activity(self) -> bool {
@@ -1155,6 +1255,42 @@ impl NativeInputActivity {
             self.has_full_control_activity()
         );
         field!(
+            "has_p1_any_control_activity",
+            self.has_p1_any_control_activity()
+        );
+        field!(
+            "has_p1_direction_activity",
+            self.has_p1_direction_activity()
+        );
+        field!(
+            "has_p1_play_control_activity",
+            self.has_p1_play_control_activity()
+        );
+        field!(
+            "has_p1_full_control_activity",
+            self.has_p1_full_control_activity()
+        );
+        field!(
+            "has_p2_any_control_activity",
+            self.has_p2_any_control_activity()
+        );
+        field!(
+            "has_p2_direction_activity",
+            self.has_p2_direction_activity()
+        );
+        field!(
+            "has_p2_play_control_activity",
+            self.has_p2_play_control_activity()
+        );
+        field!(
+            "has_p2_full_control_activity",
+            self.has_p2_full_control_activity()
+        );
+        field!(
+            "has_combined_full_control_activity",
+            self.has_combined_full_control_activity()
+        );
+        field!(
             "has_any_direction_activity",
             self.has_any_direction_activity()
         );
@@ -1284,8 +1420,27 @@ struct DmaActivitySample {
     start: Option<u32>,
     end: Option<u32>,
     words: u32,
+    payload_checksum: Option<u32>,
     nodes: u32,
     nonempty_nodes: u32,
+    pc: Option<u32>,
+    vblank: u64,
+    cycles: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DmaInterruptActivitySample {
+    kind: &'static str,
+    address: Option<u32>,
+    value: Option<u32>,
+    access_len: Option<usize>,
+    channel: Option<usize>,
+    interrupt_before: u32,
+    interrupt_after: u32,
+    effective_before: u32,
+    effective_after: u32,
+    irq_status_before: u32,
+    irq_status_after: u32,
     pc: Option<u32>,
     vblank: u64,
     cycles: u64,
@@ -1304,6 +1459,17 @@ struct MdecDmaActivitySample {
     decoded_output_index_before: usize,
     decoded_output_index_after: usize,
     decoded_output_words: usize,
+    decode_input_halfwords_remaining_before: usize,
+    decode_input_halfwords_remaining_after: usize,
+    decode_input_cursor_before: usize,
+    decode_input_cursor_after: usize,
+    decode_complete_before: bool,
+    decode_complete_after: bool,
+    discarded_input_halfwords_before: u64,
+    discarded_input_halfwords_after: u64,
+    decoded_output_checksum: u32,
+    consumed_output_checksum: u32,
+    ram_payload_checksum: u32,
     pc: Option<u32>,
     vblank: u64,
     cycles: u64,
@@ -1330,6 +1496,24 @@ impl NativeOtcDmaRecoveryChainFingerprint {
     fn same_content_as(self, other: Self) -> bool {
         self.value == other.value && self.nodes == other.nodes && self.words == other.words
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnlinkedPrimitiveReplayEvaluationKey {
+    vblank: u64,
+    primitive_header_generation: u64,
+    primitive_word_write_generation: u64,
+    gpu_linked_list_generation: u64,
+    latest_otc_key: Option<OtcReplayKey>,
+    input: ActionButtons,
+    linked_vblank: u64,
+    linked_start: u32,
+    linked_nodes: u32,
+    linked_words: u32,
+    linked_nonempty_nodes: u32,
+    linked_draw_packets: u32,
+    linked_terminated: bool,
+    linked_hit_node_limit: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1365,8 +1549,10 @@ struct NativeOtcDmaRecoveryStats {
     last_stage_roots: u32,
     last_stage_packets: u32,
     last_stage_words: u32,
+    last_stage_selection_reason: &'static str,
     last_stage_candidate_packets: Vec<Br2StageRecoverySample>,
     last_stage_selected_packets: Vec<Br2StageRecoverySample>,
+    last_stage_reject_samples: Vec<NativeOtcPacketRejectSample>,
     last_recovered_chain_words: u32,
     duplicate_chain_replay_skips: u64,
     last_chain_fingerprint: Option<NativeOtcDmaRecoveryChainFingerprint>,
@@ -1390,12 +1576,20 @@ struct NativeOtcDmaRecoveryStats {
     last_chain_model_draw_samples: Vec<Br2ChainModelDrawSample>,
     last_chain_model_generation: u64,
     last_chain_model_packets: u32,
+    last_chain_model_selection_reason: &'static str,
+    last_chain_model_reject_samples: Vec<NativeOtcPacketRejectSample>,
     last_model_roots: u32,
+    last_model_candidate_packets: u32,
+    last_model_candidate_roots: u32,
+    last_model_candidate_chains: u32,
+    last_model_selected_roots: u32,
     last_model_packets: u32,
     last_model_words: u32,
     last_model_newest_generation: u64,
     last_model_generation_start: u64,
+    last_model_selection_reason: &'static str,
     last_model_selected_packets: Vec<Br2CharacterModelRecoverySample>,
+    last_model_reject_samples: Vec<NativeOtcPacketRejectSample>,
 }
 
 impl NativeOtcDmaRecoveryStats {
@@ -1411,6 +1605,21 @@ impl NativeOtcDmaRecoveryStats {
         }
         self.last_guest_linked_list_vblank = Some(vblank);
         self.active = false;
+    }
+
+    fn arm_after_sustained_guest_stall(&mut self, current_vblank: u64) {
+        if self.armed_after_guest_resume {
+            return;
+        }
+        let Some(last_vblank) = self.last_guest_linked_list_vblank else {
+            return;
+        };
+        if last_vblank >= BR2_NATIVE_OTC_DMA_RECOVERY_MIN_GUEST_RESUME_VBLANK
+            && current_vblank.saturating_sub(last_vblank)
+                >= BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS
+        {
+            self.armed_after_guest_resume = true;
+        }
     }
 
     fn json(&self) -> String {
@@ -1471,6 +1680,24 @@ impl NativeOtcDmaRecoveryStats {
             .map(Br2StageRecoverySample::json)
             .collect::<Vec<_>>()
             .join(",");
+        let stage_reject_samples = self
+            .last_stage_reject_samples
+            .iter()
+            .map(NativeOtcPacketRejectSample::json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let chain_model_reject_samples = self
+            .last_chain_model_reject_samples
+            .iter()
+            .map(NativeOtcPacketRejectSample::json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let model_reject_samples = self
+            .last_model_reject_samples
+            .iter()
+            .map(NativeOtcPacketRejectSample::json)
+            .collect::<Vec<_>>()
+            .join(",");
         let last_chain_fingerprint = self
             .last_chain_fingerprint
             .map(|fingerprint| fingerprint.value);
@@ -1487,7 +1714,7 @@ impl NativeOtcDmaRecoveryStats {
             .last_chain_fingerprint
             .map(|fingerprint| fingerprint.newest_packet_vblank);
         format!(
-            "{{\"active\":{},\"armed_after_guest_resume\":{},\"attempts\":{},\"submissions\":{},\"rejected\":{},\"last_reason\":\"{}\",\"last_guest_linked_list_vblank\":{},\"last_guest_resume_gap_vblanks\":{},\"last_otc\":{},\"last_start\":{},\"last_start_hex\":{},\"last_detached_root\":{},\"last_nodes\":{},\"last_nonempty_nodes\":{},\"last_commands\":{},\"last_stage_tracked_headers\":{},\"last_stage_region_candidates\":{},\"last_stage_sampled_candidates\":{},\"last_stage_unlinked_candidates\":{},\"last_stage_playfield_candidates\":{},\"last_stage_safe_range_candidates\":{},\"last_stage_model_texture_candidates\":{},\"last_stage_safe_non_model_candidates\":{},\"last_stage_candidates\":{},\"last_stage_components\":{},\"last_stage_direct_otc_candidates\":{},\"last_stage_direct_generation_candidates\":{},\"last_stage_direct_generation_textured\":{},\"last_stage_newest_freshness\":{},\"last_stage_roots\":{},\"last_stage_packets\":{},\"last_stage_words\":{},\"last_stage_candidate_packets\":[{}],\"last_stage_selected_packets\":[{}],\"last_recovered_chain_words\":{},\"duplicate_chain_replay_skips\":{},\"last_chain_fingerprint\":{},\"last_chain_fingerprint_hex\":{},\"last_replayed_chain_fingerprint\":{},\"last_replayed_chain_fingerprint_hex\":{},\"last_chain_fingerprint_nodes\":{},\"last_chain_fingerprint_words\":{},\"last_chain_fingerprint_newest_packet_vblank\":{},\"last_chain_ranges\":{},\"last_chain_submitted_ranges\":{},\"last_chain_embedded_payload_rejections\":{},\"last_chain_stale_body_rejections\":{},\"last_chain_unsafe_draw_rejections\":{},\"last_chain_blocking_artifact_rejections\":{},\"last_chain_vram_transfer_rejections\":{},\"last_chain_draw_reject_reasons\":{{{}}},\"last_chain_reject_samples\":[{}],\"last_chain_submitted_samples\":[{}],\"last_chain_model_texture_draws\":{},\"last_chain_model_bounded_draws\":{},\"last_chain_model_fresh_draws\":{},\"last_chain_model_unique_packets\":{},\"last_chain_model_peak_generation_packets\":{},\"last_chain_model_draw_samples\":[{}],\"last_chain_model_generation\":{},\"last_chain_model_packets\":{},\"last_model_roots\":{},\"last_model_packets\":{},\"last_model_words\":{},\"last_model_newest_generation\":{},\"last_model_generation_start\":{},\"last_model_selected_packets\":[{}]}}",
+            "{{\"active\":{},\"armed_after_guest_resume\":{},\"attempts\":{},\"submissions\":{},\"rejected\":{},\"last_reason\":\"{}\",\"last_guest_linked_list_vblank\":{},\"last_guest_resume_gap_vblanks\":{},\"last_otc\":{},\"last_start\":{},\"last_start_hex\":{},\"last_detached_root\":{},\"last_nodes\":{},\"last_nonempty_nodes\":{},\"last_commands\":{},\"last_stage_tracked_headers\":{},\"last_stage_region_candidates\":{},\"last_stage_sampled_candidates\":{},\"last_stage_unlinked_candidates\":{},\"last_stage_playfield_candidates\":{},\"last_stage_safe_range_candidates\":{},\"last_stage_model_texture_candidates\":{},\"last_stage_safe_non_model_candidates\":{},\"last_stage_candidates\":{},\"last_stage_components\":{},\"last_stage_direct_otc_candidates\":{},\"last_stage_direct_generation_candidates\":{},\"last_stage_direct_generation_textured\":{},\"last_stage_newest_freshness\":{},\"last_stage_roots\":{},\"last_stage_packets\":{},\"last_stage_words\":{},\"last_stage_selection_reason\":\"{}\",\"last_stage_candidate_packets\":[{}],\"last_stage_selected_packets\":[{}],\"last_stage_reject_samples\":[{}],\"last_recovered_chain_words\":{},\"duplicate_chain_replay_skips\":{},\"last_chain_fingerprint\":{},\"last_chain_fingerprint_hex\":{},\"last_replayed_chain_fingerprint\":{},\"last_replayed_chain_fingerprint_hex\":{},\"last_chain_fingerprint_nodes\":{},\"last_chain_fingerprint_words\":{},\"last_chain_fingerprint_newest_packet_vblank\":{},\"last_chain_ranges\":{},\"last_chain_submitted_ranges\":{},\"last_chain_embedded_payload_rejections\":{},\"last_chain_stale_body_rejections\":{},\"last_chain_unsafe_draw_rejections\":{},\"last_chain_blocking_artifact_rejections\":{},\"last_chain_vram_transfer_rejections\":{},\"last_chain_draw_reject_reasons\":{{{}}},\"last_chain_reject_samples\":[{}],\"last_chain_submitted_samples\":[{}],\"last_chain_model_texture_draws\":{},\"last_chain_model_bounded_draws\":{},\"last_chain_model_fresh_draws\":{},\"last_chain_model_unique_packets\":{},\"last_chain_model_peak_generation_packets\":{},\"last_chain_model_draw_samples\":[{}],\"last_chain_model_generation\":{},\"last_chain_model_packets\":{},\"last_chain_model_selection_reason\":\"{}\",\"last_chain_model_reject_samples\":[{}],\"last_model_roots\":{},\"last_model_candidate_packets\":{},\"last_model_candidate_roots\":{},\"last_model_candidate_chains\":{},\"last_model_selected_roots\":{},\"last_model_packets\":{},\"last_model_words\":{},\"last_model_newest_generation\":{},\"last_model_generation_start\":{},\"last_model_selection_reason\":\"{}\",\"last_model_selected_packets\":[{}],\"last_model_reject_samples\":[{}]}}",
             self.active,
             self.armed_after_guest_resume,
             self.attempts,
@@ -1520,8 +1747,10 @@ impl NativeOtcDmaRecoveryStats {
             self.last_stage_roots,
             self.last_stage_packets,
             self.last_stage_words,
+            self.last_stage_selection_reason,
             stage_candidate_packets,
             stage_selected_packets,
+            stage_reject_samples,
             self.last_recovered_chain_words,
             self.duplicate_chain_replay_skips,
             optional_u64_json(last_chain_fingerprint),
@@ -1549,13 +1778,190 @@ impl NativeOtcDmaRecoveryStats {
             chain_model_draw_samples,
             self.last_chain_model_generation,
             self.last_chain_model_packets,
+            self.last_chain_model_selection_reason,
+            chain_model_reject_samples,
             self.last_model_roots,
+            self.last_model_candidate_packets,
+            self.last_model_candidate_roots,
+            self.last_model_candidate_chains,
+            self.last_model_selected_roots,
             self.last_model_packets,
             self.last_model_words,
             self.last_model_newest_generation,
             self.last_model_generation_start,
-            model_selected_packets
+            self.last_model_selection_reason,
+            model_selected_packets,
+            model_reject_samples
         )
+    }
+
+    fn timeline_summary_json(&self) -> String {
+        let chain_draw_reject_reasons = Gp0ReplayDrawRejectReason::ALL
+            .iter()
+            .map(|reason| {
+                let index = reason.index();
+                format!(
+                    "\"{}\":{}",
+                    reason.as_str(),
+                    self.last_chain_draw_reject_reasons[index]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let last_chain_fingerprint_newest_packet_vblank = self
+            .last_chain_fingerprint
+            .map(|fingerprint| fingerprint.newest_packet_vblank);
+        format!(
+            "{{\"active\":{},\"armed_after_guest_resume\":{},\"attempts\":{},\"submissions\":{},\"rejected\":{},\"last_reason\":\"{}\",\"last_guest_linked_list_vblank\":{},\"last_guest_resume_gap_vblanks\":{},\"last_nodes\":{},\"last_nonempty_nodes\":{},\"last_commands\":{},\"last_stage_newest_freshness\":{},\"last_stage_packets\":{},\"last_stage_words\":{},\"last_stage_selection_reason\":\"{}\",\"last_recovered_chain_words\":{},\"duplicate_chain_replay_skips\":{},\"last_chain_fingerprint_nodes\":{},\"last_chain_fingerprint_words\":{},\"last_chain_fingerprint_newest_packet_vblank\":{},\"last_chain_ranges\":{},\"last_chain_submitted_ranges\":{},\"last_chain_embedded_payload_rejections\":{},\"last_chain_stale_body_rejections\":{},\"last_chain_unsafe_draw_rejections\":{},\"last_chain_blocking_artifact_rejections\":{},\"last_chain_vram_transfer_rejections\":{},\"last_chain_draw_reject_reasons\":{{{}}},\"last_chain_model_texture_draws\":{},\"last_chain_model_bounded_draws\":{},\"last_chain_model_fresh_draws\":{},\"last_chain_model_unique_packets\":{},\"last_chain_model_peak_generation_packets\":{},\"last_chain_model_generation\":{},\"last_chain_model_packets\":{},\"last_chain_model_selection_reason\":\"{}\",\"last_model_packets\":{},\"last_model_words\":{},\"last_model_newest_generation\":{},\"last_model_selection_reason\":\"{}\"}}",
+            self.active,
+            self.armed_after_guest_resume,
+            self.attempts,
+            self.submissions,
+            self.rejected,
+            self.last_reason,
+            optional_u64_json(self.last_guest_linked_list_vblank),
+            self.last_guest_resume_gap_vblanks,
+            self.last_nodes,
+            self.last_nonempty_nodes,
+            self.last_commands,
+            self.last_stage_newest_freshness,
+            self.last_stage_packets,
+            self.last_stage_words,
+            self.last_stage_selection_reason,
+            self.last_recovered_chain_words,
+            self.duplicate_chain_replay_skips,
+            optional_u32_json(
+                self.last_chain_fingerprint
+                    .map(|fingerprint| fingerprint.nodes),
+            ),
+            optional_u32_json(
+                self.last_chain_fingerprint
+                    .map(|fingerprint| fingerprint.words),
+            ),
+            optional_u64_json(last_chain_fingerprint_newest_packet_vblank),
+            self.last_chain_ranges,
+            self.last_chain_submitted_ranges,
+            self.last_chain_embedded_payload_rejections,
+            self.last_chain_stale_body_rejections,
+            self.last_chain_unsafe_draw_rejections,
+            self.last_chain_blocking_artifact_rejections,
+            self.last_chain_vram_transfer_rejections,
+            chain_draw_reject_reasons,
+            self.last_chain_model_texture_draws,
+            self.last_chain_model_bounded_draws,
+            self.last_chain_model_fresh_draws,
+            self.last_chain_model_unique_packets,
+            self.last_chain_model_peak_generation_packets,
+            self.last_chain_model_generation,
+            self.last_chain_model_packets,
+            self.last_chain_model_selection_reason,
+            self.last_model_packets,
+            self.last_model_words,
+            self.last_model_newest_generation,
+            self.last_model_selection_reason,
+        )
+    }
+
+    fn record_stage_packet_reject(&mut self, sample: NativeOtcPacketRejectSample) {
+        push_native_otc_packet_reject_sample(&mut self.last_stage_reject_samples, sample);
+    }
+
+    fn record_chain_model_packet_reject(&mut self, sample: NativeOtcPacketRejectSample) {
+        push_native_otc_packet_reject_sample(&mut self.last_chain_model_reject_samples, sample);
+    }
+
+    fn record_model_packet_reject(&mut self, sample: NativeOtcPacketRejectSample) {
+        push_native_otc_packet_reject_sample(&mut self.last_model_reject_samples, sample);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeOtcPacketRejectSample {
+    address: u32,
+    header: Option<u32>,
+    word_count: Option<u32>,
+    freshness: Option<u64>,
+    command_address: Option<u32>,
+    texture_page: Option<u16>,
+    clut: Option<u16>,
+    reason: &'static str,
+    detail: Option<&'static str>,
+}
+
+impl NativeOtcPacketRejectSample {
+    fn new(address: u32, reason: &'static str) -> Self {
+        Self {
+            address,
+            header: None,
+            word_count: None,
+            freshness: None,
+            command_address: None,
+            texture_page: None,
+            clut: None,
+            reason,
+            detail: None,
+        }
+    }
+
+    fn with_header(mut self, header: u32) -> Self {
+        self.header = Some(header);
+        self.word_count = Some(header >> 24);
+        self
+    }
+
+    fn with_word_count(mut self, word_count: u32) -> Self {
+        self.word_count = Some(word_count);
+        self
+    }
+
+    fn with_freshness(mut self, freshness: u64) -> Self {
+        self.freshness = Some(freshness);
+        self
+    }
+
+    fn with_command_address(mut self, command_address: u32) -> Self {
+        self.command_address = Some(command_address);
+        self
+    }
+
+    fn with_texture(mut self, descriptor: (u16, u16)) -> Self {
+        self.texture_page = Some(descriptor.0);
+        self.clut = Some(descriptor.1);
+        self
+    }
+
+    fn with_detail(mut self, detail: &'static str) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
+    fn json(&self) -> String {
+        format!(
+            "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"header\":{},\"header_hex\":{},\"word_count\":{},\"freshness\":{},\"command_address\":{},\"command_address_hex\":{},\"texture_page\":{},\"texture_page_hex\":{},\"clut\":{},\"clut_hex\":{},\"reason\":\"{}\",\"detail\":{}}}",
+            self.address,
+            self.address,
+            optional_u32_json(self.header),
+            optional_u32_hex_json(self.header),
+            optional_u32_json(self.word_count),
+            optional_u64_json(self.freshness),
+            optional_u32_json(self.command_address),
+            optional_u32_hex_json(self.command_address),
+            optional_u32_json(self.texture_page.map(u32::from)),
+            optional_u32_hex_json(self.texture_page.map(u32::from)),
+            optional_u32_json(self.clut.map(u32::from)),
+            optional_u32_hex_json(self.clut.map(u32::from)),
+            self.reason,
+            optional_str_json(self.detail)
+        )
+    }
+}
+
+fn push_native_otc_packet_reject_sample(
+    samples: &mut Vec<NativeOtcPacketRejectSample>,
+    sample: NativeOtcPacketRejectSample,
+) {
+    if samples.len() < BR2_NATIVE_OTC_PACKET_DECISION_SAMPLE_LIMIT {
+        samples.push(sample);
     }
 }
 
@@ -1577,6 +1983,13 @@ struct Br2ChainModelDrawSample {
     texture_page: u16,
     clut: u16,
     bounds: Gp0DrawBounds,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NativeOtcModelGenerationSelection {
+    generation: Option<u64>,
+    packet_count: usize,
+    command_addresses: HashSet<u32>,
 }
 
 impl Br2ChainModelDrawSample {
@@ -1815,12 +2228,15 @@ struct UnlinkedPrimitiveReplayStats {
     last_success_words: usize,
     last_success_diagnostics: UnlinkedPrimitiveReplayDiagnostics,
     last_replayed_otc_key: Option<OtcReplayKey>,
+    last_evaluation_key: Option<UnlinkedPrimitiveReplayEvaluationKey>,
+    last_success_gpu_linked_list_generation: u64,
+    last_success_invalidated_by_guest_linked_list: bool,
 }
 
 impl DmaActivitySample {
     fn json(&self) -> String {
         format!(
-            "{{\"kind\":\"{}\",\"channel\":{},\"register\":{},\"address\":{},\"address_hex\":{},\"value\":{},\"value_hex\":{},\"madr\":{},\"madr_hex\":\"0x{:08x}\",\"bcr\":{},\"bcr_hex\":\"0x{:08x}\",\"chcr\":{},\"chcr_hex\":\"0x{:08x}\",\"start\":{},\"start_hex\":{},\"end\":{},\"end_hex\":{},\"words\":{},\"nodes\":{},\"nonempty_nodes\":{},\"pc\":{},\"pc_hex\":{},\"vblank\":{},\"cycles\":{}}}",
+            "{{\"kind\":\"{}\",\"channel\":{},\"register\":{},\"address\":{},\"address_hex\":{},\"value\":{},\"value_hex\":{},\"madr\":{},\"madr_hex\":\"0x{:08x}\",\"bcr\":{},\"bcr_hex\":\"0x{:08x}\",\"chcr\":{},\"chcr_hex\":\"0x{:08x}\",\"start\":{},\"start_hex\":{},\"end\":{},\"end_hex\":{},\"words\":{},\"payload_checksum\":{},\"payload_checksum_hex\":{},\"nodes\":{},\"nonempty_nodes\":{},\"pc\":{},\"pc_hex\":{},\"vblank\":{},\"cycles\":{}}}",
             self.kind,
             self.channel,
             optional_str_json(self.register),
@@ -1839,8 +2255,43 @@ impl DmaActivitySample {
             optional_u32_json(self.end),
             optional_u32_hex_json(self.end),
             self.words,
+            optional_u32_json(self.payload_checksum),
+            optional_u32_hex_json(self.payload_checksum),
             self.nodes,
             self.nonempty_nodes,
+            optional_u32_json(self.pc),
+            optional_u32_hex_json(self.pc),
+            self.vblank,
+            self.cycles
+        )
+    }
+}
+
+impl DmaInterruptActivitySample {
+    fn json(&self) -> String {
+        format!(
+            "{{\"kind\":\"{}\",\"address\":{},\"address_hex\":{},\"value\":{},\"value_hex\":{},\"access_len\":{},\"channel\":{},\"interrupt_before\":{},\"interrupt_before_hex\":\"0x{:08x}\",\"interrupt_after\":{},\"interrupt_after_hex\":\"0x{:08x}\",\"effective_before\":{},\"effective_before_hex\":\"0x{:08x}\",\"effective_after\":{},\"effective_after_hex\":\"0x{:08x}\",\"irq_status_before\":{},\"irq_status_before_hex\":\"0x{:04x}\",\"irq_status_after\":{},\"irq_status_after_hex\":\"0x{:04x}\",\"pc\":{},\"pc_hex\":{},\"vblank\":{},\"cycles\":{}}}",
+            self.kind,
+            optional_u32_json(self.address),
+            optional_u32_hex_json(self.address),
+            optional_u32_json(self.value),
+            optional_u32_hex_json(self.value),
+            self.access_len
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+            self.channel
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+            self.interrupt_before,
+            self.interrupt_before,
+            self.interrupt_after,
+            self.interrupt_after,
+            self.effective_before,
+            self.effective_before,
+            self.effective_after,
+            self.effective_after,
+            self.irq_status_before,
+            self.irq_status_before,
+            self.irq_status_after,
+            self.irq_status_after,
             optional_u32_json(self.pc),
             optional_u32_hex_json(self.pc),
             self.vblank,
@@ -1852,7 +2303,7 @@ impl DmaActivitySample {
 impl MdecDmaActivitySample {
     fn json(&self) -> String {
         format!(
-            "{{\"kind\":\"{}\",\"command\":{},\"command_hex\":\"0x{:08x}\",\"madr\":{},\"madr_hex\":\"0x{:08x}\",\"bcr\":{},\"bcr_hex\":\"0x{:08x}\",\"chcr\":{},\"chcr_hex\":\"0x{:08x}\",\"words\":{},\"start\":{},\"start_hex\":\"0x{:08x}\",\"end\":{},\"end_hex\":{},\"decoded_output_index_before\":{},\"decoded_output_index_after\":{},\"decoded_output_words\":{},\"pc\":{},\"pc_hex\":{},\"vblank\":{},\"cycles\":{}}}",
+            "{{\"kind\":\"{}\",\"command\":{},\"command_hex\":\"0x{:08x}\",\"madr\":{},\"madr_hex\":\"0x{:08x}\",\"bcr\":{},\"bcr_hex\":\"0x{:08x}\",\"chcr\":{},\"chcr_hex\":\"0x{:08x}\",\"words\":{},\"start\":{},\"start_hex\":\"0x{:08x}\",\"end\":{},\"end_hex\":{},\"decoded_output_index_before\":{},\"decoded_output_index_after\":{},\"decoded_output_words\":{},\"decode_input_halfwords_remaining_before\":{},\"decode_input_halfwords_remaining_after\":{},\"decode_input_cursor_before\":{},\"decode_input_cursor_after\":{},\"decode_complete_before\":{},\"decode_complete_after\":{},\"discarded_input_halfwords_before\":{},\"discarded_input_halfwords_after\":{},\"decoded_output_checksum\":{},\"decoded_output_checksum_hex\":\"0x{:08x}\",\"consumed_output_checksum\":{},\"consumed_output_checksum_hex\":\"0x{:08x}\",\"ram_payload_checksum\":{},\"ram_payload_checksum_hex\":\"0x{:08x}\",\"pc\":{},\"pc_hex\":{},\"vblank\":{},\"cycles\":{}}}",
             self.kind,
             self.command,
             self.command,
@@ -1870,6 +2321,20 @@ impl MdecDmaActivitySample {
             self.decoded_output_index_before,
             self.decoded_output_index_after,
             self.decoded_output_words,
+            self.decode_input_halfwords_remaining_before,
+            self.decode_input_halfwords_remaining_after,
+            self.decode_input_cursor_before,
+            self.decode_input_cursor_after,
+            self.decode_complete_before,
+            self.decode_complete_after,
+            self.discarded_input_halfwords_before,
+            self.discarded_input_halfwords_after,
+            self.decoded_output_checksum,
+            self.decoded_output_checksum,
+            self.consumed_output_checksum,
+            self.consumed_output_checksum,
+            self.ram_payload_checksum,
+            self.ram_payload_checksum,
             optional_u32_json(self.pc),
             optional_u32_hex_json(self.pc),
             self.vblank,
@@ -1970,6 +2435,9 @@ impl Default for UnlinkedPrimitiveReplayStats {
             last_success_words: 0,
             last_success_diagnostics: UnlinkedPrimitiveReplayDiagnostics::default(),
             last_replayed_otc_key: None,
+            last_evaluation_key: None,
+            last_success_gpu_linked_list_generation: 0,
+            last_success_invalidated_by_guest_linked_list: false,
         }
     }
 }
@@ -2029,6 +2497,7 @@ impl UnlinkedPrimitiveReplayStats {
         self.last_success_packets = packets;
         self.last_success_words = words;
         self.last_success_diagnostics = diagnostics;
+        self.last_success_invalidated_by_guest_linked_list = false;
     }
 
     fn record_full_validation(&mut self, vblank: u64) {
@@ -3275,6 +3744,7 @@ pub struct Bus {
     br2_code_patch_snapshot_valid: [bool; BR2_CODE_PATCH_SNAPSHOT_LEN],
     br2_code_patch_snapshot_frozen: bool,
     zn_board: ZnBoard,
+    sound_board: Option<Ps9805SoundBoard>,
     br2_native_credit_hle_consumed_coin_edges: [u64; 2],
     br2_native_credit_hle: Br2NativeCreditHleStats,
     cache_control: u32,
@@ -3299,6 +3769,10 @@ pub struct Bus {
     native_otc_dma_recovery: NativeOtcDmaRecoveryStats,
     native_otc_dma_recovery_suppressed: bool,
     native_otc_dma_recovery_interval: u64,
+    br2_retained_portrait_refresh_generation: u64,
+    br2_retained_character_select_chain_start: Option<u32>,
+    br2_retained_character_select_left_portrait: Option<(u32, Vec<u32>)>,
+    br2_retained_character_select_right_portraits: Vec<(u32, Vec<u32>)>,
     primitive_ram_writes: PrimitiveRamWriteStats,
     unlinked_primitive_replay: UnlinkedPrimitiveReplayStats,
     primitive_header_generation: u64,
@@ -3307,6 +3781,7 @@ pub struct Bus {
     unlinked_primitive_replay_interval: Option<u64>,
     unlinked_primitive_replay_enabled: bool,
     dma_activity: Vec<DmaActivitySample>,
+    dma_interrupt_activity: Vec<DmaInterruptActivitySample>,
     mdec_dma_activity: Vec<MdecDmaActivitySample>,
     dma_lifetime_activity: Vec<DmaChannelLifetimeStats>,
     banked_rom_reads: RefCell<BankedRomReadStats>,
@@ -3346,6 +3821,10 @@ impl Bus {
         board_assets: NativeBoardAssets,
     ) -> Self {
         let board_asset_status = NativeBoardAssetStatus::from_assets(&board_assets);
+        let sound_board = Ps9805SoundBoard::from_roms(
+            board_assets.audio_cpu_rom.clone(),
+            board_assets.ymf_sample_rom.clone(),
+        );
         let write_watch_ranges = native_write_watch_ranges_from_env();
         let write_watch_limit = if write_watch_ranges.is_empty() {
             0
@@ -3367,6 +3846,7 @@ impl Bus {
             br2_code_patch_snapshot_valid: [false; BR2_CODE_PATCH_SNAPSHOT_LEN],
             br2_code_patch_snapshot_frozen: false,
             zn_board: ZnBoard::with_board_assets(&board_assets),
+            sound_board,
             br2_native_credit_hle_consumed_coin_edges: [0; 2],
             br2_native_credit_hle: Br2NativeCreditHleStats::default(),
             cache_control: 0,
@@ -3391,6 +3871,10 @@ impl Bus {
             native_otc_dma_recovery: NativeOtcDmaRecoveryStats::default(),
             native_otc_dma_recovery_suppressed: false,
             native_otc_dma_recovery_interval: 1,
+            br2_retained_portrait_refresh_generation: 0,
+            br2_retained_character_select_chain_start: None,
+            br2_retained_character_select_left_portrait: None,
+            br2_retained_character_select_right_portraits: Vec::new(),
             primitive_ram_writes: PrimitiveRamWriteStats::default(),
             unlinked_primitive_replay: UnlinkedPrimitiveReplayStats::default(),
             primitive_header_generation: 0,
@@ -3399,6 +3883,7 @@ impl Bus {
             unlinked_primitive_replay_interval: None,
             unlinked_primitive_replay_enabled: true,
             dma_activity: Vec::new(),
+            dma_interrupt_activity: Vec::new(),
             mdec_dma_activity: Vec::new(),
             dma_lifetime_activity: vec![DmaChannelLifetimeStats::default(); DMA_CHANNEL_COUNT],
             banked_rom_reads: RefCell::new(BankedRomReadStats::default()),
@@ -3709,6 +4194,7 @@ impl Bus {
                 self.vblank_count,
                 self.trace_cycles.get(),
             );
+            self.route_zn_sound_write(address, value as u32, 1);
             self.sync_security_selects();
             self.record_access_trace("write", "zn_board", address, 1, value as u32);
             return;
@@ -3718,6 +4204,8 @@ impl Bus {
             let register_address = io_address & !0x03;
             let previous_dma_value =
                 dma_io_address(register_address).then(|| self.io.read_u32(register_address));
+            let dma_interrupt_before =
+                (register_address == DMA_INTERRUPT).then(|| self.dma_interrupt_snapshot());
             self.io.write_u8(io_address, value);
             if let Some(previous_dma_value) = previous_dma_value {
                 let merged = self.io.read_u32(register_address);
@@ -3728,6 +4216,16 @@ impl Bus {
                 self.sync_dma_irq();
             } else if register_address == IRQ_STATUS {
                 self.raise_dma_irq_if_pending();
+            }
+            if let Some(before) = dma_interrupt_before {
+                self.record_dma_interrupt_activity(
+                    "register_write",
+                    Some(io_address),
+                    Some(value as u32),
+                    Some(1),
+                    None,
+                    before,
+                );
             }
             self.record_access_trace("write", "io", address, 1, value as u32);
             return;
@@ -3758,6 +4256,7 @@ impl Bus {
                 self.vblank_count,
                 self.trace_cycles.get(),
             );
+            self.route_zn_sound_write(address, value as u32, 2);
             self.sync_security_selects();
             self.record_access_trace("write", "zn_board", address, 2, value as u32);
             return;
@@ -3767,6 +4266,8 @@ impl Bus {
             let register_address = io_address & !0x03;
             let previous_dma_value =
                 dma_io_address(register_address).then(|| self.io.read_u32(register_address));
+            let dma_interrupt_before =
+                (register_address == DMA_INTERRUPT).then(|| self.dma_interrupt_snapshot());
             self.io.write_u16(io_address, value);
             if let Some(previous_dma_value) = previous_dma_value {
                 let merged = self.io.read_u32(register_address);
@@ -3777,6 +4278,16 @@ impl Bus {
                 self.sync_dma_irq();
             } else if register_address == IRQ_STATUS {
                 self.raise_dma_irq_if_pending();
+            }
+            if let Some(before) = dma_interrupt_before {
+                self.record_dma_interrupt_activity(
+                    "register_write",
+                    Some(io_address),
+                    Some(value as u32),
+                    Some(2),
+                    None,
+                    before,
+                );
             }
             self.record_access_trace("write", "io", address, 2, value as u32);
             return;
@@ -3801,6 +4312,7 @@ impl Bus {
                 self.vblank_count,
                 self.trace_cycles.get(),
             );
+            self.route_zn_sound_write(address, value, 4);
             self.sync_security_selects();
             self.record_access_trace("write", "zn_board", address, 4, value);
             return;
@@ -3825,6 +4337,8 @@ impl Bus {
             }
             let previous_dma_value =
                 dma_io_address(io_address).then(|| self.io.read_u32(io_address));
+            let dma_interrupt_before =
+                (io_address == DMA_INTERRUPT).then(|| self.dma_interrupt_snapshot());
             self.io.write_u32(io_address, value);
             self.record_dma_register_write(io_address, value);
             if let Some(previous_dma_value) = previous_dma_value {
@@ -3835,6 +4349,16 @@ impl Bus {
                 self.sync_dma_irq();
             } else if io_address == IRQ_STATUS {
                 self.raise_dma_irq_if_pending();
+            }
+            if let Some(before) = dma_interrupt_before {
+                self.record_dma_interrupt_activity(
+                    "register_write",
+                    Some(io_address),
+                    Some(value),
+                    Some(4),
+                    None,
+                    before,
+                );
             }
             self.record_access_trace("write", "io", address, 4, value);
             return;
@@ -4012,6 +4536,9 @@ impl Bus {
     }
 
     pub fn tick(&mut self, cycles: u64) {
+        if let Some(sound_board) = &mut self.sound_board {
+            sound_board.tick_main_cycles(cycles);
+        }
         let timer_irqs = self.io.tick(cycles);
         self.io.irq.status |= timer_irqs;
         self.tick_pending_dma(cycles);
@@ -4070,8 +4597,28 @@ impl Bus {
         self.io.gpu.capture_vblank_presented_frame();
     }
 
+    fn route_zn_sound_write(&mut self, address: u32, value: u32, access_len: usize) {
+        let Some(sound_board) = &mut self.sound_board else {
+            return;
+        };
+        let physical_start = physical_address(address);
+        for byte_offset in 0..access_len {
+            let physical = physical_start.wrapping_add(byte_offset as u32);
+            let data = ((value >> (byte_offset * 8)) & 0xff) as u8;
+            match physical {
+                0x1fb0_0000 => sound_board.write_latch(data),
+                0x1fb0_0004 => sound_board.assert_irq2(),
+                _ => {}
+            }
+        }
+    }
+
     pub fn fast_gameplay_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
         self.io.gpu.fast_gameplay_display_rgb_frame()
+    }
+
+    pub fn fast_gameplay_display_rgb_frame_with_checksum(&self) -> (usize, usize, Vec<u32>, u32) {
+        self.io.fast_gameplay_display_rgb_frame_with_checksum()
     }
 
     pub fn unlinked_primitive_replay_interval(&self) -> Option<u64> {
@@ -4284,7 +4831,7 @@ impl Bus {
         let recent_dma_activity_counts = self.recent_dma_activity_counts_json();
         let dma_lifetime_activity = self.dma_lifetime_activity_json();
         format!(
-            "{{\"br2_draw_sync_flag\":{},\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"vblank_draw_sync_clears\":{},\"game_set_writes\":{},\"game_clear_writes\":{},\"game_other_writes\":{},\"last_game_write_value\":{},\"last_game_write_pc\":{},\"cache\":{},\"banked_rom_reads\":{},\"gpu_dma_stale_vblanks\":{},\"last_gpu_dma_register_write\":{},\"recent_gpu_dma_register_writes\":[{}],\"recent_dma_activity_counts\":[{}],\"dma_lifetime_activity\":[{}],\"dma_activity\":[{}],\"mdec_dma_activity\":[{}],\"recent_otc_ranges\":[{}],\"gpu_linked_list_dma\":{},\"native_otc_dma_recovery\":{},\"primitive_ram_writes\":{},\"recent_primitive_header_relations\":[{}],\"unlinked_primitive_replay\":{},\"primitive_packet_scan\":{},\"br2_character_model_packets\":{}}}",
+            "{{\"br2_draw_sync_flag\":{},\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"vblank_draw_sync_clears\":{},\"game_set_writes\":{},\"game_clear_writes\":{},\"game_other_writes\":{},\"last_game_write_value\":{},\"last_game_write_pc\":{},\"cache\":{},\"banked_rom_reads\":{},\"dma_irq_pending\":{},\"dma_interrupt_raw\":{},\"dma_interrupt_raw_hex\":\"0x{:08x}\",\"dma_interrupt_effective\":{},\"dma_interrupt_effective_hex\":\"0x{:08x}\",\"dma_interrupt_activity\":[{}],\"gpu_dma_stale_vblanks\":{},\"last_gpu_dma_register_write\":{},\"recent_gpu_dma_register_writes\":[{}],\"recent_dma_activity_counts\":[{}],\"dma_lifetime_activity\":[{}],\"dma_activity\":[{}],\"mdec_dma_activity\":[{}],\"recent_otc_ranges\":[{}],\"gpu_linked_list_dma\":{},\"native_otc_dma_recovery\":{},\"primitive_ram_writes\":{},\"recent_primitive_header_relations\":[{}],\"unlinked_primitive_replay\":{},\"primitive_packet_scan\":{},\"br2_character_model_packets\":{}}}",
             self.read_ram_u32_physical(BR2_DRAW_SYNC_FLAG_PHYSICAL)
                 .unwrap_or(0),
             self.vblank_count,
@@ -4297,6 +4844,12 @@ impl Bus {
             optional_u32_hex_json(self.draw_sync_last_game_write_pc),
             self.cache_json(),
             self.banked_rom_reads.borrow().json(),
+            self.io.dma.irq_pending(),
+            self.io.dma.interrupt,
+            self.io.dma.interrupt,
+            self.io.dma.read_u32(DMA_INTERRUPT),
+            self.io.dma.read_u32(DMA_INTERRUPT),
+            self.dma_interrupt_activity_json(),
             optional_u64_json(gpu_dma_stale_vblanks),
             last_gpu_dma_register_write,
             recent_gpu_dma_register_writes,
@@ -4357,7 +4910,7 @@ impl Bus {
                 .skip(recent_header_like_writes_start),
         );
         format!(
-            "{{\"br2_draw_sync_flag\":{},\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"vblank_draw_sync_clears\":{},\"game_set_writes\":{},\"game_clear_writes\":{},\"game_other_writes\":{},\"last_game_write_value\":{},\"last_game_write_pc\":{},\"cache_isolated\":{},\"cache_isolation_transitions\":{},\"dma_irq_pending\":{},\"gpu_dma_channel\":{},\"gpu_dma_stale_vblanks\":{},\"last_gpu_dma_register_write\":{},\"recent_gpu_dma_register_writes\":[{}],\"recent_dma_activity_counts\":[{}],\"dma_lifetime_activity\":[{}],\"pending_dma_completion_cycles\":[{}],\"banked_rom_reads\":{},\"recent_dma_activity\":[{}],\"mdec_dma_activity\":[{}],\"recent_otc_ranges\":[{}],\"gpu_linked_list_dma\":{{\"calls\":{},\"last_start_hex\":\"0x{:08x}\",\"last_first_node_hex\":\"0x{:08x}\",\"last_pc\":{},\"last_pc_hex\":{},\"last_vblank\":{},\"last_cycles\":{},\"last_nodes\":{},\"last_words\":{},\"last_nonempty_nodes\":{},\"last_max_node_words\":{},\"last_terminated\":{},\"last_hit_node_limit\":{},\"node_limit_hits\":{},\"max_nodes\":{},\"max_words\":{},\"max_nonempty_nodes\":{},\"max_node_words\":{},\"last_recent_commands\":[{}],\"last_first_node_samples\":[{}],\"last_tail_node_samples\":[{}],\"last_nonempty_node_samples\":[{}],\"recent_runs\":[{}]}},\"native_otc_dma_recovery\":{},\"primitive_ram_writes\":{{\"writes\":{},\"command_like_writes\":{},\"header_like_writes\":{},\"current_vblank_header_like_writes\":{},\"last_vblank_header_like_writes\":{},\"last_address\":{},\"last_address_hex\":{},\"last_value\":{},\"last_value_hex\":\"0x{:08x}\",\"last_pc\":{},\"last_pc_hex\":{},\"recent_header_like_writes\":[{}]}},\"recent_primitive_header_relations\":[{}],\"unlinked_primitive_replay\":{{\"attempts\":{},\"conditional_replays\":{},\"forced_replays\":{},\"skipped\":{},\"last_reason\":\"{}\",\"last_packets\":{},\"last_words\":{},\"last_diagnostics\":{},\"last_success_vblank\":{},\"last_success_reason\":\"{}\",\"last_success_packets\":{},\"last_success_words\":{},\"last_success_diagnostics\":{},\"top_candidates\":[{}]}},\"primitive_packet_scan\":{},\"br2_character_model_packets\":{}}}",
+            "{{\"br2_draw_sync_flag\":{},\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"vblank_draw_sync_clears\":{},\"game_set_writes\":{},\"game_clear_writes\":{},\"game_other_writes\":{},\"last_game_write_value\":{},\"last_game_write_pc\":{},\"cache_isolated\":{},\"cache_isolation_transitions\":{},\"dma_irq_pending\":{},\"dma_interrupt_raw\":{},\"dma_interrupt_raw_hex\":\"0x{:08x}\",\"dma_interrupt_effective\":{},\"dma_interrupt_effective_hex\":\"0x{:08x}\",\"dma_interrupt_activity\":[{}],\"gpu_dma_channel\":{},\"gpu_dma_stale_vblanks\":{},\"last_gpu_dma_register_write\":{},\"recent_gpu_dma_register_writes\":[{}],\"recent_dma_activity_counts\":[{}],\"dma_lifetime_activity\":[{}],\"pending_dma_completion_cycles\":[{}],\"banked_rom_reads\":{},\"recent_dma_activity\":[{}],\"mdec_dma_activity\":[{}],\"recent_otc_ranges\":[{}],\"gpu_linked_list_dma\":{{\"calls\":{},\"last_start_hex\":\"0x{:08x}\",\"last_first_node_hex\":\"0x{:08x}\",\"last_pc\":{},\"last_pc_hex\":{},\"last_vblank\":{},\"last_cycles\":{},\"last_nodes\":{},\"last_words\":{},\"last_nonempty_nodes\":{},\"last_max_node_words\":{},\"last_terminated\":{},\"last_hit_node_limit\":{},\"node_limit_hits\":{},\"max_nodes\":{},\"max_words\":{},\"max_nonempty_nodes\":{},\"max_node_words\":{},\"last_recent_commands\":[{}],\"last_first_node_samples\":[{}],\"last_tail_node_samples\":[{}],\"last_nonempty_node_samples\":[{}],\"recent_runs\":[{}]}},\"native_otc_dma_recovery\":{},\"primitive_ram_writes\":{{\"writes\":{},\"command_like_writes\":{},\"header_like_writes\":{},\"current_vblank_header_like_writes\":{},\"last_vblank_header_like_writes\":{},\"last_address\":{},\"last_address_hex\":{},\"last_value\":{},\"last_value_hex\":\"0x{:08x}\",\"last_pc\":{},\"last_pc_hex\":{},\"recent_header_like_writes\":[{}]}},\"recent_primitive_header_relations\":[{}],\"unlinked_primitive_replay\":{{\"attempts\":{},\"conditional_replays\":{},\"forced_replays\":{},\"skipped\":{},\"last_reason\":\"{}\",\"last_packets\":{},\"last_words\":{},\"last_diagnostics\":{},\"last_success_vblank\":{},\"last_success_reason\":\"{}\",\"last_success_packets\":{},\"last_success_words\":{},\"last_success_diagnostics\":{},\"top_candidates\":[{}]}},\"primitive_packet_scan\":{},\"br2_character_model_packets\":{}}}",
             self.read_ram_u32_physical(BR2_DRAW_SYNC_FLAG_PHYSICAL)
                 .unwrap_or(0),
             self.vblank_count,
@@ -4371,6 +4924,11 @@ impl Bus {
             self.cache_isolated,
             self.cache_isolation_transitions,
             self.io.dma.irq_pending(),
+            self.io.dma.interrupt,
+            self.io.dma.interrupt,
+            self.io.dma.read_u32(DMA_INTERRUPT),
+            self.io.dma.read_u32(DMA_INTERRUPT),
+            self.dma_interrupt_activity_json(),
             self.dma_channel_compact_json(DMA_GPU_CHANNEL),
             optional_u64_json(gpu_dma_stale_vblanks),
             last_gpu_dma_register_write,
@@ -4444,10 +5002,44 @@ impl Bus {
         )
     }
 
+    pub fn native_sync_timeline_summary_json(&self) -> String {
+        let gpu_dma_stale_vblanks = (self.gpu_linked_list_dma.calls > 0).then_some(
+            self.vblank_count
+                .saturating_sub(self.gpu_linked_list_dma.last_vblank),
+        );
+        format!(
+            "{{\"vblank_count\":{},\"vblank_cycle_accumulator\":{},\"dma_irq_pending\":{},\"gpu_dma_stale_vblanks\":{},\"gpu_linked_list_dma\":{{\"calls\":{},\"last_start\":{},\"last_start_hex\":\"0x{:08x}\",\"last_vblank\":{},\"last_cycles\":{},\"last_nodes\":{},\"last_words\":{},\"last_nonempty_nodes\":{},\"last_terminated\":{},\"last_hit_node_limit\":{},\"node_limit_hits\":{}}},\"native_otc_dma_recovery\":{}}}",
+            self.vblank_count,
+            self.vblank_cycle_accumulator,
+            self.io.dma.irq_pending(),
+            optional_u64_json(gpu_dma_stale_vblanks),
+            self.gpu_linked_list_dma.calls,
+            self.gpu_linked_list_dma.last_start,
+            self.gpu_linked_list_dma.last_start,
+            self.gpu_linked_list_dma.last_vblank,
+            self.gpu_linked_list_dma.last_cycles,
+            self.gpu_linked_list_dma.last_nodes,
+            self.gpu_linked_list_dma.last_words,
+            self.gpu_linked_list_dma.last_nonempty_nodes,
+            self.gpu_linked_list_dma.last_terminated,
+            self.gpu_linked_list_dma.last_hit_node_limit,
+            self.gpu_linked_list_dma.node_limit_hits,
+            self.native_otc_dma_recovery.timeline_summary_json(),
+        )
+    }
+
     fn dma_activity_json(&self) -> String {
         self.dma_activity
             .iter()
             .map(DmaActivitySample::json)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn dma_interrupt_activity_json(&self) -> String {
+        self.dma_interrupt_activity
+            .iter()
+            .map(DmaInterruptActivitySample::json)
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -5006,8 +5598,18 @@ impl Bus {
         let mut region_linked_packet_count = 0u64;
         let mut region_draw_packet_count = 0u64;
         let mut region_textured_packet_count = 0u64;
+        let mut low_ram_packet_count = 0u64;
+        let mut low_ram_linked_packet_count = 0u64;
+        let mut low_ram_draw_packet_count = 0u64;
+        let mut low_ram_textured_packet_count = 0u64;
+        let mut high_ram_packet_count = 0u64;
+        let mut high_ram_linked_packet_count = 0u64;
+        let mut high_ram_draw_packet_count = 0u64;
+        let mut high_ram_textured_packet_count = 0u64;
         let mut descriptor_counts = HashMap::<(u16, u16), (u64, u64)>::new();
         let mut recent_textured_samples = Vec::<(u64, u32, String)>::new();
+        let mut low_ram_textured_samples = Vec::<(u64, u32, String)>::new();
+        let mut low_ram_model_candidate_samples = Vec::<(u64, u32, usize, String)>::new();
         let mut beast_candidate_samples = Vec::<(u64, u32, String)>::new();
         let mut packet_count = 0u64;
         let mut linked_packet_count = 0u64;
@@ -5017,128 +5619,222 @@ impl Bus {
         let mut max_address = None;
         let mut samples = Vec::new();
 
-        let mut address = BR2_PRIMITIVE_RAM_START;
-        while address.saturating_add(8) <= BR2_PRIMITIVE_RAM_END {
-            let Some(packet) = self.primitive_packet_candidate_sample(address, &linked_nodes)
-            else {
-                address = address.saturating_add(4);
-                continue;
-            };
-            region_packet_count = region_packet_count.saturating_add(1);
-            region_linked_packet_count =
-                region_linked_packet_count.saturating_add(u64::from(packet.linked));
-            if looks_like_draw_primitive_opcode((packet.first_command >> 24) as u8) {
-                region_draw_packet_count = region_draw_packet_count.saturating_add(1);
-            }
-            let words = self.primitive_packet_command_words(address, packet.word_count);
-            let mut offset = 0usize;
-            let mut matched = None;
-            let mut first_textured = None;
-            while offset < words.len() {
-                let Some(command_words) = gp0_command_word_count(&words[offset..]) else {
-                    break;
+        for (range_start, range_end) in [
+            (
+                BR2_CHARACTER_MODEL_LOW_RAM_START,
+                BR2_CHARACTER_MODEL_LOW_RAM_END,
+            ),
+            (BR2_PRIMITIVE_RAM_START, BR2_PRIMITIVE_RAM_END),
+        ] {
+            let low_ram = range_start == BR2_CHARACTER_MODEL_LOW_RAM_START;
+            let mut address = range_start;
+            while address.saturating_add(8) <= range_end {
+                let Some(packet) = self.primitive_packet_candidate_sample(address, &linked_nodes)
+                else {
+                    address = address.saturating_add(4);
+                    continue;
                 };
-                if command_words == 0 || offset + command_words > words.len() {
-                    break;
+                region_packet_count = region_packet_count.saturating_add(1);
+                region_linked_packet_count =
+                    region_linked_packet_count.saturating_add(u64::from(packet.linked));
+                if low_ram {
+                    low_ram_packet_count = low_ram_packet_count.saturating_add(1);
+                    low_ram_linked_packet_count =
+                        low_ram_linked_packet_count.saturating_add(u64::from(packet.linked));
+                } else {
+                    high_ram_packet_count = high_ram_packet_count.saturating_add(1);
+                    high_ram_linked_packet_count =
+                        high_ram_linked_packet_count.saturating_add(u64::from(packet.linked));
                 }
-                let command = &words[offset..offset + command_words];
-                if let Some((texture_page, clut)) = gp0_command_texture_descriptor(command) {
-                    first_textured.get_or_insert((texture_page, clut, command));
-                    let entry = descriptor_counts
-                        .entry((texture_page, clut))
-                        .or_insert((0, 0));
-                    entry.0 = entry.0.saturating_add(1);
-                    entry.1 = entry.1.max(packet.command_write_vblank.unwrap_or(0));
-                    if br2_character_model_texture((texture_page, clut)) {
-                        matched = Some((texture_page, clut, command));
+                if looks_like_draw_primitive_opcode((packet.first_command >> 24) as u8) {
+                    region_draw_packet_count = region_draw_packet_count.saturating_add(1);
+                    if low_ram {
+                        low_ram_draw_packet_count = low_ram_draw_packet_count.saturating_add(1);
+                    } else {
+                        high_ram_draw_packet_count = high_ram_draw_packet_count.saturating_add(1);
                     }
                 }
-                offset += command_words;
-            }
-
-            if let Some((texture_page, clut, command)) = first_textured {
-                region_textured_packet_count = region_textured_packet_count.saturating_add(1);
-                let bounds = gp0_command_draw_bounds(command);
-                let freshness = packet
-                    .command_write_vblank
-                    .or(packet.header_write_vblank)
-                    .unwrap_or(0);
-                let sample_json = format!(
-                    "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"linked\":{},\"word_count\":{},\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"header_write_vblank\":{},\"command_write_vblank\":{},\"bounds\":{},\"next\":{},\"next_hex\":\"0x{:06x}\",\"words\":[{}],\"word_writes\":[{}]}}",
-                    packet.address,
-                    packet.address,
-                    packet.linked,
-                    packet.word_count,
-                    command[0] >> 24,
-                    command[0] >> 24,
-                    texture_page,
-                    texture_page,
-                    clut,
-                    clut,
-                    optional_u64_json(packet.header_write_vblank),
-                    optional_u64_json(packet.command_write_vblank),
-                    bounds.map_or_else(|| "null".to_string(), Gp0DrawBounds::json),
-                    packet.next,
-                    packet.next,
-                    words
-                        .iter()
-                        .map(|word| format!("\"0x{word:08x}\""))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    self.primitive_packet_word_writes_json(packet.address, packet.word_count)
-                );
-                recent_textured_samples.push((freshness, packet.address, sample_json.clone()));
-                if br2_beast_character_model_candidate_descriptor((texture_page, clut)) {
-                    beast_candidate_samples.push((freshness, packet.address, sample_json));
+                let words = self.primitive_packet_command_words(address, packet.word_count);
+                let mut offset = 0usize;
+                let mut matched = None;
+                let mut first_textured = None;
+                while offset < words.len() {
+                    let Some(command_words) = gp0_command_word_count(&words[offset..]) else {
+                        break;
+                    };
+                    if command_words == 0 || offset + command_words > words.len() {
+                        break;
+                    }
+                    let command = &words[offset..offset + command_words];
+                    if let Some((texture_page, clut)) = gp0_command_texture_descriptor(command) {
+                        first_textured.get_or_insert((texture_page, clut, command));
+                        let entry = descriptor_counts
+                            .entry((texture_page, clut))
+                            .or_insert((0, 0));
+                        entry.0 = entry.0.saturating_add(1);
+                        entry.1 = entry.1.max(packet.command_write_vblank.unwrap_or(0));
+                        if low_ram
+                            && br2_low_ram_character_model_descriptor(address, (texture_page, clut))
+                        {
+                            let freshness = packet
+                                .command_write_vblank
+                                .or(packet.header_write_vblank)
+                                .unwrap_or(0);
+                            let bounds = gp0_command_draw_bounds(command);
+                            let evaluation = self
+                                .gpu_current_br2_character_model_draw_evaluation(address, command);
+                            low_ram_model_candidate_samples.push((
+                                freshness,
+                                address,
+                                offset,
+                                format!(
+                                    "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"command_address\":{},\"command_address_hex\":\"0x{:08x}\",\"command_offset\":{},\"linked\":{},\"word_count\":{},\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"clut_row\":{},\"header_write_vblank\":{},\"command_write_vblank\":{},\"bounds\":{},\"model_bounds_coherent\":{},\"evaluation\":\"{}\",\"words\":[{}],\"word_writes\":[{}]}}",
+                                    packet.address,
+                                    packet.address,
+                                    packet.address + 4 + offset as u32 * 4,
+                                    packet.address + 4 + offset as u32 * 4,
+                                    offset,
+                                    packet.linked,
+                                    packet.word_count,
+                                    texture_page,
+                                    texture_page,
+                                    clut,
+                                    clut,
+                                    gp0_clut_row(clut),
+                                    optional_u64_json(packet.header_write_vblank),
+                                    optional_u64_json(packet.command_write_vblank),
+                                    bounds.map_or_else(
+                                        || "null".to_string(),
+                                        Gp0DrawBounds::json
+                                    ),
+                                    bounds.is_some_and(
+                                        br2_alternate_character_model_bounds_are_coherent
+                                    ),
+                                    evaluation.map_or_else(
+                                        |reason| reason.as_str(),
+                                        |_| "accepted"
+                                    ),
+                                    command
+                                        .iter()
+                                        .map(|word| format!("\"0x{word:08x}\""))
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                    self.primitive_packet_word_writes_json(
+                                        packet.address,
+                                        packet.word_count
+                                    )
+                                ),
+                            ));
+                        }
+                        if gp0_command_is_br2_character_model_for_packet(address, command) {
+                            matched = Some((texture_page, clut, command));
+                        }
+                    }
+                    offset += command_words;
                 }
-            }
 
-            let Some((texture_page, clut, command)) = matched else {
+                if let Some((texture_page, clut, command)) = first_textured {
+                    region_textured_packet_count = region_textured_packet_count.saturating_add(1);
+                    if low_ram {
+                        low_ram_textured_packet_count =
+                            low_ram_textured_packet_count.saturating_add(1);
+                    } else {
+                        high_ram_textured_packet_count =
+                            high_ram_textured_packet_count.saturating_add(1);
+                    }
+                    let bounds = gp0_command_draw_bounds(command);
+                    let freshness = packet
+                        .command_write_vblank
+                        .or(packet.header_write_vblank)
+                        .unwrap_or(0);
+                    let sample_json = format!(
+                        "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"linked\":{},\"word_count\":{},\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"header_write_vblank\":{},\"command_write_vblank\":{},\"bounds\":{},\"next\":{},\"next_hex\":\"0x{:06x}\",\"words\":[{}],\"word_writes\":[{}]}}",
+                        packet.address,
+                        packet.address,
+                        packet.linked,
+                        packet.word_count,
+                        command[0] >> 24,
+                        command[0] >> 24,
+                        texture_page,
+                        texture_page,
+                        clut,
+                        clut,
+                        optional_u64_json(packet.header_write_vblank),
+                        optional_u64_json(packet.command_write_vblank),
+                        bounds.map_or_else(|| "null".to_string(), Gp0DrawBounds::json),
+                        packet.next,
+                        packet.next,
+                        words
+                            .iter()
+                            .map(|word| format!("\"0x{word:08x}\""))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        self.primitive_packet_word_writes_json(packet.address, packet.word_count)
+                    );
+                    recent_textured_samples.push((freshness, packet.address, sample_json.clone()));
+                    if low_ram {
+                        low_ram_textured_samples.push((
+                            freshness,
+                            packet.address,
+                            sample_json.clone(),
+                        ));
+                    }
+                    if br2_beast_character_model_candidate_descriptor((texture_page, clut)) {
+                        beast_candidate_samples.push((freshness, packet.address, sample_json));
+                    }
+                }
+
+                let Some((texture_page, clut, command)) = matched else {
+                    address = address.saturating_add(4);
+                    continue;
+                };
+                packet_count = packet_count.saturating_add(1);
+                linked_packet_count = linked_packet_count.saturating_add(u64::from(packet.linked));
+                min_address =
+                    Some(min_address.map_or(address, |current: u32| current.min(address)));
+                max_address =
+                    Some(max_address.map_or(address, |current: u32| current.max(address)));
+                if let Some(vblank) = packet.header_write_vblank {
+                    newest_header_vblank = Some(
+                        newest_header_vblank.map_or(vblank, |current: u64| current.max(vblank)),
+                    );
+                }
+                if let Some(vblank) = packet.command_write_vblank {
+                    newest_command_vblank = Some(
+                        newest_command_vblank.map_or(vblank, |current: u64| current.max(vblank)),
+                    );
+                }
+
+                if samples.len() < BR2_CHARACTER_MODEL_PACKET_SAMPLE_LIMIT {
+                    let bounds = gp0_command_draw_bounds(command);
+                    let reject_reason = gp0_command_replay_draw_reject_reason(command)
+                        .map_or_else(|| "null".to_string(), |reason| format!("\"{reason:?}\""));
+                    samples.push(format!(
+                        "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"header\":{},\"header_hex\":\"0x{:08x}\",\"next\":{},\"next_hex\":\"0x{:06x}\",\"linked\":{},\"word_count\":{},\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"header_write_vblank\":{},\"command_write_vblank\":{},\"bounds\":{},\"replay_reject_reason\":{},\"dma_relation\":{},\"word_writes\":[{}]}}",
+                        packet.address,
+                        packet.address,
+                        packet.header,
+                        packet.header,
+                        packet.next,
+                        packet.next,
+                        packet.linked,
+                        packet.word_count,
+                        command[0] >> 24,
+                        command[0] >> 24,
+                        texture_page,
+                        texture_page,
+                        clut,
+                        clut,
+                        optional_u64_json(packet.header_write_vblank),
+                        optional_u64_json(packet.command_write_vblank),
+                        bounds.map_or_else(|| "null".to_string(), Gp0DrawBounds::json),
+                        reject_reason,
+                        self.primitive_address_dma_relation_json(packet.address),
+                        self.primitive_packet_word_writes_json(packet.address, packet.word_count)
+                    ));
+                }
                 address = address.saturating_add(4);
-                continue;
-            };
-            packet_count = packet_count.saturating_add(1);
-            linked_packet_count = linked_packet_count.saturating_add(u64::from(packet.linked));
-            min_address = Some(min_address.map_or(address, |current: u32| current.min(address)));
-            max_address = Some(max_address.map_or(address, |current: u32| current.max(address)));
-            if let Some(vblank) = packet.header_write_vblank {
-                newest_header_vblank =
-                    Some(newest_header_vblank.map_or(vblank, |current: u64| current.max(vblank)));
             }
-            if let Some(vblank) = packet.command_write_vblank {
-                newest_command_vblank =
-                    Some(newest_command_vblank.map_or(vblank, |current: u64| current.max(vblank)));
-            }
-
-            if samples.len() < BR2_CHARACTER_MODEL_PACKET_SAMPLE_LIMIT {
-                let bounds = gp0_command_draw_bounds(command);
-                let reject_reason = gp0_command_replay_draw_reject_reason(command)
-                    .map_or_else(|| "null".to_string(), |reason| format!("\"{reason:?}\""));
-                samples.push(format!(
-                    "{{\"address\":{},\"address_hex\":\"0x{:08x}\",\"header\":{},\"header_hex\":\"0x{:08x}\",\"next\":{},\"next_hex\":\"0x{:06x}\",\"linked\":{},\"word_count\":{},\"opcode\":{},\"opcode_hex\":\"0x{:02x}\",\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"header_write_vblank\":{},\"command_write_vblank\":{},\"bounds\":{},\"replay_reject_reason\":{},\"dma_relation\":{},\"word_writes\":[{}]}}",
-                    packet.address,
-                    packet.address,
-                    packet.header,
-                    packet.header,
-                    packet.next,
-                    packet.next,
-                    packet.linked,
-                    packet.word_count,
-                    command[0] >> 24,
-                    command[0] >> 24,
-                    texture_page,
-                    texture_page,
-                    clut,
-                    clut,
-                    optional_u64_json(packet.header_write_vblank),
-                    optional_u64_json(packet.command_write_vblank),
-                    bounds.map_or_else(|| "null".to_string(), Gp0DrawBounds::json),
-                    reject_reason,
-                    self.primitive_address_dma_relation_json(packet.address),
-                    self.primitive_packet_word_writes_json(packet.address, packet.word_count)
-                ));
-            }
-            address = address.saturating_add(4);
         }
 
         let mut descriptor_counts = descriptor_counts.into_iter().collect::<Vec<_>>();
@@ -5175,6 +5871,28 @@ impl Bus {
             .map(|(_, _, json)| json)
             .collect::<Vec<_>>()
             .join(",");
+        low_ram_textured_samples.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
+        });
+        let low_ram_textured_samples = low_ram_textured_samples
+            .into_iter()
+            .take(BR2_CHARACTER_MODEL_PACKET_SAMPLE_LIMIT)
+            .map(|(_, _, json)| json)
+            .collect::<Vec<_>>()
+            .join(",");
+        low_ram_model_candidate_samples.sort_unstable_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| right.2.cmp(&left.2))
+        });
+        let low_ram_model_candidate_samples = low_ram_model_candidate_samples
+            .into_iter()
+            .take(BR2_CHARACTER_MODEL_PACKET_SAMPLE_LIMIT * 4)
+            .map(|(_, _, _, json)| json)
+            .collect::<Vec<_>>()
+            .join(",");
         beast_candidate_samples.sort_unstable_by(|left, right| {
             right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
         });
@@ -5185,22 +5903,37 @@ impl Bus {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"range_start\":\"0x{:08x}\",\"range_end\":\"0x{:08x}\",\"texture_page\":\"0x{:04x}\",\"cluts\":[\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\"],\"current_vblank\":{},\"region_packets\":{},\"region_linked_packets\":{},\"region_unlinked_packets\":{},\"region_draw_packets\":{},\"region_textured_packets\":{},\"descriptor_counts\":[{}],\"recent_textured_samples\":[{}],\"beast_candidate_samples\":[{}],\"packets\":{},\"linked_packets\":{},\"unlinked_packets\":{},\"min_address\":{},\"min_address_hex\":{},\"max_address\":{},\"max_address_hex\":{},\"newest_header_vblank\":{},\"newest_command_vblank\":{},\"samples\":[{}]}}",
-            BR2_CHARACTER_MODEL_PACKET_START,
-            BR2_CHARACTER_MODEL_PACKET_END,
+            "{{\"low_ram_range_start\":\"0x{:08x}\",\"low_ram_range_end\":\"0x{:08x}\",\"high_ram_range_start\":\"0x{:08x}\",\"high_ram_range_end\":\"0x{:08x}\",\"texture_page\":\"0x{:04x}\",\"cluts\":[\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\"],\"current_vblank\":{},\"region_packets\":{},\"region_linked_packets\":{},\"region_unlinked_packets\":{},\"region_draw_packets\":{},\"region_textured_packets\":{},\"low_ram_packets\":{},\"low_ram_linked_packets\":{},\"low_ram_unlinked_packets\":{},\"low_ram_draw_packets\":{},\"low_ram_textured_packets\":{},\"high_ram_packets\":{},\"high_ram_linked_packets\":{},\"high_ram_unlinked_packets\":{},\"high_ram_draw_packets\":{},\"high_ram_textured_packets\":{},\"descriptor_counts\":[{}],\"recent_textured_samples\":[{}],\"low_ram_recent_textured_samples\":[{}],\"low_ram_model_candidate_samples\":[{}],\"beast_candidate_samples\":[{}],\"packets\":{},\"linked_packets\":{},\"unlinked_packets\":{},\"min_address\":{},\"min_address_hex\":{},\"max_address\":{},\"max_address_hex\":{},\"newest_header_vblank\":{},\"newest_command_vblank\":{},\"samples\":[{}]}}",
+            BR2_CHARACTER_MODEL_LOW_RAM_START,
+            BR2_CHARACTER_MODEL_LOW_RAM_END,
+            BR2_PRIMITIVE_RAM_START,
+            BR2_PRIMITIVE_RAM_END,
             BR2_CHARACTER_MODEL_TEXTURE_PAGE,
             BR2_CHARACTER_MODEL_CLUTS[0],
             BR2_CHARACTER_MODEL_CLUTS[1],
             BR2_CHARACTER_MODEL_CLUTS[2],
             BR2_CHARACTER_MODEL_CLUTS[3],
+            BR2_CHARACTER_MODEL_CLUTS[4],
             self.vblank_count,
             region_packet_count,
             region_linked_packet_count,
             region_packet_count.saturating_sub(region_linked_packet_count),
             region_draw_packet_count,
             region_textured_packet_count,
+            low_ram_packet_count,
+            low_ram_linked_packet_count,
+            low_ram_packet_count.saturating_sub(low_ram_linked_packet_count),
+            low_ram_draw_packet_count,
+            low_ram_textured_packet_count,
+            high_ram_packet_count,
+            high_ram_linked_packet_count,
+            high_ram_packet_count.saturating_sub(high_ram_linked_packet_count),
+            high_ram_draw_packet_count,
+            high_ram_textured_packet_count,
             descriptor_counts,
             recent_textured_samples,
+            low_ram_textured_samples,
+            low_ram_model_candidate_samples,
             beast_candidate_samples,
             packet_count,
             linked_packet_count,
@@ -5421,12 +6154,45 @@ impl Bus {
         self.io.compact_json()
     }
 
+    pub fn audio_stats_json(&self) -> String {
+        self.sound_board
+            .as_ref()
+            .map(Ps9805SoundBoard::stats_json)
+            .unwrap_or_else(|| "{\"available\":false}".to_string())
+    }
+
+    pub fn audio_health(&self) -> Option<AudioHealth> {
+        self.sound_board
+            .as_ref()
+            .map(Ps9805SoundBoard::audio_health)
+    }
+
+    pub fn audio_realtime_playback_needs_game_time(&self) -> bool {
+        self.sound_board
+            .as_ref()
+            .is_some_and(Ps9805SoundBoard::realtime_playback_needs_game_time)
+    }
+
+    pub fn start_coreaudio_output(&mut self) -> Result<Option<CoreAudioOutput>, String> {
+        self.sound_board
+            .as_mut()
+            .map(Ps9805SoundBoard::start_coreaudio)
+            .transpose()
+    }
+
+    pub fn audio_pcm_snapshot(&self, max_frames: usize) -> Option<Vec<StereoSample>> {
+        self.sound_board
+            .as_ref()
+            .map(|sound_board| sound_board.pcm_snapshot(max_frames))
+    }
+
     pub fn runtime_probe_json(&self) -> String {
         format!(
-            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_reads\":{},\"native_sync\":{}}}",
+            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"audio\":{},\"br2_native_credit_hle\":{},\"zn_input_reads\":{},\"native_sync\":{}}}",
             self.io.runtime_probe_json(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.audio_stats_json(),
             self.br2_native_credit_hle_json(),
             self.zn_input_reads_json(),
             self.native_sync_json()
@@ -5435,10 +6201,11 @@ impl Bus {
 
     pub fn runtime_compact_probe_json(&self) -> String {
         format!(
-            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"br2_native_credit_hle\":{},\"zn_input_reads\":{},\"native_sync\":{}}}",
+            "{{\"io\":{},\"zn_board\":{{\"state\":{},\"assets\":{}}},\"audio\":{},\"br2_native_credit_hle\":{},\"zn_input_reads\":{},\"native_sync\":{}}}",
             self.io.runtime_compact_probe_json(),
             self.zn_board.runtime_probe_json(),
             self.board_asset_status.json(),
+            self.audio_stats_json(),
             self.br2_native_credit_hle_json(),
             self.zn_input_reads_json(),
             self.native_sync_compact_json()
@@ -5592,6 +6359,16 @@ impl Bus {
                 p1_kick_active_reads: pad.p1_kick_active_reads,
                 p1_beast_active_reads: pad.p1_beast_active_reads,
                 p3_guard_active_reads: pad.p1_guard_active_reads,
+                p2_input_reads: pad.p2_input_reads,
+                p2_up_active_reads: pad.p2_up_active_reads,
+                p2_down_active_reads: pad.p2_down_active_reads,
+                p2_left_active_reads: pad.p2_left_active_reads,
+                p2_right_active_reads: pad.p2_right_active_reads,
+                p2_punch_active_reads: pad.p2_punch_active_reads,
+                p2_kick_active_reads: pad.p2_kick_active_reads,
+                p2_beast_active_reads: pad.p2_beast_active_reads,
+                p2_guard_active_reads: pad.p2_guard_active_reads,
+                system_p2_start_active_reads: pad.p2_start_active_reads,
                 ..NativeInputActivity::default()
             })
     }
@@ -5960,16 +6737,68 @@ impl Bus {
     }
 
     pub fn acknowledge_hle_bios_irq_sources(&mut self, pending: u32) {
+        let before = self.dma_interrupt_snapshot();
         if pending & (1 << 3) != 0 {
             self.io.dma.acknowledge_pending_irq_flags();
         }
         self.io.irq.status &= !pending;
         self.sync_dma_irq();
+        if pending & (1 << 3) != 0 {
+            self.record_dma_interrupt_activity("hle_ack", None, Some(pending), None, None, before);
+        }
     }
 
     fn raise_dma_irq_if_pending(&mut self) {
         if self.io.dma.irq_pending() {
             self.io.irq.status |= 1 << 3;
+        }
+    }
+
+    fn dma_interrupt_snapshot(&self) -> (u32, u32, u32) {
+        (
+            self.io.dma.interrupt,
+            self.io.dma.read_u32(DMA_INTERRUPT),
+            self.io.irq.status,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_dma_interrupt_activity(
+        &mut self,
+        kind: &'static str,
+        address: Option<u32>,
+        value: Option<u32>,
+        access_len: Option<usize>,
+        channel: Option<usize>,
+        before: (u32, u32, u32),
+    ) {
+        let after = self.dma_interrupt_snapshot();
+        let state_changed = before != after;
+        let gpu_completion = kind == "channel_complete" && channel == Some(DMA_GPU_CHANNEL);
+        let control_event = matches!(kind, "register_write" | "hle_ack");
+        if !state_changed && !gpu_completion && !control_event {
+            return;
+        }
+        self.dma_interrupt_activity
+            .push(DmaInterruptActivitySample {
+                kind,
+                address,
+                value,
+                access_len,
+                channel,
+                interrupt_before: before.0,
+                interrupt_after: after.0,
+                effective_before: before.1,
+                effective_after: after.1,
+                irq_status_before: before.2,
+                irq_status_after: after.2,
+                pc: self.trace_pc.get(),
+                vblank: self.vblank_count,
+                cycles: self.trace_cycles.get(),
+            });
+        if self.dma_interrupt_activity.len() > DMA_INTERRUPT_ACTIVITY_RECENT_LIMIT {
+            let overflow = self.dma_interrupt_activity.len() - DMA_INTERRUPT_ACTIVITY_RECENT_LIMIT;
+            self.dma_interrupt_activity.drain(0..overflow);
         }
     }
 
@@ -5990,6 +6819,7 @@ impl Bus {
             start: None,
             end: None,
             words: 0,
+            payload_checksum: None,
             nodes: 0,
             nonempty_nodes: 0,
             pc: self.trace_pc.get(),
@@ -6016,6 +6846,7 @@ impl Bus {
             start: Some(start_address & 0x00ff_fffc),
             end: stats.last_max_command_address,
             words: stats.last_words,
+            payload_checksum: None,
             nodes: stats.last_nodes,
             nonempty_nodes: stats.last_nonempty_nodes,
             pc: self.trace_pc.get(),
@@ -6024,7 +6855,13 @@ impl Bus {
         });
     }
 
-    fn record_gpu_block_dma_activity(&mut self, start_address: u32, words: u32, control: u32) {
+    fn record_gpu_block_dma_activity(
+        &mut self,
+        start_address: u32,
+        words: u32,
+        control: u32,
+        payload_checksum: u32,
+    ) {
         let (madr, bcr, chcr) = self.dma_channel_snapshot(DMA_GPU_CHANNEL);
         let start = start_address & 0x00ff_fffc;
         let end = dma_transfer_end_address(start, words, control);
@@ -6040,6 +6877,7 @@ impl Bus {
             start: Some(start),
             end,
             words,
+            payload_checksum: Some(payload_checksum),
             nodes: 0,
             nonempty_nodes: 0,
             pc: self.trace_pc.get(),
@@ -6064,6 +6902,7 @@ impl Bus {
             start: Some(start),
             end,
             words,
+            payload_checksum: None,
             nodes: 0,
             nonempty_nodes: 0,
             pc: self.trace_pc.get(),
@@ -6092,6 +6931,7 @@ impl Bus {
             start: Some(start),
             end,
             words,
+            payload_checksum: None,
             nodes: words,
             nonempty_nodes: 0,
             pc: self.trace_pc.get(),
@@ -6105,6 +6945,19 @@ impl Bus {
             .dma
             .channel_state(channel)
             .map_or((0, 0, 0), |state| (state.madr, state.bcr, state.chcr))
+    }
+
+    fn dma_ram_payload_checksum(&self, start_address: u32, words: u32, control: u32) -> u32 {
+        let mut address = start_address & 0x00ff_fffc;
+        let step = dma_address_step(control);
+        let mut checksum = 0x811c_9dc5_u32;
+        for _ in 0..words {
+            for byte in self.read_u32_fast_no_trace(address).to_le_bytes() {
+                checksum = (checksum ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+            }
+            address = address.wrapping_add(step);
+        }
+        checksum
     }
 
     fn push_dma_activity(&mut self, sample: DmaActivitySample) {
@@ -6123,7 +6976,7 @@ impl Bus {
             return;
         }
 
-        let mut completed_dma = false;
+        let mut completed_channels = Vec::new();
         for channel in 0..self.pending_dma_completion_cycles.len() {
             let remaining = &mut self.pending_dma_completion_cycles[channel];
             if *remaining == 0 {
@@ -6132,13 +6985,22 @@ impl Bus {
 
             *remaining = (*remaining).saturating_sub(cycles);
             if *remaining == 0 {
-                self.io.dma.complete_channel(channel);
-                completed_dma = true;
+                completed_channels.push(channel);
             }
         }
 
-        if completed_dma {
+        for channel in completed_channels {
+            let before = self.dma_interrupt_snapshot();
+            self.io.dma.complete_channel(channel);
             self.sync_dma_irq();
+            self.record_dma_interrupt_activity(
+                "channel_complete",
+                None,
+                None,
+                None,
+                Some(channel),
+                before,
+            );
         }
     }
 
@@ -6190,6 +7052,11 @@ impl Bus {
         let step = dma_address_step(control);
         let command_before = self.io.mdec.command();
         let output_index_before = self.io.mdec.decoded_output_index();
+        let decode_input_remaining_before = self.io.mdec.decode_input_halfwords_remaining();
+        let decode_input_cursor_before = self.io.mdec.decode_input_cursor();
+        let decode_complete_before = self.io.mdec.decode_complete();
+        let discarded_input_halfwords_before = self.io.mdec.discarded_input_halfwords();
+        let ram_payload_checksum = self.dma_ram_payload_checksum(start, words, control);
         for _ in 0..words {
             let word = self.read_u32(address);
             self.io.mdec.write_dma_input(word);
@@ -6211,6 +7078,17 @@ impl Bus {
             decoded_output_index_before: output_index_before,
             decoded_output_index_after: self.io.mdec.decoded_output_index(),
             decoded_output_words: self.io.mdec.decoded_output_words(),
+            decode_input_halfwords_remaining_before: decode_input_remaining_before,
+            decode_input_halfwords_remaining_after: self.io.mdec.decode_input_halfwords_remaining(),
+            decode_input_cursor_before,
+            decode_input_cursor_after: self.io.mdec.decode_input_cursor(),
+            decode_complete_before,
+            decode_complete_after: self.io.mdec.decode_complete(),
+            discarded_input_halfwords_before,
+            discarded_input_halfwords_after: self.io.mdec.discarded_input_halfwords(),
+            decoded_output_checksum: self.io.mdec.decoded_output_checksum(),
+            consumed_output_checksum: self.io.mdec.consumed_output_checksum(),
+            ram_payload_checksum,
             pc: self.trace_pc.get(),
             vblank: self.vblank_count,
             cycles: self.trace_cycles.get(),
@@ -6231,7 +7109,12 @@ impl Bus {
         let start = address;
         let step = dma_address_step(control);
         let output_index_before = self.io.mdec.decoded_output_index();
+        let decode_input_remaining_before = self.io.mdec.decode_input_halfwords_remaining();
+        let decode_input_cursor_before = self.io.mdec.decode_input_cursor();
+        let decode_complete_before = self.io.mdec.decode_complete();
+        let discarded_input_halfwords_before = self.io.mdec.discarded_input_halfwords();
         let mdec_video_disabled = std::env::var_os("BR2_NATIVE_DISABLE_MDEC_VIDEO").is_some();
+        self.io.mdec.begin_dma_output_request(words);
         for _ in 0..words {
             let word = if mdec_video_disabled {
                 self.io.mdec.read_disabled_dma_output()
@@ -6241,6 +7124,8 @@ impl Bus {
             self.write_dma_u32(address, word, true);
             address = address.wrapping_add(step);
         }
+        self.io.mdec.complete_dma_output_request();
+        let ram_payload_checksum = self.dma_ram_payload_checksum(start, words, control);
         self.push_mdec_dma_activity(MdecDmaActivitySample {
             kind: "mdec_out",
             command: self.io.mdec.command(),
@@ -6253,6 +7138,17 @@ impl Bus {
             decoded_output_index_before: output_index_before,
             decoded_output_index_after: self.io.mdec.decoded_output_index(),
             decoded_output_words: self.io.mdec.decoded_output_words(),
+            decode_input_halfwords_remaining_before: decode_input_remaining_before,
+            decode_input_halfwords_remaining_after: self.io.mdec.decode_input_halfwords_remaining(),
+            decode_input_cursor_before,
+            decode_input_cursor_after: self.io.mdec.decode_input_cursor(),
+            decode_complete_before,
+            decode_complete_after: self.io.mdec.decode_complete(),
+            discarded_input_halfwords_before,
+            discarded_input_halfwords_after: self.io.mdec.discarded_input_halfwords(),
+            decoded_output_checksum: self.io.mdec.decoded_output_checksum(),
+            consumed_output_checksum: self.io.mdec.consumed_output_checksum(),
+            ram_payload_checksum,
             pc: self.trace_pc.get(),
             vblank: self.vblank_count,
             cycles: self.trace_cycles.get(),
@@ -6291,6 +7187,7 @@ impl Bus {
         let first_node = start_address & 0x00ff_ffff;
         let mut address = first_node & 0x00ff_fffc;
         let mut stats = GpuLinkedListDmaRunStats::started(start_address, address);
+        let draw_sequence_before = self.io.gpu.draw_sequence();
         if gpu_linked_list_terminator(first_node) {
             stats.terminated = true;
             stats.record_context(
@@ -6304,7 +7201,11 @@ impl Bus {
             return;
         }
 
+        let next_gpu_linked_list_generation = self.gpu_linked_list_generation.saturating_add(1);
         self.io.gpu.begin_gp0_capture_batch();
+        self.invalidate_stale_unlinked_replay_for_guest_linked_list_generation(
+            next_gpu_linked_list_generation,
+        );
         for _ in 0..GPU_LINKED_LIST_NODE_LIMIT {
             let header = self.read_u32(address);
             let words = (header >> 24).min(1024);
@@ -6321,7 +7222,40 @@ impl Bus {
                 );
             }
             for range in gpu_linked_list_command_ranges(&node_commands) {
-                stats.record_command_group(&node_commands, range);
+                stats.record_command_group(&node_commands, range.clone());
+                let Some((range_start_address, _)) = node_commands.get(range.start) else {
+                    continue;
+                };
+                let range_words = node_commands[range]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                if gp0_command_is_br2_character_select_large_portrait(&range_words)
+                    && self
+                        .io
+                        .gpu
+                        .retained_br2_character_select_large_portrait_transfer_generation_valid(
+                            &range_words,
+                        )
+                {
+                    self.remember_br2_retained_character_select_left_portrait(
+                        *range_start_address,
+                        &range_words,
+                    );
+                }
+                if gp0_command_is_br2_character_select_right_portrait(&range_words)
+                    && self
+                        .io
+                        .gpu
+                        .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                            &range_words,
+                        )
+                {
+                    self.remember_br2_retained_character_select_right_portrait(
+                        *range_start_address,
+                        &range_words,
+                    );
+                }
             }
 
             let next = header & 0x00ff_ffff;
@@ -6339,8 +7273,25 @@ impl Bus {
             self.vblank_count,
             self.trace_cycles.get(),
         );
-        self.gpu_linked_list_generation = self.gpu_linked_list_generation.saturating_add(1);
+        self.gpu_linked_list_generation = next_gpu_linked_list_generation;
         self.try_unlinked_primitive_replay(&stats);
+        let (fresh_character_select_backdrop, retained_character_select_context) =
+            self.gpu_trusted_current_otc_chain_character_select_context(first_node);
+        let character_select_context =
+            fresh_character_select_backdrop || retained_character_select_context;
+        let drew_primitives = self.io.gpu.draw_sequence() > draw_sequence_before;
+        if retained_character_select_context {
+            self.br2_retained_character_select_chain_start = Some(first_node & 0x00ff_fffc);
+        } else if self.br2_retained_character_select_chain_start.is_some()
+            && !fresh_character_select_backdrop
+            && (self.gpu_linked_list_chain_has_complete_gameplay_scene(first_node)
+                || (drew_primitives && !self.br2_retained_character_select_preview_is_valid()))
+        {
+            self.clear_br2_retained_character_select_context();
+        }
+        if character_select_context && drew_primitives {
+            self.replay_latched_br2_retained_character_select_portrait();
+        }
         self.record_gpu_linked_list_dma_activity(start_address, &stats);
         self.gpu_linked_list_dma.merge_last(stats);
         self.io.gpu.end_gp0_capture_batch();
@@ -6381,6 +7332,11 @@ impl Bus {
         words: &[u32],
     ) -> ((i32, i32), Vec<std::ops::Range<usize>>) {
         let base = self.gpu_replay_validation_offset();
+        if gp0_command_is_br2_title_quadrant_rect(words)
+            && gp0_command_br2_title_quadrant_y(words) != Some(self.io.gpu.display_origin().1)
+        {
+            return (base, Vec::new());
+        }
         for offset in self.gpu_replay_validation_offsets() {
             let ranges = gp0_otc_replay_safe_draw_command_ranges_with_drawing_offset(words, offset);
             if !ranges.is_empty() {
@@ -6426,8 +7382,22 @@ impl Bus {
         packet_address: u32,
         words: &[u32],
     ) -> Result<Gp0DrawBounds, Gp0ReplayDrawRejectReason> {
+        let descriptor = gp0_command_texture_descriptor(words);
+        let base = self.gpu_replay_validation_offset();
+        // Low-RAM fighter packets are already expressed relative to the active
+        // display page. Trying the opposite interlaced field can move an
+        // off-screen ring/atlas fragment into the playfield and misclassify it
+        // as a live model. High-RAM recovery still needs alternate field
+        // probes because stage/model packets can precede the GP1 page flip.
+        let validation_offsets = if descriptor.is_some_and(|descriptor| {
+            br2_low_ram_character_model_descriptor(packet_address, descriptor)
+        }) {
+            vec![base]
+        } else {
+            self.gpu_replay_validation_offsets()
+        };
         let mut last_reason = Gp0ReplayDrawRejectReason::ModelPrefilter;
-        for drawing_offset in self.gpu_replay_validation_offsets() {
+        for drawing_offset in validation_offsets {
             match gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
                 packet_address,
                 words,
@@ -6458,6 +7428,8 @@ impl Bus {
             record_dma_activity,
             submitted_nodes,
             None,
+            None,
+            None,
         )
     }
 
@@ -6471,10 +7443,18 @@ impl Bus {
         record_dma_activity: bool,
         mut submitted_nodes: Option<&mut HashSet<u32>>,
         rejected_model_draws: Option<&HashSet<u32>>,
+        silently_suppressed_model_draws: Option<&HashSet<u32>>,
+        stale_body_exempt_model_draws: Option<&HashSet<u32>>,
     ) -> usize {
         self.io.gpu.begin_gp0_capture_batch();
         let mut submitted_words = 0usize;
         let mut address = start_address & 0x00ff_fffc;
+        let (allow_fresh_character_select_preview, allow_retained_character_select_preview) =
+            if trusted_current_otc_chain {
+                self.gpu_trusted_current_otc_chain_character_select_context(start_address)
+            } else {
+                (false, false)
+            };
         let mut stats = GpuLinkedListDmaRunStats::started(start_address, address);
         let reverse_nodes = reverse_gpu_linked_list_nodes();
         let reverse_command_groups = reverse_gpu_linked_list_command_groups();
@@ -6505,6 +7485,10 @@ impl Bus {
                             &node_commands,
                             range,
                             rejected_model_draws,
+                            silently_suppressed_model_draws,
+                            stale_body_exempt_model_draws,
+                            allow_fresh_character_select_preview,
+                            allow_retained_character_select_preview,
                         )
                     } else {
                         self.write_gpu_dma_linked_list_command_range_with_stale_body_policy_for_node(
@@ -6512,6 +7496,9 @@ impl Bus {
                             range,
                             allow_stale_draw_body,
                             Some(address),
+                            rejected_model_draws,
+                            silently_suppressed_model_draws,
+                            stale_body_exempt_model_draws,
                         )
                     });
                 }
@@ -6541,6 +7528,10 @@ impl Bus {
                                     node,
                                     range,
                                     rejected_model_draws,
+                                    silently_suppressed_model_draws,
+                                    stale_body_exempt_model_draws,
+                                    allow_fresh_character_select_preview,
+                                    allow_retained_character_select_preview,
                                 )
                             } else {
                                 self.write_gpu_dma_linked_list_command_range_with_stale_body_policy_for_node(
@@ -6548,6 +7539,9 @@ impl Bus {
                                 range,
                                 allow_stale_draw_body,
                                 Some(*node_header_address),
+                                rejected_model_draws,
+                                silently_suppressed_model_draws,
+                                stale_body_exempt_model_draws,
                             )
                             });
                     }
@@ -6559,6 +7553,10 @@ impl Bus {
                                     node,
                                     range,
                                     rejected_model_draws,
+                                    silently_suppressed_model_draws,
+                                    stale_body_exempt_model_draws,
+                                    allow_fresh_character_select_preview,
+                                    allow_retained_character_select_preview,
                                 )
                             } else {
                                 self.write_gpu_dma_linked_list_command_range_with_stale_body_policy_for_node(
@@ -6566,6 +7564,9 @@ impl Bus {
                                 range,
                                 allow_stale_draw_body,
                                 Some(*node_header_address),
+                                rejected_model_draws,
+                                silently_suppressed_model_draws,
+                                stale_body_exempt_model_draws,
                             )
                             });
                     }
@@ -6585,6 +7586,17 @@ impl Bus {
             self.record_gpu_linked_list_dma_activity(start_address, &stats);
             self.gpu_linked_list_dma.merge_last(stats);
         }
+        if trusted_current_otc_chain && allow_retained_character_select_preview {
+            self.br2_retained_character_select_chain_start = Some(start_address & 0x00ff_fffc);
+        } else if self.br2_retained_character_select_chain_start.is_some()
+            && !allow_fresh_character_select_preview
+            && self.gpu_linked_list_chain_has_complete_gameplay_scene(start_address)
+        {
+            self.clear_br2_retained_character_select_context();
+        }
+        if submitted_words > 0 && allow_retained_character_select_preview {
+            self.replay_latched_br2_retained_character_select_portrait();
+        }
         self.io.gpu.end_gp0_capture_batch_without_probes();
         submitted_words
     }
@@ -6595,33 +7607,89 @@ impl Bus {
         commands: &[(u32, u32)],
         range: std::ops::Range<usize>,
     ) -> usize {
-        self.write_gpu_dma_trusted_linked_list_command_range_with_rejections(commands, range, None)
+        self.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+            commands, range, None, None, None, false, false,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_gpu_dma_trusted_linked_list_command_range_with_rejections(
         &mut self,
         commands: &[(u32, u32)],
         range: std::ops::Range<usize>,
         rejected_model_draws: Option<&HashSet<u32>>,
+        silently_suppressed_model_draws: Option<&HashSet<u32>>,
+        stale_body_exempt_model_draws: Option<&HashSet<u32>>,
+        allow_fresh_character_select_preview: bool,
+        allow_retained_character_select_preview: bool,
     ) -> usize {
         let Some((range_start_address, first_command)) = commands.get(range.start) else {
             return 0;
         };
-        let range_words = commands[range.clone()]
+        let range_start_address = *range_start_address & 0x00ff_fffc;
+        let mut range_words = commands[range.clone()]
             .iter()
             .map(|(_, command)| *command)
             .collect::<Vec<_>>();
+        let node_header_address = commands
+            .first()
+            .and_then(|(address, _)| address.checked_sub(4))
+            .map(|address| address & 0x00ff_fffc);
+        let character_select_preview = gp0_command_is_br2_character_select_preview(
+            &range_words,
+            &self.gpu_replay_validation_offsets(),
+        );
+        let current_generation_character_select_preview = character_select_preview
+            && self.gpu_recovery_command_range_is_current_generation(
+                commands,
+                range.clone(),
+                node_header_address,
+            );
+        let retained_character_select_preview = character_select_preview
+            && !current_generation_character_select_preview
+            && allow_retained_character_select_preview
+            && BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES
+                .contains(&range_start_address)
+            && gp0_command_is_br2_retained_character_select_preview(&range_words)
+            && self
+                .io
+                .gpu
+                .retained_br2_character_select_preview_transfer_generation_valid(&range_words);
+        let retained_character_select_right_portrait = allow_retained_character_select_preview
+            && gp0_command_is_br2_character_select_right_portrait(&range_words)
+            && self
+                .io
+                .gpu
+                .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                    &range_words,
+                );
+        let retained_character_select_left_portrait = allow_retained_character_select_preview
+            && gp0_command_is_br2_character_select_large_portrait(&range_words)
+            && self
+                .io
+                .gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(
+                    &range_words,
+                );
+        let current_character_select_preview = character_select_preview
+            && ((current_generation_character_select_preview
+                && (allow_fresh_character_select_preview
+                    || allow_retained_character_select_preview))
+                || retained_character_select_preview);
         if self.native_otc_dma_recovery.record_chain_filter_stats {
             self.native_otc_dma_recovery.last_chain_ranges = self
                 .native_otc_dma_recovery
                 .last_chain_ranges
                 .saturating_add(1);
         }
-        if rejected_model_draws
-            .is_some_and(|addresses| addresses.contains(&(*range_start_address & 0x00ff_fffc)))
+        if silently_suppressed_model_draws
+            .is_some_and(|addresses| addresses.contains(&range_start_address))
         {
+            return 0;
+        }
+        if rejected_model_draws.is_some_and(|addresses| addresses.contains(&range_start_address)) {
             let detail = self
-                .gpu_current_br2_character_model_draw_evaluation(*range_start_address, &range_words)
+                .gpu_current_br2_character_model_draw_evaluation(range_start_address, &range_words)
                 .err()
                 .or(Some(Gp0ReplayDrawRejectReason::ModelPrefilter));
             self.record_native_otc_chain_filter_rejection_with_detail(
@@ -6640,7 +7708,24 @@ impl Bus {
             );
             return 0;
         }
-        if gp0_command_sequence_has_known_recovery_atlas_corruption(&range_words) {
+        if character_select_preview
+            && allow_retained_character_select_preview
+            && !current_generation_character_select_preview
+            && !retained_character_select_preview
+        {
+            self.record_native_otc_chain_filter_rejection_with_detail(
+                commands,
+                range,
+                "stale_draw_body",
+                Some(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas),
+            );
+            return 0;
+        }
+        if gp0_command_sequence_has_known_recovery_atlas_corruption(&range_words)
+            && !current_character_select_preview
+            && !retained_character_select_left_portrait
+            && !retained_character_select_right_portrait
+        {
             self.record_native_otc_chain_filter_rejection_with_detail(
                 commands,
                 range,
@@ -6650,7 +7735,7 @@ impl Bus {
             return 0;
         }
         let current_model_bounds =
-            self.gpu_current_br2_character_model_draw_bounds(*range_start_address, &range_words);
+            self.gpu_current_br2_character_model_draw_bounds(range_start_address, &range_words);
         if self.gpu_recovery_command_range_is_stale_atlas_artifact(
             commands,
             range.clone(),
@@ -6659,16 +7744,25 @@ impl Bus {
             self.record_native_otc_chain_filter_rejection(commands, range, "stale_draw_body");
             return 0;
         }
-        let node_header_address = commands
-            .first()
-            .and_then(|(address, _)| address.checked_sub(4))
-            .map(|address| address & 0x00ff_fffc);
-        if self.gpu_recovery_command_range_is_stale_character_model_generation(
+        let stale_body_exempt_model_draw = stale_body_exempt_model_draws
+            .is_some_and(|addresses| addresses.contains(&range_start_address));
+        if self.gpu_recovery_command_range_has_expired_one_shot_foreground_effect(
             commands,
             range.clone(),
             &range_words,
-            node_header_address,
+            None,
         ) {
+            self.record_native_otc_chain_filter_rejection(commands, range, "stale_draw_body");
+            return 0;
+        }
+        if !stale_body_exempt_model_draw
+            && self.gpu_recovery_command_range_is_stale_character_model_generation(
+                commands,
+                range.clone(),
+                &range_words,
+                node_header_address,
+            )
+        {
             self.record_native_otc_chain_filter_rejection(commands, range, "stale_draw_body");
             return 0;
         }
@@ -6683,7 +7777,7 @@ impl Bus {
             return 0;
         }
         if gp0_command_is_corrupt_br2_character_model_draw_for_packet(
-            *range_start_address,
+            range_start_address,
             &range_words,
         ) && current_model_bounds.is_none()
         {
@@ -6697,7 +7791,7 @@ impl Bus {
         }
         if gp0_command_sequence_has_draw(&range_words) {
             let model_draw_ranges = gp0_br2_character_model_replay_command_ranges_for_packet(
-                *range_start_address,
+                range_start_address,
                 &range_words,
             );
             let detail = gp0_command_replay_draw_reject_reason_with_state(
@@ -6708,11 +7802,23 @@ impl Bus {
             let ignored_uv_padding_pointer = detail
                 == Some(Gp0ReplayDrawRejectReason::PrimitivePointerContamination)
                 && gp0_textured_polygon_pointer_contamination_is_uv_padding_only(&range_words)
+                && !gp0_command_draw_bounds_with_offset(&range_words, drawing_offset).is_some_and(
+                    |bounds| {
+                        gp0_command_is_br2_current_otc_model_atlas_strip_false_positive_for_packet(
+                            range_start_address,
+                            &range_words,
+                            bounds,
+                        )
+                    },
+                )
                 && gp0_command_has_playfield_draw_bounds_with_offset(&range_words, drawing_offset);
             if safe_draw_ranges.is_empty()
                 && model_draw_ranges.is_empty()
                 && !ignored_uv_padding_pointer
                 && current_model_bounds.is_none()
+                && !current_character_select_preview
+                && !retained_character_select_left_portrait
+                && !retained_character_select_right_portrait
             {
                 self.record_native_otc_chain_filter_rejection_with_detail(
                     commands,
@@ -6727,9 +7833,30 @@ impl Bus {
             self.record_native_otc_chain_filter_rejection(commands, range, "blocking_artifact");
             return 0;
         }
+        if retained_character_select_preview {
+            normalize_br2_retained_character_select_preview_color(&mut range_words);
+        }
+        if retained_character_select_left_portrait {
+            self.io
+                .gpu
+                .restore_retained_br2_character_select_large_portrait_assets();
+            self.remember_br2_retained_character_select_left_portrait(
+                range_start_address,
+                &range_words,
+            );
+        }
+        if retained_character_select_right_portrait {
+            self.io
+                .gpu
+                .restore_retained_br2_character_select_right_large_portrait_assets();
+            self.remember_br2_retained_character_select_right_portrait(
+                range_start_address,
+                &range_words,
+            );
+        }
         self.io.gpu.write_recovery_gp0_command(
             &range_words,
-            *range_start_address,
+            range_start_address,
             self.trace_pc.get(),
         );
         if self.native_otc_dma_recovery.record_chain_filter_stats {
@@ -6746,7 +7873,7 @@ impl Bus {
                 self.native_otc_dma_recovery
                     .last_chain_submitted_samples
                     .push(GpuDmaRangeFilterSample {
-                        address: *range_start_address,
+                        address: range_start_address,
                         opcode: (first_command >> 24) as u8,
                         words: range.len(),
                         command_words: commands[range.clone()]
@@ -6759,6 +7886,350 @@ impl Bus {
             }
         }
         range.len()
+    }
+
+    fn gpu_recovery_command_range_is_current_generation(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        node_header_address: Option<u32>,
+    ) -> bool {
+        let min_vblank = self.vblank_count.saturating_sub(1);
+        let fresh_header = node_header_address.is_some_and(|address| {
+            self.primitive_ram_writes
+                .header_write_vblank(address & 0x00ff_fffc)
+                .is_some_and(|vblank| vblank >= min_vblank)
+        });
+        fresh_header
+            && !range.is_empty()
+            && commands[range].iter().all(|(address, _)| {
+                self.primitive_ram_writes
+                    .word_write_vblank(*address & 0x00ff_fffc)
+                    .is_some_and(|vblank| vblank >= min_vblank)
+            })
+    }
+
+    fn gpu_trusted_current_otc_chain_character_select_context(
+        &self,
+        start_address: u32,
+    ) -> (bool, bool) {
+        let mut address = start_address & 0x00ff_fffc;
+        let mut visited = HashSet::new();
+        let mut backdrop_draws = 0usize;
+        let mut preview_draws = 0usize;
+        let mut has_fresh_backdrop = false;
+        for _ in 0..GPU_LINKED_LIST_NODE_LIMIT {
+            if !visited.insert(address) {
+                return (false, false);
+            }
+            let Some(header) = self.read_ram_u32_physical(address) else {
+                return (false, false);
+            };
+            let words = (header >> 24).min(PRIMITIVE_PACKET_MAX_WORDS);
+            let node_commands = (0..words)
+                .filter_map(|index| {
+                    let command_address = address.wrapping_add(4 + index * 4);
+                    self.read_ram_u32_physical(command_address)
+                        .map(|command| (command_address, command))
+                })
+                .collect::<Vec<_>>();
+            if node_commands.len() != words as usize {
+                return (false, false);
+            }
+            for range in gpu_linked_list_command_ranges(&node_commands) {
+                let range_words = node_commands[range.clone()]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                if gp0_command_is_br2_character_select_backdrop(&range_words) {
+                    backdrop_draws = backdrop_draws.saturating_add(1);
+                    has_fresh_backdrop |= self.gpu_recovery_command_range_is_current_generation(
+                        &node_commands,
+                        range,
+                        Some(address),
+                    );
+                } else if gp0_command_is_br2_character_select_preview(
+                    &range_words,
+                    &self.gpu_replay_validation_offsets(),
+                ) || gp0_command_is_br2_character_select_right_portrait(&range_words)
+                {
+                    preview_draws = preview_draws.saturating_add(1);
+                }
+            }
+
+            let next = header & 0x00ff_ffff;
+            if gpu_linked_list_terminator(next) {
+                break;
+            }
+            address = next & 0x00ff_fffc;
+        }
+        (
+            has_fresh_backdrop,
+            backdrop_draws >= BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS && preview_draws > 0,
+        )
+    }
+
+    fn gpu_linked_list_chain_has_complete_gameplay_scene(&self, start_address: u32) -> bool {
+        let mut address = start_address & 0x00ff_fffc;
+        let mut visited = HashSet::new();
+        let mut stage_draws = 0usize;
+        let mut model_draws = 0usize;
+        for _ in 0..GPU_LINKED_LIST_NODE_LIMIT {
+            if !visited.insert(address) {
+                return false;
+            }
+            let Some(header) = self.read_ram_u32_physical(address) else {
+                return false;
+            };
+            let words = header >> 24;
+            if words > PRIMITIVE_PACKET_MAX_WORDS {
+                return false;
+            }
+            let node_commands = (0..words)
+                .filter_map(|index| {
+                    let command_address = address.wrapping_add(4 + index * 4);
+                    self.read_ram_u32_physical(command_address)
+                        .map(|command| (command_address, command))
+                })
+                .collect::<Vec<_>>();
+            if node_commands.len() != words as usize {
+                return false;
+            }
+            for range in gpu_linked_list_command_ranges(&node_commands) {
+                let Some((command_address, _)) = node_commands.get(range.start) else {
+                    continue;
+                };
+                let range_words = node_commands[range]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                if gp0_command_is_br2_character_select_backdrop(&range_words) {
+                    return false;
+                }
+                if !self
+                    .gpu_br2_stage_recovery_ranges(&range_words)
+                    .1
+                    .is_empty()
+                {
+                    stage_draws = stage_draws.saturating_add(1);
+                }
+                if self
+                    .gpu_current_br2_character_model_draw_bounds(*command_address, &range_words)
+                    .is_some()
+                {
+                    model_draws = model_draws.saturating_add(1);
+                }
+            }
+            if stage_draws >= BR2_STAGE_RECOVERY_MIN_PACKETS
+                && model_draws >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS
+            {
+                return true;
+            }
+
+            let next = header & 0x00ff_ffff;
+            if gpu_linked_list_terminator(next) {
+                break;
+            }
+            address = next & 0x00ff_fffc;
+        }
+        false
+    }
+
+    fn latest_gpu_otc_chain_start(&self) -> Option<u32> {
+        let guest = (self.gpu_linked_list_dma.calls > 0).then_some((
+            self.gpu_linked_list_dma.last_vblank,
+            self.gpu_linked_list_dma.last_cycles,
+            self.gpu_linked_list_dma.last_start,
+        ));
+        let recovered = self
+            .native_otc_dma_recovery
+            .last_otc_key
+            .zip(self.native_otc_dma_recovery.last_start)
+            .map(|(key, start)| (key.vblank, key.cycles, start));
+
+        [guest, recovered]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(vblank, cycles, _)| (*vblank, *cycles))
+            .map(|(_, _, start)| start)
+    }
+
+    fn try_refresh_br2_retained_character_select_portrait(&mut self) -> bool {
+        let generation = self.io.gpu.retained_portrait_texture_generation();
+        if generation == 0
+            || generation == self.br2_retained_portrait_refresh_generation
+            || self.io.gpu.retained_portrait_texture_coverage_per_mille() < 900
+        {
+            return false;
+        }
+
+        let Some(start_address) = self.latest_gpu_otc_chain_start() else {
+            return false;
+        };
+        let (fresh_preview, retained_preview) =
+            self.gpu_trusted_current_otc_chain_character_select_context(start_address);
+        if !fresh_preview && !retained_preview {
+            return false;
+        }
+
+        if !self.replay_br2_retained_character_select_portrait() {
+            return false;
+        }
+        self.br2_retained_character_select_chain_start = Some(start_address & 0x00ff_fffc);
+        self.br2_retained_portrait_refresh_generation = generation;
+        true
+    }
+
+    fn replay_latched_br2_retained_character_select_portrait(&mut self) -> bool {
+        if self.br2_retained_character_select_chain_start.is_none() {
+            return false;
+        }
+        if self.replay_br2_retained_character_select_portrait() {
+            return true;
+        }
+        self.clear_br2_retained_character_select_context();
+        false
+    }
+
+    fn br2_retained_character_select_preview_is_valid(&self) -> bool {
+        BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES
+            .into_iter()
+            .all(|address| {
+                let words = (0..9)
+                    .filter_map(|index| self.read_ram_u32_physical(address + index * 4))
+                    .collect::<Vec<_>>();
+                gp0_command_is_br2_retained_character_select_preview(&words)
+                    && self
+                        .io
+                        .gpu
+                        .retained_br2_character_select_preview_transfer_generation_valid(&words)
+            })
+    }
+
+    fn replay_br2_retained_character_select_portrait(&mut self) -> bool {
+        let mut retained_preview =
+            Vec::with_capacity(BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES.len());
+        for address in BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES {
+            let mut words = (0..9)
+                .filter_map(|index| self.read_ram_u32_physical(address + index * 4))
+                .collect::<Vec<_>>();
+            if !gp0_command_is_br2_retained_character_select_preview(&words)
+                || !self
+                    .io
+                    .gpu
+                    .retained_br2_character_select_preview_transfer_generation_valid(&words)
+            {
+                return false;
+            }
+            normalize_br2_retained_character_select_preview_color(&mut words);
+            retained_preview.push((address, words));
+        }
+        let retained_right_portraits = self
+            .br2_retained_character_select_right_portraits
+            .iter()
+            .filter(|(_, words)| {
+                gp0_command_is_br2_character_select_right_portrait(words)
+                    && self
+                        .io
+                        .gpu
+                        .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                            words,
+                        )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let retained_left_portrait = self
+            .br2_retained_character_select_left_portrait
+            .as_ref()
+            .filter(|(_, words)| {
+                gp0_command_is_br2_character_select_large_portrait(words)
+                    && self
+                        .io
+                        .gpu
+                        .retained_br2_character_select_large_portrait_transfer_generation_valid(
+                            words,
+                        )
+            })
+            .cloned();
+
+        for (address, words) in retained_preview {
+            self.io
+                .gpu
+                .write_recovery_gp0_command(&words, address, self.trace_pc.get());
+        }
+        if let Some((address, words)) = retained_left_portrait {
+            self.io
+                .gpu
+                .restore_retained_br2_character_select_large_portrait_assets();
+            self.io
+                .gpu
+                .write_recovery_gp0_command(&words, address, self.trace_pc.get());
+        }
+        if retained_right_portraits.len() == 2 {
+            self.io
+                .gpu
+                .restore_retained_br2_character_select_right_large_portrait_assets();
+            for (address, words) in retained_right_portraits {
+                self.io
+                    .gpu
+                    .write_recovery_gp0_command(&words, address, self.trace_pc.get());
+            }
+        }
+        true
+    }
+
+    fn remember_br2_retained_character_select_left_portrait(
+        &mut self,
+        address: u32,
+        words: &[u32],
+    ) {
+        if !gp0_command_is_br2_character_select_large_portrait(words) {
+            return;
+        }
+        self.br2_retained_character_select_left_portrait =
+            Some((address & 0x00ff_fffc, words.to_vec()));
+    }
+
+    fn remember_br2_retained_character_select_right_portrait(
+        &mut self,
+        address: u32,
+        words: &[u32],
+    ) {
+        if !gp0_command_is_br2_character_select_right_portrait(words) {
+            return;
+        }
+        let Some((texture_page, _)) = gp0_command_texture_descriptor(words) else {
+            return;
+        };
+        let descriptor = texture_page & !0x0200;
+        if let Some((stored_address, stored_words)) = self
+            .br2_retained_character_select_right_portraits
+            .iter_mut()
+            .find(|(_, stored_words)| {
+                gp0_command_texture_descriptor(stored_words)
+                    .is_some_and(|(stored_page, _)| stored_page & !0x0200 == descriptor)
+            })
+        {
+            *stored_address = address & 0x00ff_fffc;
+            stored_words.clear();
+            stored_words.extend_from_slice(words);
+        } else {
+            self.br2_retained_character_select_right_portraits
+                .push((address & 0x00ff_fffc, words.to_vec()));
+        }
+        self.br2_retained_character_select_right_portraits
+            .sort_by_key(|(_, stored_words)| {
+                gp0_command_texture_descriptor(stored_words)
+                    .map_or(u16::MAX, |(stored_page, _)| stored_page & !0x0200)
+            });
+        self.br2_retained_character_select_right_portraits
+            .truncate(2);
+    }
+
+    fn clear_br2_retained_character_select_context(&mut self) {
+        self.br2_retained_character_select_chain_start = None;
+        self.br2_retained_character_select_left_portrait = None;
+        self.br2_retained_character_select_right_portraits.clear();
     }
 
     #[cfg(test)]
@@ -6785,29 +8256,55 @@ impl Bus {
             range,
             allow_stale_draw_body,
             node_header_address,
+            None,
+            None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_gpu_dma_linked_list_command_range_with_stale_body_policy_for_node(
         &mut self,
         commands: &[(u32, u32)],
         range: std::ops::Range<usize>,
         allow_stale_draw_body: bool,
         node_header_address: Option<u32>,
+        rejected_model_draws: Option<&HashSet<u32>>,
+        silently_suppressed_model_draws: Option<&HashSet<u32>>,
+        stale_body_exempt_model_draws: Option<&HashSet<u32>>,
     ) -> usize {
         let Some((range_start_address, _)) = commands.get(range.start) else {
             return 0;
         };
+        let range_start_address = *range_start_address & 0x00ff_fffc;
         if self.native_otc_dma_recovery.record_chain_filter_stats {
             self.native_otc_dma_recovery.last_chain_ranges = self
                 .native_otc_dma_recovery
                 .last_chain_ranges
                 .saturating_add(1);
         }
+        if silently_suppressed_model_draws
+            .is_some_and(|addresses| addresses.contains(&range_start_address))
+        {
+            return 0;
+        }
         let range_words = commands[range.clone()]
             .iter()
             .map(|(_, command)| *command)
             .collect::<Vec<_>>();
+        if rejected_model_draws.is_some_and(|addresses| addresses.contains(&range_start_address)) {
+            let detail = self
+                .gpu_current_br2_character_model_draw_evaluation(range_start_address, &range_words)
+                .err()
+                .or(Some(Gp0ReplayDrawRejectReason::ModelPrefilter));
+            self.record_native_otc_chain_filter_rejection_with_detail(
+                commands,
+                range,
+                "unsafe_otc_draw",
+                detail,
+            );
+            return 0;
+        }
         if recovered_gp0_command_is_vram_transfer(&range_words) {
             self.record_native_otc_chain_filter_rejection(
                 commands,
@@ -6840,7 +8337,7 @@ impl Bus {
             );
             return 0;
         }
-        if self.gpu_linked_list_command_start_is_embedded_payload(*range_start_address) {
+        if self.gpu_linked_list_command_start_is_embedded_payload(range_start_address) {
             self.gpu_linked_list_dma.embedded_payload_skips = self
                 .gpu_linked_list_dma
                 .embedded_payload_skips
@@ -6854,22 +8351,40 @@ impl Bus {
         }
 
         let mut words = range_words;
-        let low_ram_character_model_draw =
+        let alternate_character_model_draw =
             gp0_command_texture_descriptor(&words).is_some_and(|descriptor| {
-                br2_low_ram_character_model_descriptor(*range_start_address, descriptor)
+                br2_alternate_character_model_descriptor(range_start_address, descriptor)
             });
-        if self.gpu_recovery_command_range_is_stale_character_model_generation(
+        let stale_body_exempt_model_draw = stale_body_exempt_model_draws
+            .is_some_and(|addresses| addresses.contains(&range_start_address));
+        if self.gpu_recovery_command_range_has_expired_one_shot_foreground_effect(
             commands,
             range.clone(),
             &words,
-            node_header_address,
-        ) || ((!allow_stale_draw_body || low_ram_character_model_draw)
-            && self.gpu_linked_list_command_range_has_stale_draw_body(
+            None,
+        ) {
+            self.record_native_otc_chain_filter_rejection(
+                commands,
+                range.clone(),
+                "stale_draw_body",
+            );
+            return 0;
+        }
+        if (!stale_body_exempt_model_draw
+            && self.gpu_recovery_command_range_is_stale_character_model_generation(
                 commands,
                 range.clone(),
                 &words,
                 node_header_address,
             ))
+            || ((!allow_stale_draw_body || alternate_character_model_draw)
+                && !stale_body_exempt_model_draw
+                && self.gpu_linked_list_command_range_has_stale_draw_body(
+                    commands,
+                    range.clone(),
+                    &words,
+                    node_header_address,
+                ))
         {
             self.record_native_otc_chain_filter_rejection(
                 commands,
@@ -6879,6 +8394,8 @@ impl Bus {
             return 0;
         }
         let (drawing_offset, safe_draw_ranges) = self.gpu_otc_replay_safe_draw_ranges(&words);
+        let current_model_bounds =
+            self.gpu_current_br2_character_model_draw_bounds(range_start_address, &words);
         if gp0_command_is_unsafe_br2_785a_recovery_draw(&words, drawing_offset) {
             self.record_native_otc_chain_filter_rejection(
                 commands,
@@ -6887,7 +8404,8 @@ impl Bus {
             );
             return 0;
         }
-        if gp0_command_is_corrupt_br2_character_model_draw_for_packet(*range_start_address, &words)
+        if gp0_command_is_corrupt_br2_character_model_draw_for_packet(range_start_address, &words)
+            && current_model_bounds.is_none()
         {
             self.record_native_otc_chain_filter_rejection(
                 commands,
@@ -6925,7 +8443,7 @@ impl Bus {
         }
         self.io
             .gpu
-            .write_recovery_gp0_command(&words, *range_start_address, self.trace_pc.get());
+            .write_recovery_gp0_command(&words, range_start_address, self.trace_pc.get());
         if self.native_otc_dma_recovery.record_chain_filter_stats {
             self.native_otc_dma_recovery.last_chain_submitted_ranges = self
                 .native_otc_dma_recovery
@@ -6940,7 +8458,7 @@ impl Bus {
                 self.native_otc_dma_recovery
                     .last_chain_submitted_samples
                     .push(GpuDmaRangeFilterSample {
-                        address: *range_start_address,
+                        address: range_start_address,
                         opcode: (words[0] >> 24) as u8,
                         words: words.len(),
                         command_words: words.clone(),
@@ -7080,6 +8598,154 @@ impl Bus {
                 >= BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW
     }
 
+    fn gpu_recovery_command_range_body_generation(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        words: &[u32],
+    ) -> Option<u64> {
+        let word_freshness = commands[range.clone()]
+            .iter()
+            .map(|(address, _)| {
+                self.primitive_ram_writes
+                    .word_write_vblank(*address & 0x00ff_fffc)
+            })
+            .collect::<Vec<_>>();
+        if gp0_command_vertex_word_indices(words).is_some() {
+            return br2_character_model_command_pose_generation(words, &word_freshness);
+        }
+        word_freshness.into_iter().flatten().max()
+    }
+
+    fn gpu_recovery_model_range_has_coherent_header_body_generation(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        words: &[u32],
+        node_header_address: Option<u32>,
+    ) -> bool {
+        let Some(header_generation) = node_header_address.and_then(|address| {
+            self.primitive_ram_writes
+                .header_write_vblank(address & 0x00ff_fffc)
+        }) else {
+            return false;
+        };
+        let Some(body_generation) =
+            self.gpu_recovery_command_range_body_generation(commands, range, words)
+        else {
+            return false;
+        };
+
+        header_generation.abs_diff(body_generation) <= BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS
+    }
+
+    fn gpu_recovery_command_range_is_stale_transient_foreground_effect(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        words: &[u32],
+    ) -> bool {
+        if !self
+            .gpu_replay_validation_offsets()
+            .into_iter()
+            .any(|offset| gp0_command_is_br2_transient_stage_effect(words, offset))
+        {
+            return false;
+        }
+
+        self.gpu_recovery_command_range_body_generation(commands, range, words)
+            .is_none_or(|generation| {
+                self.vblank_count.saturating_sub(generation)
+                    > BR2_TRANSIENT_FOREGROUND_EFFECT_MAX_AGE_VBLANKS
+            })
+    }
+
+    fn gpu_recovery_command_range_has_expired_one_shot_foreground_effect(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        words: &[u32],
+        expired_annular_model_draws: Option<&HashSet<u32>>,
+    ) -> bool {
+        if range.is_empty() || words.is_empty() {
+            return false;
+        }
+
+        gp0_command_ranges(words).into_iter().any(|subrange| {
+            let absolute_range =
+                range.start + subrange.start..range.start.saturating_add(subrange.end);
+            let Some((command_address, _)) = commands.get(absolute_range.start) else {
+                return false;
+            };
+            let command_address = *command_address & 0x00ff_fffc;
+            if expired_annular_model_draws
+                .is_some_and(|addresses| addresses.contains(&command_address))
+            {
+                return true;
+            }
+            let command_words = &words[subrange];
+            self.gpu_recovery_command_range_is_stale_transient_foreground_effect(
+                commands,
+                absolute_range.clone(),
+                command_words,
+            ) || self.gpu_recovery_command_range_is_stale_annular_foreground_effect(
+                commands,
+                absolute_range,
+                command_words,
+            )
+        })
+    }
+
+    fn gpu_recovery_command_range_is_stale_annular_foreground_effect(
+        &self,
+        commands: &[(u32, u32)],
+        range: std::ops::Range<usize>,
+        words: &[u32],
+    ) -> bool {
+        let Some((range_start_address, _)) = commands.get(range.start) else {
+            return false;
+        };
+        let range_start_address = *range_start_address & 0x00ff_fffc;
+        let Some(descriptor) = gp0_command_texture_descriptor(words) else {
+            return false;
+        };
+        let character_model = br2_character_model_texture(descriptor)
+            || br2_alternate_character_model_descriptor(range_start_address, descriptor);
+        let high_ram_transient_candidate = (BR2_PRIMITIVE_RAM_START..BR2_PRIMITIVE_RAM_END)
+            .contains(&range_start_address)
+            && br2_beast_character_model_candidate_descriptor(descriptor);
+        if !character_model && !high_ram_transient_candidate {
+            return false;
+        }
+
+        let bounds = if character_model {
+            self.gpu_current_br2_character_model_draw_bounds(range_start_address, words)
+        } else {
+            gp0_command_draw_bounds(words).filter(|bounds| {
+                bounds.has_visible_x
+                    && bounds.min_x <= 639
+                    && bounds.max_x >= 0
+                    && bounds.min_y <= 479
+                    && bounds.max_y >= 0
+            })
+        };
+        let Some(bounds) = bounds else {
+            return false;
+        };
+        if !br2_character_model_draw_group_is_annular_effect(
+            descriptor,
+            &[(range_start_address, bounds)],
+        ) {
+            return false;
+        }
+
+        self.gpu_recovery_command_range_body_generation(commands, range, words)
+            .is_none_or(|generation| {
+                self.vblank_count.saturating_sub(generation)
+                    > BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS
+            })
+    }
+
     fn gpu_recovery_command_range_is_stale_character_model_generation(
         &self,
         commands: &[(u32, u32)],
@@ -7094,7 +8760,7 @@ impl Bus {
             return false;
         };
         if !br2_character_model_texture(descriptor)
-            && !br2_low_ram_character_model_descriptor(*range_start_address, descriptor)
+            && !br2_alternate_character_model_descriptor(*range_start_address, descriptor)
         {
             return false;
         }
@@ -7579,6 +9245,8 @@ impl Bus {
     }
 
     fn process_vblank_native_otc_dma_recovery(&mut self) -> bool {
+        self.native_otc_dma_recovery
+            .arm_after_sustained_guest_stall(self.vblank_count);
         if self.native_otc_dma_recovery_suppressed
             || !self
                 .vblank_count
@@ -7640,11 +9308,15 @@ impl Bus {
         self.native_otc_dma_recovery.last_stage_roots = 0;
         self.native_otc_dma_recovery.last_stage_packets = 0;
         self.native_otc_dma_recovery.last_stage_words = 0;
+        self.native_otc_dma_recovery.last_stage_selection_reason = "not_evaluated";
         self.native_otc_dma_recovery
             .last_stage_candidate_packets
             .clear();
         self.native_otc_dma_recovery
             .last_stage_selected_packets
+            .clear();
+        self.native_otc_dma_recovery
+            .last_stage_reject_samples
             .clear();
         self.native_otc_dma_recovery.last_recovered_chain_words = 0;
         self.native_otc_dma_recovery.last_chain_fingerprint = None;
@@ -7680,13 +9352,26 @@ impl Bus {
             .clear();
         self.native_otc_dma_recovery.last_chain_model_generation = 0;
         self.native_otc_dma_recovery.last_chain_model_packets = 0;
+        self.native_otc_dma_recovery
+            .last_chain_model_selection_reason = "not_evaluated";
+        self.native_otc_dma_recovery
+            .last_chain_model_reject_samples
+            .clear();
         self.native_otc_dma_recovery.last_model_roots = 0;
+        self.native_otc_dma_recovery.last_model_candidate_packets = 0;
+        self.native_otc_dma_recovery.last_model_candidate_roots = 0;
+        self.native_otc_dma_recovery.last_model_candidate_chains = 0;
+        self.native_otc_dma_recovery.last_model_selected_roots = 0;
         self.native_otc_dma_recovery.last_model_packets = 0;
         self.native_otc_dma_recovery.last_model_words = 0;
         self.native_otc_dma_recovery.last_model_newest_generation = 0;
         self.native_otc_dma_recovery.last_model_generation_start = 0;
+        self.native_otc_dma_recovery.last_model_selection_reason = "not_evaluated";
         self.native_otc_dma_recovery
             .last_model_selected_packets
+            .clear();
+        self.native_otc_dma_recovery
+            .last_model_reject_samples
             .clear();
         if !validation.ready {
             self.native_otc_dma_recovery.rejected =
@@ -7697,11 +9382,19 @@ impl Bus {
 
         let chain_fingerprint = self.native_otc_dma_recovery_chain_fingerprint(key, &chains);
         self.native_otc_dma_recovery.last_chain_fingerprint = chain_fingerprint;
-        if chain_fingerprint.is_some_and(|current| {
+        let recovered_chain_nodes =
+            self.native_otc_dma_recovery_chain_nodes(chains.iter().map(|chain| chain.0));
+        let duplicate_chain = chain_fingerprint.is_some_and(|current| {
             self.native_otc_dma_recovery
                 .last_replayed_chain_fingerprint
                 .is_some_and(|replayed| current.same_content_as(replayed))
-        }) {
+        });
+        let duplicate_requires_expired_effect_cleanup = duplicate_chain
+            && !self
+                .native_otc_dma_recovery_chain_annular_model_effect_draws(&recovered_chain_nodes)
+                .1
+                .is_empty();
+        if duplicate_chain && !duplicate_requires_expired_effect_cleanup {
             self.native_otc_dma_recovery.active = true;
             self.native_otc_dma_recovery.duplicate_chain_replay_skips = self
                 .native_otc_dma_recovery
@@ -7729,13 +9422,17 @@ impl Bus {
         self.io.gpu.invalidate_recovery_presentation_caches();
         self.clear_visible_frame_for_unlinked_primitive_replay();
         self.io.gpu.begin_recovered_draw_page_tracking();
-        let recovered_chain_nodes =
-            self.native_otc_dma_recovery_chain_nodes(chains.iter().map(|chain| chain.0));
         let trusted_current_otc_chain = chains.len() == 1
             && !detached_root
             && chains
                 .first()
                 .is_some_and(|(start, _, validation)| *start == key.high && validation.terminated);
+        let trusted_current_character_select = trusted_current_otc_chain
+            && chains.first().is_some_and(|(start, _, _)| {
+                let (fresh, retained) =
+                    self.gpu_trusted_current_otc_chain_character_select_context(*start);
+                fresh || retained
+            });
         let mut rejected_chain_model_draws =
             self.native_otc_dma_recovery_invalid_model_draws(&recovered_chain_nodes);
         // A complete current OTC chain is the authoritative guest frame. Mixing
@@ -7752,29 +9449,101 @@ impl Bus {
         self.native_otc_dma_recovery.last_stage_packets =
             stage_packets.min(u32::MAX as usize) as u32;
         self.native_otc_dma_recovery.last_stage_words = stage_words.min(u32::MAX as usize) as u32;
-        let stage_generation = (self.native_otc_dma_recovery.last_stage_newest_freshness != 0)
-            .then_some(self.native_otc_dma_recovery.last_stage_newest_freshness);
-        let (chain_model_generation, chain_model_packets) = self
-            .native_otc_dma_recovery_chain_model_generation(
-                &recovered_chain_nodes,
-                stage_generation,
+        let standalone_stage_generation =
+            (self.native_otc_dma_recovery.last_stage_newest_freshness != 0)
+                .then_some(self.native_otc_dma_recovery.last_stage_newest_freshness);
+        let (chain_stage_generation, chain_stage_packets, chain_stage_words) =
+            self.native_otc_dma_recovery_chain_stage_generation(&recovered_chain_nodes);
+        if stage_packets == 0
+            && let Some(generation) = chain_stage_generation
+        {
+            self.native_otc_dma_recovery.last_stage_newest_freshness = generation;
+            self.native_otc_dma_recovery.last_stage_roots =
+                chains.len().min(u32::MAX as usize) as u32;
+            self.native_otc_dma_recovery.last_stage_packets =
+                chain_stage_packets.min(u32::MAX as usize) as u32;
+            self.native_otc_dma_recovery.last_stage_words =
+                chain_stage_words.min(u32::MAX as usize) as u32;
+            self.native_otc_dma_recovery.last_stage_selection_reason = "selected_recovered_chain";
+        }
+        let stage_generation = chain_stage_generation.or(standalone_stage_generation);
+        let fresh_chain_model_selection = self.native_otc_dma_recovery_chain_model_selection(
+            &recovered_chain_nodes,
+            stage_generation,
+        );
+        let fresh_chain_model_generation = fresh_chain_model_selection.generation;
+        let fresh_chain_model_packets = fresh_chain_model_selection.packet_count;
+        let reused_current_model_draws =
+            if trusted_current_otc_chain && fresh_chain_model_generation.is_none() {
+                let draws = self
+                    .native_otc_dma_recovery_reusable_current_model_draws(&recovered_chain_nodes);
+                (!draws.is_empty()).then_some(draws)
+            } else {
+                None
+            };
+        let replayable_chain_model_packets = reused_current_model_draws
+            .as_ref()
+            .map_or(fresh_chain_model_packets, HashSet::len);
+        if reused_current_model_draws.is_some() {
+            self.native_otc_dma_recovery
+                .last_chain_model_selection_reason = "selected_reused_current_otc";
+        }
+        let reused_current_model_generation =
+            reused_current_model_draws.as_ref().and(stage_generation);
+        let (active_annular_model_draws, expired_annular_model_draws) =
+            self.native_otc_dma_recovery_chain_annular_model_effect_draws(&recovered_chain_nodes);
+        let chain_has_annular_model_effect = !active_annular_model_draws.is_empty();
+        let selected_chain_model_draws = if fresh_chain_model_generation.is_some() {
+            &fresh_chain_model_selection.command_addresses
+        } else if let Some(reused) = reused_current_model_draws.as_ref() {
+            reused
+        } else {
+            &fresh_chain_model_selection.command_addresses
+        };
+        if !selected_chain_model_draws.is_empty() {
+            rejected_chain_model_draws.extend(
+                self.native_otc_dma_recovery_incomplete_model_overlay_draws(&recovered_chain_nodes)
+                    .into_iter()
+                    .filter(|address| {
+                        !selected_chain_model_draws.contains(address)
+                            && !active_annular_model_draws.contains(address)
+                    }),
             );
-        self.native_otc_dma_recovery.last_chain_model_generation =
-            chain_model_generation.unwrap_or_default();
+        }
+        self.native_otc_dma_recovery.last_chain_model_generation = fresh_chain_model_generation
+            .or(reused_current_model_generation)
+            .unwrap_or_default();
         self.native_otc_dma_recovery.last_chain_model_packets =
-            chain_model_packets.min(u32::MAX as usize) as u32;
-        // The current OTC chain already carries live fighter animation. Replaying
-        // an independently discovered model generation without a matching stage
-        // generation can overlay unrelated pose fragments and eventually replace
-        // textured gameplay with flat-shaded geometry.
-        let (model_roots, model_packets, model_words) = if stage_generation.is_some() {
-            self.replay_recent_br2_character_model_packets_for_scene(
+            replayable_chain_model_packets.min(u32::MAX as usize) as u32;
+        // A trusted current OTC with a complete or structurally reusable fighter
+        // model is already authoritative. Replaying an independently discovered
+        // generation over it mixes poses and can replace textured fighters with
+        // stale flat-shaded Beast geometry.
+        let current_chain_has_replayable_model =
+            fresh_chain_model_generation.is_some() || reused_current_model_draws.is_some();
+        let suppressed_incomplete_scene_stage_draws = if trusted_current_otc_chain
+            && !trusted_current_character_select
+            && self.native_otc_dma_recovery.last_chain_model_texture_draws > 0
+            && !current_chain_has_replayable_model
+        {
+            self.native_otc_dma_recovery_incomplete_scene_stage_overlay_draws(
                 &recovered_chain_nodes,
-                stage_generation,
             )
         } else {
-            (0, 0, 0)
+            HashSet::new()
         };
+        rejected_chain_model_draws.extend(suppressed_incomplete_scene_stage_draws.iter().copied());
+        let (model_roots, model_packets, model_words) =
+            if trusted_current_otc_chain && current_chain_has_replayable_model {
+                (0, 0, 0)
+            } else if stage_generation.is_some() || trusted_current_character_select {
+                self.replay_recent_br2_character_model_packets_for_scene(
+                    &recovered_chain_nodes,
+                    stage_generation,
+                )
+            } else {
+                (0, 0, 0)
+            };
         self.native_otc_dma_recovery.last_model_roots = model_roots.min(u32::MAX as usize) as u32;
         self.native_otc_dma_recovery.last_model_packets =
             model_packets.min(u32::MAX as usize) as u32;
@@ -7786,22 +9555,39 @@ impl Bus {
         let replayed_model_generation = (self.native_otc_dma_recovery.last_model_newest_generation
             != 0)
             .then_some(self.native_otc_dma_recovery.last_model_newest_generation);
-        let model_generation = replayed_model_generation.or(chain_model_generation);
+        let model_generation = replayed_model_generation
+            .or(fresh_chain_model_generation)
+            .or(reused_current_model_generation);
+        let chain_has_complete_stage_generation =
+            chain_stage_packets >= BR2_STAGE_RECOVERY_MIN_PACKETS;
+        let fresh_chain_has_complete_model_generation =
+            fresh_chain_model_packets >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS;
         let chain_has_complete_model_generation =
-            chain_model_packets >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS;
-        let reconstructed_scene =
-            stage_packets > 0 && (model_packets > 0 || chain_has_complete_model_generation);
+            fresh_chain_has_complete_model_generation || reused_current_model_draws.is_some();
+        let reconstructed_scene = (stage_packets > 0 || chain_has_complete_stage_generation)
+            && (model_packets > 0 || chain_has_complete_model_generation);
         let generation_pair_coherent =
             recovered_scene_generations_coherent(stage_generation, model_generation);
-        let selected_stage_generation_coherent = stage_generation.is_some_and(|generation| {
-            self.native_otc_dma_recovery
-                .last_stage_selected_packets
-                .iter()
-                .filter(|sample| br2_stage_recovery_sample_has_textured_draw(sample))
-                .all(|sample| {
-                    generation.abs_diff(sample.freshness) <= BR2_STAGE_REPLACEMENT_GENERATION_SLACK
+        let selected_stage_generation_coherent = if stage_packets > 0 {
+            stage_generation.is_some_and(|generation| {
+                self.native_otc_dma_recovery
+                    .last_stage_selected_packets
+                    .iter()
+                    .filter(|sample| br2_stage_recovery_sample_has_textured_draw(sample))
+                    .all(|sample| {
+                        generation.abs_diff(sample.freshness)
+                            <= BR2_STAGE_REPLACEMENT_GENERATION_SLACK
+                    })
+            })
+        } else {
+            chain_has_complete_stage_generation
+                && chain_stage_generation.is_some_and(|generation| {
+                    stage_generation.is_some_and(|stage_generation| {
+                        generation.abs_diff(stage_generation)
+                            <= BR2_STAGE_REPLACEMENT_GENERATION_SLACK
+                    })
                 })
-        });
+        };
         let selected_model_generation_coherent = if model_packets > 0 {
             model_generation.is_some_and(|generation| {
                 self.native_otc_dma_recovery
@@ -7817,7 +9603,7 @@ impl Bus {
             })
         } else {
             chain_has_complete_model_generation
-                && chain_model_generation.is_some_and(|generation| {
+                && model_generation.is_some_and(|generation| {
                     stage_generation.is_some_and(|stage_generation| {
                         generation.abs_diff(stage_generation)
                             <= BR2_RECOVERED_SCENE_GENERATION_SLACK
@@ -7827,26 +9613,35 @@ impl Bus {
         let scene_generations_coherent = generation_pair_coherent
             && selected_stage_generation_coherent
             && selected_model_generation_coherent;
-        let replacement_scene = reconstructed_scene && scene_generations_coherent;
-        if !trusted_current_otc_chain
-            && !replacement_scene
-            && !chain_has_complete_model_generation
+        // Beast transformation/guard rings are foreground effects even when
+        // the same OTC also retains reusable fighter and stage packets. Keep
+        // the last complete scene and overlay the effect instead of clearing
+        // the playfield and committing an effect-only replacement snapshot.
+        let replacement_scene =
+            reconstructed_scene && scene_generations_coherent && !chain_has_annular_model_effect;
+        if !replacement_scene
+            && !fresh_chain_has_complete_model_generation
             && self.native_otc_dma_recovery.last_chain_model_texture_draws > 0
         {
             // Detached or incomplete recovery roots are submitted after
             // restoring the stable scene. Do not let a partially assembled
-            // fighter generation overwrite that snapshot limb by limb.
-            // A trusted current OTC chain is authoritative guest output, so
-            // its individually validated pose and Beast-transition polygons
-            // must remain live even when fewer than four model packets changed.
+            // fighter generation overwrite that snapshot limb by limb. This
+            // also applies to the newest terminated OTC root once guest GPU DMA
+            // is stale: a fresh header does not make a mixed or partial model
+            // generation atomic. Annular Beast effects remain eligible because
+            // the incomplete-overlay classifier explicitly excludes them.
+            let reusable_draws = reused_current_model_draws.as_ref();
             rejected_chain_model_draws.extend(
-                self.native_otc_dma_recovery_incomplete_model_overlay_draws(&recovered_chain_nodes),
+                self.native_otc_dma_recovery_incomplete_model_overlay_draws(&recovered_chain_nodes)
+                    .into_iter()
+                    .filter(|address| reusable_draws.is_none_or(|draws| !draws.contains(address))),
             );
         }
         let scene_generation_conflict =
             stage_generation.is_some() && model_generation.is_some() && !generation_pair_coherent;
         let overlay_recovered_scene_fragments =
             !scene_generation_conflict && (!reconstructed_scene || scene_generations_coherent);
+        let mut commit_replacement_scene_after_presentation = false;
         let preserved_scene_overlay = if !replacement_scene && overlay_recovered_scene_fragments {
             self.native_otc_dma_recovery
                 .last_stage_selected_packets
@@ -7911,8 +9706,8 @@ impl Bus {
         let recovered_chain_has_provenance = native_otc_recovered_chain_has_provenance(
             chains.len(),
             detached_root,
-            stage_packets,
-            model_packets.saturating_add(chain_model_packets),
+            stage_packets.saturating_add(chain_stage_packets),
+            model_packets.saturating_add(replayable_chain_model_packets),
         );
         if !recovered_chain_has_provenance {
             self.native_otc_dma_recovery.last_reason = "preserved_unverified_detached_roots";
@@ -7920,6 +9715,9 @@ impl Bus {
         if recovered_chain_has_provenance
             && std::env::var_os("BR2_NATIVE_DISABLE_RECOVERED_OTC_CHAIN").is_none()
         {
+            let mut stale_body_exempt_model_draws =
+                reused_current_model_draws.clone().unwrap_or_default();
+            stale_body_exempt_model_draws.extend(active_annular_model_draws.iter().copied());
             for (chain_start, _, _) in &chains {
                 recovered_chain_words = recovered_chain_words.saturating_add(
                     self.process_gpu_linked_list_dma_with_policy_shared_nodes_and_rejections(
@@ -7930,6 +9728,8 @@ impl Bus {
                         false,
                         Some(&mut submitted_chain_nodes),
                         Some(&rejected_chain_model_draws),
+                        Some(&expired_annular_model_draws),
+                        Some(&stale_body_exempt_model_draws),
                     ),
                 );
             }
@@ -7949,29 +9749,143 @@ impl Bus {
             self.native_otc_dma_recovery.last_reason = "preserved_severely_corrupt_recovered_chain";
             return false;
         }
-        if recovered_chain_words > 0 {
-            self.native_otc_dma_recovery.last_replayed_chain_fingerprint = chain_fingerprint;
-        }
         if replacement_scene {
             if reconstructed_scene || recovered_chain_words > 0 {
                 if model_packets == 0 && chain_has_complete_model_generation {
                     self.native_otc_dma_recovery.last_reason = "submitted_chain_model_replacement";
                 }
                 self.io.gpu.present_recovered_draw_page(self.trace_pc.get());
-                if model_packets > 0 {
-                    self.io.gpu.commit_recovery_scene_snapshot();
+                if trusted_current_otc_chain
+                    && !self
+                        .io
+                        .native_replay_preserves_current_display_scene(&gpu_before_recovery)
+                {
+                    // A current OTC often contains only the foreground delta
+                    // even when stage-texture descriptors remain in retained
+                    // packets. If clearing the draw page collapses a detailed
+                    // scene, roll the transaction back and submit the same
+                    // chain over the last complete frame instead.
+                    self.io.gpu = gpu_before_recovery.clone();
+                    // The rejected replacement proves that the immediately
+                    // preceding frame is more complete than the candidate.
+                    // Promote that verified frame before applying the current
+                    // OTC as an overlay; otherwise an old title/select
+                    // snapshot can be restored on the next vblank and poison
+                    // every later Beast/attack frame.
+                    if !self
+                        .io
+                        .gpu
+                        .commit_recovery_scene_snapshot_if_current_is_stable_presented()
+                    {
+                        self.io.gpu.restore_recovery_scene_snapshot();
+                    }
+                    // Restoring gpu_before_recovery also restores its cached
+                    // presented frame. Validate the overlay against raw VRAM.
+                    self.io.gpu.invalidate_recovery_presentation_caches();
+                    self.io
+                        .gpu
+                        .begin_recovery_overlay_on_current_display_field();
+                    let mut fallback_chain_words = 0usize;
+                    let mut fallback_submitted_nodes = HashSet::new();
+                    let mut stale_body_exempt_model_draws =
+                        reused_current_model_draws.clone().unwrap_or_default();
+                    stale_body_exempt_model_draws
+                        .extend(active_annular_model_draws.iter().copied());
+                    for (chain_start, _, _) in &chains {
+                        fallback_chain_words = fallback_chain_words.saturating_add(
+                            self.process_gpu_linked_list_dma_with_policy_shared_nodes_and_rejections(
+                                *chain_start,
+                                true,
+                                trusted_current_otc_chain,
+                                false,
+                                false,
+                                Some(&mut fallback_submitted_nodes),
+                                Some(&rejected_chain_model_draws),
+                                Some(&expired_annular_model_draws),
+                                Some(&stale_body_exempt_model_draws),
+                            ),
+                        );
+                    }
+                    self.io.gpu.end_recovery_overlay_on_current_display_field();
+                    recovered_chain_words = fallback_chain_words;
+                    self.native_otc_dma_recovery.last_recovered_chain_words =
+                        recovered_chain_words.min(u32::MAX as usize) as u32;
+                    self.native_otc_dma_recovery.last_reason =
+                        "preserved_sparse_current_otc_replacement";
+                } else {
+                    // The candidate retained the previous scene while adding a
+                    // coherent stage/model generation. Defer persistence until
+                    // the final presentation guard accepts the whole transaction.
+                    commit_replacement_scene_after_presentation = true;
                 }
             } else {
-                self.io.gpu = gpu_before_recovery;
+                self.io.gpu = gpu_before_recovery.clone();
                 self.io.gpu.cancel_recovered_draw_page_tracking();
             }
         } else {
             self.io.gpu.end_recovery_overlay_on_current_display_field();
         }
         // Recovery batches suppress per-packet display probes for performance.
-        // Publish the completed transaction once so preserved backgrounds and
-        // recovered foreground packets are visible during this vblank.
-        self.io.gpu.capture_recovered_presented_frame();
+        // Publish and validate the completed transaction once so preserved
+        // backgrounds and recovered foreground packets are visible during this
+        // vblank. This is also the single rollback gate: revalidating every
+        // trusted overlay above duplicates full-frame scans and can discard
+        // legitimate animation deltas before this guarded capture sees them.
+        let presentation_trace = env::var("BR2_NATIVE_TRACE_RECOVERY_PRESENTATION_FROM")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|start| self.vblank_count >= *start)
+            .map(|_| {
+                self.io
+                    .gpu
+                    .native_replay_validation_probe_json(Some(&gpu_before_recovery))
+            });
+        if !replacement_scene && trusted_current_character_select {
+            self.replay_latched_br2_retained_character_select_portrait();
+        }
+        let presentation_accepted = self
+            .io
+            .gpu
+            .capture_recovered_presented_frame_after_recovery(&gpu_before_recovery);
+        if let Some(probe) = presentation_trace {
+            eprintln!(
+                "BR2 recovery presentation: {{\"vblank\":{},\"accepted\":{},\"probe\":{}}}",
+                self.vblank_count, presentation_accepted, probe
+            );
+        }
+        if !presentation_accepted {
+            self.io.gpu = gpu_before_recovery;
+            self.io
+                .gpu
+                .commit_recovery_scene_snapshot_if_current_is_stable_presented();
+            self.io.gpu.restore_recovery_scene_snapshot();
+            self.native_otc_dma_recovery.submissions =
+                self.native_otc_dma_recovery.submissions.saturating_sub(1);
+            self.native_otc_dma_recovery.rejected =
+                self.native_otc_dma_recovery.rejected.saturating_add(1);
+            self.native_otc_dma_recovery.last_reason = "preserved_sparse_recovered_presentation";
+            return false;
+        }
+        if commit_replacement_scene_after_presentation {
+            // The recovery presentation guard has already rejected sparse,
+            // atlas, and blocking-artifact output. Prefer the exact current
+            // display match here so a valid but deliberately simple scene is
+            // still promoted for later HUD-only recovery.
+            self.io
+                .gpu
+                .commit_recovery_scene_snapshot_if_current_is_presented();
+        }
+        if recovered_chain_words > 0 {
+            self.native_otc_dma_recovery.last_replayed_chain_fingerprint = chain_fingerprint;
+        }
+        if !suppressed_incomplete_scene_stage_draws.is_empty()
+            && self.native_otc_dma_recovery.last_reason == "submitted"
+        {
+            self.native_otc_dma_recovery.last_reason = "submitted_preserved_incomplete_model_scene";
+        }
+        if replacement_scene {
+            self.clear_br2_retained_character_select_context();
+        }
         true
     }
 
@@ -7979,19 +9893,30 @@ impl Bus {
         &self,
         starts: impl Iterator<Item = u32>,
     ) -> HashSet<u32> {
-        let mut nodes = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut packets = HashSet::new();
         for start in starts {
             let mut address = start;
             for _ in 0..GPU_LINKED_LIST_NODE_LIMIT {
-                if !nodes.insert(address) {
+                if !self.native_gpu_linked_list_address_in_ram(address) {
                     break;
                 }
-                if !self.native_gpu_linked_list_address_in_ram(address) {
+                if !visited.insert(address) {
                     break;
                 }
                 let Some(header) = self.read_ram_u32_physical(address) else {
                     break;
                 };
+                let word_count = header >> 24;
+                if word_count > PRIMITIVE_PACKET_MAX_WORDS {
+                    break;
+                }
+                // OTC buckets are zero-word linked-list nodes. Follow their
+                // pointer, but never expose the bucket address as a primitive
+                // packet to stage/model recovery.
+                if word_count > 0 {
+                    packets.insert(address);
+                }
                 let next = header & 0x00ff_ffff;
                 if gpu_linked_list_terminator(next) {
                     break;
@@ -7999,7 +9924,7 @@ impl Bus {
                 address = next & 0x00ff_fffc;
             }
         }
-        nodes
+        packets
     }
 
     fn native_otc_dma_recovery_chain_fingerprint(
@@ -8043,12 +9968,110 @@ impl Bus {
             && (address as usize).saturating_add(4) <= self.ram.len()
     }
 
-    fn native_otc_dma_recovery_chain_model_generation(
+    fn native_otc_dma_recovery_chain_stage_generation(
+        &self,
+        chain_nodes: &HashSet<u32>,
+    ) -> (Option<u64>, usize, usize) {
+        let mut observed_packets = Vec::<(u64, u32, usize)>::new();
+
+        for address in chain_nodes.iter().copied() {
+            let Some(header) = self.read_ram_u32_physical(address) else {
+                continue;
+            };
+            let word_count = header >> 24;
+            if word_count == 0 || word_count > PRIMITIVE_PACKET_MAX_WORDS {
+                continue;
+            }
+            let words = self.primitive_packet_command_words(address, word_count);
+            if words.len() != word_count as usize
+                || words_have_br2_character_model_texture_at(address, &words)
+            {
+                continue;
+            }
+
+            let commands = words
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, command)| (address + 4 + index as u32 * 4, command))
+                .collect::<Vec<_>>();
+            let mut has_stage_texture = false;
+            let mut accepted_words = 0usize;
+            let mut freshness = self
+                .primitive_ram_writes
+                .header_write_vblank(address)
+                .unwrap_or_default();
+
+            for range in gpu_linked_list_command_ranges(&commands) {
+                let command_words = commands[range.clone()]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                let (_, safe_ranges) = self.gpu_br2_stage_recovery_ranges(&command_words);
+                if safe_ranges.is_empty() {
+                    continue;
+                }
+                let known_stage_texture = gp0_command_texture_descriptor(&command_words)
+                    .is_some_and(|(texture_page, clut)| {
+                        br2_reused_texture_page_matches(
+                            texture_page,
+                            BR2_CHARACTER_MODEL_TEXTURE_PAGE,
+                        ) && BR2_STAGE_TEXTURE_CLUTS.contains(&clut)
+                    });
+                if !known_stage_texture {
+                    continue;
+                }
+
+                has_stage_texture = true;
+                accepted_words = accepted_words.saturating_add(command_words.len());
+                for (command_address, _) in &commands[range] {
+                    freshness = freshness.max(
+                        self.primitive_ram_writes
+                            .word_write_vblank(*command_address)
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+
+            if has_stage_texture && freshness > 0 {
+                observed_packets.push((freshness, address, accepted_words));
+            }
+        }
+
+        let Some(newest_generation) = observed_packets
+            .iter()
+            .map(|(generation, _, _)| *generation)
+            .max()
+        else {
+            return (None, 0, 0);
+        };
+        let generation_start =
+            newest_generation.saturating_sub(BR2_STAGE_REPLACEMENT_GENERATION_SLACK);
+        let selected = observed_packets
+            .into_iter()
+            .filter(|(generation, _, _)| *generation >= generation_start)
+            .collect::<Vec<_>>();
+        let packets = selected
+            .iter()
+            .map(|(_, address, _)| *address)
+            .collect::<HashSet<_>>()
+            .len();
+        if packets < BR2_STAGE_RECOVERY_MIN_PACKETS {
+            return (None, 0, 0);
+        }
+        let words = selected
+            .iter()
+            .map(|(_, _, words)| *words)
+            .fold(0usize, usize::saturating_add);
+        (Some(newest_generation), packets, words)
+    }
+
+    fn native_otc_dma_recovery_chain_model_selection(
         &mut self,
         chain_nodes: &HashSet<u32>,
         scene_generation: Option<u64>,
-    ) -> (Option<u64>, usize) {
-        let mut observed_draws = Vec::<(u64, (u16, u16), u32, Gp0DrawBounds)>::new();
+    ) -> NativeOtcModelGenerationSelection {
+        let mut observed_draws = Vec::<(u64, (u16, u16), u32, u32, Gp0DrawBounds)>::new();
         let trace_chain_models =
             std::env::var_os("BR2_NATIVE_TRACE_CHAIN_MODELS").is_some_and(|_| {
                 let min_vblank = std::env::var("BR2_NATIVE_TRACE_CHAIN_MODELS_MIN_VBLANK")
@@ -8063,21 +10086,24 @@ impl Bus {
                 continue;
             }
             let Some(header) = self.read_ram_u32_physical(address) else {
+                self.native_otc_dma_recovery
+                    .record_chain_model_packet_reject(NativeOtcPacketRejectSample::new(
+                        address,
+                        "missing_header",
+                    ));
                 continue;
             };
             let word_count = header >> 24;
             if word_count == 0 || word_count > PRIMITIVE_PACKET_MAX_WORDS {
+                self.native_otc_dma_recovery
+                    .record_chain_model_packet_reject(
+                        NativeOtcPacketRejectSample::new(address, "invalid_word_count")
+                            .with_header(header)
+                            .with_word_count(word_count),
+                    );
                 continue;
             }
-            let Some(header_generation) = self.primitive_ram_writes.header_write_vblank(address)
-            else {
-                continue;
-            };
-            if scene_generation.is_some_and(|scene_generation| {
-                header_generation.abs_diff(scene_generation) > BR2_RECOVERED_SCENE_GENERATION_SLACK
-            }) {
-                continue;
-            }
+            let header_generation = self.primitive_ram_writes.header_write_vblank(address);
 
             let commands = (0..word_count)
                 .map(|index| {
@@ -8086,6 +10112,14 @@ impl Bus {
                 })
                 .collect::<Vec<_>>();
             if commands.iter().any(|(_, command)| command.is_none()) {
+                let mut sample = NativeOtcPacketRejectSample::new(address, "incomplete_words")
+                    .with_header(header)
+                    .with_word_count(word_count);
+                if let Some(header_generation) = header_generation {
+                    sample = sample.with_freshness(header_generation);
+                }
+                self.native_otc_dma_recovery
+                    .record_chain_model_packet_reject(sample);
                 continue;
             }
             let commands = commands
@@ -8102,8 +10136,42 @@ impl Bus {
                     continue;
                 };
                 if !br2_character_model_texture(descriptor)
-                    && !br2_low_ram_character_model_descriptor(address, descriptor)
+                    && !br2_alternate_character_model_descriptor(address, descriptor)
                 {
+                    continue;
+                }
+                let retained_low_ram_model =
+                    br2_low_ram_character_model_descriptor(address, descriptor);
+                if header_generation.is_none() && !retained_low_ram_model {
+                    self.native_otc_dma_recovery
+                        .record_chain_model_packet_reject(
+                            NativeOtcPacketRejectSample::new(address, "missing_header_generation")
+                                .with_header(header)
+                                .with_word_count(word_count)
+                                .with_command_address(commands[range.start].0)
+                                .with_texture(descriptor),
+                        );
+                    continue;
+                }
+                if !retained_low_ram_model
+                    && scene_generation.is_some_and(|scene_generation| {
+                        header_generation.is_some_and(|header_generation| {
+                            header_generation.abs_diff(scene_generation)
+                                > BR2_RECOVERED_SCENE_GENERATION_SLACK
+                        })
+                    })
+                {
+                    let header_generation =
+                        header_generation.expect("non-retained model header generation");
+                    self.native_otc_dma_recovery
+                        .record_chain_model_packet_reject(
+                            NativeOtcPacketRejectSample::new(address, "scene_generation_mismatch")
+                                .with_header(header)
+                                .with_word_count(word_count)
+                                .with_freshness(header_generation)
+                                .with_command_address(commands[range.start].0)
+                                .with_texture(descriptor),
+                        );
                     continue;
                 }
                 self.native_otc_dma_recovery.last_chain_model_texture_draws = self
@@ -8115,9 +10183,21 @@ impl Bus {
                 {
                     Ok(bounds) => bounds,
                     Err(reason) => {
+                        let mut sample =
+                            NativeOtcPacketRejectSample::new(address, "bounds_rejected")
+                                .with_header(header)
+                                .with_word_count(word_count)
+                                .with_command_address(commands[range.start].0)
+                                .with_texture(descriptor)
+                                .with_detail(reason.as_str());
+                        if let Some(header_generation) = header_generation {
+                            sample = sample.with_freshness(header_generation);
+                        }
+                        self.native_otc_dma_recovery
+                            .record_chain_model_packet_reject(sample);
                         if trace_chain_models {
                             eprintln!(
-                                "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} header_generation={} scene_generation={:?} outcome=bounds_rejected reason={}",
+                                "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} header_generation={:?} scene_generation={:?} outcome=bounds_rejected reason={}",
                                 self.vblank_count,
                                 commands[range.start].0,
                                 descriptor.0,
@@ -8132,7 +10212,7 @@ impl Bus {
                 };
                 if trace_chain_models {
                     eprintln!(
-                        "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} header_generation={} scene_generation={:?} outcome=bounds_accepted bounds={}",
+                        "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} header_generation={:?} scene_generation={:?} outcome=bounds_accepted bounds={}",
                         self.vblank_count,
                         commands[range.start].0,
                         descriptor.0,
@@ -8157,6 +10237,16 @@ impl Bus {
                 let Some(pose_generation) =
                     br2_character_model_command_pose_generation(&words, &command_freshness)
                 else {
+                    let mut sample = NativeOtcPacketRejectSample::new(address, "pose_rejected")
+                        .with_header(header)
+                        .with_word_count(word_count)
+                        .with_command_address(commands[range.start].0)
+                        .with_texture(descriptor);
+                    if let Some(header_generation) = header_generation {
+                        sample = sample.with_freshness(header_generation);
+                    }
+                    self.native_otc_dma_recovery
+                        .record_chain_model_packet_reject(sample);
                     if trace_chain_models {
                         eprintln!(
                             "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome=pose_rejected word_generations={:?}",
@@ -8169,17 +10259,47 @@ impl Bus {
                     }
                     continue;
                 };
-                if header_generation.abs_diff(pose_generation)
-                    > BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK
+                let effective_header_generation = header_generation.unwrap_or(pose_generation);
+                let stale_retained_low_ram_pose = retained_low_ram_model
+                    && self.vblank_count.saturating_sub(pose_generation)
+                        > BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS;
+                let retained_low_ram_scene_mismatch = retained_low_ram_model
+                    && scene_generation.is_some_and(|scene_generation| {
+                        pose_generation.abs_diff(scene_generation)
+                            > BR2_RECOVERED_SCENE_GENERATION_SLACK
+                    });
+                let header_pose_mismatch = !retained_low_ram_model
+                    && effective_header_generation.abs_diff(pose_generation)
+                        > BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK;
+                if stale_retained_low_ram_pose
+                    || retained_low_ram_scene_mismatch
+                    || header_pose_mismatch
                 {
+                    let reason = if stale_retained_low_ram_pose {
+                        "stale_low_ram_pose"
+                    } else if retained_low_ram_scene_mismatch {
+                        "scene_pose_mismatch"
+                    } else {
+                        "header_pose_mismatch"
+                    };
+                    self.native_otc_dma_recovery
+                        .record_chain_model_packet_reject(
+                            NativeOtcPacketRejectSample::new(address, reason)
+                                .with_header(header)
+                                .with_word_count(word_count)
+                                .with_freshness(effective_header_generation)
+                                .with_command_address(commands[range.start].0)
+                                .with_texture(descriptor),
+                        );
                     if trace_chain_models {
                         eprintln!(
-                            "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome=header_pose_rejected header_generation={} pose_generation={} word_generations={:?}",
+                            "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome={} header_generation={} pose_generation={} word_generations={:?}",
                             self.vblank_count,
                             commands[range.start].0,
                             descriptor.0,
                             descriptor.1,
-                            header_generation,
+                            reason,
+                            effective_header_generation,
                             pose_generation,
                             command_freshness,
                         );
@@ -8188,12 +10308,17 @@ impl Bus {
                 }
                 if trace_chain_models {
                     eprintln!(
-                        "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome=accepted header_generation={} pose_generation={}",
+                        "br2_chain_model vblank={} packet=0x{address:08x} command=0x{:08x} texture_page=0x{:04x} clut=0x{:04x} outcome={} header_generation={} pose_generation={}",
                         self.vblank_count,
                         commands[range.start].0,
                         descriptor.0,
                         descriptor.1,
-                        header_generation,
+                        if retained_low_ram_model {
+                            "accepted_retained_low_ram_pose"
+                        } else {
+                            "accepted"
+                        },
+                        effective_header_generation,
                         pose_generation,
                     );
                 }
@@ -8218,59 +10343,104 @@ impl Bus {
                             bounds,
                         });
                 }
-                observed_draws.push((pose_generation, descriptor, address, bounds));
+                observed_draws.push((
+                    pose_generation,
+                    descriptor,
+                    address,
+                    commands[range.start].0 & 0x00ff_fffc,
+                    bounds,
+                ));
             }
         }
 
         self.native_otc_dma_recovery.last_chain_model_unique_packets = observed_draws
             .iter()
-            .map(|(_, _, address, _)| *address)
+            .map(|(_, _, address, _, _)| *address)
             .collect::<HashSet<_>>()
             .len()
             .min(u32::MAX as usize)
             as u32;
         let mut generations = observed_draws
             .iter()
-            .map(|(generation, _, _, _)| *generation)
+            .map(|(generation, _, _, _, _)| *generation)
             .collect::<Vec<_>>();
         generations.sort_unstable();
         generations.dedup();
-        generations
-            .into_iter()
-            .filter_map(|generation| {
-                let generation_start =
-                    generation.saturating_sub(BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK);
+        if generations.is_empty() {
+            self.native_otc_dma_recovery
+                .last_chain_model_selection_reason = "no_model_draws";
+            return NativeOtcModelGenerationSelection::default();
+        }
+
+        for generation in generations.into_iter().rev() {
+            let generation_start =
+                generation.saturating_sub(BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK);
+            let mut cohort_starts = observed_draws
+                .iter()
+                .map(|(draw_generation, _, _, _, _)| *draw_generation)
+                .filter(|draw_generation| (generation_start..=generation).contains(draw_generation))
+                .collect::<Vec<_>>();
+            cohort_starts.sort_unstable();
+            cohort_starts.dedup();
+            cohort_starts.reverse();
+
+            // Use the shortest newest cohort that forms a complete model. This
+            // keeps split packet updates intact without replaying older poses
+            // merely because they still fall inside the freshness slack.
+            for cohort_start in cohort_starts {
                 let mut draws_by_texture = HashMap::<(u16, u16), Vec<(u32, Gp0DrawBounds)>>::new();
-                for (draw_generation, descriptor, address, bounds) in &observed_draws {
-                    if (generation_start..=generation).contains(draw_generation) {
+                let mut packet_by_command = HashMap::<u32, u32>::new();
+                for (draw_generation, descriptor, packet_address, command_address, bounds) in
+                    &observed_draws
+                {
+                    if (cohort_start..=generation).contains(draw_generation) {
                         draws_by_texture
                             .entry(*descriptor)
                             .or_default()
-                            .push((*address, *bounds));
+                            .push((*command_address, *bounds));
+                        packet_by_command.insert(*command_address, *packet_address);
                     }
                 }
-                let rejected = br2_character_model_rejected_draw_addresses(&draws_by_texture, true);
-                let accepted = draws_by_texture
-                    .into_values()
-                    .flatten()
-                    .filter(|(address, _)| !rejected.contains(address))
-                    .collect::<Vec<_>>();
-                let packets = accepted
+                let command_addresses = br2_character_model_distinct_coherent_draw_addresses(
+                    &draws_by_texture,
+                    BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS,
+                );
+                let packet_count = command_addresses
                     .iter()
-                    .map(|(address, _)| *address)
-                    .collect::<HashSet<_>>();
+                    .filter_map(|address| packet_by_command.get(address).copied())
+                    .collect::<HashSet<_>>()
+                    .len();
                 self.native_otc_dma_recovery
                     .last_chain_model_peak_generation_packets = self
                     .native_otc_dma_recovery
                     .last_chain_model_peak_generation_packets
-                    .max(packets.len().min(u32::MAX as usize) as u32);
-                (packets.len() >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
-                    .then_some((generation, packets.len()))
-            })
-            .max_by_key(|(generation, _)| *generation)
-            .map_or((None, 0), |(generation, packets)| {
-                (Some(generation), packets)
-            })
+                    .max(packet_count.min(u32::MAX as usize) as u32);
+                if packet_count >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS {
+                    self.native_otc_dma_recovery
+                        .last_chain_model_selection_reason = "selected";
+                    return NativeOtcModelGenerationSelection {
+                        generation: Some(generation),
+                        packet_count,
+                        command_addresses,
+                    };
+                }
+            }
+        }
+
+        self.native_otc_dma_recovery
+            .last_chain_model_selection_reason = "no_complete_generation";
+        NativeOtcModelGenerationSelection::default()
+    }
+
+    #[cfg(test)]
+    fn native_otc_dma_recovery_chain_model_generation(
+        &mut self,
+        chain_nodes: &HashSet<u32>,
+        scene_generation: Option<u64>,
+    ) -> (Option<u64>, usize) {
+        let selection =
+            self.native_otc_dma_recovery_chain_model_selection(chain_nodes, scene_generation);
+        (selection.generation, selection.packet_count)
     }
 
     fn native_otc_dma_recovery_invalid_model_draws(
@@ -8278,6 +10448,7 @@ impl Bus {
         chain_nodes: &HashSet<u32>,
     ) -> HashSet<u32> {
         let mut rejected = HashSet::new();
+        let mut draws_by_texture = HashMap::<(u16, u16), Vec<(u32, Gp0DrawBounds)>>::new();
 
         for packet_address in chain_nodes.iter().copied() {
             let Some(header) = self.read_ram_u32_physical(packet_address) else {
@@ -8302,7 +10473,98 @@ impl Bus {
                 let Some((range_start_address, _)) = commands.get(range.start) else {
                     continue;
                 };
-                let words = commands[range]
+                let words = commands[range.clone()]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                let Some(descriptor) = gp0_command_texture_descriptor(&words) else {
+                    continue;
+                };
+                let command_address = *range_start_address & 0x00ff_fffc;
+                let character_model = br2_character_model_texture(descriptor)
+                    || br2_alternate_character_model_descriptor(packet_address, descriptor);
+                if character_model {
+                    if let Some(bounds) =
+                        self.gpu_current_br2_character_model_draw_bounds(packet_address, &words)
+                    {
+                        draws_by_texture
+                            .entry(descriptor)
+                            .or_default()
+                            .push((command_address, bounds));
+                    } else if !gp0_command_is_degenerate_br2_character_model_draw_for_packet(
+                        packet_address,
+                        &words,
+                    ) {
+                        rejected.insert(command_address);
+                    }
+                    continue;
+                }
+
+                let Some(canonical_descriptor) =
+                    br2_recovery_stage_model_alias_descriptor(descriptor)
+                else {
+                    continue;
+                };
+                let bounds = self
+                    .gpu_replay_validation_offsets()
+                    .into_iter()
+                    .filter_map(|offset| gp0_command_draw_bounds_with_offset(&words, offset))
+                    .find(|bounds| {
+                        bounds.has_visible_x
+                            && bounds.min_x <= 639
+                            && bounds.max_x >= -64
+                            && bounds.min_y <= 479
+                            && bounds.max_y >= 0
+                    });
+                if bounds.is_some_and(br2_recovery_stage_model_alias_draw_is_oversized) {
+                    draws_by_texture
+                        .entry(canonical_descriptor)
+                        .or_default()
+                        .push((
+                            command_address,
+                            bounds.expect("checked stage/model alias bounds"),
+                        ));
+                }
+            }
+        }
+
+        rejected.extend(br2_character_model_rejected_draw_addresses(
+            &draws_by_texture,
+            false,
+        ));
+        rejected
+    }
+
+    fn native_otc_dma_recovery_reusable_current_model_draws(
+        &self,
+        chain_nodes: &HashSet<u32>,
+    ) -> HashSet<u32> {
+        let mut draws_by_texture = HashMap::<(u16, u16), Vec<(u32, Gp0DrawBounds)>>::new();
+
+        for packet_address in chain_nodes.iter().copied() {
+            let Some(header) = self.read_ram_u32_physical(packet_address) else {
+                continue;
+            };
+            let word_count = header >> 24;
+            if word_count == 0 || word_count > PRIMITIVE_PACKET_MAX_WORDS {
+                continue;
+            }
+            let commands = (0..word_count)
+                .filter_map(|index| {
+                    let address = packet_address + 4 + index * 4;
+                    self.read_ram_u32_physical(address)
+                        .map(|command| (address, command))
+                })
+                .collect::<Vec<_>>();
+            if commands.len() != word_count as usize {
+                continue;
+            }
+
+            for range in gpu_linked_list_command_ranges(&commands) {
+                let Some((range_start_address, _)) = commands.get(range.start) else {
+                    continue;
+                };
+                let words = commands[range.clone()]
                     .iter()
                     .map(|(_, command)| *command)
                     .collect::<Vec<_>>();
@@ -8310,24 +10572,175 @@ impl Bus {
                     continue;
                 };
                 if !br2_character_model_texture(descriptor)
-                    && !br2_low_ram_character_model_descriptor(packet_address, descriptor)
+                    && !br2_alternate_character_model_descriptor(packet_address, descriptor)
                 {
                     continue;
                 }
-                if self
-                    .gpu_current_br2_character_model_draw_bounds(packet_address, &words)
-                    .is_none()
-                    && !gp0_command_is_degenerate_br2_character_model_draw_for_packet(
-                        packet_address,
+                if !self.gpu_recovery_model_range_has_coherent_header_body_generation(
+                    &commands,
+                    range.clone(),
+                    &words,
+                    Some(packet_address),
+                ) {
+                    continue;
+                }
+                if br2_high_ram_beast_character_model_descriptor(packet_address, descriptor)
+                    && self.gpu_recovery_command_range_is_stale_character_model_generation(
+                        &commands,
+                        range.clone(),
                         &words,
+                        Some(packet_address),
                     )
                 {
-                    rejected.insert(*range_start_address & 0x00ff_fffc);
+                    continue;
                 }
+                let Some(bounds) =
+                    self.gpu_current_br2_character_model_draw_bounds(packet_address, &words)
+                else {
+                    continue;
+                };
+                draws_by_texture
+                    .entry(descriptor)
+                    .or_default()
+                    .push((*range_start_address & 0x00ff_fffc, bounds));
             }
         }
 
-        rejected
+        br2_character_model_distinct_coherent_draw_addresses(
+            &draws_by_texture,
+            BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS,
+        )
+    }
+
+    #[cfg(test)]
+    fn native_otc_dma_recovery_chain_has_annular_model_effect(
+        &self,
+        chain_nodes: &HashSet<u32>,
+    ) -> bool {
+        !self
+            .native_otc_dma_recovery_chain_annular_model_effect_draws(chain_nodes)
+            .0
+            .is_empty()
+    }
+
+    fn native_otc_dma_recovery_chain_annular_model_effect_draws(
+        &self,
+        chain_nodes: &HashSet<u32>,
+    ) -> (HashSet<u32>, HashSet<u32>) {
+        self.br2_annular_model_effect_draws_for_packets(chain_nodes.iter().copied())
+    }
+
+    fn br2_annular_model_effect_draws_for_packets<I>(
+        &self,
+        packet_addresses: I,
+    ) -> (HashSet<u32>, HashSet<u32>)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut draws_by_texture =
+            HashMap::<(u16, u16), Vec<(u32, Gp0DrawBounds, Option<u64>)>>::new();
+
+        for packet_address in packet_addresses {
+            let Some(header) = self.read_ram_u32_physical(packet_address) else {
+                continue;
+            };
+            let word_count = header >> 24;
+            if word_count == 0 || word_count > PRIMITIVE_PACKET_MAX_WORDS {
+                continue;
+            }
+            let commands = (0..word_count)
+                .filter_map(|index| {
+                    let address = packet_address + 4 + index * 4;
+                    self.read_ram_u32_physical(address)
+                        .map(|command| (address, command))
+                })
+                .collect::<Vec<_>>();
+            if commands.len() != word_count as usize {
+                continue;
+            }
+
+            for range in gpu_linked_list_command_ranges(&commands) {
+                let words = commands[range.clone()]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                let Some(descriptor) = gp0_command_texture_descriptor(&words) else {
+                    continue;
+                };
+                let high_ram_transient_candidate = (BR2_PRIMITIVE_RAM_START..BR2_PRIMITIVE_RAM_END)
+                    .contains(&(packet_address & 0x00ff_fffc))
+                    && br2_beast_character_model_candidate_descriptor(descriptor);
+                let character_model = br2_character_model_texture(descriptor)
+                    || br2_alternate_character_model_descriptor(packet_address, descriptor);
+                if !character_model && !high_ram_transient_candidate {
+                    continue;
+                }
+                let bounds = if character_model {
+                    self.gpu_current_br2_character_model_draw_bounds(packet_address, &words)
+                } else {
+                    gp0_command_draw_bounds(&words).filter(|bounds| {
+                        bounds.has_visible_x
+                            && bounds.min_x <= 639
+                            && bounds.max_x >= 0
+                            && bounds.min_y <= 479
+                            && bounds.max_y >= 0
+                    })
+                };
+                let Some(bounds) = bounds else {
+                    continue;
+                };
+                let word_freshness = commands[range.clone()]
+                    .iter()
+                    .map(|(address, _)| {
+                        self.primitive_ram_writes
+                            .word_write_vblank(*address & 0x00ff_fffc)
+                    })
+                    .collect::<Vec<_>>();
+                let body_generation =
+                    br2_character_model_command_pose_generation(&words, &word_freshness);
+                draws_by_texture.entry(descriptor).or_default().push((
+                    commands[range.start].0 & 0x00ff_fffc,
+                    bounds,
+                    body_generation,
+                ));
+            }
+        }
+
+        let mut active = HashSet::new();
+        let mut expired = HashSet::new();
+        for (descriptor, draws) in draws_by_texture {
+            let bounds_by_address = draws
+                .iter()
+                .map(|(address, bounds, _)| (*address, *bounds))
+                .collect::<Vec<_>>();
+            for component in
+                br2_character_model_annular_effect_draw_groups(descriptor, &bounds_by_address)
+            {
+                let component_addresses = component
+                    .iter()
+                    .map(|(address, _)| *address)
+                    .collect::<HashSet<_>>();
+                let newest_body_generation = draws
+                    .iter()
+                    .filter(|(address, _, _)| component_addresses.contains(address))
+                    .filter_map(|(_, _, generation)| *generation)
+                    .max();
+                let destination = match newest_body_generation {
+                    Some(generation)
+                        if self.vblank_count.saturating_sub(generation)
+                            <= BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS =>
+                    {
+                        &mut active
+                    }
+                    // A refreshed OTC header can keep pointing at an old
+                    // transient ring. Without body provenance, treat the
+                    // effect as expired instead of replaying it forever.
+                    Some(_) | None => &mut expired,
+                };
+                destination.extend(component_addresses);
+            }
+        }
+        (active, expired)
     }
 
     fn native_otc_dma_recovery_incomplete_model_overlay_draws(
@@ -8367,7 +10780,7 @@ impl Bus {
                     continue;
                 };
                 if !br2_character_model_texture(descriptor)
-                    && !br2_low_ram_character_model_descriptor(packet_address, descriptor)
+                    && !br2_alternate_character_model_descriptor(packet_address, descriptor)
                 {
                     continue;
                 }
@@ -8392,12 +10805,63 @@ impl Bus {
             .collect()
     }
 
+    fn native_otc_dma_recovery_incomplete_scene_stage_overlay_draws(
+        &self,
+        chain_nodes: &HashSet<u32>,
+    ) -> HashSet<u32> {
+        let mut rejected = HashSet::new();
+
+        for packet_address in chain_nodes.iter().copied() {
+            let Some(header) = self.read_ram_u32_physical(packet_address) else {
+                continue;
+            };
+            let word_count = header >> 24;
+            if word_count == 0 || word_count > PRIMITIVE_PACKET_MAX_WORDS {
+                continue;
+            }
+            let commands = (0..word_count)
+                .filter_map(|index| {
+                    let address = packet_address + 4 + index * 4;
+                    self.read_ram_u32_physical(address)
+                        .map(|command| (address, command))
+                })
+                .collect::<Vec<_>>();
+            if commands.len() != word_count as usize {
+                continue;
+            }
+
+            for range in gpu_linked_list_command_ranges(&commands) {
+                let Some((range_start_address, _)) = commands.get(range.start) else {
+                    continue;
+                };
+                let words = commands[range]
+                    .iter()
+                    .map(|(_, command)| *command)
+                    .collect::<Vec<_>>();
+                if gp0_command_is_br2_character_select_backdrop(&words)
+                    || self
+                        .gpu_replay_validation_offsets()
+                        .into_iter()
+                        .any(|offset| gp0_command_is_br2_transient_stage_effect(&words, offset))
+                    || words_have_br2_character_model_texture_at(packet_address, &words)
+                    || self.gpu_br2_stage_recovery_ranges(&words).1.is_empty()
+                {
+                    continue;
+                }
+                rejected.insert(*range_start_address & 0x00ff_fffc);
+            }
+        }
+
+        rejected
+    }
+
     fn replay_recent_br2_stage_packets_for_otc(
         &mut self,
         otc_key: OtcReplayKey,
         excluded_nodes: &HashSet<u32>,
     ) -> (usize, usize, usize) {
         if std::env::var_os("BR2_NATIVE_DISABLE_STAGE_RECOVERY").is_some() {
+            self.native_otc_dma_recovery.last_stage_selection_reason = "disabled";
             return (0, 0, 0);
         }
         let min_vblank = self
@@ -8429,6 +10893,9 @@ impl Bus {
                 .last_stage_tracked_headers
                 .saturating_add(1);
             if excluded_nodes.contains(&address) {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "excluded_recovered_chain_node"),
+                );
                 continue;
             }
             self.native_otc_dma_recovery.last_stage_region_candidates = self
@@ -8437,6 +10904,9 @@ impl Bus {
                 .saturating_add(1);
             let Some(sample) = self.primitive_packet_candidate_sample(address, excluded_nodes)
             else {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "missing_packet_sample"),
+                );
                 continue;
             };
             self.native_otc_dma_recovery.last_stage_sampled_candidates = self
@@ -8444,6 +10914,11 @@ impl Bus {
                 .last_stage_sampled_candidates
                 .saturating_add(1);
             if sample.linked {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "linked_packet")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
                 continue;
             }
             self.native_otc_dma_recovery.last_stage_unlinked_candidates = self
@@ -8452,7 +10927,20 @@ impl Bus {
                 .saturating_add(1);
             let words = self.primitive_packet_command_words(address, sample.word_count);
             let (_, safe_ranges) = self.gpu_br2_stage_recovery_ranges(&words);
-            if words.len() != sample.word_count as usize || safe_ranges.is_empty() {
+            if words.len() != sample.word_count as usize {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "incomplete_words")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
+                continue;
+            }
+            if safe_ranges.is_empty() {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "no_safe_stage_ranges")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
                 continue;
             }
             self.native_otc_dma_recovery.last_stage_playfield_candidates = self
@@ -8470,6 +10958,11 @@ impl Bus {
                     .native_otc_dma_recovery
                     .last_stage_model_texture_candidates
                     .saturating_add(1);
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "model_texture_packet")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
                 continue;
             }
             self.native_otc_dma_recovery
@@ -8478,9 +10971,20 @@ impl Bus {
                 .last_stage_safe_non_model_candidates
                 .saturating_add(1);
             let Some(command_freshness) = sample.command_write_vblank else {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "missing_command_freshness")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
                 continue;
             };
             if command_freshness < min_vblank {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "stale_command_freshness")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count)
+                        .with_freshness(command_freshness),
+                );
                 continue;
             }
             let freshness = sample
@@ -8523,20 +11027,51 @@ impl Bus {
             }
             let Some(sample) = self.primitive_packet_candidate_sample(target, excluded_nodes)
             else {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(target, "expansion_missing_packet_sample"),
+                );
                 continue;
             };
             if sample.linked {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(target, "expansion_linked_packet")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
                 continue;
             }
             let Some(command_freshness) = sample.command_write_vblank else {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(target, "expansion_missing_command_freshness")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
                 continue;
             };
             let words = self.primitive_packet_command_words(target, sample.word_count);
             let (_, safe_ranges) = self.gpu_br2_stage_recovery_ranges(&words);
-            if words.len() != sample.word_count as usize
-                || safe_ranges.is_empty()
-                || words_have_br2_character_model_texture_at(target, &words)
-            {
+            if words.len() != sample.word_count as usize {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(target, "expansion_incomplete_words")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
+                continue;
+            }
+            if safe_ranges.is_empty() {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(target, "expansion_no_safe_stage_ranges")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
+                continue;
+            }
+            if words_have_br2_character_model_texture_at(target, &words) {
+                self.native_otc_dma_recovery.record_stage_packet_reject(
+                    NativeOtcPacketRejectSample::new(target, "expansion_model_texture_packet")
+                        .with_header(sample.header)
+                        .with_word_count(sample.word_count),
+                );
                 continue;
             }
             let has_textured_draw = safe_ranges.iter().any(|range| {
@@ -8576,6 +11111,7 @@ impl Bus {
         }
 
         if packets.is_empty() {
+            self.native_otc_dma_recovery.last_stage_selection_reason = "no_candidates";
             return (0, 0, 0);
         }
 
@@ -8689,6 +11225,8 @@ impl Bus {
             )
             .max();
         let Some(newest_freshness) = newest_freshness else {
+            self.native_otc_dma_recovery.last_stage_selection_reason =
+                "no_complete_component_or_direct_otc";
             return (0, 0, 0);
         };
         self.native_otc_dma_recovery.last_stage_newest_freshness = newest_freshness;
@@ -8724,6 +11262,12 @@ impl Bus {
         if selected.len() < BR2_STAGE_RECOVERY_MIN_PACKETS
             || (!has_complete_component && !has_textured_draw)
         {
+            self.native_otc_dma_recovery.last_stage_selection_reason =
+                if selected.len() < BR2_STAGE_RECOVERY_MIN_PACKETS {
+                    "selected_below_min_packets"
+                } else {
+                    "selected_without_complete_or_textured_draw"
+                };
             return (0, 0, 0);
         }
 
@@ -8747,6 +11291,7 @@ impl Bus {
             .filter_map(|(address, degree)| (*degree == 0).then_some(*address))
             .collect::<Vec<_>>();
         if roots.is_empty() {
+            self.native_otc_dma_recovery.last_stage_selection_reason = "no_roots";
             return (0, 0, 0);
         }
         roots.sort_unstable_by(|left, right| {
@@ -8810,6 +11355,11 @@ impl Bus {
         }
         self.io.gpu.end_gp0_capture_batch_without_probes();
 
+        self.native_otc_dma_recovery.last_stage_selection_reason = if replayed_packets > 0 {
+            "selected"
+        } else {
+            "selected_no_replayable_words"
+        };
         (roots.len(), replayed_packets, replayed_words)
     }
 
@@ -8854,6 +11404,7 @@ impl Bus {
             );
         }
         if disable_recovery {
+            self.native_otc_dma_recovery.last_model_selection_reason = "disabled";
             return (0, 0, 0);
         }
         let min_vblank = self
@@ -8893,17 +11444,35 @@ impl Bus {
 
         for address in candidate_addresses {
             if !br2_character_model_packet_address(address) || excluded_nodes.contains(&address) {
+                if br2_character_model_packet_address(address) {
+                    self.native_otc_dma_recovery.record_model_packet_reject(
+                        NativeOtcPacketRejectSample::new(address, "excluded_recovered_chain_node"),
+                    );
+                }
                 continue;
             }
             let Some(header) = self.read_ram_u32_physical(address) else {
+                self.native_otc_dma_recovery.record_model_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "missing_header"),
+                );
                 continue;
             };
             let word_count = header >> 24;
             if !(1..=PRIMITIVE_PACKET_MAX_WORDS).contains(&word_count) {
+                self.native_otc_dma_recovery.record_model_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "invalid_word_count")
+                        .with_header(header)
+                        .with_word_count(word_count),
+                );
                 continue;
             }
             let words = self.primitive_packet_command_words(address, word_count);
             if words.len() != word_count as usize {
+                self.native_otc_dma_recovery.record_model_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "incomplete_words")
+                        .with_header(header)
+                        .with_word_count(word_count),
+                );
                 continue;
             }
 
@@ -8954,6 +11523,11 @@ impl Bus {
                 offset += command_words;
             }
             if !valid_commands {
+                self.native_otc_dma_recovery.record_model_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "invalid_command_sequence")
+                        .with_header(header)
+                        .with_word_count(word_count),
+                );
                 continue;
             }
 
@@ -8973,6 +11547,12 @@ impl Bus {
                 .max()
                 .unwrap_or(0);
             if freshness < min_vblank {
+                self.native_otc_dma_recovery.record_model_packet_reject(
+                    NativeOtcPacketRejectSample::new(address, "stale_packet_generation")
+                        .with_header(header)
+                        .with_word_count(word_count)
+                        .with_freshness(freshness),
+                );
                 continue;
             }
             packets.insert(
@@ -8991,8 +11571,11 @@ impl Bus {
                 },
             );
         }
+        self.native_otc_dma_recovery.last_model_candidate_packets =
+            packets.len().min(u32::MAX as usize) as u32;
 
         if packets.len() < BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS {
+            self.native_otc_dma_recovery.last_model_selection_reason = "packet_min";
             if trace_recovery {
                 eprintln!(
                     "br2_character_model_recovery vblank={} stage=packet_min packets={}",
@@ -9027,6 +11610,8 @@ impl Bus {
         });
 
         let root_count = roots.len();
+        self.native_otc_dma_recovery.last_model_candidate_roots =
+            root_count.min(u32::MAX as usize) as u32;
         let newest_observed_model_generation = packets
             .values()
             .filter(|packet| packet.has_model_texture)
@@ -9094,14 +11679,30 @@ impl Bus {
                 && br2_character_model_recovery_chain_is_spatially_coherent(&chain, &packets)
             {
                 candidate_chains.push((root, newest_model_freshness, chain));
+            } else {
+                self.native_otc_dma_recovery.record_model_packet_reject(
+                    NativeOtcPacketRejectSample::new(root, "candidate_chain_rejected")
+                        .with_header(packets[&root].header)
+                        .with_freshness(newest_model_freshness)
+                        .with_detail(if !chain_complete {
+                            "incomplete_chain"
+                        } else if !has_valid_model_texture {
+                            "no_valid_model_texture"
+                        } else {
+                            "spatially_incoherent"
+                        }),
+                );
             }
         }
+        self.native_otc_dma_recovery.last_model_candidate_chains =
+            candidate_chains.len().min(u32::MAX as usize) as u32;
 
         let Some(newest_generation) = candidate_chains
             .iter()
             .map(|(_, freshness, _)| *freshness)
             .max()
         else {
+            self.native_otc_dma_recovery.last_model_selection_reason = "no_model_chains";
             if trace_recovery {
                 eprintln!(
                     "br2_character_model_recovery vblank={} stage=no_model_chains packets={} roots={}",
@@ -9133,6 +11734,8 @@ impl Bus {
         if scene_generation.is_some()
             && !recovered_scene_generations_coherent(scene_generation, Some(newest_generation))
         {
+            self.native_otc_dma_recovery.last_model_selection_reason =
+                "incoherent_scene_generation";
             if trace_recovery {
                 eprintln!(
                     "br2_character_model_recovery vblank={} stage=incoherent_scene_generation newest_generation={} scene_generation={:?}",
@@ -9146,6 +11749,7 @@ impl Bus {
             || newest_complete_blocking_invalid_model_generation
                 .is_some_and(|observed_generation| observed_generation > newest_generation)
         {
+            self.native_otc_dma_recovery.last_model_selection_reason = "invalid_newer_generation";
             if trace_recovery {
                 eprintln!(
                     "br2_character_model_recovery vblank={} stage=invalid_newer_generation newest_generation={} newest_invalid_observed_model_generation={:?} newest_complete_blocking_invalid_model_generation={:?}",
@@ -9162,6 +11766,7 @@ impl Bus {
         if std::env::var_os("BR2_NATIVE_ALLOW_STALE_CHARACTER_MODEL_RECOVERY").is_none()
             && model_age > BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS
         {
+            self.native_otc_dma_recovery.last_model_selection_reason = "stale_generation";
             if trace_recovery {
                 eprintln!(
                     "br2_character_model_recovery vblank={} stage=stale_generation newest_generation={} newest_observed_model_generation={:?} reference_generation={} age={}",
@@ -9200,6 +11805,7 @@ impl Bus {
         }
 
         if selected.len() < BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS {
+            self.native_otc_dma_recovery.last_model_selection_reason = "selected_min";
             if trace_recovery {
                 eprintln!(
                     "br2_character_model_recovery vblank={} stage=selected_min selected_roots={} selected_packets={}",
@@ -9210,6 +11816,8 @@ impl Bus {
             }
             return (0, 0, 0);
         }
+        self.native_otc_dma_recovery.last_model_selected_roots =
+            selected_roots.len().min(u32::MAX as usize) as u32;
 
         let mut indegree = selected
             .iter()
@@ -9313,6 +11921,11 @@ impl Bus {
         }
         self.io.gpu.end_gp0_capture_batch_without_probes();
 
+        self.native_otc_dma_recovery.last_model_selection_reason = if replayed_packets > 0 {
+            "selected"
+        } else {
+            "selected_no_replayable_words"
+        };
         (selected_roots.len(), replayed_packets, replayed_words)
     }
 
@@ -9844,11 +12457,110 @@ impl Bus {
         }
     }
 
+    fn unlinked_primitive_replay_evaluation_key(
+        &self,
+        stats: &GpuLinkedListDmaRunStats,
+    ) -> UnlinkedPrimitiveReplayEvaluationKey {
+        UnlinkedPrimitiveReplayEvaluationKey {
+            vblank: self.vblank_count,
+            primitive_header_generation: self.primitive_header_generation,
+            primitive_word_write_generation: self.primitive_ram_writes.word_write_touches,
+            gpu_linked_list_generation: self.gpu_linked_list_generation,
+            latest_otc_key: self.latest_otc_replay_key(),
+            input: self.zn_board.input,
+            linked_vblank: stats.vblank,
+            linked_start: stats.last_start,
+            linked_nodes: stats.last_nodes,
+            linked_words: stats.last_words,
+            linked_nonempty_nodes: stats.last_nonempty_nodes,
+            linked_draw_packets: draw_primitive_count(&stats.command_opcode_counts),
+            linked_terminated: stats.terminated,
+            linked_hit_node_limit: stats.hit_node_limit,
+        }
+    }
+
+    fn current_linked_list_submission_is_complete_for_replay(
+        &self,
+        stats: &GpuLinkedListDmaRunStats,
+    ) -> bool {
+        stats.vblank == self.vblank_count
+            && stats.terminated
+            && !stats.hit_node_limit
+            && stats.last_nonempty_nodes > BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT
+            && draw_primitive_count(&stats.command_opcode_counts)
+                >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS
+    }
+
+    fn gpu_linked_list_time_supersedes_otc_key(
+        vblank: u64,
+        cycles: u64,
+        key: OtcReplayKey,
+    ) -> bool {
+        vblank > key.vblank || (vblank == key.vblank && cycles > key.cycles)
+    }
+
+    fn guest_linked_list_generation_supersedes_otc_key(
+        &self,
+        stats: &GpuLinkedListDmaRunStats,
+        key: OtcReplayKey,
+    ) -> bool {
+        Self::gpu_linked_list_time_supersedes_otc_key(stats.vblank, stats.cycles, key)
+            || (self.gpu_linked_list_dma.calls > 0
+                && Self::gpu_linked_list_time_supersedes_otc_key(
+                    self.gpu_linked_list_dma.last_vblank,
+                    self.gpu_linked_list_dma.last_cycles,
+                    key,
+                ))
+    }
+
+    fn invalidate_stale_unlinked_replay_for_guest_linked_list_generation(
+        &mut self,
+        next_gpu_linked_list_generation: u64,
+    ) -> bool {
+        if self.unlinked_primitive_replay.last_success_reason
+            != "stale_gpu_dma_recent_header_stream"
+            || self.unlinked_primitive_replay.last_success_packets == 0
+            || self
+                .unlinked_primitive_replay
+                .last_success_invalidated_by_guest_linked_list
+            || next_gpu_linked_list_generation
+                <= self
+                    .unlinked_primitive_replay
+                    .last_success_gpu_linked_list_generation
+        {
+            return false;
+        }
+
+        self.clear_visible_frame_for_unlinked_primitive_replay();
+        self.io.gpu.invalidate_recovery_presentation_caches();
+        self.unlinked_primitive_replay
+            .last_success_invalidated_by_guest_linked_list = true;
+        true
+    }
+
+    fn record_unlinked_primitive_replay_fast_skip(
+        &mut self,
+        stats: &GpuLinkedListDmaRunStats,
+        reason: &'static str,
+    ) {
+        self.unlinked_primitive_replay.record_skip(
+            self.vblank_count,
+            reason,
+            0,
+            stats,
+            UnlinkedPrimitiveReplayDiagnostics::default(),
+        );
+    }
+
     fn try_unlinked_primitive_replay(&mut self, stats: &GpuLinkedListDmaRunStats) {
+        let forced_replay =
+            std::env::var_os("BR2_NATIVE_ENABLE_UNLINKED_PRIMITIVE_REPLAY").is_some();
         if let Some(reason @ ("disabled" | "disabled_by_default")) =
             self.unlinked_primitive_replay_policy_skip_reason(stats)
         {
             let replay_decision = self.unlinked_primitive_replay_decision(stats);
+            self.unlinked_primitive_replay.last_evaluation_key =
+                Some(self.unlinked_primitive_replay_evaluation_key(stats));
             self.unlinked_primitive_replay.record_skip(
                 self.vblank_count,
                 reason,
@@ -9856,6 +12568,13 @@ impl Bus {
                 stats,
                 replay_decision.diagnostics,
             );
+            return;
+        }
+
+        let evaluation_key = self.unlinked_primitive_replay_evaluation_key(stats);
+        if !forced_replay && self.current_linked_list_submission_is_complete_for_replay(stats) {
+            self.unlinked_primitive_replay.last_evaluation_key = Some(evaluation_key);
+            self.record_unlinked_primitive_replay_fast_skip(stats, "current_linked_list_complete");
             return;
         }
 
@@ -9906,6 +12625,13 @@ impl Bus {
             return;
         }
 
+        if !forced_replay
+            && self.unlinked_primitive_replay.last_evaluation_key == Some(evaluation_key)
+        {
+            self.record_unlinked_primitive_replay_fast_skip(stats, "replay_inputs_unchanged");
+            return;
+        }
+        self.unlinked_primitive_replay.last_evaluation_key = Some(evaluation_key);
         let replay_decision = self.unlinked_primitive_replay_decision(stats);
         if replay_decision.enabled {
             let linked_nodes = stats
@@ -9924,6 +12650,20 @@ impl Bus {
                 replay_decision.reason == "stale_gpu_dma_recent_header_stream";
             let latest_otc_key = self.latest_otc_replay_key();
             let coherent_latest_otc_generation = self.latest_otc_chain_draw_generation();
+            if include_recent_header_stale_body_scan
+                && latest_otc_key.is_some_and(|key| {
+                    self.guest_linked_list_generation_supersedes_otc_key(stats, key)
+                })
+            {
+                self.unlinked_primitive_replay.record_skip(
+                    self.vblank_count,
+                    "stale_header_replay_invalidated_by_guest_linked_list",
+                    replay_decision.candidate_headers,
+                    stats,
+                    replay_diagnostics,
+                );
+                return;
+            }
             if coherent_latest_otc_generation.is_some()
                 && latest_otc_key == self.unlinked_primitive_replay.last_replayed_otc_key
             {
@@ -9947,35 +12687,41 @@ impl Bus {
                 return;
             }
             let gpu_before = self.io.gpu.clone();
+            self.io.gpu.begin_gp0_capture_batch();
             self.clear_visible_frame_for_unlinked_primitive_replay();
-            let (packets, words, used_latest_otc_chain) = if coherent_latest_otc_generation
-                .is_some()
-            {
-                let replay_gpu_before = self.io.gpu.clone();
-                let otc_replay = self.replay_latest_otc_linked_list_with_diagnostics(
-                    &mut replay_diagnostics,
-                    coherent_latest_otc_generation,
-                );
-                if replay_diagnostics.otc_chain_terminated
-                    && !replay_diagnostics.otc_chain_cycle_detected
-                    && !replay_diagnostics.otc_chain_hit_node_limit
-                    && replay_diagnostics.otc_chain_safe_playfield_draw_packets
-                        >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS
-                {
-                    (otc_replay.0, otc_replay.1, true)
-                } else {
-                    self.io.gpu = replay_gpu_before;
-                    if include_recent_header_stale_body_scan {
-                        self.unlinked_primitive_replay.record_skip(
-                            self.vblank_count,
-                            "latest_otc_incomplete",
-                            replay_decision.candidate_headers,
-                            stats,
-                            replay_diagnostics,
-                        );
-                        return;
+            let mut replay_abort_reason = None;
+            let (packets, words, used_latest_otc_chain) =
+                if coherent_latest_otc_generation.is_some() {
+                    let replay_gpu_before = self.io.gpu.clone();
+                    let otc_replay = self.replay_latest_otc_linked_list_with_diagnostics(
+                        &mut replay_diagnostics,
+                        coherent_latest_otc_generation,
+                    );
+                    if replay_diagnostics.otc_chain_terminated
+                        && !replay_diagnostics.otc_chain_cycle_detected
+                        && !replay_diagnostics.otc_chain_hit_node_limit
+                        && replay_diagnostics.otc_chain_safe_playfield_draw_packets
+                            >= BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS
+                    {
+                        (otc_replay.0, otc_replay.1, true)
+                    } else {
+                        self.io.gpu = replay_gpu_before;
+                        if include_recent_header_stale_body_scan {
+                            replay_abort_reason = Some("latest_otc_incomplete");
+                            (0, 0, false)
+                        } else {
+                            replay_diagnostics.reset_replayed_commands_for_fallback();
+                            let replay = self
+                                .replay_recent_unlinked_primitive_packets_with_diagnostics(
+                                    &linked_nodes,
+                                    &mut replay_diagnostics,
+                                    include_stale_scan,
+                                    false,
+                                );
+                            (replay.0, replay.1, false)
+                        }
                     }
-                    replay_diagnostics.reset_replayed_commands_for_fallback();
+                } else {
                     let replay = self.replay_recent_unlinked_primitive_packets_with_diagnostics(
                         &linked_nodes,
                         &mut replay_diagnostics,
@@ -9983,16 +12729,18 @@ impl Bus {
                         false,
                     );
                     (replay.0, replay.1, false)
-                }
-            } else {
-                let replay = self.replay_recent_unlinked_primitive_packets_with_diagnostics(
-                    &linked_nodes,
-                    &mut replay_diagnostics,
-                    include_stale_scan,
-                    false,
+                };
+            if let Some(reason) = replay_abort_reason {
+                self.io.gpu = gpu_before;
+                self.unlinked_primitive_replay.record_skip(
+                    self.vblank_count,
+                    reason,
+                    replay_decision.candidate_headers,
+                    stats,
+                    replay_diagnostics,
                 );
-                (replay.0, replay.1, false)
-            };
+                return;
+            }
             if packets == 0 {
                 self.io.gpu = gpu_before;
                 self.unlinked_primitive_replay.record_skip(
@@ -10004,6 +12752,10 @@ impl Bus {
                 );
                 return;
             }
+            // Replay can submit thousands of recovered GP0 words. Deferring
+            // display probes until the completed submission avoids rebuilding
+            // the full interlaced frame after every draw command.
+            self.io.gpu.end_gp0_capture_batch();
             if validate_replay && !self.io.native_replay_preserves_visible_scene(&gpu_before) {
                 self.io.gpu = gpu_before;
                 self.unlinked_primitive_replay.record_skip(
@@ -10097,8 +12849,13 @@ impl Bus {
                 packets,
                 words,
             );
+            self.unlinked_primitive_replay
+                .last_success_gpu_linked_list_generation = self.gpu_linked_list_generation;
             if used_latest_otc_chain {
                 self.unlinked_primitive_replay.last_replayed_otc_key = latest_otc_key;
+            }
+            if self.replay_latched_br2_retained_character_select_portrait() {
+                self.io.gpu.capture_vblank_presented_frame();
             }
         } else {
             self.unlinked_primitive_replay.record_skip(
@@ -10159,13 +12916,7 @@ impl Bus {
                 if commands.len() != words as usize {
                     return None;
                 }
-                for range in gpu_linked_list_command_ranges(
-                    &commands
-                        .iter()
-                        .enumerate()
-                        .map(|(index, command)| (address + 4 + index as u32 * 4, *command))
-                        .collect::<Vec<_>>(),
-                ) {
+                for range in gp0_command_ranges(&commands) {
                     let command_words = &commands[range];
                     if !command_words.first().is_some_and(|command| {
                         looks_like_draw_primitive_opcode((command >> 24) as u8)
@@ -10246,6 +12997,9 @@ impl Bus {
         let mut visited = HashSet::new();
         let mut replayed_packets = 0usize;
         let mut replayed_words = 0usize;
+        let chain_nodes = self.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+        let (_, expired_annular_model_draws) =
+            self.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
 
         for _ in 0..GPU_LINKED_LIST_NODE_LIMIT {
             if address < otc_low
@@ -10318,6 +13072,14 @@ impl Bus {
                 let mut packet_words = 0usize;
                 for range in replay_ranges {
                     let range_copy = range.clone();
+                    if self.gpu_recovery_command_range_has_expired_one_shot_foreground_effect(
+                        &node_commands,
+                        range.clone(),
+                        &command_words[range_copy.clone()],
+                        Some(&expired_annular_model_draws),
+                    ) {
+                        continue;
+                    }
                     let safe_playfield_draw = !gp0_otc_replay_safe_draw_command_ranges(
                         &command_words[range_copy.clone()],
                     )
@@ -10445,7 +13207,19 @@ impl Bus {
             let command_words =
                 self.primitive_packet_command_words(sample.address, sample.word_count);
             record_replay_draw_rejects(&command_words, diagnostics);
-            let ranges = gp0_replay_safe_draw_command_ranges(&command_words);
+            let node_commands =
+                Self::command_words_with_addresses(sample.address + 4, &command_words);
+            let ranges = gp0_replay_safe_draw_command_ranges(&command_words)
+                .into_iter()
+                .filter(|range| {
+                    !self.gpu_recovery_command_range_has_expired_one_shot_foreground_effect(
+                        &node_commands,
+                        range.clone(),
+                        &command_words[range.clone()],
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
             if ranges.is_empty() {
                 diagnostics.replay_empty_safe_range_skips =
                     diagnostics.replay_empty_safe_range_skips.saturating_add(1);
@@ -10675,6 +13449,17 @@ impl Bus {
                     diagnostics.raw_stream_rejected_unsafe.saturating_add(1);
                 continue;
             }
+            let command_range = 0..words.len();
+            if self.command_draw_ranges_all_expired_one_shot_foreground_effects(
+                sample.address,
+                &words,
+                std::slice::from_ref(&command_range),
+                None,
+            ) {
+                diagnostics.raw_stream_rejected_unsafe =
+                    diagnostics.raw_stream_rejected_unsafe.saturating_add(1);
+                continue;
+            }
 
             for (index, command) in words.into_iter().enumerate() {
                 let command_address = sample.address + (index as u32) * 4;
@@ -10701,6 +13486,71 @@ impl Bus {
             }
         }
         words
+    }
+
+    fn command_words_with_addresses(start_address: u32, words: &[u32]) -> Vec<(u32, u32)> {
+        words
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, command)| {
+                (
+                    start_address.wrapping_add(index as u32 * 4) & 0x00ff_fffc,
+                    command,
+                )
+            })
+            .collect()
+    }
+
+    fn command_draw_ranges_all_expired_one_shot_foreground_effects(
+        &self,
+        command_start_address: u32,
+        command_words: &[u32],
+        ranges: &[std::ops::Range<usize>],
+        expired_annular_model_draws: Option<&HashSet<u32>>,
+    ) -> bool {
+        if ranges.is_empty() {
+            return false;
+        }
+
+        let commands = Self::command_words_with_addresses(command_start_address, command_words);
+        ranges.iter().all(|range| {
+            self.gpu_recovery_command_range_has_expired_one_shot_foreground_effect(
+                &commands,
+                range.clone(),
+                &command_words[range.clone()],
+                expired_annular_model_draws,
+            )
+        })
+    }
+
+    fn retain_unexpired_one_shot_unlinked_primitive_replay_candidates(
+        &self,
+        candidates: &mut HashMap<u32, PrimitiveReplayCandidate>,
+        linked_nodes: &HashSet<u32>,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+
+        let expired_annular_model_draws = self
+            .br2_annular_model_effect_draws_for_packets(candidates.keys().copied())
+            .1;
+        candidates.retain(|address, _| {
+            let Some(sample) = self.primitive_packet_candidate_sample(*address, linked_nodes)
+            else {
+                return false;
+            };
+            let command_words =
+                self.primitive_packet_command_words(sample.address, sample.word_count);
+            let ranges = gp0_replay_safe_draw_command_ranges(&command_words);
+            !self.command_draw_ranges_all_expired_one_shot_foreground_effects(
+                sample.address + 4,
+                &command_words,
+                &ranges,
+                Some(&expired_annular_model_draws),
+            )
+        });
     }
 
     fn collect_unlinked_primitive_replay_candidates(
@@ -10742,6 +13592,10 @@ impl Bus {
                 }
                 address = address.saturating_add(4);
             }
+            self.retain_unexpired_one_shot_unlinked_primitive_replay_candidates(
+                &mut candidates,
+                linked_nodes,
+            );
             return candidates;
         }
 
@@ -10761,6 +13615,10 @@ impl Bus {
             );
             address = address.saturating_add(4);
         }
+        self.retain_unexpired_one_shot_unlinked_primitive_replay_candidates(
+            &mut candidates,
+            linked_nodes,
+        );
         candidates
     }
 
@@ -10818,6 +13676,10 @@ impl Bus {
             );
         }
 
+        self.retain_unexpired_one_shot_unlinked_primitive_replay_candidates(
+            &mut candidates,
+            linked_nodes,
+        );
         candidates
     }
 
@@ -10907,8 +13769,23 @@ impl Bus {
                 continue;
             }
 
+            let safe_draw_ranges = gp0_replay_safe_draw_command_ranges(&command_words);
+            if self.command_draw_ranges_all_expired_one_shot_foreground_effects(
+                sample.address + 4,
+                &command_words,
+                &safe_draw_ranges,
+                None,
+            ) {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.recent_header_stale_body_reject_unsafe = diagnostics
+                        .recent_header_stale_body_reject_unsafe
+                        .saturating_add(1);
+                }
+                continue;
+            }
+
             if gp0_command_is_corrupt_br2_character_model_draw(&command_words)
-                || gp0_replay_safe_draw_command_ranges(&command_words).is_empty()
+                || safe_draw_ranges.is_empty()
             {
                 if let Some(diagnostics) = diagnostics.as_deref_mut() {
                     diagnostics.recent_header_stale_body_reject_unsafe = diagnostics
@@ -10947,6 +13824,10 @@ impl Bus {
             diagnostics,
         );
 
+        self.retain_unexpired_one_shot_unlinked_primitive_replay_candidates(
+            &mut candidates,
+            linked_nodes,
+        );
         candidates
     }
 
@@ -11176,8 +14057,23 @@ impl Bus {
             return;
         }
 
+        let safe_draw_ranges = gp0_replay_safe_draw_command_ranges(&command_words);
+        if self.command_draw_ranges_all_expired_one_shot_foreground_effects(
+            sample.address + 4,
+            &command_words,
+            &safe_draw_ranges,
+            None,
+        ) {
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.recent_header_otc_reject_unsafe = diagnostics
+                    .recent_header_otc_reject_unsafe
+                    .saturating_add(1);
+            }
+            return;
+        }
+
         if gp0_command_is_corrupt_br2_character_model_draw(&command_words)
-            || gp0_replay_safe_draw_command_ranges(&command_words).is_empty()
+            || safe_draw_ranges.is_empty()
         {
             if let Some(diagnostics) = diagnostics.as_deref_mut() {
                 diagnostics.recent_header_otc_reject_unsafe = diagnostics
@@ -11230,6 +14126,19 @@ impl Bus {
         let textured = looks_like_textured_primitive_opcode(opcode);
         let playfield =
             draw && self.primitive_packet_has_playfield_draw_bounds(address, sample.word_count);
+        if playfield {
+            let command_words =
+                self.primitive_packet_command_words(sample.address, sample.word_count);
+            let safe_draw_ranges = gp0_replay_safe_draw_command_ranges(&command_words);
+            if self.command_draw_ranges_all_expired_one_shot_foreground_effects(
+                sample.address + 4,
+                &command_words,
+                &safe_draw_ranges,
+                None,
+            ) {
+                return;
+            }
+        }
         if let Some(min_vblank) = min_vblank {
             let command_fresh = sample
                 .command_write_vblank
@@ -11354,6 +14263,8 @@ impl Bus {
         let words = dma_word_count(bcr, control).min(self.ram.len() as u32 / 4);
         let mut address = start_address & 0x00ff_fffc;
         let step = dma_address_step(control);
+        let payload_checksum = self.dma_ram_payload_checksum(address, words, control);
+        let draw_sequence_before = self.io.gpu.draw_sequence();
         if std::env::var_os("BR2_NATIVE_DEBUG_GPU_BLOCK_DMA").is_some() {
             let sequence = self
                 .dma_lifetime_activity
@@ -11395,7 +14306,11 @@ impl Bus {
             address = address.wrapping_add(step);
         }
         self.io.gpu.end_gp0_capture_batch();
-        self.record_gpu_block_dma_activity(start_address, words, control);
+        let refreshed_portrait = self.try_refresh_br2_retained_character_select_portrait();
+        if !refreshed_portrait && self.io.gpu.draw_sequence() > draw_sequence_before {
+            self.replay_latched_br2_retained_character_select_portrait();
+        }
+        self.record_gpu_block_dma_activity(start_address, words, control, payload_checksum);
         address & 0x00ff_ffff
     }
 
@@ -11880,6 +14795,8 @@ pub struct NativeBoardAssets {
     pub at28c16: Option<Vec<u8>>,
     pub at28c16_blank_default: bool,
     pub legacy_zinc_input_compat: bool,
+    pub audio_cpu_rom: Option<Vec<u8>>,
+    pub ymf_sample_rom: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -11889,6 +14806,10 @@ struct NativeBoardAssetStatus {
     at28c16_loaded: bool,
     at28c16_blank_default: bool,
     legacy_zinc_input_compat: bool,
+    audio_cpu_rom_loaded: bool,
+    audio_cpu_rom_bytes: usize,
+    ymf_sample_rom_loaded: bool,
+    ymf_sample_rom_bytes: usize,
 }
 
 impl NativeBoardAssetStatus {
@@ -11899,17 +14820,25 @@ impl NativeBoardAssetStatus {
             at28c16_loaded: assets.at28c16.is_some(),
             at28c16_blank_default: assets.at28c16_blank_default,
             legacy_zinc_input_compat: assets.legacy_zinc_input_compat,
+            audio_cpu_rom_loaded: assets.audio_cpu_rom.is_some(),
+            audio_cpu_rom_bytes: assets.audio_cpu_rom.as_ref().map(Vec::len).unwrap_or(0),
+            ymf_sample_rom_loaded: assets.ymf_sample_rom.is_some(),
+            ymf_sample_rom_bytes: assets.ymf_sample_rom.as_ref().map(Vec::len).unwrap_or(0),
         }
     }
 
     fn json(self) -> String {
         format!(
-            "{{\"cat702_1_loaded\":{},\"cat702_2_loaded\":{},\"at28c16_loaded\":{},\"at28c16_blank_default\":{},\"legacy_zinc_input_compat\":{}}}",
+            "{{\"cat702_1_loaded\":{},\"cat702_2_loaded\":{},\"at28c16_loaded\":{},\"at28c16_blank_default\":{},\"legacy_zinc_input_compat\":{},\"audio_cpu_rom_loaded\":{},\"audio_cpu_rom_bytes\":{},\"ymf_sample_rom_loaded\":{},\"ymf_sample_rom_bytes\":{}}}",
             self.cat702_1_loaded,
             self.cat702_2_loaded,
             self.at28c16_loaded,
             self.at28c16_blank_default,
-            self.legacy_zinc_input_compat
+            self.legacy_zinc_input_compat,
+            self.audio_cpu_rom_loaded,
+            self.audio_cpu_rom_bytes,
+            self.ymf_sample_rom_loaded,
+            self.ymf_sample_rom_bytes
         )
     }
 }
@@ -12434,17 +15363,26 @@ fn native_otc_recovered_chain_has_provenance(
 }
 
 fn native_otc_recovered_chain_is_severely_corrupt(stats: &NativeOtcDmaRecoveryStats) -> bool {
+    let benign_unsafe_draw_rejections = stats.last_chain_draw_reject_reasons
+        [Gp0ReplayDrawRejectReason::ModelPrefilter.index()]
+    .saturating_add(
+        stats.last_chain_draw_reject_reasons[Gp0ReplayDrawRejectReason::NonPlayfieldBounds.index()],
+    )
+    .min(stats.last_chain_unsafe_draw_rejections);
+    let corrupt_unsafe_draw_rejections = stats
+        .last_chain_unsafe_draw_rejections
+        .saturating_sub(benign_unsafe_draw_rejections);
     let rejected_ranges = stats
         .last_chain_embedded_payload_rejections
         .saturating_add(stats.last_chain_stale_body_rejections)
-        .saturating_add(stats.last_chain_unsafe_draw_rejections)
+        .saturating_add(corrupt_unsafe_draw_rejections)
         .saturating_add(stats.last_chain_blocking_artifact_rejections);
     let pointer_contamination = stats.last_chain_draw_reject_reasons
         [Gp0ReplayDrawRejectReason::PrimitivePointerContamination.index()]
         > 0;
     pointer_contamination
         || stats.last_chain_blocking_artifact_rejections > 0
-        || (stats.last_chain_unsafe_draw_rejections > 0
+        || (corrupt_unsafe_draw_rejections > 0
             && rejected_ranges.saturating_mul(3) >= stats.last_chain_ranges)
 }
 
@@ -12644,6 +15582,16 @@ fn gp0_command_replay_draw_reject_reason_with_state(
     if gp0_command_is_linked_list_artifact_draw(words) {
         return Some(Gp0ReplayDrawRejectReason::LinkedListArtifact);
     }
+    if gp0_command_is_br2_status_glyph_tile_with_drawing_offset(words, drawing_offset) {
+        return Some(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas);
+    }
+    if gp0_command_is_br2_character_select_left_preview_slice(
+        words,
+        texture_page_context,
+        drawing_offset,
+    ) {
+        return Some(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas);
+    }
     if gp0_command_is_br2_stage_transition_texture_page_artifact(words, bounds)
         || gp0_command_is_br2_stale_character_select_stage_atlas_strip(words, bounds)
         || gp0_command_is_br2_stale_title_field_texture_atlas(words, bounds)
@@ -12755,6 +15703,88 @@ fn gp0_command_sequence_has_known_recovery_atlas_corruption(words: &[u32]) -> bo
         offset = end;
     }
     false
+}
+
+fn gp0_command_is_br2_character_select_backdrop(words: &[u32]) -> bool {
+    words.len() == 9
+        && matches!((words[0] >> 24) as u8, 0x2c..=0x2f)
+        && gp0_command_texture_descriptor(words) == Some((0x000c, 0x7d18))
+        && gp0_command_draw_bounds(words).is_some_and(|bounds| {
+            bounds.has_visible_x
+                && bounds.width() >= 240
+                && bounds.height() >= 24
+                && bounds.min_x <= 256
+                && bounds.max_x >= 256
+        })
+}
+
+fn gp0_command_is_br2_character_select_preview(
+    words: &[u32],
+    drawing_offsets: &[(i32, i32)],
+) -> bool {
+    drawing_offsets.iter().copied().any(|drawing_offset| {
+        gp0_command_is_br2_character_select_left_preview_slice(words, None, drawing_offset)
+    })
+}
+
+fn gp0_command_is_br2_retained_character_select_preview(words: &[u32]) -> bool {
+    gp0_command_is_br2_character_select_left_preview_slice(words, None, (0, 0))
+}
+
+fn gp0_command_is_br2_character_select_large_portrait(words: &[u32]) -> bool {
+    gp0_command_texture_descriptor(words) == Some((0x0088, 0x7d40))
+        && gp0_command_is_known_br2_recovery_atlas_corruption(words)
+}
+
+fn gp0_command_is_br2_character_select_right_portrait(words: &[u32]) -> bool {
+    matches!(
+        gp0_command_texture_descriptor(words),
+        Some((0x0088, 0x7d80) | (0x008a, 0x7d80))
+    ) && gp0_command_is_known_br2_recovery_atlas_corruption(words)
+}
+
+fn normalize_br2_retained_character_select_preview_color(words: &mut [u32]) {
+    if gp0_command_is_br2_retained_character_select_preview(words) {
+        words[0] = (words[0] & 0xff00_0000) | 0x0080_8080;
+    }
+}
+
+fn gp0_command_is_br2_character_select_left_preview_slice(
+    words: &[u32],
+    texture_page_context: Option<u16>,
+    drawing_offset: (i32, i32),
+) -> bool {
+    if words.len() != 9 || (words[0] >> 24) as u8 != 0x2c {
+        return false;
+    }
+
+    let Some((packet_texture_page, clut)) = gp0_command_texture_descriptor(words) else {
+        return false;
+    };
+    let effective_texture_page = texture_page_context.unwrap_or(packet_texture_page);
+    if effective_texture_page & !0x0200 != 0x000d || clut != 0x7c1d {
+        return false;
+    }
+
+    let Some(bounds) = gp0_command_draw_bounds_with_offset(words, drawing_offset) else {
+        return false;
+    };
+    let captured_left_preview_geometry = bounds.min_x == 1
+        && bounds.max_x == 96
+        && matches!((bounds.min_y, bounds.max_y), (216, 296) | (296, 312));
+    if !captured_left_preview_geometry {
+        return false;
+    }
+
+    let texture_coordinates = gp0_command_texture_words(words)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|word| ((word & 0x00ff) as i32, ((word >> 8) & 0x00ff) as i32))
+        .collect::<Vec<_>>();
+    matches!(
+        texture_coordinates.as_slice(),
+        [(0, 0), (95, 0), (0, 80), (95, 80)] | [(0, 80), (95, 80), (0, 96), (95, 96)]
+    )
 }
 
 fn gp0_command_is_known_br2_recovery_atlas_corruption(words: &[u32]) -> bool {
@@ -13248,6 +16278,29 @@ fn gp0_command_is_low_bank_screen_rect_replay_artifact(
     texture_page_context.is_none_or(gp0_texture_page_is_low_bank_zn_8bpp_screen_rect_page)
 }
 
+fn gp0_command_is_br2_title_quadrant_rect(words: &[u32]) -> bool {
+    if words.len() != 4
+        || words[0] != 0x6480_8080
+        || words[2] & 0x0000_ffff != 0
+        || words[3] != 0x00f0_0100
+    {
+        return false;
+    }
+
+    let clut = (words[2] >> 16) as u16;
+    matches!(
+        (words[1], clut),
+        (0x0000_0000, 0x7c00)
+            | (0x0000_0100, 0x7c40)
+            | (0x00f0_0000, 0x7c80)
+            | (0x00f0_0100, 0x7cc0)
+    )
+}
+
+fn gp0_command_br2_title_quadrant_y(words: &[u32]) -> Option<i32> {
+    gp0_command_is_br2_title_quadrant_rect(words).then(|| gp0_signed_xy(words[1]).1)
+}
+
 fn gp0_command_sprite_clut(words: &[u32]) -> Option<u16> {
     let opcode = (*words.first()? >> 24) as u8;
     matches!(opcode, 0x64..=0x67 | 0x74..=0x77 | 0x7c..=0x7f)
@@ -13338,16 +16391,26 @@ fn gp0_br2_character_model_replay_command_ranges_for_packet(
                         | Gp0ReplayDrawRejectReason::Br2StageTransitionAtlas
                 )
             );
+        let model_atlas_strip_false_positive = model_texture
+            && gp0_command_draw_bounds(command).is_some_and(|bounds| {
+                gp0_command_is_br2_current_otc_model_atlas_strip_false_positive_for_packet(
+                    packet_address,
+                    command,
+                    bounds,
+                )
+            });
         let model_uv_padding_pointer_false_positive = model_texture
             && reject_reason == Some(Gp0ReplayDrawRejectReason::PrimitivePointerContamination)
+            && !model_atlas_strip_false_positive
             && gp0_command_is_valid_br2_character_model_draw_for_packet(packet_address, command)
             && gp0_br2_character_model_pointer_contamination_is_uv_padding_only_for_packet(
                 packet_address,
                 command,
             );
-        if reject_reason.is_none()
-            || clean_model_atlas_false_positive
-            || model_uv_padding_pointer_false_positive
+        if !model_atlas_strip_false_positive
+            && (reject_reason.is_none()
+                || clean_model_atlas_false_positive
+                || model_uv_padding_pointer_false_positive)
         {
             ranges.push(pending_state_start.take().unwrap_or(offset)..end);
         } else {
@@ -13397,7 +16460,8 @@ fn gp0_br2_stage_recovery_command_ranges_with_drawing_offset(
             });
         let character_model_texture =
             gp0_command_texture_descriptor(command).is_some_and(br2_character_model_texture);
-        let status_glyph_tile = gp0_command_is_br2_status_glyph_tile(command);
+        let status_glyph_tile =
+            gp0_command_is_br2_status_glyph_tile_with_drawing_offset(command, drawing_offset);
         let non_gameplay_high_bank_atlas = gp0_command_is_br2_non_gameplay_high_bank_atlas(command);
         let reject_reason =
             gp0_command_replay_draw_reject_reason_with_state(command, None, drawing_offset);
@@ -13495,15 +16559,15 @@ fn gp0_command_is_corrupt_br2_character_model_draw_for_packet(
     let Some(descriptor) = gp0_command_texture_descriptor(words) else {
         return false;
     };
-    let low_ram_model_descriptor =
-        br2_low_ram_character_model_descriptor(packet_address, descriptor);
-    if !br2_character_model_texture(descriptor) && !low_ram_model_descriptor {
+    let alternate_model_descriptor =
+        br2_alternate_character_model_descriptor(packet_address, descriptor);
+    if !br2_character_model_texture(descriptor) && !alternate_model_descriptor {
         return false;
     }
 
     let bounds = gp0_command_draw_bounds(words);
-    if low_ram_model_descriptor
-        && !bounds.is_some_and(br2_low_ram_character_model_bounds_are_coherent)
+    if alternate_model_descriptor
+        && !bounds.is_some_and(br2_alternate_character_model_bounds_are_coherent)
     {
         return true;
     }
@@ -13557,6 +16621,73 @@ fn gp0_textured_polygon_pointer_contamination_is_uv_padding_only(words: &[u32]) 
     saw_pointer_padding
 }
 
+fn gp0_command_is_br2_current_otc_model_atlas_strip_false_positive_for_packet(
+    packet_address: u32,
+    words: &[u32],
+    bounds: Gp0DrawBounds,
+) -> bool {
+    let packet_address = packet_address & 0x00ff_fffc;
+    if !(BR2_CHARACTER_MODEL_PACKET_START..BR2_CHARACTER_MODEL_PACKET_END).contains(&packet_address)
+    {
+        return false;
+    }
+    if words.len() != 9 || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f) {
+        return false;
+    }
+    if gp0_command_texture_descriptor(words) != Some((BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a)) {
+        return false;
+    }
+    if bounds.command_like_texture_words < 3
+        || bounds.width() < 160
+        || bounds.height() > 96
+        || bounds.width() < bounds.height().saturating_mul(2)
+    {
+        return false;
+    }
+    if bounds.primitive_pointer_words > 0
+        && !gp0_br2_character_model_pointer_contamination_is_uv_padding_only_for_packet(
+            packet_address,
+            words,
+        )
+    {
+        return false;
+    }
+
+    let texture_coordinates = gp0_command_texture_words(words)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|word| ((word & 0x00ff) as i32, ((word >> 8) & 0x00ff) as i32))
+        .collect::<Vec<_>>();
+    if texture_coordinates.len() != 4 {
+        return false;
+    }
+    let min_u = texture_coordinates
+        .iter()
+        .map(|(u, _)| *u)
+        .min()
+        .unwrap_or_default();
+    let max_u = texture_coordinates
+        .iter()
+        .map(|(u, _)| *u)
+        .max()
+        .unwrap_or_default();
+    let min_v = texture_coordinates
+        .iter()
+        .map(|(_, v)| *v)
+        .min()
+        .unwrap_or_default();
+    let max_v = texture_coordinates
+        .iter()
+        .map(|(_, v)| *v)
+        .max()
+        .unwrap_or_default();
+
+    (0xc0..=0xdf).contains(&min_u)
+        && (0xc0..=0xdf).contains(&max_u)
+        && (0xd0..=0xdf).contains(&min_v)
+        && (0xd0..=0xdf).contains(&max_v)
+}
+
 fn gp0_br2_character_model_vertices_have_compact_outlier(vertices: &[(i32, i32)]) -> bool {
     if !(3..=4).contains(&vertices.len()) {
         return false;
@@ -13598,6 +16729,19 @@ fn gp0_br2_character_model_vertices_have_compact_outlier(vertices: &[(i32, i32)]
         }
     }
     false
+}
+
+fn gp0_br2_character_model_compact_outlier_is_clipped_edge_fragment(
+    words: &[u32],
+    bounds: Gp0DrawBounds,
+) -> bool {
+    let opcode = words.first().map(|word| (word >> 24) as u8);
+    let triangle = opcode.is_some_and(|opcode| matches!(opcode, 0x24..=0x27 | 0x34..=0x37));
+    let thin_fragment = bounds.width() <= 48 || bounds.height() <= 48;
+    let touches_display_edge =
+        bounds.min_x <= 0 || bounds.max_x >= 639 || bounds.min_y <= 0 || bounds.max_y >= 479;
+
+    triangle && thin_fragment && touches_display_edge
 }
 
 fn gp0_replay_safe_draw_command_ranges_with_policy(
@@ -13659,6 +16803,8 @@ fn gp0_replay_safe_draw_command_ranges_with_policy_and_state(
                 .is_some_and(|bounds| {
                     bounds.width() <= 640 && bounds.height() <= 480 && bounds.area() <= 307_200
                 });
+        let current_otc_title_quadrant = allow_current_otc_atlas_draws
+            && gp0_command_is_br2_title_quadrant_rect(&words[offset..end]);
         let current_otc_stage_draw = allow_current_otc_atlas_draws
             && gp0_command_texture_descriptor(&words[offset..end]).is_some_and(
                 |(texture_page, clut)| {
@@ -13675,7 +16821,11 @@ fn gp0_replay_safe_draw_command_ranges_with_policy_and_state(
                         | Gp0ReplayDrawRejectReason::Br2StageTransitionAtlas
                 )
             );
-        if reject_reason.is_none() || current_otc_atlas_draw || current_otc_stage_draw {
+        if reject_reason.is_none()
+            || current_otc_atlas_draw
+            || current_otc_title_quadrant
+            || current_otc_stage_draw
+        {
             let start = pending_state_start.take().unwrap_or(offset);
             ranges.push(start..end);
         } else {
@@ -13734,11 +16884,30 @@ fn gp0_command_vertex_words(words: &[u32]) -> Option<Vec<u32>> {
         0x38..=0x3b if words.len() >= 8 => vec![words[1], words[3], words[5], words[7]],
         0x3c..=0x3f if words.len() >= 12 => vec![words[1], words[4], words[7], words[10]],
         0x40..=0x47 if words.len() >= 3 => vec![words[1], words[2]],
+        0x48..=0x4f => gp0_command_polyline_vertex_words(words, false),
         0x50..=0x57 if words.len() >= 4 => vec![words[1], words[3]],
+        0x58..=0x5f => gp0_command_polyline_vertex_words(words, true),
         0x60..=0x7f if words.len() >= 2 => vec![words[1]],
         _ => Vec::new(),
     };
     Some(vertices)
+}
+
+fn gp0_command_polyline_vertex_words(words: &[u32], shaded: bool) -> Vec<u32> {
+    let mut vertices = Vec::new();
+    let mut offset = 1usize;
+    while let Some(word) = words.get(offset).copied() {
+        if gp0_command_polyline_terminator(word) {
+            break;
+        }
+        vertices.push(word);
+        offset = offset.saturating_add(if shaded { 2 } else { 1 });
+    }
+    vertices
+}
+
+fn gp0_command_polyline_terminator(word: u32) -> bool {
+    word & 0xf000_f000 == 0x5000_5000
 }
 
 fn gp0_command_texture_words(words: &[u32]) -> Option<Vec<u32>> {
@@ -13766,15 +16935,35 @@ fn gp0_command_texture_descriptor(words: &[u32]) -> Option<(u16, u16)> {
     Some((texture_page, clut))
 }
 
+#[cfg(test)]
 fn gp0_command_is_br2_status_glyph_tile(words: &[u32]) -> bool {
+    gp0_command_is_br2_status_glyph_tile_with_drawing_offset(words, (0, 0))
+}
+
+fn gp0_command_is_br2_status_glyph_tile_with_drawing_offset(
+    words: &[u32],
+    drawing_offset: (i32, i32),
+) -> bool {
     let Some((texture_page, clut)) = gp0_command_texture_descriptor(words) else {
         return false;
     };
-    if texture_page != 0x002f || clut != 0x78df {
+    if !br2_reused_texture_page_matches(texture_page, 0x002f)
+        || (clut & 0x003f) != 0x001f
+        || !matches!(gp0_clut_row(clut), 483 | 484)
+    {
         return false;
     }
-    gp0_command_draw_bounds(words)
-        .is_some_and(|bounds| bounds.width() <= 16 && bounds.height() <= 16)
+    let Some(raw_bounds) = gp0_command_draw_bounds(words) else {
+        return false;
+    };
+    let Some(visible_bounds) = gp0_command_draw_bounds_with_offset(words, drawing_offset) else {
+        return false;
+    };
+    let compact =
+        raw_bounds.width() <= 32 && raw_bounds.height() <= 32 && raw_bounds.area() <= 1_024;
+    let in_hud_band = |bounds: Gp0DrawBounds| bounds.max_y <= 96 || bounds.min_y >= 384;
+
+    compact && (in_hud_band(raw_bounds) || in_hud_band(visible_bounds))
 }
 
 fn gp0_command_is_br2_non_gameplay_high_bank_atlas(words: &[u32]) -> bool {
@@ -13789,6 +16978,24 @@ fn gp0_command_is_br2_non_gameplay_high_bank_atlas(words: &[u32]) -> bool {
     // the framebuffer sampler. Adjacent rows belong to title, select and HUD
     // atlases and must not be replayed as persistent stage geometry.
     !matches!(gp0_clut_row(clut), 483 | 484)
+}
+
+fn gp0_command_is_br2_transient_stage_effect(words: &[u32], drawing_offset: (i32, i32)) -> bool {
+    let Some((texture_page, clut)) = gp0_command_texture_descriptor(words) else {
+        return false;
+    };
+    if texture_page & !0x0200 != 0x002f || !matches!(gp0_clut_row(clut), 483 | 484) {
+        return false;
+    }
+
+    gp0_command_draw_bounds_with_offset(words, drawing_offset).is_some_and(|bounds| {
+        bounds.has_visible_x
+            && bounds.min_y <= 479
+            && bounds.max_y >= 0
+            && bounds.width() >= 64
+            && bounds.height() >= 32
+            && bounds.area() >= 4_096
+    })
 }
 
 fn words_have_br2_character_model_texture_at(packet_address: u32, words: &[u32]) -> bool {
@@ -13833,6 +17040,7 @@ fn gp0_command_is_br2_character_model_for_packet(packet_address: u32, words: &[u
     };
     br2_character_model_texture(descriptor)
         || br2_low_ram_character_model_texture(packet_address, descriptor, words)
+        || br2_high_ram_beast_character_model_texture(packet_address, descriptor, words)
 }
 
 #[cfg(test)]
@@ -13883,10 +17091,25 @@ fn gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
 ) -> Result<Gp0DrawBounds, Gp0ReplayDrawRejectReason> {
     let descriptor =
         gp0_command_texture_descriptor(words).ok_or(Gp0ReplayDrawRejectReason::ModelPrefilter)?;
+    let high_ram_beast_model =
+        br2_high_ram_beast_character_model_descriptor(packet_address, descriptor);
     if !br2_character_model_texture(descriptor)
-        && !br2_low_ram_character_model_descriptor(packet_address, descriptor)
+        && !br2_alternate_character_model_descriptor(packet_address, descriptor)
     {
         return Err(Gp0ReplayDrawRejectReason::ModelPrefilter);
+    }
+    if high_ram_beast_model
+        && let Some(reason) =
+            gp0_command_replay_draw_reject_reason_with_state(words, None, drawing_offset)
+        && matches!(
+            reason,
+            Gp0ReplayDrawRejectReason::LinkedListArtifact
+                | Gp0ReplayDrawRejectReason::TitleOverlayAtlas
+                | Gp0ReplayDrawRejectReason::Br2StageTransitionAtlas
+                | Gp0ReplayDrawRejectReason::KnownRecoveryAtlas
+        )
+    {
+        return Err(reason);
     }
     if gp0_command_sequence_has_known_recovery_atlas_corruption(words) {
         return Err(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas);
@@ -13900,10 +17123,17 @@ fn gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
 
     let high_ram_current_model = (BR2_CHARACTER_MODEL_PACKET_START..BR2_CHARACTER_MODEL_PACKET_END)
         .contains(&(packet_address & 0x00ff_fffc));
-    if !high_ram_current_model
-        && gp0_command_is_corrupt_br2_character_model_draw_for_packet(packet_address, words)
-    {
-        return Err(Gp0ReplayDrawRejectReason::CorruptBr2CharacterModel);
+    let alternate_current_model =
+        br2_alternate_character_model_descriptor(packet_address, descriptor);
+    if gp0_command_is_corrupt_br2_character_model_draw_for_packet(packet_address, words) {
+        let bounds = gp0_command_draw_bounds(words);
+        let clipped_edge_fragment = high_ram_current_model
+            && bounds.is_some_and(|bounds| {
+                gp0_br2_character_model_compact_outlier_is_clipped_edge_fragment(words, bounds)
+            });
+        if !alternate_current_model && !clipped_edge_fragment {
+            return Err(Gp0ReplayDrawRejectReason::CorruptBr2CharacterModel);
+        }
     }
     if words
         .iter()
@@ -13927,13 +17157,24 @@ fn gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
     {
         return Err(Gp0ReplayDrawRejectReason::UnsafeBounds);
     }
-    if !bounds.has_visible_x
-        || bounds.min_x > 639
-        || bounds.max_x < -64
-        || bounds.min_y > 423
-        || bounds.max_y < 64
-    {
+    let non_playfield_bounds = if high_ram_beast_model {
+        !br2_alternate_character_model_bounds_are_coherent(bounds)
+    } else {
+        !bounds.has_visible_x
+            || bounds.min_x > 639
+            || bounds.max_x < -64
+            || bounds.min_y > 423
+            || bounds.max_y < 64
+    };
+    if non_playfield_bounds {
         return Err(Gp0ReplayDrawRejectReason::NonPlayfieldBounds);
+    }
+    if gp0_command_is_br2_current_otc_model_atlas_strip_false_positive_for_packet(
+        packet_address,
+        words,
+        bounds,
+    ) {
+        return Err(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas);
     }
     Ok(bounds)
 }
@@ -14124,14 +17365,80 @@ fn br2_character_model_generation_bounds_are_coherent(bounds: Gp0DrawBounds) -> 
         && bounds.height() <= BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_HEIGHT
 }
 
+fn br2_character_model_distinct_coherent_draw_addresses(
+    draws_by_texture: &HashMap<(u16, u16), Vec<(u32, Gp0DrawBounds)>>,
+    minimum_distinct_draws: usize,
+) -> HashSet<u32> {
+    let mut selected = HashSet::new();
+    let mut distinct_bounds = HashSet::new();
+
+    for (descriptor, draws) in draws_by_texture {
+        let annular_effect_draws =
+            br2_character_model_annular_effect_draw_addresses(*descriptor, draws);
+
+        for address_component in br2_character_model_address_components(draws) {
+            let address_component = address_component
+                .into_iter()
+                .filter(|(address, _)| !annular_effect_draws.contains(address))
+                .collect::<Vec<_>>();
+            if address_component.is_empty() {
+                continue;
+            }
+
+            for mut spatial_component in br2_character_model_spatial_components(&address_component)
+            {
+                let bounds = spatial_component
+                    .iter()
+                    .map(|(_, bounds)| *bounds)
+                    .reduce(gp0_draw_bounds_union);
+                if !bounds.is_some_and(|bounds| {
+                    br2_character_model_spatial_component_is_coherent(
+                        *descriptor,
+                        &spatial_component,
+                        bounds,
+                    )
+                }) {
+                    continue;
+                }
+
+                // Identical screen bounds from the same material are retained
+                // OTC pose duplicates, not additional fighter components.
+                spatial_component.sort_unstable_by_key(|(address, _)| *address);
+                spatial_component.reverse();
+                for (address, bounds) in spatial_component {
+                    let key = (
+                        descriptor.0,
+                        descriptor.1,
+                        bounds.min_x,
+                        bounds.max_x,
+                        bounds.min_y,
+                        bounds.max_y,
+                    );
+                    if distinct_bounds.insert(key) {
+                        selected.insert(address);
+                    }
+                }
+            }
+        }
+    }
+
+    if selected.len() >= minimum_distinct_draws {
+        selected
+    } else {
+        HashSet::new()
+    }
+}
+
 fn br2_character_model_rejected_draw_addresses(
     draws_by_texture: &HashMap<(u16, u16), Vec<(u32, Gp0DrawBounds)>>,
     reject_annular_effects: bool,
 ) -> HashSet<u32> {
     let mut rejected = HashSet::new();
     for (descriptor, draws) in draws_by_texture {
-        if !br2_character_model_texture(*descriptor) {
-            continue;
+        let annular_effect_draws =
+            br2_character_model_annular_effect_draw_addresses(*descriptor, draws);
+        if reject_annular_effects {
+            rejected.extend(annular_effect_draws.iter().copied());
         }
 
         // BR2 allocates each fighter's packet run separately, but both fighters
@@ -14139,10 +17446,11 @@ fn br2_character_model_rejected_draw_addresses(
         // Split allocation runs first so screen-space overlap cannot merge two
         // valid models into one oversized component.
         for address_component in br2_character_model_address_components(draws) {
-            if br2_character_model_draw_group_is_annular_effect(*descriptor, &address_component) {
-                if reject_annular_effects {
-                    rejected.extend(address_component.iter().map(|(address, _)| *address));
-                }
+            let address_component = address_component
+                .into_iter()
+                .filter(|(address, _)| !annular_effect_draws.contains(address))
+                .collect::<Vec<_>>();
+            if address_component.is_empty() {
                 continue;
             }
             for spatial_component in br2_character_model_spatial_components(&address_component) {
@@ -14151,7 +17459,11 @@ fn br2_character_model_rejected_draw_addresses(
                     .map(|(_, bounds)| *bounds)
                     .reduce(gp0_draw_bounds_union);
                 if bounds.is_some_and(|bounds| {
-                    !br2_character_model_generation_bounds_are_coherent(bounds)
+                    !br2_character_model_spatial_component_is_coherent(
+                        *descriptor,
+                        &spatial_component,
+                        bounds,
+                    )
                 }) {
                     rejected.extend(spatial_component.into_iter().map(|(address, _)| address));
                 }
@@ -14159,6 +17471,144 @@ fn br2_character_model_rejected_draw_addresses(
         }
     }
     rejected
+}
+
+fn br2_character_model_spatial_component_is_coherent(
+    descriptor: (u16, u16),
+    draws: &[(u32, Gp0DrawBounds)],
+    bounds: Gp0DrawBounds,
+) -> bool {
+    if br2_character_model_generation_bounds_are_coherent(bounds) {
+        return true;
+    }
+
+    // Perspective clipping can leave a small low-RAM fighter component with
+    // one edge off-screen. The individual polygons remain bounded and share a
+    // vertical band, but their union can exceed the normal 320-pixel fighter
+    // width. Preserve those two- or three-polygon fragments without allowing
+    // the longer select/stage atlas strips that previously covered the frame.
+    if !(2..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS).contains(&draws.len())
+        || bounds.width() > BR2_CHARACTER_MODEL_RECOVERY_CLIPPED_COMPONENT_MAX_WIDTH
+        || bounds.height() > BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_HEIGHT
+        || bounds.area() > BR2_CHARACTER_MODEL_RECOVERY_CLIPPED_COMPONENT_MAX_AREA
+        || !draws.iter().all(|(address, draw)| {
+            br2_low_ram_character_model_descriptor(*address, descriptor)
+                && br2_character_model_generation_bounds_are_coherent(*draw)
+        })
+    {
+        return false;
+    }
+
+    let highest_top = draws
+        .iter()
+        .map(|(_, draw)| draw.min_y)
+        .max()
+        .unwrap_or(i32::MAX);
+    let lowest_bottom = draws
+        .iter()
+        .map(|(_, draw)| draw.max_y)
+        .min()
+        .unwrap_or(i32::MIN);
+    highest_top <= lowest_bottom.saturating_add(BR2_CHARACTER_MODEL_RECOVERY_COMPONENT_GAP)
+}
+
+fn br2_character_model_annular_effect_draw_addresses(
+    descriptor: (u16, u16),
+    draws: &[(u32, Gp0DrawBounds)],
+) -> HashSet<u32> {
+    br2_character_model_annular_effect_draw_groups(descriptor, draws)
+        .into_iter()
+        .flatten()
+        .map(|(address, _)| address)
+        .collect()
+}
+
+fn br2_character_model_annular_effect_draw_groups(
+    descriptor: (u16, u16),
+    draws: &[(u32, Gp0DrawBounds)],
+) -> Vec<Vec<(u32, Gp0DrawBounds)>> {
+    let components = br2_character_model_address_components(draws);
+    let primary_components = components
+        .iter()
+        .filter(|component| br2_character_model_draw_group_is_annular_effect(descriptor, component))
+        .cloned()
+        .collect::<Vec<_>>();
+    if primary_components.is_empty() {
+        return Vec::new();
+    }
+
+    let standard_beast_ring =
+        br2_reused_texture_page_matches(descriptor.0, BR2_CHARACTER_MODEL_TEXTURE_PAGE)
+            && descriptor.1 == 0x799a;
+    if !standard_beast_ring {
+        return primary_components;
+    }
+
+    let primary_bounds = primary_components
+        .iter()
+        .map(|component| {
+            component
+                .iter()
+                .map(|(_, bounds)| *bounds)
+                .reduce(gp0_draw_bounds_union)
+                .expect("annular primary component must have bounds")
+        })
+        .collect::<Vec<_>>();
+    let mut groups = primary_components.clone();
+
+    for component in components {
+        if br2_character_model_draw_group_is_annular_effect(descriptor, &component)
+            || component.is_empty()
+            || component.len() > BR2_CHARACTER_MODEL_ANNULAR_CONTINUATION_MAX_DRAWS
+            || component.iter().any(|(_, bounds)| {
+                bounds.width() < BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_DRAW_WIDTH
+            })
+        {
+            continue;
+        }
+        let Some(bounds) = component
+            .iter()
+            .map(|(_, bounds)| *bounds)
+            .reduce(gp0_draw_bounds_union)
+        else {
+            continue;
+        };
+        if bounds.height() > BR2_CHARACTER_MODEL_ANNULAR_CONTINUATION_MAX_HEIGHT {
+            continue;
+        }
+        let Some(primary_index) = primary_bounds
+            .iter()
+            .enumerate()
+            .filter(|(_, primary)| gp0_draw_bounds_overlap(**primary, bounds))
+            .min_by_key(|(_, primary)| gp0_draw_bounds_center_distance(**primary, bounds))
+            .map(|(index, _)| index)
+        else {
+            continue;
+        };
+        groups[primary_index].extend(component);
+    }
+
+    groups
+}
+
+fn gp0_draw_bounds_overlap(left: Gp0DrawBounds, right: Gp0DrawBounds) -> bool {
+    left.min_x <= right.max_x
+        && right.min_x <= left.max_x
+        && left.min_y <= right.max_y
+        && right.min_y <= left.max_y
+}
+
+fn gp0_draw_bounds_center_distance(left: Gp0DrawBounds, right: Gp0DrawBounds) -> i32 {
+    left.min_x
+        .saturating_add(left.max_x)
+        .saturating_sub(right.min_x.saturating_add(right.max_x))
+        .abs()
+        .saturating_add(
+            left.min_y
+                .saturating_add(left.max_y)
+                .saturating_sub(right.min_y.saturating_add(right.max_y))
+                .abs(),
+        )
 }
 
 fn br2_character_model_address_components(
@@ -14216,11 +17666,29 @@ fn br2_character_model_draw_group_is_annular_effect(
     descriptor: (u16, u16),
     draws: &[(u32, Gp0DrawBounds)],
 ) -> bool {
-    if !br2_reused_texture_page_matches(descriptor.0, BR2_CHARACTER_MODEL_TEXTURE_PAGE)
-        || descriptor.1 != 0x799a
-        || draws.len() < BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_DRAWS
-    {
+    let standard_beast_ring =
+        br2_reused_texture_page_matches(descriptor.0, BR2_CHARACTER_MODEL_TEXTURE_PAGE)
+            && descriptor.1 == 0x799a;
+    let alternate_beast_ring = br2_beast_character_model_candidate_descriptor(descriptor);
+    if !standard_beast_ring && !alternate_beast_ring {
         return false;
+    }
+    // The captured one-shot Beast fragment is one oversized polygon whose
+    // vertices extend well outside the visible playfield. Wide clipped fighter
+    // limbs can have similar dimensions, so size alone must not classify a
+    // normal overlapping fighter allocation as a transient ring.
+    if draws.len() == 1
+        && draws.iter().any(|(_, bounds)| {
+            bounds.width() >= 240
+                && bounds.height() >= 80
+                && bounds.area() >= 20_000
+                && (bounds.min_x < -128
+                    || bounds.max_x > 640
+                    || bounds.min_y < -128
+                    || bounds.max_y > 608)
+        })
+    {
+        return true;
     }
     let Some(bounds) = draws
         .iter()
@@ -14229,6 +17697,28 @@ fn br2_character_model_draw_group_is_annular_effect(
     else {
         return false;
     };
+    // P2 Beast can emit a clipped horizontal ring as six adjacent wide
+    // polygons. The allocation is split before the remaining two polygons by
+    // a large RAM gap, so the normal ten-draw annular threshold cannot see the
+    // complete effect. Require the captured off-screen-to-off-screen geometry
+    // and uniformly wide strips so compact fighter limbs remain model draws.
+    let clipped_wide_band = standard_beast_ring
+        && (BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_DRAWS
+            ..=BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MAX_DRAWS)
+            .contains(&draws.len())
+        && bounds.width() >= BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_WIDTH
+        && bounds.height() >= BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_HEIGHT
+        && bounds.min_x <= -256
+        && bounds.max_x >= 480
+        && draws
+            .iter()
+            .all(|(_, draw)| draw.width() >= BR2_CHARACTER_MODEL_WIDE_BAND_EFFECT_MIN_DRAW_WIDTH);
+    if clipped_wide_band {
+        return true;
+    }
+    if draws.len() < BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_DRAWS {
+        return false;
+    }
     if bounds.width() < BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_WIDTH
         || bounds.height() < BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MIN_HEIGHT
     {
@@ -14259,6 +17749,21 @@ fn br2_character_model_draw_group_is_annular_effect(
     }
 
     central_draws <= (draws.len() / 8).max(1) && quadrants.into_iter().all(|occupied| occupied)
+}
+
+fn br2_recovery_stage_model_alias_descriptor(
+    (texture_page, clut): (u16, u16),
+) -> Option<(u16, u16)> {
+    let normalized_page = texture_page & !(0x0200 | 0x0060);
+    let normalized_model_page = BR2_CHARACTER_MODEL_TEXTURE_PAGE & !(0x0200 | 0x0060);
+    (clut == 0x7959 && normalized_page == normalized_model_page)
+        .then_some((normalized_model_page, clut))
+}
+
+fn br2_recovery_stage_model_alias_draw_is_oversized(bounds: Gp0DrawBounds) -> bool {
+    bounds.width() >= BR2_RECOVERY_STAGE_MODEL_ALIAS_MIN_DRAW_WIDTH
+        && bounds.height() >= BR2_RECOVERY_STAGE_MODEL_ALIAS_MIN_DRAW_HEIGHT
+        && bounds.area() >= BR2_RECOVERY_STAGE_MODEL_ALIAS_MIN_DRAW_AREA
 }
 
 fn gp0_command_draw_bounds(words: &[u32]) -> Option<Gp0DrawBounds> {
@@ -14432,17 +17937,21 @@ impl UnlinkedPrimitiveReplayDecision {
 }
 
 fn gpu_linked_list_command_ranges(commands: &[(u32, u32)]) -> Vec<std::ops::Range<usize>> {
+    let words = commands
+        .iter()
+        .map(|(_, command)| *command)
+        .collect::<Vec<_>>();
+    gp0_command_ranges(&words)
+}
+
+fn gp0_command_ranges(words: &[u32]) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut offset = 0;
-    while offset < commands.len() {
-        let remaining_words = commands[offset..]
-            .iter()
-            .map(|(_, command)| *command)
-            .collect::<Vec<_>>();
-        let command_words = gp0_command_word_count(&remaining_words)
+    while offset < words.len() {
+        let command_words = gp0_command_word_count(&words[offset..])
             .unwrap_or(1)
             .max(1)
-            .min(commands.len() - offset);
+            .min(words.len() - offset);
         ranges.push(offset..offset + command_words);
         offset += command_words;
     }
@@ -14638,6 +18147,7 @@ fn zn_board_address(physical: u32) -> bool {
             | 0x1fa4_0000..=0x1fa4_0003
             | 0x1fa6_0000..=0x1fa6_0001
             | 0x1faf_0000..=0x1faf_07ff
+            | 0x1fb0_0000
             | 0x1fb0_0004
             | 0x1fb2_0000..=0x1fb2_0007
     )
@@ -15095,7 +18605,7 @@ impl ZnBoard {
 
     fn json(&self) -> String {
         format!(
-            "{{\"rom_bank\":{},\"znsecsel\":{},\"coin_input_mapping\":\"{}\",\"coin\":{},\"coin_insert_edges\":{},\"legacy_system_coin_latch_reads\":{},\"legacy_system_start_latch_reads\":{},\"legacy_system_coin_latch_edges\":{},\"legacy_system_start_latch_edges\":{},\"native_credit_adapter_writes\":{},\"native_credit_adapter_edges\":{},\"sound_irq_latch\":{},\"zn2_spu_hack_reads\":{},\"zn2_spu_hack_value\":{},\"zn2_spu_hack_value_hex\":\"0x{:04x}\",\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p3_input_reads\":{},\"p3_guard_active_reads\":{},\"system_input_reads\":{},\"system_coin_active_reads\":{},\"system_service_active_reads\":{},\"system_start_active_reads\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"last_p1_input\":{},\"last_p1_input_hex\":\"0x{:08x}\",\"last_p3_input\":{},\"last_p3_input_hex\":\"0x{:08x}\",\"last_system_input\":{},\"last_system_input_hex\":\"0x{:08x}\",\"last_coin_register\":{},\"last_coin_register_hex\":\"0x{:08x}\"}}",
+            "{{\"rom_bank\":{},\"znsecsel\":{},\"coin_input_mapping\":\"{}\",\"coin\":{},\"coin_insert_edges\":{},\"legacy_system_coin_latch_reads\":{},\"legacy_system_start_latch_reads\":{},\"legacy_system_coin_latch_edges\":{},\"legacy_system_start_latch_edges\":{},\"native_credit_adapter_writes\":{},\"native_credit_adapter_edges\":{},\"sound_irq_latch\":{},\"zn2_spu_hack_reads\":{},\"zn2_spu_hack_value\":{},\"zn2_spu_hack_value_hex\":\"0x{:04x}\",\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p2_input_reads\":{},\"p2_up_active_reads\":{},\"p2_down_active_reads\":{},\"p2_left_active_reads\":{},\"p2_right_active_reads\":{},\"p2_punch_active_reads\":{},\"p2_kick_active_reads\":{},\"p2_beast_active_reads\":{},\"p2_guard_active_reads\":{},\"p3_input_reads\":{},\"p3_guard_active_reads\":{},\"system_input_reads\":{},\"system_coin_active_reads\":{},\"system_service_active_reads\":{},\"system_start_active_reads\":{},\"system_p2_coin_active_reads\":{},\"system_p2_start_active_reads\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"last_p1_input\":{},\"last_p1_input_hex\":\"0x{:08x}\",\"last_p2_input\":{},\"last_p2_input_hex\":\"0x{:08x}\",\"last_p3_input\":{},\"last_p3_input_hex\":\"0x{:08x}\",\"last_system_input\":{},\"last_system_input_hex\":\"0x{:08x}\",\"last_coin_register\":{},\"last_coin_register_hex\":\"0x{:08x}\"}}",
             self.rom_bank,
             self.znsecsel,
             self.coin_input_mapping.name(),
@@ -15120,16 +18630,29 @@ impl ZnBoard {
             self.p1_punch_active_reads.get(),
             self.p1_kick_active_reads.get(),
             self.p1_beast_active_reads.get(),
+            self.p2_input_reads.get(),
+            self.p2_up_active_reads.get(),
+            self.p2_down_active_reads.get(),
+            self.p2_left_active_reads.get(),
+            self.p2_right_active_reads.get(),
+            self.p2_punch_active_reads.get(),
+            self.p2_kick_active_reads.get(),
+            self.p2_beast_active_reads.get(),
+            self.p2_guard_active_reads.get(),
             self.p3_input_reads.get(),
             self.p3_guard_active_reads.get(),
             self.system_input_reads.get(),
             self.system_coin_active_reads.get(),
             self.system_service_active_reads.get(),
             self.system_start_active_reads.get(),
+            self.system_p2_coin_active_reads.get(),
+            self.system_p2_start_active_reads.get(),
             self.coin_register_reads.get(),
             self.coin_register_active_reads.get(),
             self.last_p1_input.get(),
             self.last_p1_input.get(),
+            self.last_p2_input.get(),
+            self.last_p2_input.get(),
             self.last_p3_input.get(),
             self.last_p3_input.get(),
             self.last_system_input.get(),
@@ -15141,7 +18664,7 @@ impl ZnBoard {
 
     fn runtime_probe_json(&self) -> String {
         format!(
-            "{{\"rom_bank\":{},\"znsecsel\":{},\"znsecsel_hex\":\"0x{:02x}\",\"coin_input_mapping\":\"{}\",\"cat702_1_select_line\":{},\"cat702_1_selected\":{},\"cat702_2_select_line\":{},\"cat702_2_selected\":{},\"zn_mcu_analog_read\":{},\"zn_mcu_trackball_read\":{},\"zn_mcu_selected\":{},\"coin\":{},\"coin_hex\":\"0x{:02x}\",\"coin_insert_edges\":{},\"legacy_coin_read_latch\":{},\"legacy_coin_read_latch_hex\":\"0x{:02x}\",\"legacy_system_coin_latch_reads\":{},\"legacy_system_start_latch_reads\":{},\"legacy_system_coin_latch_edges\":{},\"legacy_system_start_latch_edges\":{},\"native_credit_adapter_writes\":{},\"native_credit_adapter_edges\":{},\"zn2_spu_hack_reads\":{},\"zn2_spu_hack_value\":{},\"zn2_spu_hack_value_hex\":\"0x{:04x}\",\"p1_input_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p3_input_reads\":{},\"p3_guard_active_reads\":{},\"system_input_reads\":{},\"system_coin_active_reads\":{},\"system_service_active_reads\":{},\"system_start_active_reads\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"last_p1_input_hex\":\"0x{:08x}\",\"last_p3_input_hex\":\"0x{:08x}\",\"last_system_input_hex\":\"0x{:08x}\",\"last_coin_register_hex\":\"0x{:08x}\",\"diagnostics\":{}}}",
+            "{{\"rom_bank\":{},\"znsecsel\":{},\"znsecsel_hex\":\"0x{:02x}\",\"coin_input_mapping\":\"{}\",\"cat702_1_select_line\":{},\"cat702_1_selected\":{},\"cat702_2_select_line\":{},\"cat702_2_selected\":{},\"zn_mcu_analog_read\":{},\"zn_mcu_trackball_read\":{},\"zn_mcu_selected\":{},\"coin\":{},\"coin_hex\":\"0x{:02x}\",\"coin_insert_edges\":{},\"legacy_coin_read_latch\":{},\"legacy_coin_read_latch_hex\":\"0x{:02x}\",\"legacy_system_coin_latch_reads\":{},\"legacy_system_start_latch_reads\":{},\"legacy_system_coin_latch_edges\":{},\"legacy_system_start_latch_edges\":{},\"native_credit_adapter_writes\":{},\"native_credit_adapter_edges\":{},\"zn2_spu_hack_reads\":{},\"zn2_spu_hack_value\":{},\"zn2_spu_hack_value_hex\":\"0x{:04x}\",\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p2_input_reads\":{},\"p2_up_active_reads\":{},\"p2_down_active_reads\":{},\"p2_left_active_reads\":{},\"p2_right_active_reads\":{},\"p2_punch_active_reads\":{},\"p2_kick_active_reads\":{},\"p2_beast_active_reads\":{},\"p2_guard_active_reads\":{},\"p3_input_reads\":{},\"p3_guard_active_reads\":{},\"system_input_reads\":{},\"system_coin_active_reads\":{},\"system_service_active_reads\":{},\"system_start_active_reads\":{},\"system_p2_coin_active_reads\":{},\"system_p2_start_active_reads\":{},\"coin_register_reads\":{},\"coin_register_active_reads\":{},\"last_p1_input_hex\":\"0x{:08x}\",\"last_p2_input_hex\":\"0x{:08x}\",\"last_p3_input_hex\":\"0x{:08x}\",\"last_system_input_hex\":\"0x{:08x}\",\"last_coin_register_hex\":\"0x{:08x}\",\"diagnostics\":{}}}",
             self.rom_bank,
             self.znsecsel,
             self.znsecsel,
@@ -15168,19 +18691,35 @@ impl ZnBoard {
             self.zn2_spu_hack.get(),
             self.zn2_spu_hack.get(),
             self.p1_input_reads.get(),
+            self.p1_up_active_reads.get(),
+            self.p1_down_active_reads.get(),
+            self.p1_left_active_reads.get(),
+            self.p1_right_active_reads.get(),
             self.p1_start_active_reads.get(),
             self.p1_punch_active_reads.get(),
             self.p1_kick_active_reads.get(),
             self.p1_beast_active_reads.get(),
+            self.p2_input_reads.get(),
+            self.p2_up_active_reads.get(),
+            self.p2_down_active_reads.get(),
+            self.p2_left_active_reads.get(),
+            self.p2_right_active_reads.get(),
+            self.p2_punch_active_reads.get(),
+            self.p2_kick_active_reads.get(),
+            self.p2_beast_active_reads.get(),
+            self.p2_guard_active_reads.get(),
             self.p3_input_reads.get(),
             self.p3_guard_active_reads.get(),
             self.system_input_reads.get(),
             self.system_coin_active_reads.get(),
             self.system_service_active_reads.get(),
             self.system_start_active_reads.get(),
+            self.system_p2_coin_active_reads.get(),
+            self.system_p2_start_active_reads.get(),
             self.coin_register_reads.get(),
             self.coin_register_active_reads.get(),
             self.last_p1_input.get(),
+            self.last_p2_input.get(),
             self.last_p3_input.get(),
             self.last_system_input.get(),
             self.last_coin_register.get(),
@@ -15751,7 +19290,17 @@ fn parse_native_credit_projection_input_token(token: &str, coin_bit: u32) -> Opt
                 | BR2_NATIVE_P1_PUNCH_INPUT_BIT
                 | BR2_NATIVE_P1_KICK_INPUT_BIT
                 | BR2_NATIVE_P1_BEAST_INPUT_BIT
-                | BR2_NATIVE_P1_GUARD_INPUT_BIT,
+                | BR2_NATIVE_P1_GUARD_INPUT_BIT
+                | BR2_NATIVE_P2_START_INPUT_BIT
+                | BR2_NATIVE_P2_CREDIT_INPUT_BIT
+                | BR2_NATIVE_P2_UP_INPUT_BIT
+                | BR2_NATIVE_P2_DOWN_INPUT_BIT
+                | BR2_NATIVE_P2_LEFT_INPUT_BIT
+                | BR2_NATIVE_P2_RIGHT_INPUT_BIT
+                | BR2_NATIVE_P2_PUNCH_INPUT_BIT
+                | BR2_NATIVE_P2_KICK_INPUT_BIT
+                | BR2_NATIVE_P2_BEAST_INPUT_BIT
+                | BR2_NATIVE_P2_GUARD_INPUT_BIT,
         ),
         _ => parse_native_u32_env_value(token),
     }
@@ -16189,10 +19738,32 @@ fn br2_low_ram_character_model_texture(
     if !br2_low_ram_character_model_descriptor(packet_address, descriptor) {
         return false;
     }
-    gp0_command_draw_bounds(words).is_some_and(br2_low_ram_character_model_bounds_are_coherent)
+    gp0_command_draw_bounds(words).is_some_and(br2_alternate_character_model_bounds_are_coherent)
 }
 
-fn br2_low_ram_character_model_bounds_are_coherent(bounds: Gp0DrawBounds) -> bool {
+fn br2_high_ram_beast_character_model_texture(
+    packet_address: u32,
+    descriptor: (u16, u16),
+    words: &[u32],
+) -> bool {
+    if !br2_high_ram_beast_character_model_descriptor(packet_address, descriptor) {
+        return false;
+    }
+    if gp0_command_replay_draw_reject_reason(words).is_some_and(|reason| {
+        matches!(
+            reason,
+            Gp0ReplayDrawRejectReason::LinkedListArtifact
+                | Gp0ReplayDrawRejectReason::TitleOverlayAtlas
+                | Gp0ReplayDrawRejectReason::Br2StageTransitionAtlas
+                | Gp0ReplayDrawRejectReason::KnownRecoveryAtlas
+        )
+    }) {
+        return false;
+    }
+    gp0_command_draw_bounds(words).is_some_and(br2_alternate_character_model_bounds_are_coherent)
+}
+
+fn br2_alternate_character_model_bounds_are_coherent(bounds: Gp0DrawBounds) -> bool {
     bounds.width() > 1
         && bounds.height() > 1
         && bounds.width() <= BR2_CHARACTER_MODEL_RECOVERY_MAX_CHAIN_WIDTH
@@ -16212,11 +19783,37 @@ fn br2_low_ram_character_model_descriptor(
     (texture_page, clut): (u16, u16),
 ) -> bool {
     (BR2_CHARACTER_MODEL_LOW_RAM_START..BR2_CHARACTER_MODEL_LOW_RAM_END).contains(&packet_address)
-        && !br2_stage_material_texture_descriptor(texture_page, clut)
+        && (!br2_stage_material_texture_descriptor(texture_page, clut)
+            || br2_recovery_fighter_material_descriptor(packet_address, texture_page, clut))
         // TPage bits above the X base select the Y page and render mode. Live
         // fighter packets use both 0x000c and 0x001c for the same texture bank.
         && matches!(texture_page & 0x000f, 0x0008..=0x000e)
         && (480..=495).contains(&gp0_clut_row(clut))
+}
+
+fn br2_recovery_fighter_material_descriptor(
+    packet_address: u32,
+    texture_page: u16,
+    clut: u16,
+) -> bool {
+    let address = packet_address & 0x00ff_fffc;
+    (BR2_RECOVERY_FIGHTER_MATERIAL_START..BR2_RECOVERY_FIGHTER_MATERIAL_END).contains(&address)
+        && texture_page & !0x0600 == 0x001c
+        && clut == 0x7994
+}
+
+fn br2_high_ram_beast_character_model_descriptor(
+    packet_address: u32,
+    descriptor: (u16, u16),
+) -> bool {
+    let address = packet_address & 0x00ff_fffc;
+    (BR2_CHARACTER_MODEL_PACKET_START..BR2_CHARACTER_MODEL_PACKET_END).contains(&address)
+        && br2_beast_character_model_candidate_descriptor(descriptor)
+}
+
+fn br2_alternate_character_model_descriptor(packet_address: u32, descriptor: (u16, u16)) -> bool {
+    br2_low_ram_character_model_descriptor(packet_address, descriptor)
+        || br2_high_ram_beast_character_model_descriptor(packet_address, descriptor)
 }
 
 fn br2_stage_material_texture_descriptor(texture_page: u16, clut: u16) -> bool {
@@ -16237,8 +19834,9 @@ mod tests {
     use super::{
         BR2_BOOT_WORD_COPY_LOOP_PHYSICAL, BR2_CHARACTER_MODEL_PACKET_END,
         BR2_CHARACTER_MODEL_PACKET_START, BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS,
-        BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS, BR2_CHARACTER_MODEL_TEXTURE_PAGE,
-        BR2_CODE_PATCH_SNAPSHOT_LEN, BR2_CREDIT_PLAYER_MODE_OFFSET, BR2_CREDIT_REQUIRED_P1_OFFSET,
+        BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS, BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS,
+        BR2_CHARACTER_MODEL_TEXTURE_PAGE, BR2_CODE_PATCH_SNAPSHOT_LEN,
+        BR2_CREDIT_PLAYER_MODE_OFFSET, BR2_CREDIT_REQUIRED_P1_OFFSET,
         BR2_CREDIT_REQUIRED_P2_OFFSET, BR2_CREDIT_SHARED_SLOT_OFFSET, BR2_CREDIT_STATE_BASE,
         BR2_DRAW_SYNC_FLAG_VIRTUAL, BR2_INPUT_SCRATCHPAD_WORD,
         BR2_INPUT_SCRATCHPAD_WRITE_PC_PHYSICAL,
@@ -16284,9 +19882,125 @@ mod tests {
         DMA_GPU_BCR, DMA_GPU_CHCR, DMA_GPU_MADR, DMA_INTERRUPT, DMA_MDEC_IN_BCR, DMA_MDEC_IN_CHCR,
         DMA_MDEC_IN_MADR, DMA_MDEC_OUT_BCR, DMA_MDEC_OUT_CHCR, DMA_MDEC_OUT_MADR, DMA_OTC_BCR,
         DMA_OTC_CHCR, DMA_OTC_MADR, DMA_SPU_CHCR, GPU_GP0, IRQ_MASK, IRQ_STATUS, MDEC_COMMAND,
-        SIO_DATA, SPU_REGION_START, TIMER1_COUNTER, TIMER1_MODE, TIMER1_TARGET,
+        MDEC_STATUS, SIO_CONTROL, SIO_DATA, SPU_REGION_START, TIMER1_COUNTER, TIMER1_MODE,
+        TIMER1_TARGET,
     };
     use std::collections::{HashMap, HashSet};
+
+    fn install_retained_character_select_fixture(bus: &mut Bus) {
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        let retained_preview = [
+            [
+                0x2c80_8080,
+                0x00d8_0001,
+                0x7c1d_0000,
+                0x00d8_0060,
+                0x000d_005f,
+                0x0128_0001,
+                0x0000_5000,
+                0x0128_0060,
+                0x0000_505f,
+            ],
+            [
+                0x2c7f_7f7f,
+                0x0128_0001,
+                0x7c1d_5000,
+                0x0128_0060,
+                0x000d_505f,
+                0x0138_0001,
+                0x0000_6000,
+                0x0138_0060,
+                0x0000_605f,
+            ],
+        ];
+        let backdrop_base = 0x0039_0000;
+        let preview_packet_headers = super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES
+            .map(|address| address - 4);
+
+        bus.vblank_count = 96;
+        for index in 0..super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS {
+            let packet = backdrop_base + index as u32 * 0x40;
+            let next = if index + 1 == super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS {
+                preview_packet_headers[0]
+            } else {
+                packet + 0x40
+            };
+            bus.write_u32(
+                packet,
+                (select_backdrop.len() as u32) << 24 | (next & 0x00ff_ffff),
+            );
+            for (word_index, word) in select_backdrop.iter().copied().enumerate() {
+                bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+            }
+        }
+        for (preview_index, words) in retained_preview.iter().enumerate() {
+            let next = preview_packet_headers
+                .get(preview_index + 1)
+                .copied()
+                .unwrap_or(0x00ff_ffff);
+            bus.write_u32(
+                preview_packet_headers[preview_index],
+                (words.len() as u32) << 24 | (next & 0x00ff_ffff),
+            );
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(
+                    super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES[preview_index]
+                        + word_index as u32 * 4,
+                    word,
+                );
+            }
+        }
+
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_start = backdrop_base;
+        bus.gpu_linked_list_dma.last_vblank = 96;
+        bus.gpu_linked_list_dma.last_cycles = 1;
+    }
+
+    #[test]
+    fn retained_character_select_preview_color_normalization_is_descriptor_exact() {
+        let mut preview = [
+            0x2c10_1010,
+            0x00d8_0001,
+            0x7c1d_0000,
+            0x00d8_0060,
+            0x000d_005f,
+            0x0128_0001,
+            0x0000_5000,
+            0x0128_0060,
+            0x0000_505f,
+        ];
+        super::normalize_br2_retained_character_select_preview_color(&mut preview);
+        assert_eq!(preview[0], 0x2c80_8080);
+
+        let mut neighboring_clut = preview;
+        neighboring_clut[0] = 0x2c10_1010;
+        neighboring_clut[2] = 0x7bdd_0000;
+        super::normalize_br2_retained_character_select_preview_color(&mut neighboring_clut);
+        assert_eq!(
+            neighboring_clut[0], 0x2c10_1010,
+            "a neighboring palette descriptor must not be normalized"
+        );
+    }
+
+    fn upload_gpu_image(bus: &mut Bus, x: u32, y: u32, width: u32, height: u32, word: u32) {
+        bus.io.gpu.write_gp0(0xa000_0000);
+        bus.io.gpu.write_gp0((y << 16) | x);
+        bus.io.gpu.write_gp0((height << 16) | width);
+        for _ in 0..width.saturating_mul(height).div_ceil(2) {
+            bus.io.gpu.write_gp0(word);
+        }
+    }
 
     #[test]
     fn recovered_scene_accepts_observed_model_pose_age_but_rejects_older_generations() {
@@ -16600,6 +20314,88 @@ mod tests {
     }
 
     #[test]
+    fn gpu_unlinked_replay_skips_complete_current_submission_before_candidate_scan() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_interval(Some(1));
+        bus.vblank_count = 44;
+
+        for index in 0..BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_RECENT_HEADERS {
+            let base = 0x0038_1000 + (index as u32) * 0x20;
+            bus.write_u32(base, 0x05ff_ffff);
+            bus.write_u32(base + 4, 0x2800_ff00);
+            bus.write_u32(base + 8, 0x0050_0000);
+            bus.write_u32(base + 12, 0x0050_0008);
+            bus.write_u32(base + 16, 0x0058_0000);
+            bus.write_u32(base + 20, 0x0058_0008);
+        }
+
+        let mut stats = GpuLinkedListDmaRunStats::started(0x003a_1000, 0x003a_1000);
+        stats.last_nodes = BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT + 1;
+        stats.last_nonempty_nodes = BR2_UNLINKED_PRIMITIVE_REPLAY_SPARSE_NODE_LIMIT + 1;
+        stats.last_words = BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS * 5;
+        stats.command_opcode_counts[0x28] = BR2_UNLINKED_PRIMITIVE_REPLAY_MIN_DRAW_PACKETS;
+        stats.terminated = true;
+        stats.record_context(None, bus.vblank_count, 0);
+
+        bus.try_unlinked_primitive_replay(&stats);
+
+        assert_eq!(
+            bus.unlinked_primitive_replay.last_reason,
+            "current_linked_list_complete"
+        );
+        assert_eq!(bus.unlinked_primitive_replay.last_candidate_headers, 0);
+        assert_eq!(
+            bus.unlinked_primitive_replay
+                .last_diagnostics
+                .recent_header_count,
+            0,
+            "complete current DMA must not enter the candidate scanner"
+        );
+        assert_eq!(bus.unlinked_primitive_replay.last_packets, 0);
+        assert!(bus.unlinked_primitive_replay.last_evaluation_key.is_some());
+    }
+
+    #[test]
+    fn gpu_unlinked_replay_skips_unchanged_generation_until_input_changes() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_interval(Some(1));
+        bus.vblank_count = 55;
+
+        let mut stats = GpuLinkedListDmaRunStats::started(0x003a_1000, 0x003a_1000);
+        stats.last_nodes = 1;
+        stats.last_nonempty_nodes = 1;
+        stats.last_words = 1;
+        stats.terminated = true;
+        stats.record_context(None, bus.vblank_count, 0);
+
+        bus.try_unlinked_primitive_replay(&stats);
+        assert_eq!(
+            bus.unlinked_primitive_replay.last_reason,
+            "linked_list_too_short"
+        );
+        assert_eq!(bus.unlinked_primitive_replay.skipped, 1);
+
+        bus.try_unlinked_primitive_replay(&stats);
+        assert_eq!(
+            bus.unlinked_primitive_replay.last_reason,
+            "replay_inputs_unchanged"
+        );
+        assert_eq!(bus.unlinked_primitive_replay.last_candidate_headers, 0);
+        assert_eq!(bus.unlinked_primitive_replay.skipped, 2);
+
+        bus.set_input(ActionButtons {
+            beast: true,
+            ..ActionButtons::default()
+        });
+        bus.try_unlinked_primitive_replay(&stats);
+        assert_eq!(
+            bus.unlinked_primitive_replay.last_reason,
+            "linked_list_too_short"
+        );
+        assert_eq!(bus.unlinked_primitive_replay.skipped, 3);
+    }
+
+    #[test]
     fn bus_unlinked_primitive_replay_interval_env_values_parse() {
         assert_eq!(
             parse_native_unlinked_primitive_replay_interval_override("1"),
@@ -16706,6 +20502,51 @@ mod tests {
         assert!(activity_json.contains("\"p2_guard_active_reads\":1"));
         assert!(activity_json.contains("\"system_p2_start_active_reads\":1"));
         assert!(activity_json.contains("\"system_p2_coin_active_reads\":1"));
+    }
+
+    #[test]
+    fn bus_input_activity_merges_player_two_sio_controller_activity() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+
+        bus.set_input(ActionButtons {
+            p2_coin: true,
+            p2_start: true,
+            p2_up: true,
+            p2_down: true,
+            p2_left: true,
+            p2_right: true,
+            p2_punch: true,
+            p2_kick: true,
+            p2_beast: true,
+            p2_guard: true,
+            ..ActionButtons::default()
+        });
+
+        bus.write_u16(SIO_CONTROL, 0x2003);
+        for request in [0x01, 0x42, 0x00, 0x00, 0x00] {
+            bus.write_u8(SIO_DATA, request);
+        }
+
+        let activity = bus.input_activity();
+        assert_eq!(activity.p2_input_reads, 1);
+        assert_eq!(activity.p2_up_active_reads, 1);
+        assert_eq!(activity.p2_down_active_reads, 1);
+        assert_eq!(activity.p2_left_active_reads, 1);
+        assert_eq!(activity.p2_right_active_reads, 1);
+        assert_eq!(activity.p2_punch_active_reads, 1);
+        assert_eq!(activity.p2_kick_active_reads, 1);
+        assert_eq!(activity.p2_beast_active_reads, 1);
+        assert_eq!(activity.p2_guard_active_reads, 1);
+        assert_eq!(activity.p2_coin_insert_edges, 1);
+        assert_eq!(activity.system_p2_start_active_reads, 1);
+        assert!(activity.has_p2_any_control_activity());
+        assert!(activity.has_p2_direction_activity());
+        assert!(activity.has_p2_play_control_activity());
+        assert!(activity.has_p2_full_control_activity());
+
+        let activity_json = activity.json();
+        assert!(activity_json.contains("\"system_p2_start_active_reads\":1"));
+        assert!(activity_json.contains("\"has_p2_full_control_activity\":true"));
     }
 
     #[test]
@@ -17493,6 +21334,29 @@ mod tests {
     }
 
     #[test]
+    fn native_credit_projection_wide_mask_includes_both_players() {
+        let mask = super::parse_native_credit_projection_input_mask("wide", 0x8)
+            .expect("wide projection input mask should parse");
+
+        for bit in [
+            super::BR2_NATIVE_P1_PUNCH_INPUT_BIT,
+            super::BR2_NATIVE_P1_BEAST_INPUT_BIT,
+            super::BR2_NATIVE_P2_START_INPUT_BIT,
+            super::BR2_NATIVE_P2_CREDIT_INPUT_BIT,
+            super::BR2_NATIVE_P2_UP_INPUT_BIT,
+            super::BR2_NATIVE_P2_PUNCH_INPUT_BIT,
+            super::BR2_NATIVE_P2_BEAST_INPUT_BIT,
+            super::BR2_NATIVE_P2_GUARD_INPUT_BIT,
+        ] {
+            assert_ne!(
+                mask & bit,
+                0,
+                "wide projection must include bit 0x{bit:08x}"
+            );
+        }
+    }
+
+    #[test]
     fn native_credit_adapter_input_bit_can_be_set_per_bus() {
         let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
 
@@ -17858,6 +21722,11 @@ mod tests {
         assert!(full_activity.has_direction_activity());
         assert!(full_activity.has_play_control_activity());
         assert!(full_activity.has_full_control_activity());
+        assert!(full_activity.has_p1_any_control_activity());
+        assert!(full_activity.has_p1_full_control_activity());
+        assert!(!full_activity.has_p2_any_control_activity());
+        assert!(!full_activity.has_p2_full_control_activity());
+        assert!(!full_activity.has_combined_full_control_activity());
         assert!(full_activity.has_any_control_activity());
         assert!(full_activity.has_credit_probe_activity());
         assert!(full_activity.has_coin_register_active_activity());
@@ -17906,6 +21775,50 @@ mod tests {
         assert!(json.contains("\"has_credit_probe_activity\":true"));
         assert!(json.contains("\"has_coin_register_active_activity\":true"));
         assert!(json.contains("\"has_native_credit_adapter_activity\":true"));
+
+        let p2_full_activity = NativeInputActivity {
+            p2_input_reads: 8,
+            p2_up_active_reads: 1,
+            p2_down_active_reads: 1,
+            p2_left_active_reads: 1,
+            p2_right_active_reads: 1,
+            p2_punch_active_reads: 1,
+            p2_kick_active_reads: 1,
+            p2_beast_active_reads: 1,
+            p3_input_reads: 1,
+            p2_guard_active_reads: 1,
+            system_input_reads: 2,
+            system_p2_coin_active_reads: 1,
+            system_p2_start_active_reads: 1,
+            ..NativeInputActivity::default()
+        };
+        assert!(p2_full_activity.has_p2_any_control_activity());
+        assert!(p2_full_activity.has_p2_direction_activity());
+        assert!(p2_full_activity.has_p2_play_control_activity());
+        assert!(p2_full_activity.has_p2_full_control_activity());
+        assert!(!p2_full_activity.has_p1_full_control_activity());
+        assert!(
+            full_activity
+                .saturating_added(p2_full_activity)
+                .has_combined_full_control_activity()
+        );
+
+        let p2_edge_coin_activity = NativeInputActivity {
+            system_p2_coin_active_reads: 0,
+            p2_coin_insert_edges: 1,
+            ..p2_full_activity
+        };
+        assert!(p2_edge_coin_activity.has_p2_play_control_activity());
+        assert!(p2_edge_coin_activity.has_p2_full_control_activity());
+
+        let p2_counter_coin_activity = NativeInputActivity {
+            system_p2_coin_active_reads: 0,
+            p2_coin_insert_edges: 0,
+            coin_counter_1_edges: 1,
+            ..p2_full_activity
+        };
+        assert!(p2_counter_coin_activity.has_p2_play_control_activity());
+        assert!(p2_counter_coin_activity.has_p2_full_control_activity());
     }
 
     #[test]
@@ -17914,6 +21827,7 @@ mod tests {
             p1_input_reads: 8,
             p1_up_active_reads: 2,
             p1_punch_active_reads: 1,
+            system_p2_start_active_reads: 1,
             system_coin_active_reads: 1,
             native_credit_adapter_writes: 1,
             ..NativeInputActivity::default()
@@ -17923,6 +21837,7 @@ mod tests {
             p1_up_active_reads: 2,
             p1_down_active_reads: 4,
             p1_punch_active_reads: 3,
+            system_p2_start_active_reads: 3,
             system_coin_active_reads: 1,
             p3_guard_active_reads: 5,
             native_credit_adapter_writes: 4,
@@ -17935,6 +21850,7 @@ mod tests {
         assert_eq!(delta.p1_up_active_reads, 0);
         assert_eq!(delta.p1_down_active_reads, 4);
         assert_eq!(delta.p1_punch_active_reads, 2);
+        assert_eq!(delta.system_p2_start_active_reads, 2);
         assert_eq!(delta.system_coin_active_reads, 0);
         assert_eq!(delta.p3_guard_active_reads, 5);
         assert_eq!(delta.native_credit_adapter_writes, 3);
@@ -17944,6 +21860,7 @@ mod tests {
         assert_eq!(merged.p1_input_reads, 13);
         assert_eq!(merged.p1_down_active_reads, 4);
         assert_eq!(merged.p1_punch_active_reads, 3);
+        assert_eq!(merged.system_p2_start_active_reads, 3);
         assert_eq!(merged.p3_guard_active_reads, 5);
         assert_eq!(merged.native_credit_adapter_writes, 4);
         assert_eq!(merged.native_credit_adapter_edges, 1);
@@ -18723,6 +22640,64 @@ mod tests {
     }
 
     #[test]
+    fn gpu_linked_list_command_ranges_keep_transfer_payloads_grouped() {
+        let packet = [
+            (0x0000_1004, 0xa000_0000),
+            (0x0000_1008, 0x0004_0008),
+            (0x0000_100c, 0x0002_0002),
+            (0x0000_1010, 0xaaaa_bbbb),
+            (0x0000_1014, 0xcccc_dddd),
+            (0x0000_1018, 0xe600_0000),
+        ];
+
+        let ranges = gpu_linked_list_command_ranges(&packet);
+
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .collect::<Vec<_>>(),
+            vec![5, 1]
+        );
+        assert_eq!(
+            packet[ranges[0].clone()]
+                .iter()
+                .map(|(_, command)| *command)
+                .collect::<Vec<_>>(),
+            vec![
+                0xa000_0000,
+                0x0004_0008,
+                0x0002_0002,
+                0xaaaa_bbbb,
+                0xcccc_dddd,
+            ]
+        );
+    }
+
+    #[test]
+    fn bus_fast_gameplay_display_rgb_frame_with_checksum_forwards_io_frame() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let (width, height) = bus.io.gpu.display_dimensions();
+        bus.write_u32(GPU_GP0, 0x0210_2030);
+        bus.write_u32(GPU_GP0, 0);
+        bus.write_u32(GPU_GP0, ((height as u32) << 16) | width as u32);
+        bus.write_u32(GPU_GP0, 0x02f0_e0d0);
+        bus.write_u32(GPU_GP0, (11 << 16) | 7);
+        bus.write_u32(GPU_GP0, (13 << 16) | 19);
+
+        let (legacy_width, legacy_height, legacy_rgb) = bus.fast_gameplay_display_rgb_frame();
+        let (width, height, rgb, checksum) = bus.fast_gameplay_display_rgb_frame_with_checksum();
+        let (io_width, io_height, io_rgb, io_checksum) =
+            bus.io.fast_gameplay_display_rgb_frame_with_checksum();
+
+        assert_eq!((width, height), (legacy_width, legacy_height));
+        assert_eq!((io_width, io_height), (legacy_width, legacy_height));
+        assert_eq!(rgb, legacy_rgb);
+        assert_eq!(io_rgb, legacy_rgb);
+        assert_eq!(checksum, io_checksum);
+    }
+
+    #[test]
     fn gpu_linked_list_dma_skips_range_starting_inside_gp0_payload() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         let command_start = 0x003b_4ff0;
@@ -18988,6 +22963,425 @@ mod tests {
             bus.io_json().contains("\"gpu_presentation_captures\":0"),
             "replay-local clears must not publish the stale pre-replay frame"
         );
+    }
+
+    #[test]
+    fn stale_unlinked_replay_is_cleared_once_when_guest_linked_list_generation_arrives() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+
+        for word in [0x0200_00ff, 0x0010_0010, 0x0008_0008] {
+            bus.io.gpu.write_gp0(word);
+        }
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_ne!(
+            frame[16 * width + 16],
+            0,
+            "test setup must start with an old replay overlay visible"
+        );
+
+        let linked = GpuLinkedListDmaRunStats::started(0, 0);
+        bus.unlinked_primitive_replay.record_replay(
+            10,
+            "stale_gpu_dma_recent_header_stream",
+            0,
+            &linked,
+            UnlinkedPrimitiveReplayDiagnostics::default(),
+            1,
+            3,
+        );
+        bus.unlinked_primitive_replay
+            .last_success_gpu_linked_list_generation = bus.gpu_linked_list_generation;
+
+        let node = 0x003a_1000;
+        bus.write_u32(node, 0x03ff_ffff);
+        bus.write_u32(node + 4, 0x6000_ff00);
+        bus.write_u32(node + 8, 0x0030_0030);
+        bus.write_u32(node + 12, 0x0008_0008);
+
+        let commands_before = bus.io.gpu.commands_seen;
+        bus.process_gpu_linked_list_dma(node);
+
+        let commands_after_first_generation = bus.io.gpu.commands_seen;
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_eq!(
+            frame[16 * width + 16],
+            0,
+            "a superseding guest linked-list generation must remove stale replay pixels"
+        );
+        assert_ne!(
+            frame[48 * width + 48],
+            0,
+            "the guest linked-list draw submitted after the clear must remain visible"
+        );
+        assert!(
+            bus.unlinked_primitive_replay
+                .last_success_invalidated_by_guest_linked_list
+        );
+        assert_eq!(
+            commands_after_first_generation - commands_before,
+            6,
+            "first guest generation after stale replay should clear once then submit the 3-word node"
+        );
+
+        bus.process_gpu_linked_list_dma(node);
+
+        assert_eq!(
+            bus.io.gpu.commands_seen - commands_after_first_generation,
+            3,
+            "the same stale replay success must not be cleared repeatedly"
+        );
+    }
+
+    #[test]
+    fn guest_linked_list_finishes_character_select_with_retained_portrait_overlay() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        let backdrop_base = 0x0039_0000;
+        let backdrop_last = backdrop_base
+            + (super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS as u32 - 1) * 0x40;
+        let preview_headers = super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES
+            .map(|address| address - 4);
+
+        bus.write_u32(
+            preview_headers[0],
+            0x0900_0000 | (preview_headers[1] & 0x00ff_ffff),
+        );
+        bus.write_u32(
+            preview_headers[1],
+            0x0900_0000 | (backdrop_base & 0x00ff_ffff),
+        );
+        bus.write_u32(backdrop_last, 0x0900_0000 | 0x00ff_ffff);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+
+        bus.process_gpu_linked_list_dma(preview_headers[0]);
+
+        assert_eq!(
+            bus.io.gpu.last_recovery_draw_address_for_test(),
+            Some(super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES[1]),
+            "the retained portrait must be redrawn after a guest backdrop that follows it"
+        );
+    }
+
+    #[test]
+    fn guest_linked_list_does_not_overlay_retained_portrait_outside_character_select() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+
+        let gameplay_packet = 0x0038_8000;
+        bus.write_u32(gameplay_packet, 0x03ff_ffff);
+        bus.write_u32(gameplay_packet + 4, 0x6000_ff00);
+        bus.write_u32(gameplay_packet + 8, 0x0030_0030);
+        bus.write_u32(gameplay_packet + 12, 0x0008_0008);
+
+        bus.process_gpu_linked_list_dma(gameplay_packet);
+
+        assert_eq!(
+            bus.io.gpu.last_recovery_draw_address_for_test(),
+            None,
+            "non-select guest chains must not receive a retained portrait overlay"
+        );
+    }
+
+    #[test]
+    fn guest_stage_transition_does_not_replay_latched_select_portrait() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        bus.process_gpu_linked_list_dma(0x0039_0000);
+        assert!(bus.br2_retained_character_select_chain_start.is_some());
+
+        let stage_packet = 0x0038_8000;
+        let stage_transition = [
+            0x2c7f_7f7f,
+            0x003c_0200,
+            0x781b_3c00,
+            0x003c_0100,
+            0x000b_3cff,
+            0x0078_0200,
+            0x0000_7800,
+            0x0078_0100,
+            0x0000_78ff,
+        ];
+        bus.vblank_count = 129;
+        bus.write_u32(
+            stage_packet,
+            (stage_transition.len() as u32) << 24 | 0x00ff_ffff,
+        );
+        for (index, word) in stage_transition.iter().copied().enumerate() {
+            bus.write_u32(stage_packet + 4 + index as u32 * 4, word);
+        }
+        let commands_before = bus.io.gpu.commands_seen;
+
+        bus.process_gpu_linked_list_dma(stage_packet);
+
+        assert_eq!(
+            bus.io.gpu.commands_seen - commands_before,
+            stage_transition.len() as u64,
+            "a pre-gameplay stage transition must not receive the latched select overlay"
+        );
+        assert!(
+            bus.br2_retained_character_select_chain_start.is_some(),
+            "an incomplete transition may keep the latch for cleanup by the first complete gameplay scene"
+        );
+    }
+
+    #[test]
+    fn trusted_recovery_stage_transition_does_not_replay_latched_select_portrait() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        bus.process_gpu_linked_list_dma(0x0039_0000);
+        assert!(bus.br2_retained_character_select_chain_start.is_some());
+
+        let stage_packet = 0x0038_8000;
+        let stage_transition = [
+            0x2c7f_7f7f,
+            0x003c_0200,
+            0x781b_3c00,
+            0x003c_0100,
+            0x000b_3cff,
+            0x0078_0200,
+            0x0000_7800,
+            0x0078_0100,
+            0x0000_78ff,
+        ];
+        bus.vblank_count = 129;
+        bus.write_u32(
+            stage_packet,
+            (stage_transition.len() as u32) << 24 | 0x00ff_ffff,
+        );
+        for (index, word) in stage_transition.iter().copied().enumerate() {
+            bus.write_u32(stage_packet + 4 + index as u32 * 4, word);
+        }
+        let commands_before = bus.io.gpu.commands_seen;
+
+        let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+            stage_packet,
+            true,
+            true,
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(submitted, stage_transition.len());
+        assert_eq!(
+            bus.io.gpu.commands_seen - commands_before,
+            stage_transition.len() as u64,
+            "trusted recovery must not append a select portrait to a non-select transition chain"
+        );
+        assert!(bus.br2_retained_character_select_chain_start.is_some());
+    }
+
+    #[test]
+    fn guest_linked_list_latched_select_backdrop_redraws_retained_portrait() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        let backdrop_base = 0x0039_0000;
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        bus.process_gpu_linked_list_dma(backdrop_base);
+        assert_eq!(
+            bus.br2_retained_character_select_chain_start,
+            Some(backdrop_base)
+        );
+
+        bus.vblank_count = 129;
+        for index in 0..super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS {
+            let packet = backdrop_base + index as u32 * 0x40;
+            let next = if index + 1 == super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS {
+                0x00ff_ffff
+            } else {
+                packet + 0x40
+            };
+            bus.write_u32(
+                packet,
+                (select_backdrop.len() as u32) << 24 | (next & 0x00ff_ffff),
+            );
+            for (word_index, word) in select_backdrop.iter().copied().enumerate() {
+                bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+            }
+        }
+        let commands_before = bus.io.gpu.commands_seen;
+
+        bus.process_gpu_linked_list_dma(backdrop_base);
+
+        assert_eq!(
+            bus.io.gpu.commands_seen - commands_before,
+            (super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS * select_backdrop.len() + 18)
+                as u64,
+            "a backdrop-only select continuation must finish with the two retained portrait slices"
+        );
+        assert_eq!(
+            bus.io.gpu.last_recovery_draw_address_for_test(),
+            Some(super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES[1])
+        );
+        assert_eq!(
+            bus.br2_retained_character_select_chain_start,
+            Some(backdrop_base)
+        );
+    }
+
+    #[test]
+    fn guest_linked_list_does_not_invent_unseen_left_portrait_after_stage_uploads() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        let backdrop_base = 0x0039_0000;
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        let large_portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7d40_0000,
+            0x0071_00e0,
+            0x0088_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+        for (index, word) in large_portrait.iter().copied().enumerate() {
+            bus.write_u32(
+                super::BR2_CHARACTER_SELECT_LEFT_LARGE_PORTRAIT_COMMAND_ADDRESS + index as u32 * 4,
+                word,
+            );
+        }
+
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        bus.process_gpu_linked_list_dma(backdrop_base);
+        assert_eq!(
+            bus.br2_retained_character_select_chain_start,
+            Some(backdrop_base)
+        );
+
+        upload_gpu_image(&mut bus, 512, 0, 128, 240, 0x3210_1234);
+        upload_gpu_image(&mut bus, 0, 496, 256, 1, 0x03e0_001f);
+        upload_gpu_image(&mut bus, 512, 0, 64, 256, 0x03e0_03e0);
+        upload_gpu_image(&mut bus, 576, 0, 64, 256, 0x03e0_03e0);
+        upload_gpu_image(&mut bus, 0, 496, 16, 16, 0x03e0_03e0);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(512, 0), 0x03e0);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(0, 496), 0x03e0);
+
+        bus.vblank_count = 129;
+        for index in 0..super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS {
+            let packet = backdrop_base + index as u32 * 0x40;
+            let next = if index + 1 == super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS {
+                0x00ff_ffff
+            } else {
+                packet + 0x40
+            };
+            bus.write_u32(
+                packet,
+                (select_backdrop.len() as u32) << 24 | (next & 0x00ff_ffff),
+            );
+            for (word_index, word) in select_backdrop.iter().copied().enumerate() {
+                bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+            }
+        }
+
+        bus.process_gpu_linked_list_dma(backdrop_base);
+
+        assert_eq!(
+            bus.io.gpu.framebuffer_raw_pixel_for_test(512, 0),
+            0x03e0,
+            "guest select replay must not restore the captured wolf/title atlas texture"
+        );
+        assert_eq!(
+            bus.io.gpu.framebuffer_raw_pixel_for_test(0, 496),
+            0x03e0,
+            "guest select replay must not restore the captured wolf/title atlas CLUT"
+        );
+        assert_eq!(
+            bus.io.gpu.last_recovery_draw_address_for_test(),
+            Some(super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES[1]),
+            "only the validated small select preview may remain as the retained overlay"
+        );
+    }
+
+    #[test]
+    fn state_only_guest_chain_does_not_replay_latched_select_portrait() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        bus.process_gpu_linked_list_dma(0x0039_0000);
+
+        let state_packet = 0x0038_8000;
+        bus.write_u32(state_packet, 0x01ff_ffff);
+        bus.write_u32(state_packet + 4, 0xe100_0400);
+        let commands_before = bus.io.gpu.commands_seen;
+        let draws_before = bus.io.gpu.draw_sequence();
+
+        bus.process_gpu_linked_list_dma(state_packet);
+
+        assert_eq!(bus.io.gpu.commands_seen, commands_before + 1);
+        assert_eq!(bus.io.gpu.draw_sequence(), draws_before);
+        assert_eq!(
+            bus.br2_retained_character_select_chain_start,
+            Some(0x0039_0000),
+            "state-only packets must neither clear nor redraw the active select latch"
+        );
+    }
+
+    #[test]
+    fn invalid_retained_preview_clears_character_select_latch_on_next_draw() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        bus.process_gpu_linked_list_dma(0x0039_0000);
+        assert!(bus.br2_retained_character_select_chain_start.is_some());
+
+        bus.write_u32(
+            super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES[0],
+            0,
+        );
+        let draw_packet = 0x0038_8000;
+        bus.write_u32(draw_packet, 0x03ff_ffff);
+        bus.write_u32(draw_packet + 4, 0x6000_ff00);
+        bus.write_u32(draw_packet + 8, 0x0030_0030);
+        bus.write_u32(draw_packet + 12, 0x0008_0008);
+        let commands_before = bus.io.gpu.commands_seen;
+
+        bus.process_gpu_linked_list_dma(draw_packet);
+
+        assert_eq!(bus.io.gpu.commands_seen, commands_before + 3);
+        assert_eq!(bus.br2_retained_character_select_chain_start, None);
     }
 
     #[test]
@@ -19501,7 +23895,11 @@ mod tests {
         bus.write_u32(packet, (5 << 24) | (next & 0x00ff_ffff));
         bus.write_u32(otc_high, packet);
 
-        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert!(
+            bus.process_vblank_native_otc_dma_recovery(),
+            "{}",
+            bus.native_otc_dma_recovery.json()
+        );
         assert_eq!(bus.native_otc_dma_recovery.submissions, 1);
         assert_eq!(bus.native_otc_dma_recovery.duplicate_chain_replay_skips, 0);
         let first_commands = bus.io.gpu.commands_seen;
@@ -19531,7 +23929,11 @@ mod tests {
         bus.write_u32(packet, (5 << 24) | (next & 0x00ff_ffff));
         bus.write_u32(otc_high, packet);
 
-        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert!(
+            bus.process_vblank_native_otc_dma_recovery(),
+            "{}",
+            bus.native_otc_dma_recovery.json()
+        );
         assert_eq!(bus.native_otc_dma_recovery.submissions, 1);
         assert_eq!(bus.native_otc_dma_recovery.duplicate_chain_replay_skips, 1);
         assert_eq!(
@@ -19567,6 +23969,138 @@ mod tests {
         assert_ne!(
             bus.native_otc_dma_recovery.last_replayed_chain_fingerprint,
             Some(first_fingerprint)
+        );
+    }
+
+    #[test]
+    fn stale_gpu_dma_duplicate_chain_replays_to_remove_expired_annular_effect() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let generation = 2_897;
+        let packets = (0..12)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x1000 + index * 0x28)
+            .collect::<Vec<_>>();
+        let positions = [
+            (294, 285),
+            (252, 254),
+            (230, 205),
+            (230, 141),
+            (237, 89),
+            (270, 62),
+            (318, 62),
+            (364, 70),
+            (398, 110),
+            (409, 171),
+            (384, 229),
+            (345, 271),
+        ];
+        let sizes = [
+            (55, 35),
+            (51, 58),
+            (40, 66),
+            (29, 69),
+            (46, 64),
+            (52, 49),
+            (55, 35),
+            (52, 58),
+            (39, 66),
+            (28, 69),
+            (47, 64),
+            (53, 49),
+        ];
+
+        for tile_y in 0..15u32 {
+            for tile_x in 0..16u32 {
+                let color = if (tile_x + tile_y).is_multiple_of(2) {
+                    0x0200_7fff
+                } else {
+                    0x027f_ff00
+                };
+                for word in [
+                    color,
+                    ((tile_y * 16) << 16) | (tile_x * 16),
+                    (16 << 16) | 16,
+                ] {
+                    bus.io.gpu.write_gp0(word);
+                }
+            }
+        }
+        bus.io.gpu.capture_vblank_presented_frame();
+
+        bus.vblank_count = generation;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        for (index, address) in packets.iter().copied().enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let (x, y) = positions[index];
+            let (width, height) = sizes[index];
+            let words = [
+                0x2e80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + width - 1),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + height - 1) << 16) | x,
+                0,
+                ((y + height - 1) << 16) | (x + width - 1),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+        bus.write_u32(otc_high, packets[0]);
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+
+        assert!(
+            bus.process_vblank_native_otc_dma_recovery(),
+            "{}",
+            bus.native_otc_dma_recovery.json()
+        );
+        assert_eq!(bus.native_otc_dma_recovery.submissions, 1);
+        assert!(bus.native_otc_dma_recovery.last_recovered_chain_words > 0);
+        let first_fingerprint = bus
+            .native_otc_dma_recovery
+            .last_replayed_chain_fingerprint
+            .expect("annular replay fingerprint");
+        bus.tick(DMA_OTC_COMPLETION_DELAY_CYCLES);
+
+        bus.vblank_count =
+            generation + super::BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS + 1;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        for address in &packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        bus.write_u32(otc_high, packets[0]);
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_fingerprint
+                .map(|current| current.same_content_as(first_fingerprint)),
+            Some(true)
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.duplicate_chain_replay_skips, 0,
+            "identical packet content must be revisited once its one-shot body expires"
+        );
+        assert_eq!(bus.native_otc_dma_recovery.submissions, 2);
+        assert_eq!(bus.native_otc_dma_recovery.last_recovered_chain_words, 0);
+        assert_ne!(
+            bus.native_otc_dma_recovery.last_reason,
+            "skipped_duplicate_recovered_chain"
         );
     }
 
@@ -19871,6 +24405,11 @@ mod tests {
             bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
             1
         );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
+        );
     }
 
     #[test]
@@ -20025,6 +24564,35 @@ mod tests {
     }
 
     #[test]
+    fn stale_gpu_dma_recovery_arms_after_a_mature_guest_stalls_without_resuming() {
+        let mut recovery = NativeOtcDmaRecoveryStats::default();
+        let last_guest_vblank = BR2_NATIVE_OTC_DMA_RECOVERY_MIN_GUEST_RESUME_VBLANK + 152;
+        recovery.observe_guest_linked_list_dma(last_guest_vblank);
+
+        recovery.arm_after_sustained_guest_stall(
+            last_guest_vblank + BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS - 1,
+        );
+        assert!(!recovery.armed_after_guest_resume);
+
+        recovery.arm_after_sustained_guest_stall(
+            last_guest_vblank + BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS,
+        );
+        assert!(recovery.armed_after_guest_resume);
+    }
+
+    #[test]
+    fn stale_gpu_dma_recovery_does_not_arm_an_early_boot_stall() {
+        let mut recovery = NativeOtcDmaRecoveryStats::default();
+        let last_guest_vblank = BR2_NATIVE_OTC_DMA_RECOVERY_MIN_GUEST_RESUME_VBLANK - 1;
+        recovery.observe_guest_linked_list_dma(last_guest_vblank);
+        recovery.arm_after_sustained_guest_stall(
+            last_guest_vblank + BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS + 1_000,
+        );
+
+        assert!(!recovery.armed_after_guest_resume);
+    }
+
+    #[test]
     fn stale_gpu_dma_recovery_does_not_arm_during_boot_long_gap() {
         let mut recovery = NativeOtcDmaRecoveryStats::default();
         recovery.observe_guest_linked_list_dma(100);
@@ -20163,6 +24731,117 @@ mod tests {
     }
 
     #[test]
+    fn stale_gpu_dma_chain_model_replacement_updates_the_preserved_scene() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let stage_packets = [0x003a_6000, 0x003a_6040];
+        let model_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x2000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let scene_x = 100usize;
+        let scene_y = 100usize;
+
+        for word in [0x0200_00ff, 0x0064_0064, 0x0010_0010] {
+            bus.io.gpu.write_gp0(word);
+        }
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        let pre_match_pixel = frame[scene_y * width + scene_x];
+        assert_ne!(pre_match_pixel, 0);
+
+        bus.vblank_count = 100;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+
+        for (index, address) in stage_packets.iter().copied().enumerate() {
+            let next = stage_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = scene_x as u32 + index as u32 * 16;
+            let words = [
+                0x6000_ff00,
+                ((scene_y as u32) << 16) | x,
+                0x0010_0010,
+                0x2e7f_7f7f,
+                0x0161_0170,
+                0x7959_0030,
+                0x0161_0193,
+                0x0039_003f,
+                0x0184_0170,
+                0x0000_0f30,
+                0x0184_0193,
+                0x8039_0f3f,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets.get(index + 1).copied().unwrap_or(otc_high) & 0x00ff_ffff;
+            let x = 180 + index as u32 * 12;
+            let y = 120 + index as u32 * 12;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert!(bus.native_otc_dma_recovery.last_detached_root);
+        assert!(
+            bus.native_otc_dma_recovery.last_stage_packets >= stage_packets.len() as u32,
+            "{}",
+            bus.native_otc_dma_recovery.json()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_model_packets,
+            model_packets.len() as u32
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_reason,
+            "submitted_chain_model_replacement"
+        );
+
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        let replacement_pixel = frame[scene_y * width + scene_x];
+        assert_ne!(replacement_pixel, 0);
+        assert_ne!(replacement_pixel, pre_match_pixel);
+
+        for word in [0x0200_0000, 0x0064_0064, 0x0010_0010] {
+            bus.io.gpu.write_gp0(word);
+        }
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_eq!(frame[scene_y * width + scene_x], 0);
+        assert!(bus.io.gpu.restore_recovery_scene_snapshot());
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_eq!(
+            frame[scene_y * width + scene_x],
+            replacement_pixel,
+            "later HUD-only recovery must restore the match scene, not the pre-match snapshot"
+        );
+    }
+
+    #[test]
     fn stale_gpu_dma_small_detached_root_preserves_the_previous_scene() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.set_unlinked_primitive_replay_enabled(false);
@@ -20264,6 +24943,57 @@ mod tests {
             "detached geometry alone must not be allowed to erase a complete frame"
         );
         assert_ne!(frame[64 * width + 64], 0);
+    }
+
+    #[test]
+    fn native_otc_recovery_chain_nodes_follow_buckets_but_return_only_packets() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let otc_high = 0x0039_dfb0;
+        let otc_low = otc_high - 4;
+        let first_packet = 0x0039_0f80;
+        let second_packet = 0x0039_0fc0;
+
+        bus.write_u32(otc_high, first_packet);
+        bus.write_u32(first_packet + 4, 0xe100_0000);
+        bus.write_u32(first_packet, (1 << 24) | (otc_low & 0x00ff_ffff));
+        bus.write_u32(otc_low, second_packet);
+        bus.write_u32(second_packet + 4, 0xe600_0000);
+        bus.write_u32(second_packet, (1 << 24) | 0x00ff_ffff);
+
+        let packets = bus.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+
+        assert_eq!(packets, HashSet::from([first_packet, second_packet]));
+        assert!(!packets.contains(&otc_high));
+        assert!(!packets.contains(&otc_low));
+    }
+
+    #[test]
+    fn native_otc_recovery_chain_nodes_stop_on_cycles_and_oversized_headers() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let first_bucket = 0x0039_dfb0;
+        let second_bucket = first_bucket - 4;
+
+        bus.write_u32(first_bucket, second_bucket);
+        bus.write_u32(second_bucket, first_bucket);
+        assert!(
+            bus.native_otc_dma_recovery_chain_nodes([first_bucket].into_iter())
+                .is_empty(),
+            "a zero-word OTC cycle must terminate without becoming packet input"
+        );
+
+        let oversized = 0x0039_0f80;
+        let valid_after_oversized = 0x0039_0fc0;
+        bus.write_u32(
+            oversized,
+            ((super::PRIMITIVE_PACKET_MAX_WORDS + 1) << 24) | (valid_after_oversized & 0x00ff_ffff),
+        );
+        bus.write_u32(valid_after_oversized + 4, 0xe100_0000);
+        bus.write_u32(valid_after_oversized, (1 << 24) | 0x00ff_ffff);
+        assert!(
+            bus.native_otc_dma_recovery_chain_nodes([oversized].into_iter())
+                .is_empty(),
+            "an oversized header must stop traversal before its untrusted link"
+        );
     }
 
     #[test]
@@ -20383,7 +25113,279 @@ mod tests {
     }
 
     #[test]
-    fn stale_gpu_dma_trusted_current_chain_keeps_partial_live_model_pose() {
+    fn stale_gpu_dma_trusted_current_chain_does_not_duplicate_complete_live_model() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let stage_packets = [0x003a_6000, 0x003a_6040];
+        let standalone_model_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x4800 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let current_model_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x5800 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let generation = 3_255;
+        let model_words = |x: u32, y: u32| {
+            [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ]
+        };
+
+        bus.io.gpu.ensure_recovery_scene_snapshot();
+        for tile_y in 0..15u32 {
+            for tile_x in 0..16u32 {
+                let color = if (tile_x + tile_y).is_multiple_of(2) {
+                    0x0200_7fff
+                } else {
+                    0x027f_ff00
+                };
+                for word in [
+                    color,
+                    ((tile_y * 16) << 16) | (tile_x * 16),
+                    (16 << 16) | 16,
+                ] {
+                    bus.io.gpu.write_gp0(word);
+                }
+            }
+        }
+        bus.io.gpu.capture_vblank_presented_frame();
+
+        bus.vblank_count = generation;
+        for (index, address) in standalone_model_packets.iter().copied().enumerate() {
+            let words = model_words(80 + index as u32 * 12, 96 + index as u32 * 16);
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            let next = standalone_model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        for (index, address) in stage_packets.iter().copied().enumerate() {
+            let next = stage_packets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(current_model_packets[0])
+                & 0x00ff_ffff;
+            let words = [
+                0x2e7f_7f7f,
+                0x0161_0170,
+                0x7959_0030,
+                0x0161_0193,
+                0x0039_003f,
+                0x0184_0170,
+                0x0000_0f30,
+                0x0184_0193,
+                0x8039_0f3f,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        for (index, address) in current_model_packets.iter().copied().enumerate() {
+            let words = model_words(176 + index as u32 * 12, 112 + index as u32 * 16);
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            let next = current_model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        bus.write_u32(otc_high, stage_packets[0]);
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            generation - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(&chain_nodes, Some(generation)),
+            (Some(generation), BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+        );
+        let mut standalone_probe = bus.clone();
+        assert!(
+            standalone_probe
+                .replay_recent_br2_character_model_packets_for_scene(&chain_nodes, Some(generation))
+                .1
+                >= BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS,
+            "the fixture must contain a standalone model generation that would be duplicated"
+        );
+
+        assert!(
+            bus.process_vblank_native_otc_dma_recovery(),
+            "{}",
+            bus.native_otc_dma_recovery.json()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_model_packets,
+            current_model_packets.len() as u32
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_model_packets, 0,
+            "a complete trusted current model must suppress standalone model replay"
+        );
+        assert!(
+            bus.native_otc_dma_recovery.last_recovered_chain_words > 0,
+            "the trusted current chain itself must still be submitted"
+        );
+    }
+
+    #[test]
+    fn stale_gpu_dma_sparse_current_chain_replacement_preserves_dense_match_scene() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let stage_packets = [0x003a_6000, 0x003a_6040];
+        let model_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x2000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        bus.io.gpu.ensure_recovery_scene_snapshot();
+        for tile_y in 0..15u32 {
+            for tile_x in 0..16u32 {
+                let color = if (tile_x + tile_y).is_multiple_of(2) {
+                    0x0200_7fff
+                } else {
+                    0x027f_ff00
+                };
+                for word in [
+                    color,
+                    ((tile_y * 16) << 16) | (tile_x * 16),
+                    (16 << 16) | 16,
+                ] {
+                    bus.io.gpu.write_gp0(word);
+                }
+            }
+        }
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        let preserved_pixel = frame[16 * width + 16];
+        assert_ne!(preserved_pixel, 0);
+        bus.io.gpu.capture_vblank_presented_frame();
+        let gpu_before_recovery = bus.io.gpu.clone();
+
+        bus.vblank_count = 3_255;
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+
+        for (index, address) in stage_packets.iter().copied().enumerate() {
+            let next = stage_packets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(model_packets[0])
+                & 0x00ff_ffff;
+            let x = 96 + index as u32 * 48;
+            let words = [
+                0x2e7f_7f7f,
+                0x0060_0000 | x,
+                0x7959_0030,
+                0x0060_0024 | x,
+                0x0039_003f,
+                0x0084_0000 | x,
+                0x0000_0f30,
+                0x0084_0024 | x,
+                0x8039_0f3f,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 176 + index as u32 * 18;
+            let y = 128 + index as u32 * 20;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+        bus.write_u32(otc_high, stage_packets[0]);
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_stage_generation(&chain_nodes)
+                .1,
+            stage_packets.len()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(
+                &chain_nodes,
+                Some(bus.vblank_count)
+            ),
+            (
+                Some(bus.vblank_count),
+                BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS
+            )
+        );
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert!(!bus.native_otc_dma_recovery.last_detached_root);
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_reason,
+            "preserved_sparse_current_otc_replacement",
+            "{}",
+            bus.io
+                .gpu
+                .native_replay_validation_probe_json(Some(&gpu_before_recovery))
+        );
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_eq!(
+            frame[16 * width + 16],
+            preserved_pixel,
+            "a sparse live foreground delta must remain over the last dense match scene"
+        );
+
+        for word in [0x0200_0000, 0x0010_0010, 0x0008_0008] {
+            bus.io.gpu.write_gp0(word);
+        }
+        bus.io.gpu.restore_recovery_scene_snapshot();
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_eq!(
+            frame[16 * width + 16],
+            preserved_pixel,
+            "rollback must promote the verified dense frame over an older sparse snapshot"
+        );
+    }
+
+    #[test]
+    fn stale_gpu_dma_trusted_current_chain_rejects_partial_model_generation() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.set_unlinked_primitive_replay_enabled(false);
         let otc_high = 0x003a_213c;
@@ -20451,19 +25453,414 @@ mod tests {
 
         assert!(bus.process_vblank_native_otc_dma_recovery());
         assert_eq!(bus.native_otc_dma_recovery.last_chain_model_packets, 0);
-        assert_eq!(
-            bus.native_otc_dma_recovery.last_chain_draw_reject_reasons
-                [Gp0ReplayDrawRejectReason::ModelPrefilter.index()],
-            0,
-            "trusted current OTC pose deltas must not be relabeled as invalid model overlays"
+        assert!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections
+                >= model_packets.len() as u32,
+            "every partial fighter draw must be rejected before it can corrupt the stable frame"
         );
+        assert_eq!(bus.native_otc_dma_recovery.last_recovered_chain_words, 0);
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
+    }
+
+    #[test]
+    fn stale_gpu_dma_trusted_current_chain_reuses_delayed_idle_model_generation_within_window() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let model_packets = (0..BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x2800 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let generation = 3_100;
+
+        for word in [0x0200_00ff, 0x0010_0010, 0x0008_0008] {
+            bus.io.gpu.write_gp0(word);
+        }
+        bus.vblank_count = generation;
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 112 + (index as u32 % 4) * 16;
+            let y = 96 + (index as u32 / 4) * 32;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count = generation + BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        for address in &model_packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        bus.write_u32(otc_high, model_packets[0]);
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(&chain_nodes, None),
+            (None, 0),
+            "delayed idle vertex payloads are reusable overlays, not a freshly written generation"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes),
+            model_packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>()
+        );
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
         assert_eq!(
             bus.native_otc_dma_recovery
-                .last_chain_unsafe_draw_rejections,
+                .last_chain_model_selection_reason,
+            "selected_reused_current_otc"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_model_packets,
+            model_packets.len() as u32
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
             0
         );
-        assert!(bus.native_otc_dma_recovery.last_recovered_chain_words >= 27);
-        assert!(bus.io.gpu.commands_seen >= commands_before + 27);
+        assert!(
+            bus.native_otc_dma_recovery.last_recovered_chain_words
+                >= (model_packets.len() * 9) as u32
+        );
+    }
+
+    #[test]
+    fn stale_gpu_dma_trusted_current_chain_rejects_mixed_generation_reused_model_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let model_packets = (0..BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x3400 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        for word in [0x0200_00ff, 0x0010_0010, 0x0008_0008] {
+            bus.io.gpu.write_gp0(word);
+        }
+        let commands_before = bus.io.gpu.commands_seen;
+
+        bus.vblank_count = 2_230;
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 112 + (index as u32 % 4) * 16;
+            let y = 96 + (index as u32 / 4) * 32;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count = 2_422;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        for address in &model_packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        bus.write_u32(otc_high, model_packets[0]);
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(
+                &chain_nodes,
+                Some(bus.vblank_count),
+            ),
+            (None, 0),
+            "fresh headers at vblank 2422 must not promote vblank 2230 model bodies"
+        );
+        assert!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes)
+                .is_empty(),
+            "the reusable-current fallback must also enforce header/body generation coherence"
+        );
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert_ne!(
+            bus.native_otc_dma_recovery
+                .last_chain_model_selection_reason,
+            "selected_reused_current_otc"
+        );
+        assert_eq!(bus.native_otc_dma_recovery.last_chain_model_packets, 0);
+        assert_eq!(bus.native_otc_dma_recovery.last_recovered_chain_words, 0);
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
+    }
+
+    #[test]
+    fn stale_gpu_dma_trusted_current_chain_rejects_obsolete_high_ram_beast_generation() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let model_packets = (0..BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x800 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let generation = 2_614;
+
+        bus.vblank_count = generation;
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 112 + (index as u32 % 4) * 16;
+            let y = 96 + (index as u32 / 4) * 32;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x781e_0000,
+                (y << 16) | (x + 16),
+                0x000e_0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count =
+            generation + BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS.saturating_add(1);
+        for address in &model_packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([model_packets[0]].into_iter());
+        assert_eq!(chain_nodes.len(), model_packets.len());
+        assert!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes)
+                .is_empty(),
+            "fresh OTC headers must not make an obsolete high-RAM Beast body reusable"
+        );
+
+        let first_packet = model_packets[0];
+        let commands = (0..9)
+            .map(|index| {
+                let address = first_packet + 4 + index * 4;
+                (address, bus.read_u32(address))
+            })
+            .collect::<Vec<_>>();
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+            0,
+            "the trusted current OTC writer must reject the stale Beast payload"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            1
+        );
+    }
+
+    #[test]
+    fn stale_reused_current_model_draws_cannot_replace_dense_scene_snapshot() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let stage_packets = [0x003a_6000, 0x003a_6040];
+        let model_packets = (0..BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x3000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let model_generation = 3_100;
+
+        for tile_y in 0..15u32 {
+            for tile_x in 0..16u32 {
+                let color = if (tile_x + tile_y).is_multiple_of(2) {
+                    0x0200_7fff
+                } else {
+                    0x027f_ff00
+                };
+                for word in [
+                    color,
+                    ((tile_y * 16) << 16) | (tile_x * 16),
+                    (16 << 16) | 16,
+                ] {
+                    bus.io.gpu.write_gp0(word);
+                }
+            }
+        }
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        let preserved_pixel = frame[16 * width + 16];
+        assert_ne!(preserved_pixel, 0);
+
+        bus.vblank_count = model_generation;
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 112 + (index as u32 % 4) * 16;
+            let y = 96 + (index as u32 / 4) * 32;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count =
+            model_generation + BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS.saturating_add(1);
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+
+        for (index, address) in stage_packets.iter().copied().enumerate() {
+            let next = stage_packets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(model_packets[0])
+                & 0x00ff_ffff;
+            let x = 96 + index as u32 * 48;
+            let words = [
+                0x2e7f_7f7f,
+                0x0060_0000 | x,
+                0x7959_0030,
+                0x0060_0024 | x,
+                0x0039_003f,
+                0x0084_0000 | x,
+                0x0000_0f30,
+                0x0084_0024 | x,
+                0x8039_0f3f,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+        for address in &model_packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        bus.write_u32(otc_high, stage_packets[0]);
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([otc_high].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_stage_generation(&chain_nodes)
+                .1,
+            stage_packets.len()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(
+                &chain_nodes,
+                Some(bus.vblank_count)
+            ),
+            (None, 0),
+            "fresh packet headers must not promote stale fighter bodies to a current generation"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes),
+            HashSet::new()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_incomplete_scene_stage_overlay_draws(&chain_nodes),
+            stage_packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>(),
+            "a stage overlay must not be replayed without the matching fighter generation"
+        );
+
+        assert!(bus.process_vblank_native_otc_dma_recovery());
+        assert_ne!(
+            bus.native_otc_dma_recovery
+                .last_chain_model_selection_reason,
+            "selected_reused_current_otc"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_model_generation, 0,
+            "reusable stale draws are an overlay, not an atomic current model generation"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_reason,
+            "submitted_preserved_incomplete_model_scene"
+        );
+        assert!(
+            bus.native_otc_dma_recovery.last_recovered_chain_words
+                < (stage_packets.len() * 9) as u32,
+            "mixed-generation fighter and stage packets must not cover the stable scene"
+        );
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_eq!(
+            frame[16 * width + 16],
+            preserved_pixel,
+            "stage plus reusable fighter overlays must preserve the dense match scene"
+        );
+
+        for word in [0x0200_0000, 0x0010_0010, 0x0008_0008] {
+            bus.io.gpu.write_gp0(word);
+        }
+        bus.io.gpu.restore_recovery_scene_snapshot();
+        let (width, _, frame) = bus.io.display_rgb_frame();
+        assert_eq!(
+            frame[16 * width + 16],
+            preserved_pixel,
+            "an overlay-only recovery must not replace the stable scene snapshot"
+        );
     }
 
     #[test]
@@ -20544,6 +25941,951 @@ mod tests {
                 .is_empty(),
             "an annular transformation effect must remain eligible over a preserved scene"
         );
+        assert!(
+            bus.native_otc_dma_recovery_chain_has_annular_model_effect(&chain_nodes),
+            "the recovery transaction must preserve the complete scene while the Beast ring is active"
+        );
+        assert!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes)
+                .is_empty(),
+            "an annular Beast effect must not be promoted to a reusable complete fighter"
+        );
+        let annular_draws = packets
+            .iter()
+            .map(|address| address + 4)
+            .collect::<HashSet<_>>();
+        let (active, expired) =
+            bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+        assert_eq!(
+            active, annular_draws,
+            "fresh body writes keep the transient Beast ring active"
+        );
+        assert!(
+            expired.is_empty(),
+            "fresh annular effects must not be suppressed before their vblank window expires"
+        );
+
+        bus.vblank_count =
+            generation + super::BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS + 1;
+        for address in &packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        let (active, expired) =
+            bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+        assert!(active.is_empty());
+        assert_eq!(
+            expired, annular_draws,
+            "fresh OTC headers must not revive an expired transformation ring"
+        );
+        assert!(
+            !bus.native_otc_dma_recovery_chain_has_annular_model_effect(&chain_nodes),
+            "expired annular effects must not block a later complete-scene replacement"
+        );
+
+        let first_packet = packets[0];
+        let commands = (0..9)
+            .map(|index| {
+                let address = first_packet + 4 + index * 4;
+                (address, bus.read_u32(address))
+            })
+            .collect::<Vec<_>>();
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        let commands_before = bus.io.gpu.commands_seen;
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                Some(&expired),
+                Some(&expired),
+                false,
+                false,
+            ),
+            0,
+            "expired annular suppression must win even if stale-body exemptions contain the draw"
+        );
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            0
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
+        );
+        assert!(
+            !super::native_otc_recovered_chain_is_severely_corrupt(&bus.native_otc_dma_recovery),
+            "expired effects must be silently suppressed instead of rolling recovery back"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_annular_effect_requires_body_generation_even_with_fresh_header() {
+        fn write_raw_ram_u32(bus: &mut Bus, address: u32, value: u32) {
+            let offset = address as usize;
+            bus.ram[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packets = (0..12)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x1400 + index * 0x28)
+            .collect::<Vec<_>>();
+        let positions = [
+            (294, 285),
+            (252, 254),
+            (230, 205),
+            (230, 141),
+            (237, 89),
+            (270, 62),
+            (318, 62),
+            (364, 70),
+            (398, 110),
+            (409, 171),
+            (384, 229),
+            (345, 271),
+        ];
+        let sizes = [
+            (55, 35),
+            (51, 58),
+            (40, 66),
+            (29, 69),
+            (46, 64),
+            (52, 49),
+            (55, 35),
+            (52, 58),
+            (39, 66),
+            (28, 69),
+            (47, 64),
+            (53, 49),
+        ];
+
+        for (index, address) in packets.iter().copied().enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let (x, y) = positions[index];
+            let (width, height) = sizes[index];
+            let words = [
+                0x2e80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + width - 1),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + height - 1) << 16) | x,
+                0,
+                ((y + height - 1) << 16) | (x + width - 1),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                write_raw_ram_u32(&mut bus, address + 4 + word_index as u32 * 4, word);
+            }
+            write_raw_ram_u32(&mut bus, address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count = 512;
+        for address in &packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        let annular_draws = packets
+            .iter()
+            .map(|address| address + 4)
+            .collect::<HashSet<_>>();
+        assert!(
+            packets.iter().all(|address| bus
+                .primitive_ram_writes
+                .word_write_vblank(address + 4)
+                .is_none()),
+            "the fixture must have fresh headers but no body-write generation"
+        );
+        let (active, expired) =
+            bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+        assert!(
+            active.is_empty(),
+            "header freshness alone must not keep a transient Beast ring active"
+        );
+        assert_eq!(
+            expired, annular_draws,
+            "unprovenanced annular bodies are expired so they cannot loop forever"
+        );
+        assert!(!bus.native_otc_dma_recovery_chain_has_annular_model_effect(&chain_nodes));
+
+        let first_packet = packets[0];
+        let commands = (0..9)
+            .map(|index| {
+                let address = first_packet + 4 + index * 4;
+                (address, bus.read_u32(address))
+            })
+            .collect::<Vec<_>>();
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        let commands_before = bus.io.gpu.commands_seen;
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                Some(&expired),
+                None,
+                false,
+                false,
+            ),
+            0
+        );
+        assert_eq!(
+            bus.io.gpu.commands_seen, commands_before,
+            "expired annular payload must not be submitted to the GPU"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            0
+        );
+    }
+
+    #[test]
+    fn captured_p2_beast_wide_band_component_is_annular() {
+        let bounds = |min_x, max_x, min_y, max_y| super::Gp0DrawBounds {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            has_visible_x: min_x <= 576 && max_x >= -64,
+            zero_vertices: 0,
+            zero_texture_words: 0,
+            command_like_texture_words: 4,
+            primitive_pointer_words: 1,
+        };
+        let captured = [
+            (0x0038_bef0, bounds(-309, -43, 295, 413)),
+            (0x0038_bf30, bounds(-309, -46, 274, 413)),
+            (0x0038_c07c, bounds(206, 351, 228, 283)),
+            (0x0038_c11c, bounds(349, 505, 228, 289)),
+            (0x0038_c16c, bounds(206, 353, 191, 231)),
+            (0x0038_c20c, bounds(349, 505, 191, 236)),
+        ];
+        assert!(
+            super::br2_character_model_draw_group_is_annular_effect(
+                (BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a),
+                &captured,
+            ),
+            "the captured six-strip P2 Beast band must not become a reusable fighter generation"
+        );
+        let captured_continuation = [
+            (0x0038_c9d4, bounds(351, 502, 173, 209)),
+            (0x0038_cac4, bounds(351, 502, 148, 176)),
+        ];
+        let complete_effect = captured
+            .into_iter()
+            .chain(captured_continuation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::br2_character_model_annular_effect_draw_addresses(
+                (BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a),
+                &complete_effect,
+            ),
+            complete_effect
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<HashSet<_>>(),
+            "the detached two-strip continuation belongs to the same Beast effect"
+        );
+        let draws_by_texture = HashMap::from([(
+            (BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a),
+            complete_effect.clone(),
+        )]);
+        assert_eq!(
+            super::br2_character_model_rejected_draw_addresses(&draws_by_texture, true),
+            complete_effect
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<HashSet<_>>(),
+            "all eight transient strips must be excluded from model generation selection"
+        );
+
+        let compact_fighter = [
+            (0x0038_bef0, bounds(244, 263, 317, 334)),
+            (0x0038_bf30, bounds(365, 398, 300, 309)),
+            (0x0038_c07c, bounds(374, 413, 336, 357)),
+            (0x0038_c11c, bounds(332, 383, 348, 359)),
+            (0x0038_c16c, bounds(374, 413, 321, 348)),
+            (0x0038_c20c, bounds(333, 383, 329, 351)),
+        ];
+        assert!(
+            !super::br2_character_model_draw_group_is_annular_effect(
+                (BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a),
+                &compact_fighter,
+            ),
+            "a compact six-draw fighter component must remain reusable"
+        );
+    }
+
+    #[test]
+    fn compact_32_draw_character_generation_is_not_classified_as_annular() {
+        let bounds = |min_x, max_x, min_y, max_y| super::Gp0DrawBounds {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            has_visible_x: true,
+            zero_vertices: 0,
+            zero_texture_words: 0,
+            command_like_texture_words: 4,
+            primitive_pointer_words: 1,
+        };
+        let mut draws = Vec::new();
+        for index in 0..16u32 {
+            let x = 244 + (index % 4) as i32 * 42;
+            let y = 300 + (index / 4) as i32 * 18;
+            draws.push((0x0038_bef0 + index * 0x28, bounds(x, x + 40, y, y + 20)));
+        }
+        for index in 0..16u32 {
+            let x = 284 + (index % 4) as i32 * 30;
+            let y = 202 + (index / 4) as i32 * 12;
+            draws.push((0x0038_c9d4 + index * 0x28, bounds(x, x + 24, y, y + 10)));
+        }
+        let descriptor = (BR2_CHARACTER_MODEL_TEXTURE_PAGE, 0x799a);
+        assert!(
+            super::br2_character_model_annular_effect_draw_addresses(descriptor, &draws).is_empty(),
+            "the captured compact 32-draw idle pose must remain a fighter generation"
+        );
+        assert!(
+            super::br2_character_model_rejected_draw_addresses(
+                &HashMap::from([(descriptor, draws)]),
+                true,
+            )
+            .is_empty(),
+            "compact fighter components must survive grouped geometry validation"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_rejects_captured_oversized_7959_stage_model_alias_group() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet_addresses = [
+            0x0039_2f74,
+            0x0039_3034,
+            0x0039_30f4,
+            0x0039_31b4,
+            0x0039_3274,
+            0x0039_3334,
+        ];
+        let pack_xy =
+            |x: i32, y: i32| -> u32 { ((y as u32) & 0x07ff) << 16 | ((x as u32) & 0x07ff) };
+
+        for (index, packet_address) in packet_addresses.iter().copied().enumerate() {
+            let x = 360 - index as i32;
+            let y = -113 + index as i32 * 31;
+            let words = [
+                0x2e80_8080,
+                pack_xy(x, y),
+                0x7959_0070,
+                pack_xy(x + 346, y),
+                0x0059_007f,
+                pack_xy(x, y + 346),
+                0x001c_0f70,
+                pack_xy(x + 346, y + 346),
+                0x001c_0f7f,
+            ];
+            let next = packet_addresses
+                .get(index + 1)
+                .copied()
+                .unwrap_or(0x00ff_ffff);
+            write_primitive_packet(&mut bus, packet_address, &words, next);
+        }
+
+        let chain_nodes =
+            bus.native_otc_dma_recovery_chain_nodes([packet_addresses[0]].into_iter());
+        let expected = packet_addresses
+            .iter()
+            .map(|address| address + 4)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes),
+            expected,
+            "the six captured screen-covering 0x7959 aliases must be blocked before GPU submission"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_expires_alternate_beast_rings_from_vertex_age() {
+        fn assert_ring_lifecycle(clut: u16) {
+            let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+            let generation = 2_764;
+            let packets = (0..12)
+                .map(|index| 0x0039_4200 + index * 0x28)
+                .collect::<Vec<_>>();
+            let positions = [
+                (32, 35),
+                (226, 35),
+                (278, 35),
+                (472, 35),
+                (32, 424),
+                (124, 424),
+                (380, 424),
+                (472, 424),
+                (40, 43),
+                (286, 43),
+                (40, 432),
+                (388, 432),
+            ];
+            let sizes = [
+                (9, 9),
+                (9, 9),
+                (9, 9),
+                (9, 9),
+                (9, 9),
+                (9, 9),
+                (9, 9),
+                (9, 9),
+                (187, 9),
+                (187, 9),
+                (85, 9),
+                (85, 9),
+            ];
+
+            bus.vblank_count = generation;
+            for (index, packet) in packets.iter().copied().enumerate() {
+                let next = packets
+                    .get(index + 1)
+                    .copied()
+                    .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+                let (x, y) = positions[index];
+                let (width, height) = sizes[index];
+                let words = [
+                    0x2d7f_7f7f,
+                    (y << 16) | x,
+                    u32::from(clut) << 16,
+                    (y << 16) | (x + width - 1),
+                    u32::from(0x000e_u16) << 16 | (width - 1),
+                    ((y + height - 1) << 16) | x,
+                    (height - 1) << 8,
+                    ((y + height - 1) << 16) | (x + width - 1),
+                    (height - 1) << 8 | (width - 1),
+                ];
+                for (word_index, word) in words.iter().copied().enumerate() {
+                    bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+                }
+                bus.write_u32(packet, ((words.len() as u32) << 24) | next);
+            }
+
+            let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+            let draws = packets
+                .iter()
+                .map(|packet| packet + 4)
+                .collect::<HashSet<_>>();
+            let (active, expired) =
+                bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+            assert_eq!(active, draws, "fresh alternate Beast ring must render");
+            assert!(expired.is_empty());
+
+            bus.vblank_count =
+                generation + super::BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS + 1;
+            for packet in &packets {
+                let header = bus.read_u32(*packet);
+                bus.write_u32(*packet, header);
+                let texture_page_word = bus.read_u32(*packet + 20);
+                bus.write_u32(*packet + 20, texture_page_word);
+            }
+
+            let (active, expired) =
+                bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+            assert!(
+                active.is_empty(),
+                "fresh headers and descriptors must not revive stale ring vertices"
+            );
+            assert_eq!(expired, draws);
+        }
+
+        assert_ring_lifecycle(0x781e);
+        assert_ring_lifecycle(0x785e);
+    }
+
+    #[test]
+    fn alternate_beast_descriptor_single_stage_quad_is_not_annular() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0039_8000;
+        let generation = 1_900;
+        let stage_quad = [
+            0x2d7f_7f7f,
+            0x0033_0028,
+            0x781e_a020,
+            0x0033_00e2,
+            0x000e_a027,
+            0x003b_0028,
+            0x0146_a828,
+            0x003b_00e2,
+            0x0146_a82f,
+        ];
+
+        bus.vblank_count = generation;
+        for (index, word) in stage_quad.iter().copied().enumerate() {
+            bus.write_u32(packet + 4 + index as u32 * 4, word);
+        }
+        bus.write_u32(packet, ((stage_quad.len() as u32) << 24) | 0x00ff_ffff);
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packet].into_iter());
+
+        bus.vblank_count =
+            generation + super::BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS + 1;
+        let header = bus.read_u32(packet);
+        bus.write_u32(packet, header);
+        let (active, expired) =
+            bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+        assert!(active.is_empty());
+        assert!(
+            expired.is_empty(),
+            "a lone rectangular stage quad sharing 0x000e/0x781e must remain stage geometry"
+        );
+    }
+
+    #[test]
+    fn nontrusted_recovered_chain_silently_suppresses_expired_annular_effect() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let generation = 1_480;
+        let packets = (0..12)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x1c00 + index * 0x28)
+            .collect::<Vec<_>>();
+        let positions = [
+            (294, 285),
+            (252, 254),
+            (230, 205),
+            (230, 141),
+            (237, 89),
+            (270, 62),
+            (318, 62),
+            (364, 70),
+            (398, 110),
+            (409, 171),
+            (384, 229),
+            (345, 271),
+        ];
+
+        bus.vblank_count = generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let (x, y) = positions[index];
+            let words = [
+                0x2e80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 40),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 40) << 16) | x,
+                0,
+                ((y + 40) << 16) | (x + 40),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count =
+            generation + super::BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS + 1;
+        for address in &packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        let (_, expired) =
+            bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+        assert_eq!(
+            expired,
+            packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>()
+        );
+
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        let commands_before = bus.io.gpu.commands_seen;
+        assert_eq!(
+            bus.process_gpu_linked_list_dma_with_policy_shared_nodes_and_rejections(
+                packets[0],
+                true,
+                false,
+                false,
+                false,
+                None,
+                None,
+                Some(&expired),
+                Some(&expired),
+            ),
+            0,
+            "detached recovery must not replay an expired one-shot Beast ring"
+        );
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
+        assert_eq!(bus.native_otc_dma_recovery.last_chain_submitted_ranges, 0);
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            0
+        );
+        assert!(!super::native_otc_recovered_chain_is_severely_corrupt(
+            &bus.native_otc_dma_recovery
+        ));
+    }
+
+    #[test]
+    fn high_bank_transient_stage_effect_requires_fresh_body_generation() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0038_d400;
+        let effect = [
+            0x2d7f_7f7f,
+            0x00c0_00c0,
+            0x791f_0038,
+            0x00c0_0100,
+            0x002f_0078,
+            0x0100_00c0,
+            0x0000_4038,
+            0x0100_0100,
+            0x0000_4078,
+        ];
+
+        assert!(super::gp0_command_is_br2_transient_stage_effect(
+            &effect,
+            (0, 0)
+        ));
+
+        bus.vblank_count = 2_048;
+        for (index, word) in effect.iter().copied().enumerate() {
+            bus.write_u32(packet + 4 + index as u32 * 4, word);
+        }
+        bus.write_u32(packet, ((effect.len() as u32) << 24) | 0x00ff_ffff);
+
+        let commands = effect
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (packet + 4 + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        assert!(
+            !bus.gpu_recovery_command_range_is_stale_transient_foreground_effect(
+                &commands,
+                0..commands.len(),
+                &effect,
+            )
+        );
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+            effect.len(),
+            "fresh high-bank impact effects remain replayable"
+        );
+
+        bus.vblank_count = 2_048 + super::BR2_TRANSIENT_FOREGROUND_EFFECT_MAX_AGE_VBLANKS + 1;
+        let header = bus.read_u32(packet);
+        bus.write_u32(packet, header);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        let commands_before = bus.io.gpu.commands_seen;
+        assert!(
+            bus.gpu_recovery_command_range_is_stale_transient_foreground_effect(
+                &commands,
+                0..commands.len(),
+                &effect,
+            )
+        );
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+            0,
+            "a refreshed OTC header must not retrigger an old impact effect body"
+        );
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            1
+        );
+    }
+
+    fn high_bank_transient_foreground_effect_words() -> [u32; 9] {
+        [
+            0x2d7f_7f7f,
+            0x00c0_00c0,
+            0x791f_0038,
+            0x00c0_0100,
+            0x002f_0078,
+            0x0100_00c0,
+            0x0000_4038,
+            0x0100_0100,
+            0x0000_4078,
+        ]
+    }
+
+    fn persistent_stage_material_quad_words() -> [u32; 9] {
+        [
+            0x2c80_8080,
+            0x00b4_0000,
+            0x7d18_0000,
+            0x00b4_0040,
+            0x000c_0040,
+            0x00f4_0000,
+            0x0000_4000,
+            0x00f4_0040,
+            0x0000_4040,
+        ]
+    }
+
+    fn write_primitive_packet(bus: &mut Bus, packet: u32, words: &[u32], next: u32) {
+        for (index, word) in words.iter().copied().enumerate() {
+            bus.write_u32(packet + 4 + index as u32 * 4, word);
+        }
+        bus.write_u32(packet, ((words.len() as u32) << 24) | (next & 0x00ff_ffff));
+    }
+
+    #[test]
+    fn latest_otc_replay_skips_stale_transient_foreground_effect_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0038_d540;
+        let otc_high = 0x0039_ffec;
+        let effect = high_bank_transient_foreground_effect_words();
+
+        bus.vblank_count = 2_100;
+        write_primitive_packet(&mut bus, packet, &effect, 0x00ff_ffff);
+
+        bus.vblank_count = 2_100 + super::BR2_TRANSIENT_FOREGROUND_EFFECT_MAX_AGE_VBLANKS + 1;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        let next_bucket = bus.read_u32(otc_high);
+        bus.write_u32(
+            packet,
+            ((effect.len() as u32) << 24) | (next_bucket & 0x00ff_ffff),
+        );
+        bus.write_u32(otc_high, packet);
+
+        let commands_before = bus.io.gpu.commands_seen;
+        let mut diagnostics = UnlinkedPrimitiveReplayDiagnostics::default();
+        let replayed = bus.replay_latest_otc_linked_list_with_diagnostics(&mut diagnostics, None);
+
+        assert_eq!(replayed, (0, 0));
+        assert_eq!(
+            bus.io.gpu.commands_seen, commands_before,
+            "latest OTC replay must not loop an expired ground-impact foreground effect"
+        );
+        assert!(diagnostics.otc_chain_terminated);
+    }
+
+    #[test]
+    fn latest_otc_replay_keeps_fresh_transient_foreground_effect_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0038_d580;
+        let otc_high = 0x0039_ffec;
+        let effect = high_bank_transient_foreground_effect_words();
+
+        bus.vblank_count = 2_200;
+        write_primitive_packet(&mut bus, packet, &effect, 0x00ff_ffff);
+
+        bus.vblank_count = 2_200 + super::BR2_TRANSIENT_FOREGROUND_EFFECT_MAX_AGE_VBLANKS;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        let next_bucket = bus.read_u32(otc_high);
+        bus.write_u32(
+            packet,
+            ((effect.len() as u32) << 24) | (next_bucket & 0x00ff_ffff),
+        );
+        bus.write_u32(otc_high, packet);
+
+        let commands_before = bus.io.gpu.commands_seen;
+        let mut diagnostics = UnlinkedPrimitiveReplayDiagnostics::default();
+        let replayed = bus.replay_latest_otc_linked_list_with_diagnostics(&mut diagnostics, None);
+
+        assert_eq!(replayed, (1, effect.len()));
+        assert_eq!(
+            bus.io.gpu.commands_seen - commands_before,
+            effect.len() as u64
+        );
+        assert!(diagnostics.otc_chain_terminated);
+    }
+
+    #[test]
+    fn unlinked_replay_skips_stale_transient_foreground_effect_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0038_d5c0;
+        let linked_nodes = HashSet::<u32>::new();
+        let effect = high_bank_transient_foreground_effect_words();
+
+        bus.vblank_count = 3_000;
+        write_primitive_packet(&mut bus, packet, &effect, 0x00ff_ffff);
+
+        bus.vblank_count = 3_000 + super::BR2_TRANSIENT_FOREGROUND_EFFECT_MAX_AGE_VBLANKS + 1;
+        let min_vblank = bus
+            .vblank_count
+            .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
+        bus.write_u32(packet, ((effect.len() as u32) << 24) | 0x00ff_ffff);
+
+        let candidates = bus.collect_recent_header_stale_body_unlinked_primitive_replay_candidates(
+            &linked_nodes,
+            min_vblank,
+            None,
+        );
+        assert!(
+            !candidates.contains_key(&packet),
+            "fresh headers must not turn an expired one-shot foreground effect into a replay candidate"
+        );
+
+        let commands_before = bus.io.gpu.commands_seen;
+        let mut diagnostics = UnlinkedPrimitiveReplayDiagnostics::default();
+        let replayed = bus.replay_recent_unlinked_primitive_packets_with_diagnostics(
+            &linked_nodes,
+            &mut diagnostics,
+            true,
+            true,
+        );
+
+        assert_eq!(replayed, (0, 0));
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
+    }
+
+    #[test]
+    fn unlinked_replay_keeps_persistent_stage_geometry_with_stale_body() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let packet = 0x0038_d600;
+        let linked_nodes = HashSet::<u32>::new();
+        let stage_quad = persistent_stage_material_quad_words();
+
+        assert!(gp0_command_has_playfield_draw_bounds(&stage_quad));
+        assert!(!gp0_replay_safe_draw_command_ranges(&stage_quad).is_empty());
+        bus.vblank_count = 3_100;
+        write_primitive_packet(&mut bus, packet, &stage_quad, 0x00ff_ffff);
+
+        bus.vblank_count = 3_100 + super::BR2_TRANSIENT_FOREGROUND_EFFECT_MAX_AGE_VBLANKS + 1;
+        let min_vblank = bus
+            .vblank_count
+            .saturating_sub(BR2_UNLINKED_PRIMITIVE_REPLAY_VBLANK_WINDOW);
+        bus.write_u32(packet, ((stage_quad.len() as u32) << 24) | 0x00ff_ffff);
+
+        let candidates = bus.collect_recent_header_stale_body_unlinked_primitive_replay_candidates(
+            &linked_nodes,
+            min_vblank,
+            None,
+        );
+        assert!(
+            candidates.contains_key(&packet),
+            "persistent map/stage geometry must not be removed by the transient effect guard"
+        );
+
+        let commands_before = bus.io.gpu.commands_seen;
+        let mut diagnostics = UnlinkedPrimitiveReplayDiagnostics::default();
+        let replayed = bus.replay_recent_unlinked_primitive_packets_with_diagnostics(
+            &linked_nodes,
+            &mut diagnostics,
+            false,
+            true,
+        );
+
+        assert_eq!(replayed, (1, stage_quad.len()));
+        assert_eq!(
+            bus.io.gpu.commands_seen - commands_before,
+            stage_quad.len() as u64
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_expires_captured_large_beast_fragment_without_reusing_it() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let generation = 3_171;
+        let model_packets = (0..BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x3000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let effect_packet = 0x0038_b1b4;
+        let effect_command = effect_packet + 4;
+
+        bus.vblank_count = generation;
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(effect_packet)
+                & 0x00ff_ffff;
+            let x = 112 + (index as u32 % 4) * 16;
+            let y = 96 + (index as u32 / 4) * 32;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        let large_effect_fragment = [
+            0x2c50_5050,
+            0x00c1_073b,
+            0x799a_0000,
+            0x00c1_003c,
+            u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x00ff,
+            0x0126_073b,
+            0x0000_ff00,
+            0x0126_003c,
+            0x0000_ffff,
+        ];
+        bus.write_u32(
+            effect_packet,
+            (large_effect_fragment.len() as u32) << 24 | 0x00ff_ffff,
+        );
+        for (index, word) in large_effect_fragment.iter().copied().enumerate() {
+            bus.write_u32(effect_command + index as u32 * 4, word);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([model_packets[0]].into_iter());
+        let reusable = bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes);
+        assert_eq!(
+            reusable.len(),
+            model_packets.len(),
+            "only the coherent fighter body may be reused"
+        );
+        assert!(
+            !reusable.contains(&effect_command),
+            "the captured 0x0038b1b8 Beast fragment must never become a reusable fighter draw"
+        );
+        let (active, expired) =
+            bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+        assert_eq!(active, HashSet::from([effect_command]));
+        assert!(expired.is_empty());
+
+        bus.vblank_count =
+            generation + super::BR2_CHARACTER_MODEL_ANNULAR_EFFECT_MAX_AGE_VBLANKS + 1;
+        for address in model_packets.iter().copied().chain([effect_packet]) {
+            let header = bus.read_u32(address);
+            bus.write_u32(address, header);
+        }
+        let (active, expired) =
+            bus.native_otc_dma_recovery_chain_annular_model_effect_draws(&chain_nodes);
+        assert!(active.is_empty());
+        assert_eq!(
+            expired,
+            HashSet::from([effect_command]),
+            "the detached Beast fragment must be silently suppressed after its effect window"
+        );
     }
 
     #[test]
@@ -20592,6 +26934,288 @@ mod tests {
                 .map(|address| address + 4)
                 .collect::<HashSet<_>>(),
             "every partial fighter draw must be excluded from the stable-scene overlay"
+        );
+        assert!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes)
+                .is_empty(),
+            "a partial fighter pose must never bypass stale-generation filtering"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_accepts_fresh_low_ram_pose_with_retained_headers() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let retained_header_generation = 700;
+        let pose_generation = 900;
+        let packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| super::BR2_CHARACTER_MODEL_LOW_RAM_START + 0x9000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let model_words = |index: usize| {
+            let x = 128 + index as u32 * 18;
+            let y = 112 + index as u32 * 20;
+            [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x78c3_0000,
+                (y << 16) | (x + 16),
+                0x000b_0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ]
+        };
+
+        bus.vblank_count = retained_header_generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let words = model_words(index);
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count = pose_generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let words = model_words(index);
+            for word_index in [1usize, 3, 5, 7] {
+                bus.write_u32(address + 4 + word_index as u32 * 4, words[word_index]);
+            }
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        let selection =
+            bus.native_otc_dma_recovery_chain_model_selection(&chain_nodes, Some(pose_generation));
+        assert_eq!(selection.generation, Some(pose_generation));
+        assert_eq!(
+            selection.packet_count,
+            BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS
+        );
+        assert_eq!(
+            selection.command_addresses,
+            packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>(),
+            "fresh low-RAM fighter vertices must remain authoritative when packet headers are retained"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_accepts_fresh_low_ram_fighter_without_header_generation() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let pose_generation = 900;
+        let packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| super::BR2_RECOVERY_FIGHTER_MATERIAL_START + 0x1d0 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        bus.vblank_count = pose_generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let x = 128 + index as u32 * 18;
+            let y = 112 + index as u32 * 20;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x7994_0000,
+                (y << 16) | (x + 16),
+                0x001c_0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let header = ((words.len() as u32) << 24) | next;
+            let offset = address as usize;
+            bus.ram[offset..offset + 4].copy_from_slice(&header.to_le_bytes());
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        let selection =
+            bus.native_otc_dma_recovery_chain_model_selection(&chain_nodes, Some(pose_generation));
+
+        assert!(packets.iter().all(|address| {
+            bus.primitive_ram_writes
+                .header_write_vblank(*address)
+                .is_none()
+        }));
+        assert_eq!(selection.generation, Some(pose_generation));
+        assert_eq!(
+            selection.command_addresses,
+            packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_rejects_stale_low_ram_pose_with_refreshed_headers() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let pose_generation = 700;
+        let current_generation = pose_generation + BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS + 1;
+        let packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| super::BR2_CHARACTER_MODEL_LOW_RAM_START + 0xa000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        bus.vblank_count = pose_generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let x = 128 + index as u32 * 18;
+            let y = 112 + index as u32 * 20;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x78c3_0000,
+                (y << 16) | (x + 16),
+                0x000b_0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count = current_generation;
+        for address in &packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(
+                &chain_nodes,
+                Some(current_generation),
+            ),
+            (None, 0),
+            "a refreshed low-RAM packet header must not revive an obsolete fighter body"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_selects_only_the_newest_complete_model_cohort() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let old_generation = 700;
+        let new_generation = old_generation + super::BR2_CHARACTER_MODEL_RECOVERY_GENERATION_SLACK;
+        let old_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x2000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let new_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x3000 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let packets = old_packets
+            .iter()
+            .chain(&new_packets)
+            .copied()
+            .collect::<Vec<_>>();
+
+        for (index, address) in packets.iter().copied().enumerate() {
+            bus.vblank_count = if index < old_packets.len() {
+                old_generation
+            } else {
+                new_generation
+            };
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let cohort_index = index % BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS;
+            let x = if index < old_packets.len() { 96 } else { 224 } + cohort_index as u32 * 18;
+            let y = 112 + cohort_index as u32 * 20;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x799a_0000,
+                (y << 16) | (x + 16),
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 24) << 16) | x,
+                0,
+                ((y + 24) << 16) | (x + 16),
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([old_packets[0]].into_iter());
+        let selection =
+            bus.native_otc_dma_recovery_chain_model_selection(&chain_nodes, Some(new_generation));
+        assert_eq!(selection.generation, Some(new_generation));
+        assert_eq!(
+            selection.packet_count,
+            BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS
+        );
+        assert_eq!(
+            selection.command_addresses,
+            new_packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>(),
+            "the older complete pose must not be replayed beside the newest pose"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_rejects_repeated_model_bounds_as_complete_generation() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let generation = 702;
+        let packets = (0..BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x3800 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        bus.vblank_count = generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let words = [
+                0x2c80_8080,
+                0x0070_0090,
+                0x799a_0000,
+                0x0070_00a0,
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                0x0088_0090,
+                0,
+                0x0088_00a0,
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(&chain_nodes, Some(generation),),
+            (None, 0),
+            "repeated identical bounds must not count as a complete fighter"
+        );
+        assert!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes)
+                .is_empty(),
+            "repeated retained draws must not become a reusable fighter generation"
         );
     }
 
@@ -20644,6 +27268,276 @@ mod tests {
         assert!(
             rejected.is_empty(),
             "a compact fighter generation must remain eligible for replay"
+        );
+        let reusable = bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes);
+        assert_eq!(
+            reusable,
+            packets
+                .iter()
+                .map(|address| address + 4)
+                .collect::<HashSet<_>>(),
+            "a complete bounded current OTC fighter must remain drawable while idle"
+        );
+        assert_eq!(
+            reusable.len(),
+            BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS
+        );
+
+        let stale_vblank = BR2_CHARACTER_MODEL_RECOVERY_MAX_AGE_VBLANKS + 1;
+        bus.vblank_count = stale_vblank;
+        for address in &packets {
+            let header = bus.read_u32(*address);
+            bus.write_u32(*address, header);
+        }
+        let first_packet = packets[0];
+        let commands = (0..9)
+            .map(|index| {
+                let address = first_packet + 4 + index * 4;
+                (address, bus.read_u32(address))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+            0,
+            "the normal recovery writer must still reject stale fighter bodies"
+        );
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                None,
+                Some(&reusable),
+                false,
+                false,
+            ),
+            commands.len(),
+            "only the structurally verified current OTC draw set may reuse stale body words"
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_rejects_current_799a_uv_padding_atlas_strip_false_positive() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let generation = 4_207;
+        let packets = (0..BR2_CHARACTER_MODEL_REUSED_CURRENT_OTC_MIN_DRAWS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x1d00 + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+        let pack_xy =
+            |x: i32, y: i32| -> u32 { ((y as u32) & 0x07ff) << 16 | ((x as u32) & 0x07ff) };
+        let atlas_strip = |x: i32, y: i32| -> [u32; 9] {
+            [
+                0x2e50_5050,
+                pack_xy(x, y),
+                0x799a_d0c0,
+                pack_xy(x + 199, y),
+                0x0039_d0df,
+                pack_xy(x, y + 44),
+                0x8038_dec2,
+                pack_xy(x + 199, y + 44),
+                0x0000_dfdd,
+            ]
+        };
+
+        bus.vblank_count = generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let words = atlas_strip(-16 + (index as i32 % 3) * 4, 64 + index as i32 * 5);
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packets[0]].into_iter());
+        let expected_rejections = packets
+            .iter()
+            .map(|address| address + 4)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes),
+            expected_rejections,
+            "captured 0x0039/0x799a atlas strips must not be treated as live fighter packets"
+        );
+        assert!(
+            bus.native_otc_dma_recovery_reusable_current_model_draws(&chain_nodes)
+                .is_empty(),
+            "atlas strips must not be promoted to reusable current OTC fighter bodies"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(&chain_nodes, Some(generation)),
+            (None, 0),
+            "atlas strips must not form a false positive model generation"
+        );
+
+        let first_packet = packets[0];
+        let first_words = atlas_strip(-16, 64);
+        let first_commands = first_words
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (first_packet + 4 + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        assert!(
+            super::gp0_br2_character_model_replay_command_ranges_for_packet(
+                first_packet,
+                &first_words,
+            )
+            .is_empty(),
+            "the model replay path must not revive the false positive through UV-padding"
+        );
+        let mut direct_bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        direct_bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        assert_eq!(
+            direct_bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &first_commands,
+                0..first_commands.len(),
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+            0,
+            "trusted current OTC must reject the false positive even without a precomputed set"
+        );
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &first_commands,
+                0..first_commands.len(),
+                Some(&expected_rejections),
+                None,
+                None,
+                false,
+                false,
+            ),
+            0,
+            "trusted current OTC replay must reject the false positive before drawing it"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_draw_reject_reasons
+                [Gp0ReplayDrawRejectReason::KnownRecoveryAtlas.index()],
+            1
+        );
+    }
+
+    #[test]
+    fn native_otc_chain_rejects_r2_wide_799a_atlas_strips_with_and_without_pointer_padding() {
+        let packet = 0x0038_c0c0;
+        let pack_xy =
+            |x: i32, y: i32| -> u32 { ((y as u32) & 0x07ff) << 16 | ((x as u32) & 0x07ff) };
+        let wide_pointer_strip = [
+            0x2e50_5050,
+            pack_xy(413, 213),
+            0x799a_d0c0,
+            pack_xy(655, 213),
+            0x0039_d0df,
+            pack_xy(413, 290),
+            0x8038_dec2,
+            pack_xy(655, 290),
+            0x0000_dfdd,
+        ];
+        let wide_non_pointer_strip = [
+            0x2e50_5050,
+            pack_xy(422, 174),
+            0x799a_d0c0,
+            pack_xy(703, 174),
+            0x0039_d0df,
+            pack_xy(422, 214),
+            0x0000_dec2,
+            pack_xy(703, 214),
+            0x0000_dfdd,
+        ];
+
+        for words in [wide_pointer_strip, wide_non_pointer_strip] {
+            let bounds =
+                super::gp0_command_draw_bounds(&words).expect("atlas strip must have bounds");
+            assert!(
+                super::gp0_command_is_br2_current_otc_model_atlas_strip_false_positive_for_packet(
+                    packet, &words, bounds,
+                ),
+                "r2 wide 0x0039/0x799a atlas strips must not be promoted as Beast model replay"
+            );
+            assert_eq!(
+                super::gp0_current_otc_br2_character_model_draw_evaluation_for_packet(
+                    packet,
+                    &words,
+                    (0, 0),
+                ),
+                Err(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas)
+            );
+            assert!(
+                super::gp0_br2_character_model_replay_command_ranges_for_packet(packet, &words)
+                    .is_empty(),
+                "the model replay path must not revive the atlas-strip through UV padding"
+            );
+        }
+    }
+
+    #[test]
+    fn native_otc_recovery_accepts_r2_stage_polyline_packets() {
+        let stage_polyline = [
+            0x4880_4040,
+            0x00d1_00a0,
+            0x00d4_00b4,
+            0x00d7_0097,
+            0x5555_5555,
+        ];
+
+        let bounds = super::gp0_command_draw_bounds(&stage_polyline)
+            .expect("r2 stage polyline must expose drawable bounds");
+        assert_eq!((bounds.min_x, bounds.max_x), (151, 180));
+        assert_eq!((bounds.min_y, bounds.max_y), (209, 215));
+        assert_eq!(
+            gp0_command_replay_draw_reject_reason(&stage_polyline),
+            None,
+            "current OTC stage polylines must not be discarded as no_bounds"
+        );
+        assert_eq!(
+            gp0_otc_replay_safe_draw_command_ranges(&stage_polyline),
+            vec![0..stage_polyline.len()]
+        );
+        assert_eq!(
+            gp0_br2_stage_recovery_command_ranges(&stage_polyline),
+            vec![0..stage_polyline.len()]
+        );
+
+        let commands = stage_polyline
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (0x0004_6604 + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+            commands.len()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
         );
     }
 
@@ -20916,7 +27810,8 @@ mod tests {
         bus.write_u32(hud_packet, (5 << 24) | (next & 0x00ff_ffff));
         bus.write_u32(otc_high, hud_packet);
 
-        assert!(bus.process_vblank_native_otc_dma_recovery());
+        let recovered = bus.process_vblank_native_otc_dma_recovery();
+        eprintln!("{}", bus.native_otc_dma_recovery.json());
 
         assert_eq!(bus.native_otc_dma_recovery.last_stage_packets, 0);
         assert_eq!(
@@ -20929,6 +27824,105 @@ mod tests {
                 .is_empty()
         );
         assert!(bus.native_otc_dma_recovery.last_recovered_chain_words > 0);
+        assert!(recovered, "{}", bus.native_otc_dma_recovery.json());
+    }
+
+    #[test]
+    fn stale_gpu_dma_character_select_overlays_model_without_stage_generation() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_enabled(false);
+        let otc_high = 0x003a_213c;
+        let select_packet = 0x0038_c000;
+        let model_packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + index as u32 * 0x28)
+            .collect::<Vec<_>>();
+
+        for tile_y in 0..15u32 {
+            for tile_x in 0..16u32 {
+                let color = if (tile_x + tile_y).is_multiple_of(2) {
+                    0x0200_7fff
+                } else {
+                    0x027f_ff00
+                };
+                for word in [
+                    color,
+                    ((tile_y * 16) << 16) | (tile_x * 16),
+                    (16 << 16) | 16,
+                ] {
+                    bus.io.gpu.write_gp0(word);
+                }
+            }
+        }
+        bus.io.gpu.ensure_recovery_scene_snapshot();
+
+        bus.vblank_count = 700;
+        for (index, address) in model_packets.iter().copied().enumerate() {
+            let next = model_packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let y = 120 + index as u32 * 8;
+            let words = [
+                0x2c7f_7f7f,
+                (y << 16) | 160,
+                0x799a_0000,
+                (y << 16) | 176,
+                u32::from(BR2_CHARACTER_MODEL_TEXTURE_PAGE) << 16 | 0x0010,
+                ((y + 16) << 16) | 160,
+                0,
+                ((y + 16) << 16) | 176,
+                0x0010_0010,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        bus.vblank_count = 701;
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank =
+            bus.vblank_count - BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_DMA_VBLANKS;
+        bus.native_otc_dma_recovery.armed_after_guest_resume = true;
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, 1);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        let next = bus.read_u32(otc_high);
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        for (index, word) in select_backdrop.iter().copied().enumerate() {
+            bus.write_u32(select_packet + 4 + index as u32 * 4, word);
+        }
+        bus.write_u32(
+            select_packet,
+            ((select_backdrop.len() as u32) << 24) | (next & 0x00ff_ffff),
+        );
+        bus.write_u32(otc_high, select_packet);
+
+        let recovered = bus.process_vblank_native_otc_dma_recovery();
+
+        assert_eq!(bus.native_otc_dma_recovery.last_stage_packets, 0);
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_model_packets,
+            model_packets.len() as u32,
+            "a fresh character-select backdrop must allow its current standalone 3D preview"
+        );
+        assert!(
+            !bus.native_otc_dma_recovery
+                .last_model_selected_packets
+                .is_empty()
+        );
+        assert!(bus.native_otc_dma_recovery.last_recovered_chain_words > 0);
+        assert!(recovered, "{}", bus.native_otc_dma_recovery.json());
     }
 
     #[test]
@@ -23819,6 +30813,73 @@ mod tests {
     }
 
     #[test]
+    fn stale_gpu_dma_recent_header_stream_skips_otc_superseded_by_guest_linked_list() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.set_unlinked_primitive_replay_interval(Some(1));
+        let linked_node = 0x003a_1000;
+        let otc_high = 0x0039_ffec;
+        let packet_count = BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_HEADER_OTC_MIN_HEADERS;
+
+        bus.vblank_count = 8;
+        for index in 0..packet_count {
+            let packet = 0x0038_c000 + index * 0x40;
+            bus.write_u32(packet + 4, 0x2c80_8080);
+            bus.write_u32(packet + 8, 0x0064_0064);
+            bus.write_u32(packet + 12, 0x0001_0001);
+            bus.write_u32(packet + 16, 0x0064_00c8);
+            bus.write_u32(packet + 20, 0x0002_0002);
+            bus.write_u32(packet + 24, 0x00c8_0064);
+            bus.write_u32(packet + 28, 0x0003_0003);
+            bus.write_u32(packet + 32, 0x00c8_00c8);
+            bus.write_u32(packet + 36, 0x0004_0004);
+        }
+        bus.primitive_ram_writes.advance_vblank();
+        bus.primitive_ram_writes.advance_vblank();
+
+        bus.vblank_count = BR2_UNLINKED_PRIMITIVE_REPLAY_STALE_HEADER_OTC_MIN_VBLANK + 8;
+        bus.set_trace_context(0x8000_0100, 100);
+        bus.write_u32(DMA_OTC_MADR, otc_high);
+        bus.write_u32(DMA_OTC_BCR, packet_count);
+        bus.write_u32(DMA_OTC_CHCR, 0x1100_0002);
+        let otc_low = otc_high - (packet_count - 1) * 4;
+        for index in 0..packet_count {
+            let packet = 0x0038_c000 + index * 0x40;
+            let bucket = otc_low + index * 4;
+            let next = bus.read_u32(bucket);
+            bus.write_u32(packet, 0x0900_0000 | (next & 0x00ff_ffff));
+            bus.write_u32(bucket, packet);
+        }
+
+        bus.gpu_linked_list_dma.calls = 1;
+        bus.gpu_linked_list_dma.last_vblank = bus.vblank_count;
+        bus.gpu_linked_list_dma.last_cycles = 200;
+
+        let mut stats = GpuLinkedListDmaRunStats::started(linked_node, linked_node);
+        stats.last_nodes = 1;
+        stats.last_words = 1;
+        stats.last_nonempty_nodes = 1;
+        stats.vblank = 8;
+        stats.visited_nodes.push(linked_node);
+
+        let decision = bus.unlinked_primitive_replay_decision(&stats);
+        assert!(decision.enabled, "{decision:?}");
+        assert_eq!(decision.reason, "stale_gpu_dma_recent_header_stream");
+        let commands_before = bus.io.gpu.commands_seen;
+
+        bus.try_unlinked_primitive_replay(&stats);
+
+        assert_eq!(
+            bus.unlinked_primitive_replay.last_reason,
+            "stale_header_replay_invalidated_by_guest_linked_list"
+        );
+        assert_eq!(bus.unlinked_primitive_replay.last_packets, 0);
+        assert_eq!(
+            bus.io.gpu.commands_seen, commands_before,
+            "an OTC chain superseded by a newer guest linked-list must not be replayed"
+        );
+    }
+
+    #[test]
     fn stale_gpu_dma_replays_each_completed_latest_otc_chain_once() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         bus.set_unlinked_primitive_replay_interval(Some(1));
@@ -24081,6 +31142,81 @@ mod tests {
                 0
             );
             assert_eq!(bus.native_otc_dma_recovery.last_chain_submitted_ranges, 1);
+        }
+    }
+
+    #[test]
+    fn native_otc_recovery_rejects_character_select_preview_without_complete_backdrop() {
+        let preview_slices = [
+            [
+                0x2c80_8080,
+                0x00d8_0001,
+                0x7c1d_0000,
+                0x00d8_0060,
+                0x000d_005f,
+                0x0128_0001,
+                0x0000_5000,
+                0x0128_0060,
+                0x0000_505f,
+            ],
+            [
+                0x2c7f_7f7f,
+                0x0128_0001,
+                0x7c1d_5000,
+                0x0128_0060,
+                0x000d_505f,
+                0x0138_0001,
+                0x0000_6000,
+                0x0138_0060,
+                0x0000_605f,
+            ],
+        ];
+
+        for (slice_index, preview_slice) in preview_slices.into_iter().enumerate() {
+            assert_eq!(
+                gp0_command_replay_draw_reject_reason_with_state(
+                    &preview_slice,
+                    Some(0x020d),
+                    (0, 0),
+                ),
+                Some(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas)
+            );
+
+            for trusted_current_otc_chain in [false, true] {
+                let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+                let packet = 0x0039_2000 + slice_index as u32 * 0x100;
+                bus.vblank_count = 96;
+                bus.write_u32(packet, 0x09ff_ffff);
+                for (index, word) in preview_slice.iter().copied().enumerate() {
+                    bus.write_u32(packet + 4 + index as u32 * 4, word);
+                }
+                bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+                let commands_before = bus.io.gpu.commands_seen;
+
+                let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+                    packet,
+                    true,
+                    trusted_current_otc_chain,
+                    false,
+                    true,
+                    None,
+                );
+
+                assert_eq!(
+                    submitted, 0,
+                    "slice={slice_index}, trusted={trusted_current_otc_chain}"
+                );
+                assert_eq!(bus.io.gpu.commands_seen, commands_before);
+                assert_eq!(
+                    bus.native_otc_dma_recovery
+                        .last_chain_unsafe_draw_rejections,
+                    1
+                );
+                assert_eq!(
+                    bus.native_otc_dma_recovery.last_chain_reject_samples[0].detail,
+                    Some("known_recovery_atlas")
+                );
+            }
         }
     }
 
@@ -24378,6 +31514,777 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn native_otc_recovery_rejects_recent_right_character_select_atlas_without_provenance() {
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        let right_portraits = [
+            [
+                0x2c80_8080,
+                0x0071_01e0,
+                0x7d80_00c0,
+                0x0071_01a0,
+                0x0088_00ff,
+                0x0170_01e0,
+                0x0000_ffc0,
+                0x0170_01a0,
+                0x0000_ffff,
+            ],
+            [
+                0x2c80_8080,
+                0x0071_01a0,
+                0x7d80_0000,
+                0x0071_0120,
+                0x008a_007f,
+                0x0170_01a0,
+                0x0000_ff00,
+                0x0170_0120,
+                0x0000_ff7f,
+            ],
+        ];
+        let backdrop_count = super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS;
+        let backdrop_base = 0x0039_0000;
+        let portrait_packets = [0x0039_1120, 0x0039_1148];
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+
+        bus.vblank_count = 96;
+        for index in 0..backdrop_count {
+            let packet = backdrop_base + index as u32 * 0x40;
+            let next = if index + 1 == backdrop_count {
+                portrait_packets[0]
+            } else {
+                packet + 0x40
+            };
+            bus.write_u32(
+                packet,
+                (select_backdrop.len() as u32) << 24 | (next & 0x00ff_ffff),
+            );
+            for (word_index, word) in select_backdrop.iter().copied().enumerate() {
+                bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+            }
+        }
+        for (index, (packet, portrait)) in portrait_packets
+            .into_iter()
+            .zip(right_portraits)
+            .enumerate()
+        {
+            let next = if index + 1 == right_portraits.len() {
+                0x00ff_ffff
+            } else {
+                portrait_packets[index + 1]
+            };
+            bus.write_u32(packet, (portrait.len() as u32) << 24 | (next & 0x00ff_ffff));
+            for (word_index, word) in portrait.into_iter().enumerate() {
+                bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+            }
+        }
+
+        bus.vblank_count = 128;
+        for packet in portrait_packets {
+            bus.write_u32(packet, bus.read_u32(packet));
+            bus.write_u32(packet + 4, 0x2c40_4040);
+        }
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        assert_eq!(
+            bus.gpu_trusted_current_otc_chain_character_select_context(backdrop_base),
+            (false, true)
+        );
+        let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+            backdrop_base,
+            true,
+            true,
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(
+            submitted,
+            backdrop_count * select_backdrop.len(),
+            "{:?}",
+            bus.native_otc_dma_recovery.last_chain_reject_samples
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            right_portraits.len() as u32
+        );
+        for rejection in &bus.native_otc_dma_recovery.last_chain_reject_samples {
+            assert_eq!(rejection.reason, "unsafe_otc_draw");
+            assert_eq!(rejection.detail, Some("known_recovery_atlas"));
+        }
+    }
+
+    #[test]
+    fn native_otc_recovery_accepts_and_replays_left_select_portrait_with_exact_provenance() {
+        let portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7d40_0000,
+            0x0071_00e0,
+            0x0088_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+        let address = super::BR2_CHARACTER_SELECT_LEFT_LARGE_PORTRAIT_COMMAND_ADDRESS;
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        upload_gpu_image(&mut bus, 512, 0, 128, 240, 0x3210_1234);
+        upload_gpu_image(&mut bus, 0, 496, 256, 1, 0x03e0_001f);
+
+        let commands = portrait
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (address + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                &commands,
+                0..commands.len(),
+                None,
+                None,
+                None,
+                false,
+                true,
+            ),
+            portrait.len()
+        );
+        assert_eq!(
+            bus.br2_retained_character_select_left_portrait
+                .as_ref()
+                .map(|(stored_address, words)| (*stored_address, words.as_slice())),
+            Some((address, portrait.as_slice()))
+        );
+
+        upload_gpu_image(&mut bus, 512, 0, 64, 256, 0x03e0_03e0);
+        upload_gpu_image(&mut bus, 576, 0, 64, 256, 0x03e0_03e0);
+        upload_gpu_image(&mut bus, 0, 496, 16, 16, 0x03e0_03e0);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(512, 0), 0x03e0);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(0, 496), 0x03e0);
+
+        bus.br2_retained_character_select_chain_start = Some(0x0039_0000);
+        assert!(bus.replay_br2_retained_character_select_portrait());
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(512, 0), 0x1234);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(0, 496), 0x001f);
+        assert_eq!(
+            bus.io.gpu.last_recovery_draw_address_for_test(),
+            Some(address),
+            "the restored left portrait must be the final retained select overlay"
+        );
+    }
+
+    #[test]
+    fn native_otc_recovery_accepts_and_replays_right_select_portrait_with_exact_provenance() {
+        let right_portraits = [
+            [
+                0x2c64_6464,
+                0x0071_01e0,
+                0x7d80_00c0,
+                0x0071_01a0,
+                0x0088_00ff,
+                0x0170_01e0,
+                0x0000_ffc0,
+                0x0170_01a0,
+                0x0000_ffff,
+            ],
+            [
+                0x2c64_6464,
+                0x0071_01a0,
+                0x7d80_0000,
+                0x0071_0120,
+                0x008a_007f,
+                0x0170_01a0,
+                0x0000_ff00,
+                0x0170_0120,
+                0x0000_ff7f,
+            ],
+        ];
+        let addresses = [0x0039_1120, 0x0039_1148];
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        upload_gpu_image(&mut bus, 512, 0, 128, 240, 0x3210_1234);
+        upload_gpu_image(&mut bus, 0, 496, 256, 1, 0x03e0_001f);
+        upload_gpu_image(&mut bus, 640, 0, 128, 240, 0x7654_5678);
+        upload_gpu_image(&mut bus, 0, 497, 256, 1, 0x7fff_03e0);
+
+        for (address, portrait) in addresses.into_iter().zip(right_portraits.iter()) {
+            let commands = portrait
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, word)| (address + index as u32 * 4, word))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bus.write_gpu_dma_trusted_linked_list_command_range_with_rejections(
+                    &commands,
+                    0..commands.len(),
+                    None,
+                    None,
+                    None,
+                    false,
+                    true,
+                ),
+                portrait.len()
+            );
+        }
+        assert_eq!(bus.br2_retained_character_select_right_portraits.len(), 2);
+
+        upload_gpu_image(&mut bus, 576, 0, 64, 256, 0x03e0_03e0);
+        upload_gpu_image(&mut bus, 640, 0, 64, 256, 0x03e0_03e0);
+        upload_gpu_image(&mut bus, 0, 496, 16, 16, 0x03e0_03e0);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(608, 0), 0x03e0);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(640, 0), 0x03e0);
+
+        bus.br2_retained_character_select_chain_start = Some(0x0039_0000);
+        assert!(bus.replay_br2_retained_character_select_portrait());
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(608, 0), 0x1234);
+        assert_eq!(bus.io.gpu.framebuffer_raw_pixel_for_test(640, 0), 0x5678);
+        assert_eq!(
+            bus.io.gpu.last_recovery_draw_address_for_test(),
+            Some(addresses[1]),
+            "the second right-side slice must be the final retained select overlay"
+        );
+    }
+
+    #[test]
+    fn trusted_current_otc_keeps_fresh_character_select_preview_with_current_backdrop() {
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        let large_preview = [
+            0x2c10_1010,
+            0x00d8_0001,
+            0x7c1d_0000,
+            0x00d8_0060,
+            0x000d_005f,
+            0x0128_0001,
+            0x0000_5000,
+            0x0128_0060,
+            0x0000_505f,
+        ];
+        let backdrop_packet = 0x0039_0400;
+        let preview_packet = 0x0039_0508;
+
+        for trusted_current_otc_chain in [false, true] {
+            let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+            bus.vblank_count = 96;
+            bus.write_u32(
+                backdrop_packet,
+                (select_backdrop.len() as u32) << 24 | preview_packet,
+            );
+            for (index, word) in select_backdrop.iter().copied().enumerate() {
+                bus.write_u32(backdrop_packet + 4 + index as u32 * 4, word);
+            }
+            bus.write_u32(
+                preview_packet,
+                (large_preview.len() as u32) << 24 | 0x00ff_ffff,
+            );
+            for (index, word) in large_preview.iter().copied().enumerate() {
+                bus.write_u32(preview_packet + 4 + index as u32 * 4, word);
+            }
+            bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+
+            let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+                backdrop_packet,
+                true,
+                trusted_current_otc_chain,
+                false,
+                true,
+                None,
+            );
+
+            if trusted_current_otc_chain {
+                assert_eq!(submitted, select_backdrop.len() + large_preview.len());
+                assert_eq!(
+                    bus.io
+                        .gpu
+                        .recovery_draw_first_word_for_test(preview_packet + 4),
+                    Some(0x2c10_1010),
+                    "a fresh current-generation preview must preserve guest modulation"
+                );
+                assert_eq!(
+                    bus.io.gpu.last_recovery_draw_address_for_test(),
+                    Some(preview_packet + 4)
+                );
+                assert_eq!(
+                    bus.native_otc_dma_recovery
+                        .last_chain_unsafe_draw_rejections,
+                    0
+                );
+                assert_eq!(bus.native_otc_dma_recovery.last_chain_submitted_ranges, 2);
+            } else {
+                assert_eq!(submitted, select_backdrop.len());
+                assert_eq!(
+                    bus.native_otc_dma_recovery
+                        .last_chain_unsafe_draw_rejections,
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_current_otc_rejects_stale_character_select_preview_with_complete_backdrop() {
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        let large_preview = [
+            0x2c80_8080,
+            0x00d8_0001,
+            0x7c1d_0000,
+            0x00d8_0060,
+            0x000d_005f,
+            0x0128_0001,
+            0x0000_5000,
+            0x0128_0060,
+            0x0000_505f,
+        ];
+
+        for backdrop_count in [
+            super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS - 1,
+            super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS,
+        ] {
+            let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+            let backdrop_base = 0x0039_2000;
+            let preview_packet = 0x0039_3000;
+            bus.vblank_count = 96;
+            for index in 0..backdrop_count {
+                let packet = backdrop_base + index as u32 * 0x40;
+                let next = if index + 1 == backdrop_count {
+                    preview_packet
+                } else {
+                    packet + 0x40
+                };
+                bus.write_u32(
+                    packet,
+                    (select_backdrop.len() as u32) << 24 | (next & 0x00ff_ffff),
+                );
+                for (word_index, word) in select_backdrop.iter().copied().enumerate() {
+                    bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+                }
+            }
+            bus.write_u32(
+                preview_packet,
+                (large_preview.len() as u32) << 24 | 0x00ff_ffff,
+            );
+            for (index, word) in large_preview.iter().copied().enumerate() {
+                bus.write_u32(preview_packet + 4 + index as u32 * 4, word);
+            }
+
+            bus.vblank_count = 100;
+            for index in 0..backdrop_count {
+                let packet = backdrop_base + index as u32 * 0x40;
+                let header = bus.read_u32(packet);
+                bus.write_u32(packet, header);
+            }
+            let preview_header = bus.read_u32(preview_packet);
+            bus.write_u32(preview_packet, preview_header);
+            bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+
+            let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+                backdrop_base,
+                true,
+                true,
+                false,
+                true,
+                None,
+            );
+            let backdrop_words = backdrop_count * select_backdrop.len();
+            if backdrop_count == super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS {
+                assert_eq!(submitted, backdrop_words);
+                assert_eq!(
+                    bus.native_otc_dma_recovery.last_chain_stale_body_rejections, 1,
+                    "a retained backdrop must not revive stale preview payload"
+                );
+                assert_eq!(
+                    bus.native_otc_dma_recovery.last_chain_reject_samples[0].reason,
+                    "stale_draw_body"
+                );
+                assert_eq!(
+                    bus.native_otc_dma_recovery.last_chain_reject_samples[0].detail,
+                    Some("known_recovery_atlas")
+                );
+            } else {
+                assert_eq!(submitted, backdrop_words);
+                assert_eq!(
+                    bus.native_otc_dma_recovery
+                        .last_chain_unsafe_draw_rejections,
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_otc_recovery_rejects_captured_stale_select_portrait_replay() {
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        let captured_stale_portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7d40_0000,
+            0x0071_00e0,
+            0x0088_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+        let backdrop_count = super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS;
+        let backdrop_base = 0x0039_0000;
+        let portrait_packet = 0x0039_10f8;
+        let portrait_command = portrait_packet + 4;
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+
+        assert_eq!(portrait_command, 0x0039_10fc);
+        assert_eq!(
+            super::gp0_command_texture_descriptor(&captured_stale_portrait),
+            Some((0x0088, 0x7d40))
+        );
+        assert!(gp0_command_sequence_has_known_recovery_atlas_corruption(
+            &captured_stale_portrait
+        ));
+
+        bus.vblank_count = 96;
+        for index in 0..backdrop_count {
+            let packet = backdrop_base + index as u32 * 0x40;
+            let next = if index + 1 == backdrop_count {
+                portrait_packet
+            } else {
+                packet + 0x40
+            };
+            bus.write_u32(
+                packet,
+                (select_backdrop.len() as u32) << 24 | (next & 0x00ff_ffff),
+            );
+            for (word_index, word) in select_backdrop.iter().copied().enumerate() {
+                bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+            }
+        }
+        bus.write_u32(
+            portrait_packet,
+            (captured_stale_portrait.len() as u32) << 24 | 0x00ff_ffff,
+        );
+        for (index, word) in captured_stale_portrait.iter().copied().enumerate() {
+            bus.write_u32(portrait_command + index as u32 * 4, word);
+        }
+
+        bus.vblank_count = 128;
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+            backdrop_base,
+            true,
+            true,
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(submitted, backdrop_count * select_backdrop.len());
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            1
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_reject_samples[0].address,
+            portrait_command
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_reject_samples[0].reason,
+            "unsafe_otc_draw"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_reject_samples[0].detail,
+            Some("known_recovery_atlas")
+        );
+    }
+
+    #[test]
+    fn untrusted_otc_recovery_rejects_left_select_portrait_even_with_exact_vram_provenance() {
+        let select_backdrop = [
+            0x2c7f_7f7f,
+            0x006c_0000,
+            0x7d18_0000,
+            0x006c_0100,
+            0x000c_0040,
+            0x008e_0000,
+            0x0000_0700,
+            0x008e_0100,
+            0x0000_0740,
+        ];
+        let portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7d40_0000,
+            0x0071_00e0,
+            0x0088_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+        let backdrop_count = super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS;
+        let backdrop_base = 0x0039_0000;
+        let portrait_packet = 0x0039_10f8;
+        let portrait_command = portrait_packet + 4;
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+
+        bus.vblank_count = 96;
+        for index in 0..backdrop_count {
+            let packet = backdrop_base + index as u32 * 0x40;
+            let next = if index + 1 == backdrop_count {
+                portrait_packet
+            } else {
+                packet + 0x40
+            };
+            bus.write_u32(
+                packet,
+                (select_backdrop.len() as u32) << 24 | (next & 0x00ff_ffff),
+            );
+            for (word_index, word) in select_backdrop.iter().copied().enumerate() {
+                bus.write_u32(packet + 4 + word_index as u32 * 4, word);
+            }
+        }
+        bus.write_u32(portrait_packet, (portrait.len() as u32) << 24 | 0x00ff_ffff);
+        for (index, word) in portrait.iter().copied().enumerate() {
+            bus.write_u32(portrait_command + index as u32 * 4, word);
+        }
+
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 512, 0, 96, 256, 0x3210_1234);
+        upload_gpu_image(&mut bus, 0, 496, 256, 1, 0x03e0_001f);
+        for index in 0..96 {
+            upload_gpu_image(
+                &mut bus,
+                700 + index % 32,
+                700 + index / 32,
+                1,
+                1,
+                0x7fff_001f,
+            );
+        }
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+        let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+            backdrop_base,
+            true,
+            true,
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(submitted, backdrop_count * select_backdrop.len());
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            1
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_reject_samples[0].address,
+            portrait_command
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_reject_samples[0].reason,
+            "unsafe_otc_draw"
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_reject_samples[0].detail,
+            Some("known_recovery_atlas")
+        );
+    }
+
+    #[test]
+    fn native_otc_recovery_accepts_retained_select_portrait_with_current_vram_assets() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+
+        let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+            0x0039_0000,
+            true,
+            true,
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(
+            submitted,
+            super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS * 9 + 18
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            0
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
+        );
+    }
+
+    #[test]
+    fn native_otc_recovery_accepts_retained_select_portrait_with_persisted_clut_data() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        for (address, color) in super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES
+            .into_iter()
+            .zip([0x0010_1010, 0x0020_2020])
+        {
+            bus.write_u32(address, 0x2c00_0000 | color);
+        }
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        for index in 0..16 {
+            bus.io.gpu.set_framebuffer_raw_pixel_for_test(
+                464 + index,
+                496,
+                if index % 2 == 0 { 0x001f } else { 0x03e0 },
+            );
+        }
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+
+        let submitted = bus.process_gpu_linked_list_dma_with_policy_and_shared_nodes(
+            0x0039_0000,
+            true,
+            true,
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(
+            submitted,
+            super::BR2_CHARACTER_SELECT_RETAINED_BACKDROP_MIN_DRAWS * 9 + 18
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery.last_chain_stale_body_rejections,
+            0
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
+        );
+        for address in super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES {
+            assert_eq!(
+                bus.io.gpu.recovery_draw_first_word_for_test(address),
+                Some(0x2c80_8080),
+                "retained preview at 0x{address:08x} must use neutral texture modulation"
+            );
+        }
+        assert_eq!(
+            bus.io.gpu.last_recovery_draw_address_for_test(),
+            Some(super::BR2_CHARACTER_SELECT_RETAINED_PREVIEW_COMMAND_ADDRESSES[1]),
+            "the retained portrait must be the final select-chain overlay"
+        );
+    }
+
+    #[test]
+    fn retained_select_portrait_refreshes_once_per_completed_texture_generation() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+
+        let generation = bus.io.gpu.retained_portrait_texture_generation();
+        let commands_before = bus.io.gpu.commands_seen;
+        assert!(generation > 0);
+        assert!(bus.io.gpu.retained_portrait_texture_coverage_per_mille() >= 900);
+        assert!(bus.try_refresh_br2_retained_character_select_portrait());
+        assert_eq!(bus.br2_retained_portrait_refresh_generation, generation);
+        assert_eq!(bus.io.gpu.commands_seen, commands_before + 18);
+        assert!(!bus.try_refresh_br2_retained_character_select_portrait());
+        assert_eq!(bus.io.gpu.commands_seen, commands_before + 18);
+    }
+
+    #[test]
+    fn retained_select_portrait_rejects_palette_fallback_without_exact_clut_upload() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        bus.vblank_count = 128;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 495, 16, 1, 0x7fff_001f);
+
+        let commands_before = bus.io.gpu.commands_seen;
+        assert!(bus.io.gpu.retained_portrait_texture_coverage_per_mille() >= 900);
+        assert!(!bus.try_refresh_br2_retained_character_select_portrait());
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
+    }
+
+    #[test]
+    fn retained_select_portrait_refresh_rejects_newer_non_select_otc_context() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_retained_character_select_fixture(&mut bus);
+        let gameplay_packet = 0x0038_8000;
+        bus.write_u32(gameplay_packet, 0x00ff_ffff);
+        bus.native_otc_dma_recovery.last_otc_key = Some(OtcReplayKey {
+            vblank: 129,
+            cycles: 1,
+            low: gameplay_packet,
+            high: gameplay_packet,
+            words: 1,
+        });
+        bus.native_otc_dma_recovery.last_start = Some(gameplay_packet);
+
+        bus.vblank_count = 129;
+        upload_gpu_image(&mut bus, 832, 256, 24, 97, 0x3210_1234);
+        upload_gpu_image(&mut bus, 464, 496, 16, 1, 0x7fff_001f);
+        let commands_before = bus.io.gpu.commands_seen;
+
+        assert!(!bus.try_refresh_br2_retained_character_select_portrait());
+        assert_eq!(bus.br2_retained_portrait_refresh_generation, 0);
+        assert_eq!(bus.io.gpu.commands_seen, commands_before);
     }
 
     #[test]
@@ -24971,13 +32878,67 @@ mod tests {
         ];
 
         assert!(gp0_command_is_br2_status_glyph_tile(&status_glyph));
-        assert_eq!(
-            gp0_otc_replay_safe_draw_command_ranges_with_drawing_offset(&status_glyph, (0, -240),),
-            vec![0..status_glyph.len()]
+        assert!(
+            gp0_otc_replay_safe_draw_command_ranges_with_drawing_offset(&status_glyph, (0, -240),)
+                .is_empty()
         );
         assert!(
             gp0_br2_stage_recovery_command_ranges_with_drawing_offset(&status_glyph, (0, -240),)
                 .is_empty()
+        );
+        assert_eq!(
+            gp0_command_replay_draw_reject_reason_with_state(&status_glyph, None, (0, -240),),
+            Some(Gp0ReplayDrawRejectReason::KnownRecoveryAtlas)
+        );
+    }
+
+    #[test]
+    fn recovery_excludes_small_791f_hud_tile_but_keeps_large_beast_effect() {
+        let small_hud_tile = [
+            0x2d7f_7f7f,
+            0x01c8_0028,
+            0x791f_0048,
+            0x01c8_0038,
+            0x002f_0058,
+            0x01d8_0028,
+            0x0000_1048,
+            0x01d8_0038,
+            0x0000_1058,
+        ];
+        let large_beast_effect = [
+            0x2d7f_7f7f,
+            0x00c0_00c0,
+            0x791f_0038,
+            0x00c0_0100,
+            0x002f_0078,
+            0x0100_00c0,
+            0x0000_4038,
+            0x0100_0100,
+            0x0000_4078,
+        ];
+
+        assert!(
+            super::gp0_command_is_br2_status_glyph_tile_with_drawing_offset(
+                &small_hud_tile,
+                (0, -240),
+            )
+        );
+        assert!(
+            gp0_otc_replay_safe_draw_command_ranges_with_drawing_offset(
+                &small_hud_tile,
+                (0, -240),
+            )
+            .is_empty()
+        );
+        assert!(
+            !super::gp0_command_is_br2_status_glyph_tile_with_drawing_offset(
+                &large_beast_effect,
+                (0, 0),
+            )
+        );
+        assert_eq!(
+            gp0_br2_stage_recovery_command_ranges_with_drawing_offset(&large_beast_effect, (0, 0),),
+            vec![0..large_beast_effect.len()]
         );
     }
 
@@ -25126,6 +33087,32 @@ mod tests {
     }
 
     #[test]
+    fn br2_row_480_clut_is_model_only_on_the_standard_model_page() {
+        let model = [
+            0x2d7f_7f7f,
+            0x0090_0180,
+            0x781e_0000,
+            0x0090_0190,
+            0x0039_0010,
+            0x00a0_0180,
+            0,
+            0x00a0_0190,
+            0x0010_0010,
+        ];
+
+        assert!(super::br2_character_model_texture((0x0039, 0x781e)));
+        assert!(super::br2_character_model_texture((0x0239, 0x781e)));
+        assert!(
+            super::words_have_br2_character_model_texture_at(0x0039_1000, &model),
+            "the captured row-480 standard model bank must participate in scene recovery"
+        );
+        assert!(
+            !super::br2_character_model_texture((0x000e, 0x781e)),
+            "the low-bank stage/HUD alias must still require packet and bounds validation"
+        );
+    }
+
+    #[test]
     fn low_ram_character_model_packets_are_tracked_and_recovered() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         let packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
@@ -25213,6 +33200,27 @@ mod tests {
                 "low-RAM stage material 0x{clut:04x} at 0x{address:08x} must not be recovered as a fighter"
             );
         }
+    }
+
+    #[test]
+    fn low_ram_fighter_material_packet_is_not_excluded_as_stage_geometry() {
+        let address = 0x0003_d1d0;
+        let fighter = [
+            0x2c80_8080,
+            0x00e0_0100,
+            0x7994_0000,
+            0x00e0_0120,
+            0x001c_0020,
+            0x0100_0100,
+            0x0000_0020,
+            0x0100_0120,
+            0x0000_2020,
+        ];
+
+        assert!(super::br2_stage_material_texture_descriptor(0x001c, 0x7994));
+        assert!(super::words_have_br2_character_model_texture_at(
+            address, &fighter
+        ));
     }
 
     #[test]
@@ -26025,11 +34033,31 @@ mod tests {
             &stats
         ));
 
+        stats.last_chain_ranges = 3;
+        stats.last_chain_submitted_ranges = 0;
+        stats.last_chain_unsafe_draw_rejections = 3;
+        stats.last_chain_draw_reject_reasons[Gp0ReplayDrawRejectReason::ModelPrefilter.index()] = 3;
+        assert!(
+            !super::native_otc_recovered_chain_is_severely_corrupt(&stats),
+            "intentionally preserving an incomplete model generation is not chain corruption"
+        );
+
+        stats.last_chain_draw_reject_reasons[Gp0ReplayDrawRejectReason::ModelPrefilter.index()] = 0;
+        stats.last_chain_draw_reject_reasons
+            [Gp0ReplayDrawRejectReason::NonPlayfieldBounds.index()] = 3;
+        assert!(
+            !super::native_otc_recovered_chain_is_severely_corrupt(&stats),
+            "off-playfield primitives are already filtered and must not roll back the valid scene"
+        );
+
+        stats.last_chain_ranges = 4;
+        stats.last_chain_unsafe_draw_rejections = 4;
         stats.last_chain_draw_reject_reasons
             [Gp0ReplayDrawRejectReason::PrimitivePointerContamination.index()] = 1;
-        assert!(super::native_otc_recovered_chain_is_severely_corrupt(
-            &stats
-        ));
+        assert!(
+            super::native_otc_recovered_chain_is_severely_corrupt(&stats),
+            "real pointer contamination must remain fatal when mixed with benign bounds filtering"
+        );
     }
 
     #[test]
@@ -26214,6 +34242,58 @@ mod tests {
     }
 
     #[test]
+    fn latest_otc_replay_accepts_exact_br2_title_quadrant_rects_only() {
+        let title_quadrants = [
+            [0x6480_8080, 0x0000_0000, 0x7c00_0000, 0x00f0_0100],
+            [0x6480_8080, 0x0000_0100, 0x7c40_0000, 0x00f0_0100],
+            [0x6480_8080, 0x00f0_0000, 0x7c80_0000, 0x00f0_0100],
+            [0x6480_8080, 0x00f0_0100, 0x7cc0_0000, 0x00f0_0100],
+        ];
+
+        for title_quadrant in title_quadrants {
+            assert!(gp0_command_replay_draw_reject_reason(&title_quadrant).is_some());
+            assert!(gp0_replay_safe_draw_command_ranges(&title_quadrant).is_empty());
+            assert_eq!(
+                gp0_otc_replay_safe_draw_command_ranges(&title_quadrant),
+                vec![0..title_quadrant.len()]
+            );
+        }
+
+        let mismatched_quadrant = [0x6480_8080, 0x0000_0100, 0x7c80_0000, 0x00f0_0100];
+        let wrong_size = [0x6480_8080, 0x00f0_0000, 0x7c80_0000, 0x00ef_0100];
+        for unsafe_rect in [mismatched_quadrant, wrong_size] {
+            assert!(gp0_replay_safe_draw_command_ranges(&unsafe_rect).is_empty());
+            assert!(gp0_otc_replay_safe_draw_command_ranges(&unsafe_rect).is_empty());
+        }
+    }
+
+    #[test]
+    fn latest_otc_replay_keeps_only_the_visible_br2_title_page() {
+        let top_left = [0x6480_8080, 0x0000_0000, 0x7c00_0000, 0x00f0_0100];
+        let bottom_left = [0x6480_8080, 0x00f0_0000, 0x7c80_0000, 0x00f0_0100];
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+
+        assert_eq!(bus.io.gpu.display_origin(), (0, 0));
+        assert_eq!(
+            bus.gpu_otc_replay_safe_draw_ranges(&top_left).1,
+            vec![0..top_left.len()]
+        );
+        assert!(
+            bus.gpu_otc_replay_safe_draw_ranges(&bottom_left)
+                .1
+                .is_empty()
+        );
+
+        bus.io.gpu.write_gp1(0x0503_c000);
+        assert_eq!(bus.io.gpu.display_origin(), (0, 240));
+        assert!(bus.gpu_otc_replay_safe_draw_ranges(&top_left).1.is_empty());
+        assert_eq!(
+            bus.gpu_otc_replay_safe_draw_ranges(&bottom_left).1,
+            vec![0..bottom_left.len()]
+        );
+    }
+
+    #[test]
     fn gp0_replay_safe_draw_rejects_primitive_pointer_contaminated_quad() {
         let corrupt = [
             0x2e01_a0df,
@@ -26296,6 +34376,182 @@ mod tests {
     }
 
     #[test]
+    fn high_ram_p2_beast_long_descriptor_is_selected_as_character_model_chain() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        let generation = 2_510;
+        let packets = (0..BR2_CHARACTER_MODEL_RECOVERY_MIN_PACKETS)
+            .map(|index| BR2_CHARACTER_MODEL_PACKET_START + 0x5000 + index as u32 * 0x40)
+            .collect::<Vec<_>>();
+
+        bus.vblank_count = generation;
+        for (index, address) in packets.iter().copied().enumerate() {
+            let next = packets
+                .get(index + 1)
+                .copied()
+                .map_or(0x00ff_ffff, |next| next & 0x00ff_ffff);
+            let x = 392 + index as u32 * 8;
+            let y = 144 + index as u32 * 18;
+            let words = [
+                0x2c80_8080,
+                (y << 16) | x,
+                0x781e_0000,
+                (y << 16) | (x + 24),
+                0x000e_0018,
+                ((y + 28) << 16) | x,
+                0x0000_1c00,
+                ((y + 28) << 16) | (x + 24),
+                0x0000_1c18,
+            ];
+            for (word_index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(address + 4 + word_index as u32 * 4, word);
+            }
+            bus.write_u32(address, ((words.len() as u32) << 24) | next);
+        }
+
+        let first = packets[0];
+        let first_words = bus.primitive_packet_command_words(first, 9);
+        assert!(
+            super::words_have_br2_character_model_texture_at(first, &first_words),
+            "P2 Beast(Long) high-RAM material must be eligible for model recovery"
+        );
+        assert!(
+            super::gp0_command_is_valid_br2_character_model_draw_for_packet(first, &first_words)
+        );
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([first].into_iter());
+        assert!(
+            bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes)
+                .is_empty()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery_chain_model_generation(&chain_nodes, Some(generation),),
+            (Some(generation), packets.len())
+        );
+
+        let commands_before = bus.io.gpu.commands_seen;
+        assert_eq!(
+            bus.replay_recent_br2_character_model_packets(&HashSet::new()),
+            (1, packets.len(), packets.len() * 9)
+        );
+        assert_eq!(
+            bus.io.gpu.commands_seen - commands_before,
+            (packets.len() * 9) as u64
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_model_selected_packets
+                .iter()
+                .map(|packet| packet.address)
+                .collect::<Vec<_>>(),
+            packets
+        );
+    }
+
+    #[test]
+    fn high_ram_p2_beast_descriptor_rejects_stage_transition_atlas_strip() {
+        let packet = BR2_CHARACTER_MODEL_PACKET_START + 0x5800;
+        let stage_transition_strip = [
+            0x2c7f_7f7f,
+            0x012c_0000,
+            0x781b_0000,
+            0x012c_00ff,
+            0x001b_00ff,
+            0x0168_0000,
+            0x0000_4000,
+            0x0168_00ff,
+            0x0000_40ff,
+        ];
+
+        assert_eq!(
+            gp0_command_replay_draw_reject_reason(&stage_transition_strip),
+            Some(Gp0ReplayDrawRejectReason::LinkedListArtifact)
+        );
+        assert!(!super::words_have_br2_character_model_texture_at(
+            packet,
+            &stage_transition_strip
+        ));
+        assert!(
+            super::gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+                packet,
+                &stage_transition_strip,
+                (0, 0),
+            )
+            .is_none()
+        );
+        assert!(
+            super::gp0_br2_character_model_replay_command_ranges_for_packet(
+                packet,
+                &stage_transition_strip,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn high_ram_p2_beast_descriptor_rejects_bottom_hud_geometry() {
+        let packet = BR2_CHARACTER_MODEL_PACKET_START + 0x5c00;
+        let bottom_hud = [
+            0x2c7f_7f7f,
+            0x01a8_0180,
+            0x781e_0000,
+            0x01a8_0190,
+            0x020e_0010,
+            0x01b8_0180,
+            0,
+            0x01b8_0190,
+            0x0010_0010,
+        ];
+
+        assert!(super::br2_beast_character_model_candidate_descriptor(
+            super::gp0_command_texture_descriptor(&bottom_hud)
+                .expect("bottom HUD fixture has a texture descriptor")
+        ));
+        assert!(!super::words_have_br2_character_model_texture_at(
+            packet,
+            &bottom_hud
+        ));
+        assert!(
+            !super::gp0_command_is_valid_br2_character_model_draw_for_packet(packet, &bottom_hud)
+        );
+        assert!(
+            super::gp0_br2_character_model_replay_command_ranges_for_packet(packet, &bottom_hud,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn high_ram_p2_beast_descriptor_accepts_lower_leg_at_bottom_playfield_edge() {
+        let packet = BR2_CHARACTER_MODEL_PACKET_START + 0x5a00;
+        let lower_leg = [
+            0x2c7f_7f7f,
+            0x01a8_0180,
+            0x781e_0000,
+            0x01a8_0190,
+            0x020e_0010,
+            0x01ac_0180,
+            0,
+            0x01ac_0190,
+            0x0004_0010,
+        ];
+
+        assert!(super::words_have_br2_character_model_texture_at(
+            packet, &lower_leg
+        ));
+        assert!(
+            super::gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+                packet,
+                &lower_leg,
+                (0, 0),
+            )
+            .is_some(),
+            "valid Beast feet reach y=428 and must not be rejected as bottom HUD"
+        );
+        assert!(
+            super::gp0_command_is_valid_br2_character_model_draw_for_packet(packet, &lower_leg)
+        );
+    }
+
+    #[test]
     fn trusted_otc_accepts_captured_p2_beast_model_component() {
         let packet = 0x0038_fa2c;
         let captured_model = [
@@ -26327,6 +34583,20 @@ mod tests {
                 packet,
                 &captured_model,
             )
+        );
+        let captured_bounds = super::gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+            packet,
+            &captured_model,
+            (0, 0),
+        )
+        .expect("captured P2 Beast model component must stay valid");
+        assert!(
+            !super::gp0_command_is_br2_current_otc_model_atlas_strip_false_positive_for_packet(
+                packet,
+                &captured_model,
+                captured_bounds,
+            ),
+            "the atlas-strip guard must not reject the captured valid Beast component"
         );
         assert!(
             bus.native_otc_dma_recovery_invalid_model_draws(&HashSet::from([packet]))
@@ -26397,6 +34667,104 @@ mod tests {
     }
 
     #[test]
+    fn trusted_otc_accepts_captured_clipped_p2_long_low_ram_component() {
+        let packet = 0x0003_a114;
+        let captured_model = [
+            0x2c80_8080,
+            0x0051_0023,
+            0x7b14_bdbe,
+            0xfff7_001f,
+            0x001b_80be,
+            0x0052_006d,
+            0x0000_bd80,
+            0xfffb_006b,
+            0x0000_8080,
+        ];
+        let commands = captured_model
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, word)| (packet + index as u32 * 4, word))
+            .collect::<Vec<_>>();
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.native_otc_dma_recovery.record_chain_filter_stats = true;
+
+        assert!(
+            super::gp0_command_is_corrupt_br2_character_model_draw_for_packet(
+                packet,
+                &captured_model,
+            ),
+            "the legacy compact-outlier heuristic must reproduce the captured false positive"
+        );
+        assert!(
+            super::gp0_current_otc_br2_character_model_draw_bounds_for_packet(
+                packet,
+                &captured_model,
+                (0, 0),
+            )
+            .is_some(),
+            "the trusted current OTC must preserve the clipped P2 Long body component"
+        );
+        assert_eq!(
+            bus.write_gpu_dma_trusted_linked_list_command_range(&commands, 0..commands.len()),
+            commands.len()
+        );
+        assert_eq!(
+            bus.native_otc_dma_recovery
+                .last_chain_unsafe_draw_rejections,
+            0
+        );
+    }
+
+    #[test]
+    fn current_otc_preserves_captured_clipped_p2_long_component_pair() {
+        let packet_a = 0x0004_2228;
+        let packet_b = 0x0004_24c8;
+        let captured_a = [
+            0x2c80_8080,
+            0x004b_01e0,
+            0x7894_00c8,
+            0x003f_02df,
+            0x003c_00cf,
+            0x008f_01da,
+            0x0000_3cc8,
+            0x008f_02c4,
+            0x0000_3ece,
+        ];
+        let captured_b = [
+            0x2c80_8080,
+            0x004b_01e0,
+            0x7894_00cf,
+            0x008f_01da,
+            0x003c_3ccf,
+            0x0051_011d,
+            0x0000_00c8,
+            0x008e_0122,
+            0x0000_3ec9,
+        ];
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        bus.vblank_count = 5_362;
+
+        for (packet, next, words) in [
+            (packet_a, packet_b, captured_a),
+            (packet_b, 0x00ff_ffff, captured_b),
+        ] {
+            for (index, word) in words.iter().copied().enumerate() {
+                bus.write_u32(packet + 4 + index as u32 * 4, word);
+            }
+            bus.write_u32(packet, (words.len() as u32) << 24 | (next & 0x00ff_ffff));
+        }
+
+        let chain_nodes = bus.native_otc_dma_recovery_chain_nodes([packet_a].into_iter());
+        assert_eq!(chain_nodes, HashSet::from([packet_a, packet_b]));
+        assert!(
+            bus.native_otc_dma_recovery_invalid_model_draws(&chain_nodes)
+                .is_empty(),
+            "the two bounded Long polygons form one clipped body component, not a full-screen atlas strip"
+        );
+    }
+
+    #[test]
     fn trusted_otc_rejects_oversized_p2_beast_effect_polygon() {
         let packet = 0x0038_f98c;
         let oversized_effect = [
@@ -26441,6 +34809,10 @@ mod tests {
                 &commands,
                 0..commands.len(),
                 Some(&rejected),
+                None,
+                None,
+                false,
+                false,
             ),
             0
         );
@@ -27094,6 +35466,52 @@ mod tests {
         bus.tick(DMA_MDEC_COMPLETION_DELAY_CYCLES);
 
         assert_eq!(bus.read_u32(DMA_MDEC_OUT_CHCR) & (1 << 24), 0);
+    }
+
+    #[test]
+    fn mdec_output_dma_preserves_valid_stream_across_requests() {
+        let mut bus = Bus::new(Vec::new(), 2 * 1024 * 1024);
+        let macroblock = [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ];
+
+        bus.write_u32(MDEC_COMMAND, 0x3a00_000c);
+        for word in macroblock.into_iter().chain(macroblock) {
+            bus.write_u32(MDEC_COMMAND, word);
+        }
+
+        bus.write_u32(DMA_MDEC_OUT_MADR, 0x0000_3000);
+        bus.write_u32(DMA_MDEC_OUT_BCR, 128);
+        bus.write_u32(DMA_MDEC_OUT_CHCR, 1 << 24);
+
+        assert_eq!(bus.io.mdec.decoded_output_words(), 128);
+        assert_ne!(bus.read_u32(0x0000_3000), 0);
+        assert_ne!(bus.read_u32(MDEC_STATUS) & (1 << 31), 0);
+        assert_eq!(bus.read_u32(MDEC_STATUS) & (1 << 29), 0);
+        assert_eq!(bus.io.mdec.discarded_input_halfwords(), 0);
+
+        bus.tick(DMA_MDEC_COMPLETION_DELAY_CYCLES);
+        bus.write_u32(DMA_MDEC_OUT_MADR, 0x0000_4000);
+        bus.write_u32(DMA_MDEC_OUT_BCR, 128);
+        bus.write_u32(DMA_MDEC_OUT_CHCR, 1 << 24);
+
+        assert_eq!(bus.io.mdec.decoded_output_words(), 256);
+        assert!(
+            (0..128).any(|word| bus.read_u32(0x0000_4000 + word * 4) != 0),
+            "second MDEC output DMA must write decoded pixels"
+        );
+        assert_ne!(bus.read_u32(MDEC_STATUS) & (1 << 31), 0);
+        assert_eq!(bus.read_u32(MDEC_STATUS) & (1 << 29), 0);
+        assert_eq!(bus.io.mdec.discarded_input_halfwords(), 0);
+        assert!(
+            bus.native_sync_json()
+                .contains("\"decode_input_halfwords_remaining_after\":0")
+        );
     }
 
     #[test]

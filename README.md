@@ -189,7 +189,31 @@ unless credit, game start, and a clean non-title transition are all observed.
 `native-play-snapshot` exits non-zero unless the final rendered window frame
 meets the stricter gameplay-scene criteria. Warning screens, black letterboxed
 transitions, and red/salmon single-palette corruption are not counted as
-playable native rendering.
+playable native rendering. With `--match-script`, it also requires all 20 P1/P2
+coin, start, direction, and combat actions to be read by the guest and requires
+the generated stereo PCM WAV to contain a non-zero signal.
+
+Run the complete visible macOS Live QA flow after preparing the reusable ROM
+cache:
+
+```sh
+scripts/native-live-qa-macos.sh
+```
+
+The script opens the real GUI and CoreAudio output, drives title entry, character
+selection, combat, P1/P2 movement and attacks, and both Beast controls. Presented
+frames and deep renderer diagnostics are written asynchronously under
+`tmp/live-qa-gui-*-captures`, so capture encoding does not block the emulation
+thread. The command exits non-zero unless the bounded run reaches its final
+frame, renders a full gameplay scene, reads every requested input, outputs
+audible realtime CoreAudio, advances every vblank attempt, and keeps normal,
+attack, and Beast frame timing within the production latency gate. Set
+`BR2_LIVE_QA_MAX_FRAMES`, `BR2_LIVE_QA_OUTPUT_PREFIX`, or the documented
+`BR2_NATIVE_GUI_*` variables only when a longer diagnostic run is needed. The
+default is 4,200 frames, and values below the complete 3,973-frame input
+sequence are rejected. The default post-selection wait keeps both players'
+movement, attacks, and Beast checks inside actual gameplay rather than the VS
+transition.
 
 Install MAME if you also want an external compatibility reference:
 
@@ -272,9 +296,10 @@ Windows binaries or ROM data.
 The current native core runs on macOS, opens a local framebuffer window, reads
 the mapped controls, uploads visible texture data to VRAM, tracks presentation
 quality, and exposes CPU/IO/GPU state for iterative validation.
-`native-health-check` and `native-play-snapshot --match-script` remain the
-release gates for full-scene composition, input coverage, and gameplay-scene
-rendering.
+`native-health-check`, `native-play-snapshot --match-script`, and
+`scripts/native-live-qa-macos.sh` are the release gates for full-scene
+composition, all P1/P2 controls, non-silent PCM, realtime CoreAudio, and
+gameplay performance.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend. Native backend
 creation performs the match-entry sequence once, stores a playable emulator
@@ -309,7 +334,8 @@ curl -sS -X POST http://127.0.0.1:8765/step \
 non-vision-agent responses small. Set it to `true` only when a base64 PNG is
 needed. Native screenshots use the same aspect-corrected 640x480 buffer as the
 macOS GUI. Each `/step` must provide exactly one of `action` or `buttons`.
-`action` preserves the `Discrete(20)` contract; `buttons` permits any
+`action` uses the current `Discrete(38)` contract, including P1 and P2 actions;
+`buttons` permits any
 simultaneous boolean control combination. `frames` must be between 1 and 600.
 If the core cannot reach the next vblank within its safety budget, the request
 fails instead of returning a partial frame count. The response `info` contains
@@ -328,7 +354,7 @@ Endpoints:
 
 Action space:
 
-- Type: `Discrete(20)`
+- Type: `Discrete(38)`
 - Values: see `cargo run -- action-space`
 - Extended control: a `buttons` object for arbitrary simultaneous controls
 

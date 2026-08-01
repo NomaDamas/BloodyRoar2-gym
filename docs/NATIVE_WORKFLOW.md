@@ -246,12 +246,13 @@ Run the stricter health gate when validating native emulator completeness:
 cargo run --release -- native-health-check assets/roms 500000
 ```
 
-`native-health-check` branches from the autoplay checkpoint through up, down,
-left, right, punch, kick, beast, and guard. It reports whether every action was
-read by the game I/O, whether rendered frames contain visible/detail content,
-and whether each branch remains a native playable candidate. A non-zero exit
-with `overall_status:"partial"` means the macOS core and controls are running
-but the native renderer or branch stability is not yet complete.
+`native-health-check` branches from the autoplay checkpoint through P1 up,
+down, left, right, punch, kick, beast, and guard, then directly probes the full
+20-action P1/P2 control set. It reports whether every action was read by the
+game I/O, whether generated PCM is non-silent, whether rendered frames contain
+visible/detail content, and whether each branch remains a native playable
+candidate. A non-zero exit with `overall_status:"partial"` means at least one
+native renderer, input, audio, or branch-stability gate is not complete.
 
 Open the native macOS play window:
 
@@ -348,7 +349,23 @@ counters and a clean transition away from the title.
 `native-play-snapshot` is intentionally stricter than the quick GUI path: it
 fails unless the final window frame satisfies gameplay-scene heuristics. A
 character transition, black letterbox, or red/salmon corrupted frame is a
-rendering gap, not a native playable pass.
+rendering gap, not a native playable pass. `--match-script` additionally
+requires all 20 P1/P2 actions and a non-silent PCM WAV.
+
+Run the visible GUI/CoreAudio release gate:
+
+```sh
+scripts/native-live-qa-macos.sh
+```
+
+This opens the real macOS window while an asynchronous writer captures periodic
+presented frames and deep renderer diagnostics under `tmp/`. The bounded run
+fails unless title-to-match progression, requested P1/P2 controls, final
+gameplay rendering, realtime CoreAudio, vblank progress, and normal,
+attack, and Beast frame latency all pass. It always refreshes the release
+binary, defaults to 4,200 frames, and rejects budgets below the complete
+3,973-frame P1/P2 sequence. The default post-selection wait places the P1/P2
+movement, attack, and Beast checks after the VS transition in actual gameplay.
 
 Capture a deterministic visual artifact for review:
 

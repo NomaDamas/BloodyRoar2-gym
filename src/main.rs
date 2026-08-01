@@ -4,15 +4,18 @@ use std::ffi::{c_char, c_void};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bloodyroar2_gym::{
     ACTION_SPACE, Action, ActionButtons, BloodyRoar2Env, MameConfig, MameRuntime,
     NativeDisplayFrame, NativeEmulator, NativeGpuDrawCapturePredicate, NativeInputActivity,
-    NativeRomSet, NativeTraceConfig, NullBackend, ZincConfig, ZincRuntime, action_space_json,
-    api_index_json, native_aspect_corrected_gui_frame, native_playable_match_entry_script,
-    native_update_aspect_corrected_gui_frame, native_window_frame_from_display,
-    native_window_prefers_stronger_stacked_field, observation_space_json, png_from_rgb888_pixels,
+    NativeRomSet, NativeTraceConfig, NullBackend, StereoSample, YMF271_SAMPLE_RATE_HZ, ZincConfig,
+    ZincRuntime, action_space_json, api_index_json, native_aspect_corrected_gui_frame,
+    native_playable_match_entry_script, native_update_aspect_corrected_gui_frame,
+    native_window_frame_from_display, native_window_prefers_stronger_stacked_field,
+    observation_space_json, png_from_rgb888_pixels,
 };
 use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 #[cfg(target_os = "macos")]
@@ -28,19 +31,48 @@ const NATIVE_PLAY_WINDOW_POSITION_X: isize = 80;
 const NATIVE_PLAY_WINDOW_POSITION_Y: isize = 80;
 const NATIVE_PLAY_FAST_FORWARD_MAX_FRAMES: u64 = 9_000;
 const NATIVE_PLAY_SCRIPT_INSTRUCTIONS_PER_FRAME: u64 = 500_000;
-const NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME: u64 = 240_000;
-const NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME: u64 = NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE;
+// A GUI attempt must be able to reach the 566k-cycle guest vblank boundary.
+// Smaller user-provided budgets turn one guest frame into several host loops,
+// which makes input and presentation appear stalled.
+const NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME: u64 = 600_000;
+const NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME: u64 = 600_000;
+const NATIVE_PLAY_GUI_MAX_INSTRUCTIONS_PER_FRAME: u64 = 1_000_000;
 const NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE: u64 = 5_000;
+#[cfg(target_os = "macos")]
 const NATIVE_PLAY_GUI_ACTIVE_INPUT_POLL_SLICES: u64 = 8;
-const NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES: u64 = 24;
-const NATIVE_PLAY_GUI_PLATFORM_INPUT_SAMPLE_POLL_SLICES: u64 = 1;
+#[cfg(not(target_os = "macos"))]
+const NATIVE_PLAY_GUI_ACTIVE_INPUT_POLL_SLICES: u64 = 8;
+#[cfg(target_os = "macos")]
+const NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES: u64 = 8;
+#[cfg(not(target_os = "macos"))]
+const NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES: u64 = 8;
+#[cfg(target_os = "macos")]
+// Window-local minifb keys are still sampled on every event pump; cache the
+// expensive Quartz/AppKit fallback across pumps within one guest-frame attempt.
+const NATIVE_PLAY_GUI_PLATFORM_INPUT_SAMPLE_POLL_SLICES: u64 =
+    NATIVE_PLAY_GUI_ACTIVE_INPUT_POLL_SLICES;
+#[cfg(not(target_os = "macos"))]
+const NATIVE_PLAY_GUI_PLATFORM_INPUT_SAMPLE_POLL_SLICES: u64 = 4;
+const NATIVE_PLAY_GUI_EVENT_PUMP_MAX_POLL_SLICES: u64 = 8;
+const NATIVE_PLAY_GUI_EVENT_PUMP_INTERVAL: Duration = Duration::from_millis(8);
+const NATIVE_PLAY_GUI_FRAME_ATTEMPT_MULTIPLIER: u64 = 4;
+const NATIVE_PLAY_GUI_MIN_WALL_TIMEOUT_SECS: u64 = 120;
+const NATIVE_PLAY_GUI_MAX_WALL_TIMEOUT_SECS: u64 = 1_800;
+const NATIVE_PLAY_GUI_P95_FRAME_BUDGET_US: u64 = 33_333;
+const NATIVE_PLAY_GUI_MAX_FRAME_STALL_US: u64 = 250_000;
+const NATIVE_PLAY_GUI_MAX_OVER_33_MS_RATIO_NUMERATOR: u64 = 1;
+const NATIVE_PLAY_GUI_MAX_OVER_33_MS_RATIO_DENOMINATOR: u64 = 20;
 const NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE_ENV: &str = "BR2_NATIVE_GUI_POLL_INSTRUCTION_SLICE";
+const NATIVE_PLAY_GUI_WALL_TIMEOUT_SECS_ENV: &str = "BR2_NATIVE_GUI_WALL_TIMEOUT_SECS";
 const NATIVE_PLAY_GUI_CAPTURE_DIR_ENV: &str = "BR2_NATIVE_GUI_CAPTURE_DIR";
 const NATIVE_PLAY_GUI_CAPTURE_INTERVAL_ENV: &str = "BR2_NATIVE_GUI_CAPTURE_INTERVAL";
+const NATIVE_PLAY_GUI_DEEP_CAPTURE_ENV: &str = "BR2_NATIVE_GUI_DEEP_CAPTURE";
+const NATIVE_PLAY_GUI_DEEP_CAPTURE_INTERVAL_ENV: &str = "BR2_NATIVE_GUI_DEEP_CAPTURE_INTERVAL";
 const NATIVE_PLAY_GUI_ALLOW_SYNTHETIC_INPUT_ENV: &str = "BR2_NATIVE_GUI_ALLOW_SYNTHETIC_INPUT";
 const NATIVE_PLAY_GUI_INPUT_TRACE_ENV: &str = "BR2_NATIVE_TRACE_GUI_INPUT";
 const NATIVE_PLAY_GUI_INPUT_TRACE_COMPAT_ENV: &str = "BR2_NATIVE_PLAY_GUI_INPUT_TRACE";
 const NATIVE_PLAY_GUI_TEST_INPUT_SCRIPT_ENV: &str = "BR2_NATIVE_GUI_TEST_INPUT_SCRIPT";
+const NATIVE_PLAY_GUI_TEST_EXCLUSIVE_INPUT_ENV: &str = "BR2_NATIVE_GUI_TEST_EXCLUSIVE_INPUT";
 const NATIVE_PLAY_GUI_DISPLAY_REFRESH_FRAMES_ENV: &str = "BR2_NATIVE_GUI_DISPLAY_REFRESH_FRAMES";
 const NATIVE_PLAY_GUI_OTC_RECOVERY_INTERVAL_ENV: &str = "BR2_NATIVE_GUI_OTC_RECOVERY_INTERVAL";
 const NATIVE_PLAY_GUI_CAPTURE_INTERVAL_FRAMES: u64 = 30;
@@ -49,28 +81,30 @@ const NATIVE_PLAY_GUI_OTC_RECOVERY_INTERVAL: u64 = 1;
 const NATIVE_PLAY_GUI_PRESENTED_CAPTURE_HEARTBEAT_FRAMES: u64 = 60;
 const NATIVE_PLAY_GUI_GAMEPLAY_PRESENTED_CAPTURE_HEARTBEAT_FRAMES: u64 = 240;
 const NATIVE_PLAY_GUI_PLAYABILITY_REFRESH_FRAMES: u64 = 60;
-const NATIVE_PLAY_GUI_EXPENSIVE_DISPLAY_REFRESH_FRAMES: u64 = 60;
-const NATIVE_PLAY_GUI_FAST_FRAME_CLASSIFICATION_STRIDE: u64 = 4;
-const NATIVE_PLAY_GUI_FAST_REJECTION_REFRESH_THRESHOLD: u8 = 3;
+const NATIVE_PLAY_GUI_EXPENSIVE_DISPLAY_REFRESH_FRAMES: u64 = 600;
+const NATIVE_PLAY_GUI_FAST_FRAME_CLASSIFICATION_STRIDE: u64 = 30;
+const NATIVE_PLAY_GUI_FAST_REJECTION_REFRESH_THRESHOLD: u8 = 30;
 const NATIVE_PLAY_GUI_POST_START_STALE_REFRESH_ATTEMPTS: u8 = 8;
+#[cfg(test)]
 const NATIVE_PLAY_GUI_BUFFER_RESUBMIT_FRAMES: u64 = 60;
+const NATIVE_PLAY_GUI_CAPTURE_QUEUE_CAPACITY: usize = 4;
 const NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES: u64 = 30;
 const NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_INTERVAL: u64 = 5;
-const NATIVE_PLAY_WINDOW_ACTIVATION_BACKGROUND_RETRY_INTERVAL: u64 = 60;
 const NATIVE_PLAY_WINDOW_TARGET_FPS: usize = 60;
+const NATIVE_PLAY_MINIFB_TARGET_FPS: usize = 0;
 const NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME: u64 =
     NATIVE_PLAY_SCRIPT_INSTRUCTIONS_PER_FRAME;
 const NATIVE_SCRIPT_VBLANK_POLL_INSTRUCTION_SLICE: u64 = 5_000;
 const NATIVE_WARNING_SKIP_INITIAL_FRAMES: u64 = 30;
 const NATIVE_WARNING_SKIP_PULSE_FRAMES: u64 = 12;
 const NATIVE_WARNING_SKIP_GAP_FRAMES: u64 = 24;
-#[cfg(test)]
-const NATIVE_WARNING_SKIP_RETRY_CYCLES: usize = 0;
-#[cfg(test)]
+const NATIVE_WARNING_SKIP_RETRY_CYCLES: usize = 16;
 const NATIVE_WARNING_SKIP_RETRY_GAP_FRAMES: u64 = 18;
 const NATIVE_PLAY_TITLE_ENTRY_FRAMES: u64 = 528;
 const NATIVE_PLAY_TITLE_READY_EXTRA_WAIT_FRAMES: u64 = 900;
 const NATIVE_TITLE_RUNTIME_MIN_P1_POLLS: u64 = 1_150;
+const NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES: u64 =
+    NATIVE_PLAY_TITLE_ENTRY_FRAMES + NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES;
 const NATIVE_PLAY_HANDOFF_SETTLE_FRAMES: u64 = 120;
 const NATIVE_PLAY_HANDOFF_CHECK_STRIDE_FRAMES: u64 = 6;
 const NATIVE_PLAY_HANDOFF_RENDER_CHECK_STRIDE_FRAMES: u64 = 60;
@@ -112,7 +146,10 @@ const NATIVE_CREDIT_MAPPING_PROBE_WALL_TIMEOUT_SECS_ENV: &str =
 // Brief physical key taps survive at least one default GUI emulation frame so
 // BR2 cannot miss them between its comparatively sparse input polls.
 const NATIVE_PLAY_INPUT_LATCH_FRAMES: u16 = 4;
-const NATIVE_PLAY_DIRECT_INPUT_PROBE_POLL_SLICES: u16 = 30;
+// A controller transaction can already be in flight when a probe changes the
+// requested buttons. Cover two sparse guest polls so the first stale packet
+// cannot make a valid control look unread.
+const NATIVE_PLAY_DIRECT_INPUT_PROBE_POLL_SLICES: u16 = 60;
 const NATIVE_PLAY_ENTER_COIN_FRAMES: u16 = 12;
 const NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES: u16 = 24;
 const NATIVE_PLAY_ENTER_START_FRAMES: u16 = 18;
@@ -3008,25 +3045,29 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
-        "native-match-tail-timeline" => {
+        "native-match-tail-timeline" | "native-match-tail-timeline-compact" => {
+            let compact = command == "native-match-tail-timeline-compact";
+            let usage = native_match_tail_timeline_usage(compact);
             let rom = next_native_rom_source_or_default(&mut args);
             let instructions_per_frame = args
                 .next()
-                .ok_or_else(|| {
-                    "usage: bloodyroar2-gym native-match-tail-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> [action:frames...]"
-                        .to_string()
-                })?
+                .ok_or_else(|| usage.to_string())?
                 .parse::<u64>()
                 .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
-            let output_prefix = args.next().map(PathBuf::from).ok_or_else(|| {
-                "usage: bloodyroar2-gym native-match-tail-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> [action:frames...]"
-                    .to_string()
-            })?;
+            let output_prefix = if compact {
+                None
+            } else {
+                Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| usage.to_string())?,
+                )
+            };
             let raw_tail_segments = args.collect::<Vec<_>>();
             run_native_match_tail_timeline(
                 rom,
                 instructions_per_frame.max(1),
-                &output_prefix,
+                output_prefix.as_deref(),
                 raw_tail_segments,
             )
         }
@@ -3653,6 +3694,205 @@ fn run() -> Result<(), String> {
     }
 }
 
+const NATIVE_GUI_TIMING_SAMPLE_LIMIT: usize = 262_144;
+
+#[derive(Clone, Debug, Default)]
+struct NativeGuiTimingStats {
+    samples_us: Vec<u32>,
+    total_samples: u64,
+    total_us: u128,
+    max_us: u64,
+    over_16_67_ms: u64,
+    over_33_33_ms: u64,
+}
+
+impl NativeGuiTimingStats {
+    fn record(&mut self, elapsed: Duration) {
+        let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.total_samples = self.total_samples.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(u128::from(elapsed_us));
+        self.max_us = self.max_us.max(elapsed_us);
+        self.over_16_67_ms = self
+            .over_16_67_ms
+            .saturating_add(u64::from(elapsed_us > 16_667));
+        self.over_33_33_ms = self
+            .over_33_33_ms
+            .saturating_add(u64::from(elapsed_us > 33_333));
+        if self.samples_us.len() < NATIVE_GUI_TIMING_SAMPLE_LIMIT {
+            self.samples_us
+                .push(elapsed_us.min(u64::from(u32::MAX)) as u32);
+        }
+    }
+
+    fn percentile_us(&self, percentile: usize) -> u64 {
+        if self.samples_us.is_empty() {
+            return 0;
+        }
+        let mut sorted = self.samples_us.clone();
+        sorted.sort_unstable();
+        let rank = sorted
+            .len()
+            .saturating_mul(percentile)
+            .saturating_add(99)
+            .checked_div(100)
+            .unwrap_or(1)
+            .max(1)
+            .saturating_sub(1)
+            .min(sorted.len().saturating_sub(1));
+        u64::from(sorted[rank])
+    }
+
+    fn p95_within_production_budget(&self) -> bool {
+        self.total_samples > 0 && self.percentile_us(95) <= NATIVE_PLAY_GUI_P95_FRAME_BUDGET_US
+    }
+
+    fn max_stall_within_production_budget(&self) -> bool {
+        self.total_samples > 0 && self.max_us <= NATIVE_PLAY_GUI_MAX_FRAME_STALL_US
+    }
+
+    fn over_33_ms_ratio_within_production_budget(&self) -> bool {
+        self.total_samples > 0
+            && self
+                .over_33_33_ms
+                .saturating_mul(NATIVE_PLAY_GUI_MAX_OVER_33_MS_RATIO_DENOMINATOR)
+                <= self
+                    .total_samples
+                    .saturating_mul(NATIVE_PLAY_GUI_MAX_OVER_33_MS_RATIO_NUMERATOR)
+    }
+
+    fn json(&self) -> String {
+        let mean_us = if self.total_samples == 0 {
+            0
+        } else {
+            self.total_us
+                .checked_div(u128::from(self.total_samples))
+                .unwrap_or(0)
+        };
+        format!(
+            "{{\"samples\":{},\"quantile_samples\":{},\"quantile_samples_dropped\":{},\"mean_us\":{},\"p95_us\":{},\"p99_us\":{},\"max_us\":{},\"over_16_67_ms\":{},\"over_33_33_ms\":{}}}",
+            self.total_samples,
+            self.samples_us.len(),
+            self.total_samples
+                .saturating_sub(self.samples_us.len() as u64),
+            mean_us,
+            self.percentile_us(95),
+            self.percentile_us(99),
+            self.max_us,
+            self.over_16_67_ms,
+            self.over_33_33_ms
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeGuiPerformanceGate {
+    frame_samples_present: bool,
+    attack_samples_required: bool,
+    attack_samples_present: bool,
+    beast_samples_required: bool,
+    beast_samples_present: bool,
+    frame_p95_within_budget: bool,
+    attack_p95_within_budget: bool,
+    beast_p95_within_budget: bool,
+    frame_max_stall_within_budget: bool,
+    attack_max_stall_within_budget: bool,
+    beast_max_stall_within_budget: bool,
+    frame_over_33_ms_ratio_within_budget: bool,
+    attack_over_33_ms_ratio_within_budget: bool,
+    beast_over_33_ms_ratio_within_budget: bool,
+    no_missed_vblank_attempts: bool,
+    verified: bool,
+}
+
+impl NativeGuiPerformanceGate {
+    fn json(self) -> String {
+        format!(
+            "{{\"frame_samples_present\":{},\"attack_samples_required\":{},\"attack_samples_present\":{},\"beast_samples_required\":{},\"beast_samples_present\":{},\"p95_budget_us\":{},\"max_stall_budget_us\":{},\"max_over_33_ms_ratio\":\"{}/{}\",\"frame_p95_within_budget\":{},\"attack_p95_within_budget\":{},\"beast_p95_within_budget\":{},\"frame_max_stall_within_budget\":{},\"attack_max_stall_within_budget\":{},\"beast_max_stall_within_budget\":{},\"frame_over_33_ms_ratio_within_budget\":{},\"attack_over_33_ms_ratio_within_budget\":{},\"beast_over_33_ms_ratio_within_budget\":{},\"no_missed_vblank_attempts\":{},\"verified\":{}}}",
+            self.frame_samples_present,
+            self.attack_samples_required,
+            self.attack_samples_present,
+            self.beast_samples_required,
+            self.beast_samples_present,
+            NATIVE_PLAY_GUI_P95_FRAME_BUDGET_US,
+            NATIVE_PLAY_GUI_MAX_FRAME_STALL_US,
+            NATIVE_PLAY_GUI_MAX_OVER_33_MS_RATIO_NUMERATOR,
+            NATIVE_PLAY_GUI_MAX_OVER_33_MS_RATIO_DENOMINATOR,
+            self.frame_p95_within_budget,
+            self.attack_p95_within_budget,
+            self.beast_p95_within_budget,
+            self.frame_max_stall_within_budget,
+            self.attack_max_stall_within_budget,
+            self.beast_max_stall_within_budget,
+            self.frame_over_33_ms_ratio_within_budget,
+            self.attack_over_33_ms_ratio_within_budget,
+            self.beast_over_33_ms_ratio_within_budget,
+            self.no_missed_vblank_attempts,
+            self.verified,
+        )
+    }
+}
+
+fn native_gui_performance_gate(
+    frame: &NativeGuiTimingStats,
+    attack: &NativeGuiTimingStats,
+    beast: &NativeGuiTimingStats,
+    required_buttons: ActionButtons,
+    missed_vblank_attempts: u64,
+) -> NativeGuiPerformanceGate {
+    let attack_samples_required = action_buttons_have_any_attack(required_buttons);
+    let beast_samples_required = required_buttons.beast || required_buttons.p2_beast;
+    let frame_samples_present = frame.total_samples > 0;
+    let attack_samples_present = attack.total_samples > 0;
+    let beast_samples_present = beast.total_samples > 0;
+    let frame_p95_within_budget = frame.p95_within_production_budget();
+    let attack_p95_within_budget =
+        !attack_samples_required || attack.p95_within_production_budget();
+    let beast_p95_within_budget = !beast_samples_required || beast.p95_within_production_budget();
+    let frame_max_stall_within_budget = frame.max_stall_within_production_budget();
+    let attack_max_stall_within_budget =
+        !attack_samples_required || attack.max_stall_within_production_budget();
+    let beast_max_stall_within_budget =
+        !beast_samples_required || beast.max_stall_within_production_budget();
+    let frame_over_33_ms_ratio_within_budget = frame.over_33_ms_ratio_within_production_budget();
+    let attack_over_33_ms_ratio_within_budget =
+        !attack_samples_required || attack.over_33_ms_ratio_within_production_budget();
+    let beast_over_33_ms_ratio_within_budget =
+        !beast_samples_required || beast.over_33_ms_ratio_within_production_budget();
+    let no_missed_vblank_attempts = missed_vblank_attempts == 0;
+    let verified = frame_samples_present
+        && (!attack_samples_required || attack_samples_present)
+        && (!beast_samples_required || beast_samples_present)
+        && frame_p95_within_budget
+        && attack_p95_within_budget
+        && beast_p95_within_budget
+        && frame_max_stall_within_budget
+        && attack_max_stall_within_budget
+        && beast_max_stall_within_budget
+        && frame_over_33_ms_ratio_within_budget
+        && attack_over_33_ms_ratio_within_budget
+        && beast_over_33_ms_ratio_within_budget
+        && no_missed_vblank_attempts;
+
+    NativeGuiPerformanceGate {
+        frame_samples_present,
+        attack_samples_required,
+        attack_samples_present,
+        beast_samples_required,
+        beast_samples_present,
+        frame_p95_within_budget,
+        attack_p95_within_budget,
+        beast_p95_within_budget,
+        frame_max_stall_within_budget,
+        attack_max_stall_within_budget,
+        beast_max_stall_within_budget,
+        frame_over_33_ms_ratio_within_budget,
+        attack_over_33_ms_ratio_within_budget,
+        beast_over_33_ms_ratio_within_budget,
+        no_missed_vblank_attempts,
+        verified,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_native_play(
     rom: PathBuf,
@@ -3696,6 +3936,12 @@ fn run_native_play(
     let mut observed_test_input_buttons = ActionButtons::default();
     let mut observed_test_guest_buttons = ActionButtons::default();
     let mut test_input_activity = NativeInputActivity::default();
+    let mut gui_frame_timing = NativeGuiTimingStats::default();
+    let mut gui_emulation_timing = NativeGuiTimingStats::default();
+    let mut gui_attack_frame_timing = NativeGuiTimingStats::default();
+    let mut gui_beast_frame_timing = NativeGuiTimingStats::default();
+    let mut gui_frame_attempts = 0u64;
+    let mut gui_missed_vblank_attempts = 0u64;
     let mut pending_manual_takeover_buttons: Option<ActionButtons> = None;
     let mut last_effective_buttons = ActionButtons::default();
     let initial_native_playable_candidate = emulator.native_playable_candidate();
@@ -3841,7 +4087,7 @@ fn run_native_play(
     let initial_fast_window_frame =
         native_play_present_native_resolution_actual_frame(&emulator.fast_gameplay_display_frame());
     let mut gui_title_ready_for_tail = !gui_title_gate_enabled
-        || boot_fast_forward_stop_reason == "title_screen_ready"
+        || native_title_ready_stop_reason_allows_tail(boot_fast_forward_stop_reason)
         || script_segment_index >= script_segments.len()
         || native_play_emulator_title_screen_input_ready_fast(&emulator)
         || native_title_runtime_input_ready(emulator.input_activity(), &initial_fast_window_frame)
@@ -3895,6 +4141,16 @@ fn run_native_play(
                 gui_native_3d_gameplay_signal,
             )
         };
+    let mut gui_render_recovery_phase = native_play_gui_render_recovery_phase(
+        gui_native_playable_candidate,
+        gui_native_3d_gameplay_signal,
+        emulator.br2_native_credit_hle_game_start_accepted_seen(),
+    );
+    set_native_play_gui_render_recovery_phase(
+        &mut emulator,
+        gui_render_recovery_phase.0,
+        gui_render_recovery_phase.1,
+    );
     let mut gui_gpu_gameplay_context = native_play_cached_gpu_gameplay_context(
         gui_native_playable_candidate,
         gui_gpu_native_playable_candidate,
@@ -3992,7 +4248,7 @@ fn run_native_play(
     } else if autoplay_enabled {
         "Bloody Roar 2 native Rust - visible assist, keys layer until title then cancel script, Esc quit"
     } else {
-        "Bloody Roar 2 native Rust - arrows/WASD move, Z/Space/J punch, X/K kick, Q/L beast, E/I guard, C coin, V service, Enter credit then start, P start, Esc quit"
+        "Bloody Roar 2 native Rust - P1 arrows Z/Space X Q/L E, C/P/Enter; P2 WASD J K U I, N/O; Esc quit"
     };
     native_play_prepare_foreground_application();
     let mut window = Window::new(
@@ -4009,7 +4265,9 @@ fn run_native_play(
     .map_err(|error| format!("failed to create native play window: {error:?}"))?;
     window.set_position(NATIVE_PLAY_WINDOW_POSITION_X, NATIVE_PLAY_WINDOW_POSITION_Y);
     native_play_activate_window(&window);
-    window.set_target_fps(NATIVE_PLAY_WINDOW_TARGET_FPS);
+    // Keep a single pacing owner. minifb's target FPS sleeps inside
+    // update_with_buffer; native_play_gui_pacing_delay owns the GUI deadline.
+    window.set_target_fps(native_play_minifb_target_fps());
     window.set_title(&native_play_runtime_title(
         autoplay_enabled,
         script_segments.get(script_segment_index).is_some(),
@@ -4023,12 +4281,17 @@ fn run_native_play(
     ));
     let mut input_latch = NativeInputLatch::default();
     let mut physical_input_latch = NativeInputLatch::default();
+    let mut test_input_latch = NativeInputLatch::default();
+    let mut platform_input_state = NativePlatformInputState::default();
     let mut physical_enter = NativePhysicalEnterSequencer::default();
     let mut input_trace = NativeGuiInputTrace::from_env(emulator.input_activity());
     let mut test_input_script =
         NativeGuiTestInputScript::from_segments_or_env(&gui_test_input_segments)?;
     let test_input_enabled = test_input_script.is_enabled();
+    let required_test_input_buttons = test_input_script.requested_buttons();
+    let exclusive_test_input = native_play_gui_test_exclusive_input(test_input_enabled);
     let mut test_input_observed = false;
+    let mut test_input_release_observed = false;
     if test_input_script.is_enabled() {
         let source = if gui_test_input_segments.is_empty() {
             NATIVE_PLAY_GUI_TEST_INPUT_SCRIPT_ENV
@@ -4040,6 +4303,11 @@ fn run_native_play(
             source,
             test_input_script.len()
         );
+        if exclusive_test_input {
+            eprintln!(
+                "native GUI exclusive test input enabled: physical controls ignored, Esc and window close remain active"
+            );
+        }
     }
     window
         .update_with_buffer(
@@ -4048,36 +4316,51 @@ fn run_native_play(
             current_presented_frame.height,
         )
         .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+    // Hidden boot can generate minutes of queued audio before the first
+    // visible frame. Start playback only after the initial window is ready;
+    // the sound board keeps a short latest-sample prebuffer for a clean handoff.
+    let coreaudio_output = emulator
+        .start_coreaudio_output()
+        .map_err(|error| format!("failed to start native audio: {error}"))?;
+    if coreaudio_output.is_none() {
+        eprintln!("native audio unavailable: PS9805 ROM assets were not loaded");
+    }
     // AppKit cannot reliably promote the native window until minifb has
     // presented its first buffer and completed the initial event pump.
     native_play_activate_window(&window);
     let gui_capture_dir = native_play_gui_capture_dir();
     let gui_capture_interval = native_play_gui_capture_interval();
+    let mut gui_capture_writer = gui_capture_dir
+        .as_ref()
+        .map(|capture_dir| NativePlayGuiCaptureWriter::new(capture_dir.clone()));
     let gui_draw_capture_output_prefix = gui_draw_capture
         .output_prefix
         .clone()
         .or_else(|| gui_capture_dir.as_ref().map(|path| path.join("draw")))
         .unwrap_or_else(|| PathBuf::from("native-play-draw-capture"));
     let mut gui_draw_capture_armed = false;
-    if let Some(capture_dir) = gui_capture_dir.as_deref() {
-        write_native_play_gui_capture(
-            capture_dir,
+    if let Some(capture_writer) = gui_capture_writer.as_mut() {
+        capture_writer.capture(
             "initial",
             gui_rendered_frames,
             &current_presented_frame,
             ActionButtons::default(),
             &emulator,
+            true,
         )?;
     }
-    // Event polling happens many times per emulated frame. Rate-limit only the
-    // presented frame, otherwise minifb sleeps once per instruction slice.
-    window.set_target_fps(0);
-
+    let gui_loop_started_at = Instant::now();
+    let gui_max_frame_attempts = native_play_gui_max_frame_attempts(max_frames);
+    let gui_wall_timeout = native_play_gui_wall_timeout(max_frames);
+    let mut gui_stop_reason = "running";
     while window.is_open()
-        && !window.is_key_down(Key::Escape)
         && !emulator.is_terminal()
         && max_frames.is_none_or(|max_frames| gui_rendered_frames < max_frames)
+        && gui_max_frame_attempts
+            .is_none_or(|max_frame_attempts| gui_frame_attempts < max_frame_attempts)
+        && gui_wall_timeout.is_none_or(|wall_timeout| gui_loop_started_at.elapsed() < wall_timeout)
     {
+        let gui_frame_started_at = Instant::now();
         if !gui_draw_capture_armed
             && gui_draw_capture
                 .arm_gui_frame
@@ -4100,6 +4383,19 @@ fn run_native_play(
         if retried_window_activation {
             native_play_activate_window(&window);
         }
+        let consume_pressed_key_edges = native_play_should_consume_pressed_key_edges(
+            gui_rendered_frames,
+            window_active,
+            window_has_input_focus,
+            retried_window_activation,
+        );
+        let input_sample = native_window_button_sample(
+            &mut window,
+            window_active,
+            consume_pressed_key_edges,
+            true,
+            &mut platform_input_state,
+        );
         let scripted_segment_action = script_segments
             .get(script_segment_index)
             .map(|segment| segment.action);
@@ -4113,7 +4409,9 @@ fn run_native_play(
         } else {
             scripted_segment_action
         };
-        physical_enter.set_enabled(!script_tail_waiting_for_title || gui_title_ready_for_tail);
+        // Enter is a physical coin/start command, not part of the visible
+        // assist. Never let a failed title heuristic hold it indefinitely.
+        physical_enter.set_enabled(true);
         // Physical input must cancel the visible assist immediately. Waiting
         // for the title heuristic made valid key presses appear unresponsive
         // whenever a partially rendered title frame stalled that heuristic.
@@ -4122,26 +4420,51 @@ fn run_native_play(
             script_segment_index,
             gui_title_ready_for_tail,
         );
+        let gui_emulation_started_at = Instant::now();
         let step = step_native_play_window_frame_checked(
             &mut emulator,
             gui_instructions_per_frame,
-            &mut window,
+            input_sample,
             scripted_action,
             manual_takeover_enabled,
             &mut input_latch,
             &mut physical_input_latch,
+            &mut test_input_latch,
             &mut physical_enter,
             &mut input_trace,
             &test_input_script,
-            retried_window_activation,
+            exclusive_test_input,
+            !consume_pressed_key_edges,
+            |input_poll_index| {
+                window.update();
+                if !window.is_open() {
+                    return Some(NativeWindowButtonSample {
+                        quit_requested: true,
+                        ..NativeWindowButtonSample::default()
+                    });
+                }
+                let raw_window_active = window.is_active();
+                let window_active = native_play_window_is_active(&window, raw_window_active);
+                Some(native_window_button_sample(
+                    &mut window,
+                    window_active,
+                    true,
+                    native_play_gui_should_sample_platform_input(input_poll_index),
+                    &mut platform_input_state,
+                ))
+            },
         )?;
+        gui_emulation_timing.record(gui_emulation_started_at.elapsed());
+        gui_frame_attempts = gui_frame_attempts.saturating_add(1);
+        if !step.vblank_advanced {
+            gui_missed_vblank_attempts = gui_missed_vblank_attempts.saturating_add(1);
+        }
         if step.window_closed_or_escape {
+            gui_stop_reason = "window_closed_or_escape";
             break;
         }
         if step.vblank_advanced && script_tail_waiting_for_title {
-            let fast_window_frame = native_play_present_native_resolution_actual_frame(
-                &emulator.fast_gameplay_display_frame(),
-            );
+            let (fast_window_frame, _) = emulator.fast_gameplay_window_frame_with_checksum();
             gui_title_ready_for_tail =
                 native_play_emulator_title_screen_input_ready_fast(&emulator)
                     || native_title_runtime_input_ready(
@@ -4196,6 +4519,9 @@ fn run_native_play(
             merge_action_buttons(observed_test_guest_buttons, step.test_guest_buttons);
         test_input_activity = test_input_activity.saturating_added(step.test_input_activity);
         test_input_observed |= step.test_input_override;
+        test_input_release_observed |= test_input_script.is_complete()
+            && !step.test_input_override
+            && native_input_activity_has_poll(step.guest_input_activity);
         let cancel_for_manual_takeover = manual_takeover || pending_takeover_buttons.is_some();
         let mut effective_step_buttons = step.buttons;
         if cancel_for_manual_takeover {
@@ -4270,6 +4596,19 @@ fn run_native_play(
                 gui_native_3d_gameplay_signal,
             ));
         }
+        let desired_render_recovery_phase = native_play_gui_render_recovery_phase(
+            gui_native_playable_candidate,
+            gui_native_3d_gameplay_signal,
+            player_session_started,
+        );
+        if gui_render_recovery_phase != desired_render_recovery_phase {
+            gui_render_recovery_phase = desired_render_recovery_phase;
+            set_native_play_gui_render_recovery_phase(
+                &mut emulator,
+                gui_render_recovery_phase.0,
+                gui_render_recovery_phase.1,
+            );
+        }
         last_effective_buttons = effective_step_buttons;
         let final_bounded_frame = step.vblank_advanced
             && max_frames
@@ -4296,9 +4635,8 @@ fn run_native_play(
                 && (gui_gpu_native_playable_candidate
                     || gui_gpu_rendered_scene_candidate
                     || gui_native_3d_gameplay_signal);
-            let fast_actual_frame = native_play_present_native_resolution_actual_frame(
-                &emulator.fast_gameplay_display_frame(),
-            );
+            let (fast_actual_frame, fast_actual_checksum) =
+                emulator.fast_gameplay_window_frame_with_checksum();
             let classify_fast_actual = native_play_gui_should_classify_fast_frame(
                 gui_rendered_frames,
                 buttons_changed,
@@ -4310,39 +4648,57 @@ fn run_native_play(
             let (fast_actual_stats, fast_actual_checksum) = if classify_fast_actual {
                 NativeFrameStats::from_frame_with_checksum(&fast_actual_frame)
             } else {
-                (
-                    current_visible_stats,
-                    native_frame_checksum(&fast_actual_frame),
+                (current_visible_stats, fast_actual_checksum)
+            };
+            let preferred_raw_title = if classify_fast_actual
+                && !gui_player_session_started
+                && native_play_title_stats_input_ready(fast_actual_stats)
+            {
+                let raw_actual = emulator.raw_actual_display_frame();
+                let active_actual = emulator.actual_display_frame();
+                native_play_preferred_full_height_raw_title(
+                    &raw_actual,
+                    &active_actual,
+                    fast_actual_stats,
                 )
+            } else {
+                None
             };
             let fast_actual_accepted = if classify_fast_actual {
-                !native_play_gui_post_start_stale_title(
-                    gui_player_session_started,
-                    fast_actual_stats,
-                ) && (native_play_fast_gui_frame_stats_are_safe(
-                    gui_native_playable_candidate,
-                    gui_gpu_gameplay_context,
-                    fast_actual_stats,
-                ) || native_play_preserved_gui_handoff_frame_is_safe(
-                    gui_player_session_started,
-                    fast_actual_stats,
-                ) || (gui_native_playable_candidate
-                    && gui_gpu_native_playable_candidate
-                    && native_play_gpu_verified_window_stats_with_context(
+                preferred_raw_title.is_some()
+                    || (!native_play_gui_post_start_stale_title(
+                        gui_player_session_started,
+                        fast_actual_stats,
+                    ) && (native_play_fast_gui_frame_stats_are_safe(
                         gui_native_playable_candidate,
                         gui_gpu_gameplay_context,
                         fast_actual_stats,
-                    )
-                    && !native_play_frame_has_blocking_render_artifact(fast_actual_stats)))
+                    ) || native_play_preserved_gui_handoff_frame_is_safe(
+                        gui_player_session_started,
+                        fast_actual_stats,
+                    ) || (gui_native_playable_candidate
+                        && gui_gpu_native_playable_candidate
+                        && native_play_gpu_verified_window_stats_with_context(
+                            gui_native_playable_candidate,
+                            gui_gpu_gameplay_context,
+                            fast_actual_stats,
+                        )
+                        && !native_play_frame_has_blocking_render_artifact(fast_actual_stats))))
             } else {
                 native_play_gui_can_reuse_fast_frame_classification(
+                    gui_player_session_started,
                     current_visible_stats,
                     current_visible_checksum,
                     &fast_actual_frame,
                     fast_actual_checksum,
                 )
             };
-            if fast_actual_accepted {
+            if let Some((raw_title, raw_title_stats)) = preferred_raw_title {
+                current_visible_checksum = native_frame_checksum(&raw_title);
+                current_visible_window_frame = raw_title;
+                current_visible_stats = raw_title_stats;
+                fast_display_rejection_streak = 0;
+            } else if fast_actual_accepted {
                 current_visible_window_frame = fast_actual_frame;
                 current_visible_stats = fast_actual_stats;
                 current_visible_checksum = fast_actual_checksum;
@@ -4390,14 +4746,25 @@ fn run_native_play(
                     current_visible_stats = selected.stats;
                 } else {
                     let actual_should_replace =
-                        native_play_native_resolution_actual_should_replace_window_candidate(
+                        native_play_native_resolution_actual_should_replace_window_candidate_for_gui(
                             gui_native_playable_candidate,
                             gui_gpu_gameplay_context,
                             gui_actual_supports_playable,
+                            &actual_frame,
                             actual_stats,
+                            &candidate_frame,
                             candidate_stats,
                         ) || (gui_native_playable_candidate
                             && gui_gpu_native_playable_candidate
+                            && native_play_fresh_actual_replacement_frame_passes_artifact_checks(
+                                actual_stats,
+                            )
+                            && !native_play_projected_active_field_actual_should_hold_window_candidate(
+                                &actual_frame,
+                                actual_stats,
+                                &candidate_frame,
+                                candidate_stats,
+                            )
                             && native_play_gpu_verified_window_stats_with_context(
                                 gui_native_playable_candidate,
                                 gui_gpu_gameplay_context,
@@ -4454,6 +4821,7 @@ fn run_native_play(
                 gui_actual_supports_playable,
                 frame_stats,
             );
+        let mut submitted_window_buffer = false;
         if refresh_display {
             let frame_change = native_play_gui_window_frame_change(
                 last_presented_window_checksum,
@@ -4468,12 +4836,12 @@ fn run_native_play(
                 last_gui_presented_at,
                 Instant::now(),
                 native_play_gui_present_interval(present_elapsed_frames),
-                pending_display_refresh,
+                pending_display_refresh || emulator.audio_realtime_playback_needs_game_time(),
             );
             if !pacing_delay.is_zero() {
                 std::thread::sleep(pacing_delay);
             }
-            if native_play_gui_should_submit_buffer(
+            if native_play_gui_should_rebuild_presented_buffer(
                 frame_change.changed,
                 retried_window_activation,
                 gui_rendered_frames,
@@ -4482,6 +4850,13 @@ fn run_native_play(
                     &current_visible_window_frame,
                     &mut current_presented_frame,
                 );
+                last_presented_window_checksum = frame_change.checksum;
+            }
+            if native_play_gui_should_submit_buffer(
+                frame_change.changed,
+                retried_window_activation,
+                gui_rendered_frames,
+            ) {
                 window
                     .update_with_buffer(
                         &current_presented_frame.pixels,
@@ -4489,33 +4864,25 @@ fn run_native_play(
                         current_presented_frame.height,
                     )
                     .map_err(|error| format!("failed to update native play window: {error:?}"))?;
-                last_presented_window_checksum = frame_change.checksum;
+                submitted_window_buffer = true;
             }
             last_gui_presented_at = Instant::now();
             last_gui_presented_frame =
                 native_play_gui_present_frame(gui_rendered_frames, step.vblank_advanced);
             pending_display_refresh = false;
         }
+        if !submitted_window_buffer {
+            window
+                .update_with_buffer(
+                    &current_presented_frame.pixels,
+                    current_presented_frame.width,
+                    current_presented_frame.height,
+                )
+                .map_err(|error| format!("failed to update native play window: {error:?}"))?;
+        }
         if step.vblank_advanced {
             rendered_frames += 1;
             gui_rendered_frames += 1;
-        }
-        if let Some(capture_dir) = gui_capture_dir.as_deref()
-            && refresh_display
-            && (buttons_changed
-                || gui_rendered_frames == 1
-                || gui_rendered_frames
-                    .saturating_sub(1)
-                    .is_multiple_of(gui_capture_interval))
-        {
-            write_native_play_gui_capture(
-                capture_dir,
-                "presented",
-                gui_rendered_frames,
-                &current_presented_frame,
-                effective_step_buttons,
-                &emulator,
-            )?;
         }
         if refresh_display
             && display_frame_classified
@@ -4527,7 +4894,7 @@ fn run_native_play(
         {
             last_safe_window_frame = Some(current_visible_window_frame.clone());
         }
-        if step.vblank_advanced {
+        if step.input_timing_advanced {
             test_input_script.advance_frame();
         }
         if frame_render_ready {
@@ -4544,20 +4911,64 @@ fn run_native_play(
             first_native_playable_frame.get_or_insert(rendered_frames);
             last_native_playable_frame = Some(rendered_frames);
         }
+        let elapsed = gui_frame_started_at.elapsed();
+        gui_frame_timing.record(elapsed);
+        if action_buttons_have_any_attack(effective_step_buttons) {
+            gui_attack_frame_timing.record(elapsed);
+        }
+        if effective_step_buttons.beast || effective_step_buttons.p2_beast {
+            gui_beast_frame_timing.record(elapsed);
+        }
+        if let Some(capture_writer) = gui_capture_writer.as_mut()
+            && refresh_display
+            && (buttons_changed
+                || gui_rendered_frames == 1
+                || gui_rendered_frames
+                    .saturating_sub(1)
+                    .is_multiple_of(gui_capture_interval))
+        {
+            // QA capture cloning and deep snapshot construction are not part
+            // of the production frame budget. The async writer already keeps
+            // PNG encoding and disk I/O off the GUI thread.
+            capture_writer.capture(
+                "presented",
+                gui_rendered_frames,
+                &current_presented_frame,
+                effective_step_buttons,
+                &emulator,
+                false,
+            )?;
+        }
+    }
+    if gui_stop_reason == "running" {
+        gui_stop_reason = native_play_gui_stop_reason(
+            window.is_open(),
+            window.is_key_down(Key::Escape),
+            emulator.is_terminal(),
+            max_frames,
+            gui_rendered_frames,
+            gui_max_frame_attempts,
+            gui_frame_attempts,
+            gui_wall_timeout,
+            gui_loop_started_at.elapsed(),
+        );
     }
 
     let final_native_playable_candidate = emulator.native_playable_candidate();
     let final_raw_frame = current_visible_window_frame;
     let final_frame = current_presented_frame;
-    if let Some(capture_dir) = gui_capture_dir.as_deref() {
-        write_native_play_gui_capture(
-            capture_dir,
+    if let Some(capture_writer) = gui_capture_writer.as_mut() {
+        capture_writer.capture(
             "final",
             gui_rendered_frames,
             &final_frame,
             last_effective_buttons,
             &emulator,
+            true,
         )?;
+    }
+    if let Some(capture_writer) = gui_capture_writer {
+        capture_writer.finish()?;
     }
     if !gui_draw_capture.predicates.is_empty() {
         let captures = if gui_draw_capture_armed {
@@ -4631,36 +5042,72 @@ fn run_native_play(
         && final_frame_context_ready;
     let final_window_size = window.get_size();
     let input_activity = emulator.input_activity();
+    let audio_health = emulator.audio_health();
+    let audio_health_json = audio_health.map_or_else(
+        || "{\"state\":\"unavailable\",\"reason\":\"sound_board_not_loaded\",\"audible\":false,\"render_progressing\":false,\"pcm_nonzero\":false,\"realtime_output_seen\":false,\"realtime_ok\":false}".to_string(),
+        |health| health.json(),
+    );
+    let audio_realtime_verified = coreaudio_output.is_some()
+        && audio_health.is_some_and(|health| health.audible() && health.realtime_ok);
+    let gui_performance_gate = native_gui_performance_gate(
+        &gui_frame_timing,
+        &gui_attack_frame_timing,
+        &gui_beast_frame_timing,
+        required_test_input_buttons,
+        gui_missed_vblank_attempts,
+    );
+    let gui_performance_gate_json = gui_performance_gate.json();
     let any_input_controls_active = input_activity.has_any_control_activity();
     let input_controls_active = input_activity.has_play_control_activity();
     let full_controls_active = input_activity.has_full_control_activity();
     let physical_any_input_observed = action_buttons_any(observed_physical_buttons);
     let physical_direction_input_observed =
-        action_buttons_have_direction_coverage(observed_physical_buttons);
+        action_buttons_have_full_direction_coverage(observed_physical_buttons);
     let physical_play_input_observed =
-        action_buttons_have_play_control_coverage(observed_physical_buttons);
+        action_buttons_have_full_play_control_coverage(observed_physical_buttons);
     let physical_full_input_observed =
         physical_direction_input_observed && physical_play_input_observed;
     let physical_any_input_guest_verified = action_buttons_any(observed_physical_guest_buttons);
     let physical_play_input_guest_verified =
-        action_buttons_have_play_control_coverage(observed_physical_guest_buttons);
+        action_buttons_have_full_play_control_coverage(observed_physical_guest_buttons);
     let physical_full_input_guest_verified =
-        action_buttons_have_direction_coverage(observed_physical_guest_buttons)
+        action_buttons_have_full_direction_coverage(observed_physical_guest_buttons)
             && physical_play_input_guest_verified;
+    let test_input_completed = test_input_script.is_complete();
     let test_any_input_observed = action_buttons_any(observed_test_input_buttons);
-    let test_direction_input_observed =
+    let test_p1_direction_input_observed =
         action_buttons_have_direction_coverage(observed_test_input_buttons);
-    let test_play_input_observed =
+    let test_p1_play_input_observed =
         action_buttons_have_combat_control_coverage(observed_test_input_buttons);
-    let test_full_input_observed = test_direction_input_observed && test_play_input_observed;
+    let test_p1_full_input_observed =
+        test_p1_direction_input_observed && test_p1_play_input_observed;
+    let test_p2_direction_input_observed =
+        action_buttons_have_p2_direction_coverage(observed_test_input_buttons);
+    let test_p2_play_input_observed =
+        action_buttons_have_p2_combat_control_coverage(observed_test_input_buttons);
+    let test_p2_full_input_observed =
+        test_p2_direction_input_observed && test_p2_play_input_observed;
+    let test_direction_input_observed =
+        test_p1_direction_input_observed || test_p2_direction_input_observed;
+    let test_play_input_observed = test_p1_play_input_observed || test_p2_play_input_observed;
+    let test_full_input_observed = test_p1_full_input_observed || test_p2_full_input_observed;
     let test_any_input_guest_verified = test_input_activity.has_any_control_activity();
-    let test_play_input_guest_verified =
+    let test_p1_play_input_guest_verified =
         action_buttons_have_combat_control_coverage(observed_test_guest_buttons);
-    let test_full_input_guest_verified =
+    let test_p1_full_input_guest_verified =
         action_buttons_have_direction_coverage(observed_test_guest_buttons)
-            && test_play_input_guest_verified;
+            && test_p1_play_input_guest_verified;
+    let test_p2_play_input_guest_verified =
+        action_buttons_have_p2_combat_control_coverage(observed_test_guest_buttons);
+    let test_p2_full_input_guest_verified =
+        action_buttons_have_p2_direction_coverage(observed_test_guest_buttons)
+            && test_p2_play_input_guest_verified;
+    let test_play_input_guest_verified =
+        test_p1_play_input_guest_verified || test_p2_play_input_guest_verified;
+    let test_full_input_guest_verified =
+        test_p1_full_input_guest_verified || test_p2_full_input_guest_verified;
     let test_requested_input_guest_verified =
-        action_buttons_cover(observed_test_guest_buttons, observed_test_input_buttons);
+        action_buttons_cover(observed_test_guest_buttons, required_test_input_buttons);
     let player_session_started = emulator.br2_native_credit_hle_game_start_accepted_seen();
     // The GPU classifier is deliberately conservative and can mistake BR2's
     // in-fight lower HUD for an intro caption. A started player session plus a
@@ -4679,7 +5126,9 @@ fn run_native_play(
         && physical_full_input_guest_verified;
     let native_play_test_input_verified = native_playable_observed_or_final
         && test_input_observed
-        && test_requested_input_guest_verified;
+        && test_input_completed
+        && test_requested_input_guest_verified
+        && test_input_release_observed;
     let render_ready =
         (observed_render_ready || final_frame_render_verified) && final_frame_render_ready;
     let gameplay_ready =
@@ -4708,9 +5157,30 @@ fn run_native_play(
     let first_render_ready_frame = optional_u64_json(first_render_ready_frame);
     let last_render_ready_frame = optional_u64_json(last_render_ready_frame);
     println!(
-        "{{\"rendered_frames\":{},\"gui_rendered_frames\":{},\"manual_override_frames\":{},\"manual_input_observed\":{},\"manual_takeover_observed\":{},\"physical_input_buttons\":{},\"physical_input_activity\":{},\"physical_any_input_observed\":{},\"physical_direction_input_observed\":{},\"physical_play_input_observed\":{},\"physical_full_input_observed\":{},\"physical_any_input_guest_verified\":{},\"physical_play_input_guest_verified\":{},\"physical_full_input_guest_verified\":{},\"test_input_enabled\":{},\"test_input_observed\":{},\"test_input_buttons\":{},\"test_input_activity\":{},\"test_any_input_observed\":{},\"test_direction_input_observed\":{},\"test_play_input_observed\":{},\"test_full_input_observed\":{},\"test_any_input_guest_verified\":{},\"test_play_input_guest_verified\":{},\"test_full_input_guest_verified\":{},\"native_play_test_input_verified\":{},\"last_effective_buttons\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_fast_forwarded\":{},\"autoplay_stop_at_first_playable\":{},\"boot_fast_forwarded\":{},\"boot_fast_forwarded_frames\":{},\"boot_fast_forward_stop_reason\":\"{}\",\"autoplay_fast_forward_max_frames\":{},\"autoplay_fast_forward_instructions_per_frame\":{},\"gui_instructions_per_frame\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_missed_vblank_frames\":{},\"autoplay_segments\":[{}],\"initial_raw_frame\":{},\"initial_window_frame\":{},\"final_raw_frame\":{},\"final_window_size\":{{\"width\":{},\"height\":{}}},\"input_activity\":{},\"render_ready\":{},\"observed_render_ready\":{},\"first_render_ready_frame\":{},\"last_render_ready_frame\":{},\"player_session_started\":{},\"gameplay_ready\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"any_input_controls_active\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_any_input_verified\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_visible_content\":{},\"final_frame_scene_detail\":{},\"final_frame_render_ready\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
+        "{{\"rendered_frames\":{},\"gui_rendered_frames\":{},\"gui_watchdog\":{{\"frame_attempts\":{},\"missed_vblank_attempts\":{},\"stop_reason\":\"{}\",\"wall_elapsed_ms\":{},\"wall_timeout_secs\":{},\"max_frame_attempts\":{}}},\"gui_input_verification\":{{\"test_input_completed\":{},\"release_observed\":{},\"required_buttons\":{},\"guest_buttons\":{},\"requested_guest_verified\":{},\"p1_direction_observed\":{},\"p1_play_observed\":{},\"p1_full_observed\":{},\"p2_direction_observed\":{},\"p2_play_observed\":{},\"p2_full_observed\":{},\"p1_play_guest_verified\":{},\"p1_full_guest_verified\":{},\"p2_play_guest_verified\":{},\"p2_full_guest_verified\":{}}},\"manual_override_frames\":{},\"manual_input_observed\":{},\"manual_takeover_observed\":{},\"physical_input_buttons\":{},\"physical_input_activity\":{},\"physical_any_input_observed\":{},\"physical_direction_input_observed\":{},\"physical_play_input_observed\":{},\"physical_full_input_observed\":{},\"physical_any_input_guest_verified\":{},\"physical_play_input_guest_verified\":{},\"physical_full_input_guest_verified\":{},\"test_input_enabled\":{},\"test_input_observed\":{},\"test_input_buttons\":{},\"test_input_activity\":{},\"test_any_input_observed\":{},\"test_direction_input_observed\":{},\"test_play_input_observed\":{},\"test_full_input_observed\":{},\"test_any_input_guest_verified\":{},\"test_play_input_guest_verified\":{},\"test_full_input_guest_verified\":{},\"native_play_test_input_verified\":{},\"last_effective_buttons\":{},\"executed_steps\":{},\"autoplay_enabled\":{},\"autoplay_fast_forwarded\":{},\"autoplay_stop_at_first_playable\":{},\"boot_fast_forwarded\":{},\"boot_fast_forwarded_frames\":{},\"boot_fast_forward_stop_reason\":\"{}\",\"autoplay_fast_forward_max_frames\":{},\"autoplay_fast_forward_instructions_per_frame\":{},\"gui_instructions_per_frame\":{},\"autoplay_script_completed\":{},\"autoplay_scripted_frames\":{},\"autoplay_missed_vblank_frames\":{},\"autoplay_segments\":[{}],\"initial_raw_frame\":{},\"initial_window_frame\":{},\"final_raw_frame\":{},\"final_window_size\":{{\"width\":{},\"height\":{}}},\"input_activity\":{},\"audio\":{},\"audio_health\":{},\"audio_realtime_verified\":{},\"gpu_recovery_raster_cache\":{},\"timing\":{{\"frame\":{},\"emulation\":{},\"attack_frame\":{},\"beast_frame\":{}}},\"performance\":{},\"performance_verified\":{},\"render_ready\":{},\"observed_render_ready\":{},\"first_render_ready_frame\":{},\"last_render_ready_frame\":{},\"player_session_started\":{},\"gameplay_ready\":{},\"native_playable_candidate\":{},\"observed_native_playable_candidate\":{},\"first_native_playable_frame\":{},\"last_native_playable_frame\":{},\"final_native_playable_candidate\":{},\"any_input_controls_active\":{},\"input_controls_active\":{},\"full_controls_active\":{},\"native_play_any_input_verified\":{},\"native_play_input_verified\":{},\"native_play_full_input_verified\":{},\"final_frame_full_size\":{},\"final_frame_visible_content\":{},\"final_frame_scene_detail\":{},\"final_frame_render_ready\":{},\"final_frame_gameplay_scene\":{},\"final_frame_handoff_scene\":{},\"final_frame_render_verified\":{},\"final_frame\":{},\"playable\":{},\"state\":{}}}",
         rendered_frames,
         gui_rendered_frames,
+        gui_frame_attempts,
+        gui_missed_vblank_attempts,
+        gui_stop_reason,
+        gui_loop_started_at.elapsed().as_millis(),
+        optional_u64_json(gui_wall_timeout.map(|timeout| timeout.as_secs())),
+        optional_u64_json(gui_max_frame_attempts),
+        test_input_completed,
+        test_input_release_observed,
+        required_test_input_buttons.json(),
+        observed_test_guest_buttons.json(),
+        test_requested_input_guest_verified,
+        test_p1_direction_input_observed,
+        test_p1_play_input_observed,
+        test_p1_full_input_observed,
+        test_p2_direction_input_observed,
+        test_p2_play_input_observed,
+        test_p2_full_input_observed,
+        test_p1_play_input_guest_verified,
+        test_p1_full_input_guest_verified,
+        test_p2_play_input_guest_verified,
+        test_p2_full_input_guest_verified,
         manual_override_frames,
         manual_input_observed,
         manual_takeover_observed,
@@ -4765,6 +5235,16 @@ fn run_native_play(
         final_window_size.0,
         final_window_size.1,
         input_activity.json(),
+        emulator.audio_stats_json(),
+        audio_health_json,
+        audio_realtime_verified,
+        emulator.recovery_raster_cache_stats_json(),
+        gui_frame_timing.json(),
+        gui_emulation_timing.json(),
+        gui_attack_frame_timing.json(),
+        gui_beast_frame_timing.json(),
+        gui_performance_gate_json,
+        gui_performance_gate.verified,
         render_ready,
         observed_render_ready,
         first_render_ready_frame,
@@ -4794,6 +5274,11 @@ fn run_native_play(
         emulator.gui_runtime_probe_json()
     );
     let strict_playability_required = max_frames.is_some() || test_input_enabled;
+    if max_frames.is_some() && gui_stop_reason != "max_frames" {
+        return Err(format!(
+            "native play bounded GUI stopped early: stop_reason={gui_stop_reason} rendered_frames={gui_rendered_frames} frame_attempts={gui_frame_attempts} missed_vblank_attempts={gui_missed_vblank_attempts}"
+        ));
+    }
     if strict_playability_required && !playable {
         return Err(format!(
             "native play verification failed: playable_candidate={} render_verified={} presented_size={}x{} expected={}x{}",
@@ -4806,9 +5291,25 @@ fn run_native_play(
         ));
     }
     if test_input_enabled && !native_play_test_input_verified {
-        return Err(
-            "native play GUI test input failed to reach every requested guest control".to_string(),
-        );
+        return Err(format!(
+            "native play GUI test input verification failed: completed={test_input_completed} guest_buttons={} required_buttons={} release_observed={test_input_release_observed}",
+            observed_test_guest_buttons.json(),
+            required_test_input_buttons.json(),
+        ));
+    }
+    if strict_playability_required && !audio_realtime_verified {
+        return Err(format!(
+            "native play GUI audio verification failed: coreaudio_started={} health={audio_health_json}",
+            coreaudio_output.is_some()
+        ));
+    }
+    if strict_playability_required && !gui_performance_gate.verified {
+        return Err(format!(
+            "native play GUI performance verification failed: performance={gui_performance_gate_json} frame={} attack={} beast={}",
+            gui_frame_timing.json(),
+            gui_attack_frame_timing.json(),
+            gui_beast_frame_timing.json(),
+        ));
     }
     Ok(())
 }
@@ -5001,7 +5502,22 @@ fn native_play_should_retry_window_activation(
     if gui_rendered_frames < NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES {
         return gui_rendered_frames.is_multiple_of(NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_INTERVAL);
     }
-    gui_rendered_frames.is_multiple_of(NATIVE_PLAY_WINDOW_ACTIVATION_BACKGROUND_RETRY_INTERVAL)
+    false
+}
+
+fn native_play_should_consume_pressed_key_edges(
+    gui_rendered_frames: u64,
+    window_active: bool,
+    window_has_input_focus: bool,
+    retried_window_activation: bool,
+) -> bool {
+    if retried_window_activation {
+        return false;
+    }
+    if !window_has_input_focus && gui_rendered_frames < NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES {
+        return false;
+    }
+    window_active || window_has_input_focus
 }
 
 fn native_play_gui_capture_dir() -> Option<PathBuf> {
@@ -5018,55 +5534,221 @@ fn native_play_gui_capture_interval() -> u64 {
         .unwrap_or(NATIVE_PLAY_GUI_CAPTURE_INTERVAL_FRAMES)
 }
 
-fn write_native_play_gui_capture(
-    capture_dir: &Path,
-    label: &str,
+fn native_play_gui_deep_capture_interval() -> Option<u64> {
+    env::var(NATIVE_PLAY_GUI_DEEP_CAPTURE_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn native_play_gui_test_exclusive_input(test_input_enabled: bool) -> bool {
+    test_input_enabled && native_env_flag_enabled(NATIVE_PLAY_GUI_TEST_EXCLUSIVE_INPUT_ENV)
+}
+
+fn native_env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| native_env_flag_value_enabled(&value))
+}
+
+fn native_env_flag_value_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+#[derive(Clone)]
+struct NativePlayGuiDeepCapture {
+    stable_frame: NativeDisplayFrame,
+    actual_frame: NativeDisplayFrame,
+    raw_actual_frame: NativeDisplayFrame,
+    observation_frame: NativeDisplayFrame,
+    native_playable_candidate: bool,
+    gpu_playable_candidate: bool,
+    gte_gameplay_signal: bool,
+    input_activity: String,
+    audio: String,
+    gpu_recovery_raster_cache: String,
+    native_sync: String,
+    runtime_probe: String,
+}
+
+struct NativePlayGuiCaptureTask {
+    label: String,
     gui_frame: u64,
-    frame: &NativeDisplayFrame,
+    frame: NativeDisplayFrame,
     buttons: ActionButtons,
-    emulator: &NativeEmulator,
+    deep: Option<NativePlayGuiDeepCapture>,
+}
+
+enum NativePlayGuiCaptureCommand {
+    Capture(Box<NativePlayGuiCaptureTask>),
+    Finish,
+}
+
+struct NativePlayGuiCaptureWriter {
+    sender: SyncSender<NativePlayGuiCaptureCommand>,
+    worker: JoinHandle<Result<(), String>>,
+    deep_capture: bool,
+    deep_capture_interval: Option<u64>,
+    dropped: u64,
+}
+
+impl NativePlayGuiCaptureWriter {
+    fn new(capture_dir: PathBuf) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<NativePlayGuiCaptureCommand>(
+            NATIVE_PLAY_GUI_CAPTURE_QUEUE_CAPACITY,
+        );
+        let worker = std::thread::spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    NativePlayGuiCaptureCommand::Capture(task) => {
+                        write_native_play_gui_capture_task(&capture_dir, *task)?;
+                    }
+                    NativePlayGuiCaptureCommand::Finish => break,
+                }
+            }
+            Ok(())
+        });
+        Self {
+            sender,
+            worker,
+            deep_capture: native_env_flag_enabled(NATIVE_PLAY_GUI_DEEP_CAPTURE_ENV),
+            deep_capture_interval: native_play_gui_deep_capture_interval(),
+            dropped: 0,
+        }
+    }
+
+    fn capture(
+        &mut self,
+        label: &str,
+        gui_frame: u64,
+        frame: &NativeDisplayFrame,
+        buttons: ActionButtons,
+        emulator: &NativeEmulator,
+        required: bool,
+    ) -> Result<(), String> {
+        let periodic_deep = self
+            .deep_capture_interval
+            .is_some_and(|interval| gui_frame.saturating_sub(1).is_multiple_of(interval));
+        let deep =
+            (self.deep_capture && (required || periodic_deep)).then(|| NativePlayGuiDeepCapture {
+                stable_frame: emulator.display_frame(),
+                actual_frame: emulator.actual_display_frame(),
+                raw_actual_frame: emulator.raw_actual_display_frame(),
+                observation_frame: emulator.observation_frame(),
+                native_playable_candidate: emulator.native_playable_candidate(),
+                gpu_playable_candidate: emulator.gpu_native_playable_candidate(),
+                gte_gameplay_signal: emulator.native_3d_gameplay_signal(),
+                input_activity: emulator.input_activity_json(),
+                audio: emulator.audio_stats_json(),
+                gpu_recovery_raster_cache: emulator.recovery_raster_cache_stats_json(),
+                native_sync: emulator.native_sync_compact_json(),
+                runtime_probe: emulator.gui_runtime_probe_json(),
+            });
+        let command = NativePlayGuiCaptureCommand::Capture(Box::new(NativePlayGuiCaptureTask {
+            label: label.to_string(),
+            gui_frame,
+            frame: frame.clone(),
+            buttons,
+            deep,
+        }));
+        if required {
+            self.sender
+                .send(command)
+                .map_err(|_| "native GUI capture worker stopped unexpectedly".to_string())
+        } else {
+            match self.sender.try_send(command) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => {
+                    self.dropped = self.dropped.saturating_add(1);
+                    Ok(())
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    Err("native GUI capture worker stopped unexpectedly".to_string())
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Result<(), String> {
+        self.sender
+            .send(NativePlayGuiCaptureCommand::Finish)
+            .map_err(|_| "native GUI capture worker stopped unexpectedly".to_string())?;
+        let result = self
+            .worker
+            .join()
+            .map_err(|_| "native GUI capture worker panicked".to_string())?;
+        if self.dropped > 0 {
+            eprintln!(
+                "native GUI capture: dropped {} non-critical frames to preserve realtime playback",
+                self.dropped
+            );
+        }
+        result
+    }
+}
+
+fn write_native_play_gui_capture_task(
+    capture_dir: &Path,
+    task: NativePlayGuiCaptureTask,
 ) -> Result<(), String> {
+    let NativePlayGuiCaptureTask {
+        label,
+        gui_frame,
+        frame,
+        buttons,
+        deep,
+    } = task;
     let prefix = capture_dir.join(format!("{gui_frame:06}-{label}"));
     let png_path = prefix.with_extension("png");
     let json_path = prefix.with_extension("json");
-    let frame_stats = NativeFrameStats::from_frame(frame);
-    let stable_frame = emulator.display_frame();
-    let actual_frame = emulator.actual_display_frame();
-    let raw_actual_frame = emulator.raw_actual_display_frame();
-    let observation_frame = emulator.observation_frame();
-    for (suffix, source_frame) in [
-        ("stable", &stable_frame),
-        ("actual", &actual_frame),
-        ("raw-actual", &raw_actual_frame),
-        ("observation", &observation_frame),
-    ] {
-        write_native_display_frame_png(
-            source_frame,
-            &capture_dir.join(format!("{gui_frame:06}-{label}.{suffix}.png")),
-        )?;
-    }
-    write_native_display_frame_png(frame, &png_path)?;
-    write_output_file(
-        &json_path,
+    let frame_stats = NativeFrameStats::from_frame(&frame);
+    write_native_display_frame_png(&frame, &png_path)?;
+    let json = if let Some(deep) = deep {
+        for (suffix, source_frame) in [
+            ("stable", &deep.stable_frame),
+            ("actual", &deep.actual_frame),
+            ("raw-actual", &deep.raw_actual_frame),
+            ("observation", &deep.observation_frame),
+        ] {
+            write_native_display_frame_png(
+                source_frame,
+                &capture_dir.join(format!("{gui_frame:06}-{label}.{suffix}.png")),
+            )?;
+        }
         format!(
-            "{{\"label\":\"{}\",\"gui_frame\":{},\"checksum\":{},\"buttons\":{},\"native_playable_candidate\":{},\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"frame\":{},\"stable_frame\":{},\"actual_frame\":{},\"raw_actual_frame\":{},\"observation_frame\":{},\"input_activity\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{}}}",
-            escape_json(label),
+            "{{\"label\":\"{}\",\"gui_frame\":{},\"capture_mode\":\"deep_async\",\"checksum\":{},\"buttons\":{},\"native_playable_candidate\":{},\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"frame\":{},\"stable_frame\":{},\"actual_frame\":{},\"raw_actual_frame\":{},\"observation_frame\":{},\"input_activity\":{},\"audio\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"runtime_probe\":{}}}",
+            escape_json(&label),
             gui_frame,
-            native_frame_checksum(frame),
+            native_frame_checksum(&frame),
             buttons.json(),
-            emulator.native_playable_candidate(),
-            emulator.gpu_native_playable_candidate(),
-            emulator.native_3d_gameplay_signal(),
+            deep.native_playable_candidate,
+            deep.gpu_playable_candidate,
+            deep.gte_gameplay_signal,
             frame_stats.json(),
-            NativeFrameStats::from_frame(&stable_frame).json(),
-            NativeFrameStats::from_frame(&actual_frame).json(),
-            NativeFrameStats::from_frame(&raw_actual_frame).json(),
-            NativeFrameStats::from_frame(&observation_frame).json(),
-            emulator.input_activity_json(),
-            emulator.recovery_raster_cache_stats_json(),
-            emulator.native_sync_compact_json()
-        ),
-    )
+            NativeFrameStats::from_frame(&deep.stable_frame).json(),
+            NativeFrameStats::from_frame(&deep.actual_frame).json(),
+            NativeFrameStats::from_frame(&deep.raw_actual_frame).json(),
+            NativeFrameStats::from_frame(&deep.observation_frame).json(),
+            deep.input_activity,
+            deep.audio,
+            deep.gpu_recovery_raster_cache,
+            deep.native_sync,
+            deep.runtime_probe
+        )
+    } else {
+        format!(
+            "{{\"label\":\"{}\",\"gui_frame\":{},\"capture_mode\":\"presented_async\",\"checksum\":{},\"buttons\":{},\"frame\":{}}}",
+            escape_json(&label),
+            gui_frame,
+            native_frame_checksum(&frame),
+            buttons.json(),
+            frame_stats.json()
+        )
+    };
+    write_output_file(&json_path, json)
 }
 
 struct NativePlayFastForwardResult {
@@ -5442,10 +6124,15 @@ fn run_native_title_ready_boot_wait_with_timeout_policy(
 }
 
 fn native_title_ready_normalized_boot_progress(
-    _emulator: &NativeEmulator,
+    emulator: &NativeEmulator,
     _boot_wait_segment_len: usize,
-    progress: NativeScriptProgress,
+    mut progress: NativeScriptProgress,
 ) -> NativeScriptProgress {
+    if !native_title_ready_stop_reason_allows_tail(progress.summary.stop_reason)
+        && native_title_runtime_boot_progress_allows_tail(emulator.input_activity(), progress)
+    {
+        progress.summary.stop_reason = "title_runtime_ready";
+    }
     progress
 }
 
@@ -5453,35 +6140,60 @@ fn native_title_ready_boot_progress_allows_tail(
     emulator: &NativeEmulator,
     progress: NativeScriptProgress,
 ) -> bool {
-    matches!(
-        progress.summary.stop_reason,
-        "title_screen_ready" | "handoff_frame_ready" | "playable_candidate_settled"
-    ) || native_play_emulator_title_screen_input_ready(emulator)
+    native_title_ready_stop_reason_allows_tail(progress.summary.stop_reason)
+        || native_play_emulator_title_tail_ready(emulator)
         || native_play_emulator_handoff_ready(emulator)
         || native_title_runtime_input_ready(
             emulator.input_activity(),
             &native_play_unsanitized_window_frame_for_emulator(emulator),
         )
+        || native_title_runtime_boot_progress_allows_tail(emulator.input_activity(), progress)
+}
+
+fn native_title_ready_stop_reason_allows_tail(stop_reason: &str) -> bool {
+    matches!(
+        stop_reason,
+        "title_screen_ready"
+            | "title_runtime_ready"
+            | "handoff_frame_ready"
+            | "playable_candidate_settled"
+    )
+}
+
+fn native_title_runtime_boot_progress_allows_tail(
+    activity: NativeInputActivity,
+    progress: NativeScriptProgress,
+) -> bool {
+    progress.summary.total_frames >= NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES
+        && progress.summary.frame_attempts >= progress.summary.total_frames
+        && native_title_runtime_tail_poll_ready(activity)
+}
+
+fn native_title_runtime_activity_allows_tail(
+    activity: NativeInputActivity,
+    total_frames: u64,
+) -> bool {
+    total_frames >= NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES
+        && native_title_runtime_tail_poll_ready(activity)
+}
+
+fn native_title_runtime_tail_poll_ready(activity: NativeInputActivity) -> bool {
+    // These counters are cumulative, so balanced high-volume polling is the
+    // continuity proxy for the title runtime accepting inputs over many frames.
+    native_title_runtime_poll_ready(activity) && activity.native_credit_adapter_edges > 0
 }
 
 fn native_title_runtime_input_ready(
     activity: NativeInputActivity,
     frame: &NativeDisplayFrame,
 ) -> bool {
-    if native_title_runtime_poll_ready(activity) {
-        return true;
-    }
-
     let stats = NativeFrameStats::from_frame(frame);
-    activity.p1_input_reads > 0
-        && activity.system_input_reads > 0
-        && activity.p1_punch_active_reads > 0
-        && (activity.system_start_active_reads > 0 || activity.p1_start_active_reads > 0)
-        && stats.has_visible_content()
-        && stats.has_scene_detail()
-        && !stats.has_sparse_warning_text_overlay()
-        && !stats.has_warning_text_overlay()
-        && !stats.has_blocking_display_artifact()
+    let controls_ready = native_title_runtime_poll_ready(activity)
+        || (activity.p1_input_reads > 0
+            && activity.system_input_reads > 0
+            && activity.p1_punch_active_reads > 0
+            && (activity.system_start_active_reads > 0 || activity.p1_start_active_reads > 0));
+    controls_ready && native_play_title_stats_tail_ready(stats)
 }
 
 fn native_title_runtime_poll_ready(activity: NativeInputActivity) -> bool {
@@ -5499,10 +6211,18 @@ fn native_title_render_probe_ready(activity: NativeInputActivity) -> bool {
         && activity.system_input_reads >= NATIVE_TITLE_RUNTIME_MIN_P1_POLLS
 }
 
+fn native_match_tail_timeline_usage(compact: bool) -> &'static str {
+    if compact {
+        "usage: bloodyroar2-gym native-match-tail-timeline-compact <rom_zip_or_dir> <instructions_per_frame> [action:frames...]"
+    } else {
+        "usage: bloodyroar2-gym native-match-tail-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> [action:frames...]"
+    }
+}
+
 fn run_native_match_tail_timeline(
     rom: PathBuf,
     instructions_per_frame: u64,
-    output_prefix: &Path,
+    output_prefix: Option<&Path>,
     raw_tail_segments: Vec<String>,
 ) -> Result<(), String> {
     let mut emulator = native_emulator_from_rom_source(rom)?;
@@ -5532,14 +6252,6 @@ fn run_native_match_tail_timeline(
         "skipped_match_tail_timeline_boot_timeout",
     );
 
-    let boot_prefix = suffixed_path(output_prefix, "boot");
-    let (
-        boot_actual_display_output,
-        boot_raw_actual_display_output,
-        boot_display_output,
-        boot_observation_output,
-        boot_vram_output,
-    ) = write_native_snapshot(&emulator, &boot_prefix)?;
     let mut timeline_safe_window_frame = None;
     let mut timeline_current_window_frame = native_play_snapshot_lightweight_selected_window_frame(
         &emulator,
@@ -5556,8 +6268,35 @@ fn run_native_match_tail_timeline(
         &mut timeline_current_window_frame,
     );
     let boot_window_frame = timeline_current_window_frame.clone();
-    let boot_window_output = suffixed_path(&boot_prefix, "window.png");
-    write_native_display_frame_png(&boot_window_frame, &boot_window_output)?;
+    let boot_json = if let Some(output_prefix) = output_prefix {
+        let boot_prefix = suffixed_path(output_prefix, "boot");
+        let (
+            boot_actual_display_output,
+            boot_raw_actual_display_output,
+            boot_display_output,
+            boot_observation_output,
+            boot_vram_output,
+        ) = write_native_snapshot(&emulator, &boot_prefix)?;
+        let boot_window_output = suffixed_path(&boot_prefix, "window.png");
+        write_native_display_frame_png(&boot_window_frame, &boot_window_output)?;
+        format!(
+            "{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{}}}",
+            boot_progress.summary.json(),
+            escape_json(&boot_actual_display_output.display().to_string()),
+            escape_json(&boot_raw_actual_display_output.display().to_string()),
+            escape_json(&boot_display_output.display().to_string()),
+            escape_json(&boot_observation_output.display().to_string()),
+            escape_json(&boot_vram_output.display().to_string()),
+            escape_json(&boot_window_output.display().to_string()),
+            NativeFrameStats::from_frame(&boot_window_frame).json(),
+        )
+    } else {
+        format!(
+            "{{\"run\":{},\"frames\":{}}}",
+            boot_progress.summary.json(),
+            native_match_tail_timeline_compact_frames_json(&emulator, &boot_window_frame),
+        )
+    };
 
     let tail_segments = parsed_tail_segments.unwrap_or_else(|| {
         remaining_native_script_segments_after_title_ready(
@@ -5603,55 +6342,79 @@ fn run_native_match_tail_timeline(
             );
         }
 
-        let snapshot_prefix = suffixed_path(
-            output_prefix,
-            &format!(
-                "tail-{:02}-{}",
-                index + 1,
-                native_script_filename_action(segment.action)
-            ),
-        );
-        let (
-            actual_display_output,
-            raw_actual_display_output,
-            display_output,
-            observation_output,
-            vram_output,
-        ) = write_native_snapshot(&emulator, &snapshot_prefix)?;
         native_play_snapshot_remember_lightweight_safe_window_frame(
             &emulator,
             &mut timeline_safe_window_frame,
             &mut timeline_current_window_frame,
         );
         let window_frame = timeline_current_window_frame.clone();
-        let window_output = suffixed_path(&snapshot_prefix, "window.png");
-        write_native_display_frame_png(&window_frame, &window_output)?;
-        snapshots.push(format!(
-            "{{\"tail_index\":{},\"action_index\":{},\"action\":\"{}\",\"segment_frames\":{},\"segment_run\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"executed_steps\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"input_activity\":{},\"br2_credit_hle\":{},\"render_submit_gate\":{},\"gte\":{},\"credit_debug_words\":[{}],\"compact_state\":{},\"gpu\":{},\"native_sync\":{}}}",
-            index,
-            segment.action.index(),
-            segment.action.name(),
-            segment.frames,
-            segment_progress.summary.json(),
-            total_frames,
-            missed_vblank_frames,
-            emulator.executed_steps(),
-            escape_json(&actual_display_output.display().to_string()),
-            escape_json(&raw_actual_display_output.display().to_string()),
-            escape_json(&display_output.display().to_string()),
-            escape_json(&observation_output.display().to_string()),
-            escape_json(&vram_output.display().to_string()),
-            escape_json(&window_output.display().to_string()),
-            NativeFrameStats::from_frame(&window_frame).json(),
-            emulator.input_activity_json(),
-            emulator.br2_native_credit_hle_json(),
-            emulator.cpu.br2_render_submit_gate_diagnostics_json(),
-            emulator.cpu.gte_json(),
-            native_credit_debug_words_json(&emulator),
-            native_emulator_compact_state_json(&emulator),
-            emulator.gpu_diagnostic_json(),
-            emulator.native_sync_compact_json()
-        ));
+        let snapshot_json = if let Some(output_prefix) = output_prefix {
+            let snapshot_prefix = suffixed_path(
+                output_prefix,
+                &format!(
+                    "tail-{:02}-{}",
+                    index + 1,
+                    native_script_filename_action(segment.action)
+                ),
+            );
+            let (
+                actual_display_output,
+                raw_actual_display_output,
+                display_output,
+                observation_output,
+                vram_output,
+            ) = write_native_snapshot(&emulator, &snapshot_prefix)?;
+            let window_output = suffixed_path(&snapshot_prefix, "window.png");
+            write_native_display_frame_png(&window_frame, &window_output)?;
+            format!(
+                "{{\"tail_index\":{},\"action_index\":{},\"action\":\"{}\",\"segment_frames\":{},\"segment_run\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"executed_steps\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"input_activity\":{},\"br2_credit_hle\":{},\"render_submit_gate\":{},\"gte\":{},\"credit_debug_words\":[{}],\"compact_state\":{},\"gpu\":{},\"native_sync\":{}}}",
+                index,
+                segment.action.index(),
+                segment.action.name(),
+                segment.frames,
+                segment_progress.summary.json(),
+                total_frames,
+                missed_vblank_frames,
+                emulator.executed_steps(),
+                escape_json(&actual_display_output.display().to_string()),
+                escape_json(&raw_actual_display_output.display().to_string()),
+                escape_json(&display_output.display().to_string()),
+                escape_json(&observation_output.display().to_string()),
+                escape_json(&vram_output.display().to_string()),
+                escape_json(&window_output.display().to_string()),
+                NativeFrameStats::from_frame(&window_frame).json(),
+                emulator.input_activity_json(),
+                emulator.br2_native_credit_hle_json(),
+                emulator.cpu.br2_render_submit_gate_diagnostics_json(),
+                emulator.cpu.gte_json(),
+                native_credit_debug_words_json(&emulator),
+                native_emulator_compact_state_json(&emulator),
+                native_match_tail_timeline_compact_gpu_json(&emulator),
+                emulator.native_sync_timeline_summary_json()
+            )
+        } else {
+            format!(
+                "{{\"tail_index\":{},\"action_index\":{},\"action\":\"{}\",\"segment_frames\":{},\"segment_run\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"executed_steps\":{},\"frames\":{},\"input_activity\":{},\"br2_credit_hle\":{},\"render_submit_gate\":{},\"gte\":{},\"credit_debug_words\":[{}],\"compact_state\":{},\"gpu\":{},\"native_sync\":{}}}",
+                index,
+                segment.action.index(),
+                segment.action.name(),
+                segment.frames,
+                segment_progress.summary.json(),
+                total_frames,
+                missed_vblank_frames,
+                emulator.executed_steps(),
+                native_match_tail_timeline_compact_frames_json(&emulator, &window_frame),
+                emulator.input_activity_json(),
+                emulator.br2_native_credit_hle_json(),
+                emulator.cpu.br2_render_submit_gate_diagnostics_json(),
+                emulator.cpu.gte_json(),
+                native_credit_debug_words_json(&emulator),
+                native_emulator_compact_state_json(&emulator),
+                native_match_tail_timeline_compact_gpu_json(&emulator),
+                emulator.native_sync_timeline_summary_json()
+            )
+        };
+        snapshots.push(snapshot_json);
 
         if emulator.is_terminal()
             || segment_progress.summary.stop_reason == "wall_timeout"
@@ -5688,34 +6451,100 @@ fn run_native_match_tail_timeline(
     } else {
         "null".to_string()
     };
-    println!(
-        "{{\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"auto_mapping\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"executed_steps\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{}}},\"tail_segments\":[{}],\"snapshots\":[{}],\"render_code\":[{}],\"render_data\":[{}],\"runtime_trace\":{},\"render_submit_gate\":{},\"native_sync\":{},\"state\":{}}}",
-        instructions_per_frame,
-        fast_forward_instructions_per_frame,
-        auto_mapping
-            .map(|mapping| format!("\"{}\"", escape_json(mapping)))
-            .unwrap_or_else(|| "null".to_string()),
-        total_frames,
-        missed_vblank_frames,
-        emulator.executed_steps(),
-        boot_progress.summary.json(),
-        escape_json(&boot_actual_display_output.display().to_string()),
-        escape_json(&boot_raw_actual_display_output.display().to_string()),
-        escape_json(&boot_display_output.display().to_string()),
-        escape_json(&boot_observation_output.display().to_string()),
-        escape_json(&boot_vram_output.display().to_string()),
-        escape_json(&boot_window_output.display().to_string()),
-        NativeFrameStats::from_frame(&boot_window_frame).json(),
-        native_script_segments_json(&tail_segments),
-        snapshots.join(","),
-        render_code,
-        render_data,
-        runtime_trace,
-        emulator.cpu.br2_render_submit_gate_diagnostics_json(),
-        emulator.native_sync_compact_json(),
-        emulator.input_check_probe_json()
-    );
+    let auto_mapping_json = auto_mapping
+        .map(|mapping| format!("\"{}\"", escape_json(mapping)))
+        .unwrap_or_else(|| "null".to_string());
+    if output_prefix.is_some() {
+        println!(
+            "{{\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"auto_mapping\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"executed_steps\":{},\"boot\":{},\"tail_segments\":[{}],\"snapshots\":[{}],\"render_code\":[{}],\"render_data\":[{}],\"runtime_trace\":{},\"render_submit_gate\":{},\"native_sync\":{},\"state\":{}}}",
+            instructions_per_frame,
+            fast_forward_instructions_per_frame,
+            auto_mapping_json,
+            total_frames,
+            missed_vblank_frames,
+            emulator.executed_steps(),
+            boot_json,
+            native_script_segments_json(&tail_segments),
+            snapshots.join(","),
+            render_code,
+            render_data,
+            runtime_trace,
+            emulator.cpu.br2_render_submit_gate_diagnostics_json(),
+            emulator.native_sync_timeline_summary_json(),
+            emulator.display_diagnosis_json()
+        );
+    } else {
+        println!(
+            "{{\"output_mode\":\"compact\",\"images_written\":false,\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"auto_mapping\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"executed_steps\":{},\"boot\":{},\"tail_segments\":[{}],\"snapshots\":[{}],\"render_code\":[{}],\"render_data\":[{}],\"runtime_trace\":{},\"render_submit_gate\":{},\"native_sync\":{},\"state\":{}}}",
+            instructions_per_frame,
+            fast_forward_instructions_per_frame,
+            auto_mapping_json,
+            total_frames,
+            missed_vblank_frames,
+            emulator.executed_steps(),
+            boot_json,
+            native_script_segments_json(&tail_segments),
+            snapshots.join(","),
+            render_code,
+            render_data,
+            runtime_trace,
+            emulator.cpu.br2_render_submit_gate_diagnostics_json(),
+            emulator.native_sync_timeline_summary_json(),
+            emulator.display_diagnosis_json()
+        );
+    }
     Ok(())
+}
+
+fn native_match_tail_timeline_compact_gpu_json(emulator: &NativeEmulator) -> String {
+    format!(
+        "{{\"draw_sequence\":{},\"gpu_playable_candidate\":{},\"gpu_rendered_scene_candidate\":{},\"gte_gameplay_signal\":{},\"recovery_raster_cache\":{}}}",
+        emulator.draw_sequence(),
+        emulator.gpu_native_playable_candidate(),
+        emulator.gpu_native_rendered_scene_candidate(),
+        emulator.native_3d_gameplay_signal(),
+        emulator.recovery_raster_cache_stats_json(),
+    )
+}
+
+fn native_match_tail_timeline_compact_frames_json(
+    emulator: &NativeEmulator,
+    window_frame: &NativeDisplayFrame,
+) -> String {
+    let actual = emulator.actual_display_frame();
+    let raw_actual = emulator.raw_actual_display_frame();
+    let display = emulator.display_frame();
+    let observation = emulator.observation_frame();
+    native_match_tail_timeline_frame_stats_json(
+        NativeFrameStats::from_frame_with_checksum(&actual),
+        NativeFrameStats::from_frame_with_checksum(&raw_actual),
+        NativeFrameStats::from_frame_with_checksum(&display),
+        NativeFrameStats::from_frame_with_checksum(&observation),
+        NativeFrameStats::from_frame_with_checksum(window_frame),
+    )
+}
+
+fn native_match_tail_timeline_frame_stats_json(
+    actual: (NativeFrameStats, u32),
+    raw_actual: (NativeFrameStats, u32),
+    display: (NativeFrameStats, u32),
+    observation: (NativeFrameStats, u32),
+    window: (NativeFrameStats, u32),
+) -> String {
+    format!(
+        "{{\"actual_frame\":{},\"raw_actual_frame\":{},\"display_frame\":{},\"observation_frame\":{},\"window_frame\":{}}}",
+        native_match_tail_timeline_frame_stats_with_checksum_json(actual),
+        native_match_tail_timeline_frame_stats_with_checksum_json(raw_actual),
+        native_match_tail_timeline_frame_stats_with_checksum_json(display),
+        native_match_tail_timeline_frame_stats_with_checksum_json(observation),
+        native_match_tail_timeline_frame_stats_with_checksum_json(window)
+    )
+}
+
+fn native_match_tail_timeline_frame_stats_with_checksum_json(
+    (stats, checksum): (NativeFrameStats, u32),
+) -> String {
+    format!("{{\"checksum\":{},\"stats\":{}}}", checksum, stats.json())
 }
 
 fn native_match_tail_runtime_trace_json(
@@ -5953,6 +6782,12 @@ fn run_native_play_snapshot(
         handoff_runtime_running,
         handoff_frame_full_size && handoff_frame_scene_accepted,
     );
+    let title_render_verified = native_runtime_render_verified(
+        handoff_runtime_running,
+        handoff_frame_full_size
+            && native_title_render_probe_ready(emulator.input_activity())
+            && native_play_title_stats_tail_ready(boot_frame_stats),
+    );
     let handoff_playable =
         boot_summary.observed_native_playable_candidate && handoff_render_verified;
     if !draw_capture_predicates_from_boot
@@ -6129,6 +6964,9 @@ fn run_native_play_snapshot(
     let final_window_frame = native_play_aspect_corrected_gui_frame(&selected_window_frame);
     let window_output = suffixed_path(output_prefix, "window.png");
     write_native_display_frame_png(&final_window_frame, &window_output)?;
+    let audio_output = write_native_audio_snapshot(&emulator, output_prefix)?;
+    let audio_output_json = &audio_output.json;
+    let audio_stats_json = emulator.audio_stats_json();
     let final_frame_stats = NativeFrameStats::from_frame(&final_window_frame);
     let final_native_playable_candidate = native_play_snapshot_final_playability_candidate(
         require_gameplay_scene,
@@ -6190,7 +7028,7 @@ fn run_native_play_snapshot(
     let player_session_started = emulator.br2_native_credit_hle_game_start_accepted_seen();
     let final_playable =
         player_session_started && final_native_playable_candidate && final_render_verified;
-    let required_playable = if final_stage_required {
+    let render_playable = if final_stage_required {
         final_playable
     } else {
         player_session_started && handoff_playable
@@ -6214,15 +7052,22 @@ fn run_native_play_snapshot(
     } else {
         final_frame_gameplay_scene || final_frame_handoff_scene
     };
-    let input_activity = if match_script {
+    let direct_input_probe = if match_script {
         let mut direct_input = emulator.clone();
-        emulator.input_activity().saturating_added(
-            run_native_direct_input_probe(&mut direct_input, native_health_branch_actions())
-                .activity,
-        )
+        run_native_direct_input_probe(&mut direct_input, native_full_input_probe_actions())
     } else {
-        emulator.input_activity()
+        NativeDirectInputProbe::skipped("skipped_not_match_script")
     };
+    let input_activity = emulator
+        .input_activity()
+        .saturating_added(direct_input_probe.activity);
+    let direct_input_actions_read =
+        direct_input_probe.action_read_count == native_full_input_probe_actions().len();
+    let match_input_verified = !match_script
+        || (direct_input_actions_read && input_activity.has_combined_full_control_activity());
+    let match_audio_verified = !match_script || audio_output.verified;
+    let required_playable = render_playable && match_input_verified && match_audio_verified;
+    let input_proof_json = native_input_proof_json(input_activity);
     let br2_credit_hle_accepted_seen = emulator.br2_native_credit_hle_game_start_accepted_seen();
     let rom_compatibility = emulator.rom_compatibility();
     let assets_complete = rom_compatibility.native_runtime_usable();
@@ -6267,7 +7112,7 @@ fn run_native_play_snapshot(
         write_output_file(state_output, final_state_json.as_bytes())?;
     }
     let summary_json = format!(
-        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_credit_hle\":{},\"br2_runtime_progress\":{},\"credit_debug_words\":[{}],\"boot\":{{\"run\":{},\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"display_diagnosis\":{},\"executed_steps\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_credit_hle\":{},\"br2_runtime_progress\":{},\"credit_debug_words\":[{}],\"boot\":{{\"run\":{},\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"title_render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"input_proof\":{},\"direct_input_probe\":{},\"match_input_verified\":{},\"match_audio_verified\":{},\"audio\":{},\"audio_output\":{},\"security_state\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"display_diagnosis\":{},\"executed_steps\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         escape_json(&summary_output.display().to_string()),
         state_output_json,
@@ -6298,6 +7143,7 @@ fn run_native_play_snapshot(
         handoff_frame_full_size,
         handoff_frame_scene_accepted,
         handoff_render_verified,
+        title_render_verified,
         handoff_frame_gameplay_scene,
         handoff_frame_handoff_scene,
         handoff_playable,
@@ -6324,6 +7170,12 @@ fn run_native_play_snapshot(
         final_native_playable_candidate,
         final_playable,
         input_activity.json(),
+        input_proof_json,
+        direct_input_probe.json(),
+        match_input_verified,
+        match_audio_verified,
+        audio_stats_json,
+        audio_output_json,
         security_state_json,
         emulator.recovery_raster_cache_stats_json(),
         native_sync_json,
@@ -6333,7 +7185,7 @@ fn run_native_play_snapshot(
     write_output_file(&summary_output, summary_json.as_bytes())?;
 
     println!(
-        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_runtime_progress\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"security_state\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"executed_steps\":{},\"state\":{}}}",
+        "{{\"output_prefix\":\"{}\",\"summary_output\":\"{}\",\"state_output\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"fast_forward_max_frames\":{},\"snapshot_wall_timeout_secs\":{},\"script_name\":\"{}\",\"complete_script\":{},\"match_script\":{},\"require_gameplay_scene\":{},\"required_stage\":\"{}\",\"handoff_playable\":{},\"final_playable\":{},\"final_render_verified\":{},\"playable\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"blocker_report\":{},\"br2_runtime_progress\":{},\"boot\":{{\"run\":{},\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"title_render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"playable\":{}}},\"tail_segments\":[{}],\"tail_run\":{},\"render_settle_run\":{},\"draw_capture_range\":{},\"draw_capture_predicates\":[{}],\"draw_captures\":[{}],\"final_window_selection\":{},\"final\":{{\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"display_output\":\"{}\",\"observation_output\":\"{}\",\"vram_output\":\"{}\",\"window_output\":\"{}\",\"window_frame\":{},\"runtime_running\":{},\"full_size\":{},\"scene_accepted\":{},\"render_verified\":{},\"gameplay_scene\":{},\"handoff_scene\":{},\"native_playable_candidate\":{},\"playable\":{}}},\"input_activity\":{},\"input_proof\":{},\"direct_input_probe\":{},\"match_input_verified\":{},\"match_audio_verified\":{},\"audio\":{},\"audio_output\":{},\"security_state\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"executed_steps\":{},\"state\":{}}}",
         escape_json(&output_prefix.display().to_string()),
         escape_json(&summary_output.display().to_string()),
         state_output_json,
@@ -6367,6 +7219,7 @@ fn run_native_play_snapshot(
         handoff_frame_full_size,
         handoff_frame_scene_accepted,
         handoff_render_verified,
+        title_render_verified,
         handoff_frame_gameplay_scene,
         handoff_frame_handoff_scene,
         handoff_playable,
@@ -6393,6 +7246,12 @@ fn run_native_play_snapshot(
         final_native_playable_candidate,
         final_playable,
         input_activity.json(),
+        input_proof_json,
+        direct_input_probe.json(),
+        match_input_verified,
+        match_audio_verified,
+        audio_stats_json,
+        audio_output_json,
         security_state_json,
         emulator.recovery_raster_cache_stats_json(),
         native_sync_json,
@@ -6402,6 +7261,17 @@ fn run_native_play_snapshot(
 
     if required_playable {
         Ok(())
+    } else if match_script && !match_input_verified {
+        Err(format!(
+            "native play snapshot failed: match input proof incomplete (actions_read={}/{}, combined_full_controls={})",
+            direct_input_probe.action_read_count,
+            native_full_input_probe_actions().len(),
+            input_activity.has_combined_full_control_activity()
+        ))
+    } else if match_script && !match_audio_verified {
+        Err(format!(
+            "native play snapshot failed: match audio proof is silent or unavailable ({audio_output_json})"
+        ))
     } else if !match_script && !boot_summary.observed_native_playable_candidate {
         Err(format!(
             "native play snapshot failed: {script_name} script did not observe a playable frame (stop_reason={}, frames={}, segment_index={}, segment_frame={})",
@@ -6435,9 +7305,18 @@ fn native_play_snapshot_lightweight_selected_window_frame(
     // Gameplay keeps a native-resolution field-composed frame cached in the
     // GPU. Prefer it before the general display resolver, whose artifact
     // checks may scan the same 512x480 image many times.
-    let fast_actual =
-        native_play_present_native_resolution_actual_frame(&emulator.fast_gameplay_display_frame());
+    let fast_source = emulator.fast_gameplay_display_frame();
+    let fast_actual = native_play_present_native_resolution_actual_frame(&fast_source);
     let fast_actual_stats = NativeFrameStats::from_frame(&fast_actual);
+    if native_play_title_stats_input_ready(fast_actual_stats) {
+        let raw_actual = emulator.raw_actual_display_frame();
+        let actual = emulator.actual_display_frame();
+        if let Some((raw_title, _)) =
+            native_play_preferred_full_height_raw_title(&raw_actual, &actual, fast_actual_stats)
+        {
+            return raw_title;
+        }
+    }
     if native_play_snapshot_native_actual_frame_is_safe(fast_actual_stats)
         || native_play_snapshot_cached_frame_is_safe(fast_actual_stats)
     {
@@ -6473,6 +7352,7 @@ fn native_play_snapshot_lightweight_selected_window_frame(
     if native_window_prefers_stronger_stacked_field(&raw_actual)
         && candidate_stats.has_visible_content()
         && candidate_stats.has_scene_detail()
+        && native_play_fresh_actual_replacement_frame_passes_artifact_checks(candidate_stats)
     {
         return candidate;
     }
@@ -6803,6 +7683,7 @@ fn native_play_snapshot_final_window_selection_json(
 
 fn native_play_snapshot_cached_frame_is_safe(stats: NativeFrameStats) -> bool {
     stats.has_presentable_scene()
+        || native_play_title_stats_tail_ready(stats)
         || native_play_safe_render_ready_fallback_frame_stats(stats)
         || native_play_snapshot_title_fallback_frame_stats(stats)
         || native_play_runtime_verified_actual_window_stats(stats)
@@ -6929,7 +7810,8 @@ fn native_play_snapshot_caption_ui_allows_gameplay(stats: NativeFrameStats) -> b
         && ((!stats.has_bottom_caption_band() && !stats.has_intro_caption_band())
             || (stats.has_native_context_caption_ui()
                 && !stats.has_large_bottom_caption_video_band())
-            || (stats.has_dense_native_fight_hud() && !stats.has_large_bottom_caption_video_band()))
+            || (stats.has_dense_native_fight_hud() && !stats.has_large_bottom_caption_video_band())
+            || stats.has_transient_native_combat_effect())
 }
 
 fn native_play_safe_render_ready_fallback_frame_stats(stats: NativeFrameStats) -> bool {
@@ -6943,7 +7825,7 @@ fn native_play_snapshot_frame_has_lightweight_playability_signal(stats: NativeFr
         && !native_play_frame_has_blocking_render_artifact(stats)
         && !stats.has_title_screen_frame()
         && !stats.has_warning_text_overlay()
-        && !stats.has_bottom_caption_band()
+        && (!stats.has_bottom_caption_band() || stats.has_transient_native_combat_effect())
 }
 
 fn native_play_snapshot_final_playability_candidate(
@@ -6952,7 +7834,8 @@ fn native_play_snapshot_final_playability_candidate(
     stats: NativeFrameStats,
 ) -> bool {
     let caption_ui_gameplay = (stats.has_native_context_caption_ui()
-        || stats.has_dense_native_fight_hud())
+        || stats.has_dense_native_fight_hud()
+        || stats.has_transient_native_combat_effect())
         && native_play_snapshot_caption_ui_allows_gameplay(stats)
         && native_play_snapshot_frame_has_lightweight_gpu_context(stats);
     (runtime_playable_candidate
@@ -7816,7 +8699,7 @@ fn run_native_startup_probe(
     let total_elapsed_ms = load_started_at.elapsed().as_millis();
 
     println!(
-        "{{\"command\":\"native-startup-probe\",\"mode\":\"{}\",\"load_elapsed_ms\":{},\"fast_forward_elapsed_ms\":{},\"total_elapsed_ms\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"cache\":{},\"auto_input_mapping\":{},\"run\":{},\"script_segment_count\":{},\"script_total_frames\":{},\"executed_steps\":{},\"native_playable_candidate\":{},\"frame_full_size\":{},\"blocking_render_artifact\":{},\"gameplay_scene\":{},\"render_verified\":{},\"playable\":{},\"frame\":{},\"input_activity\":{}}}",
+        "{{\"command\":\"native-startup-probe\",\"mode\":\"{}\",\"load_elapsed_ms\":{},\"fast_forward_elapsed_ms\":{},\"total_elapsed_ms\":{},\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"cache\":{},\"auto_input_mapping\":{},\"run\":{},\"script_segment_count\":{},\"script_total_frames\":{},\"executed_steps\":{},\"native_playable_candidate\":{},\"frame_full_size\":{},\"blocking_render_artifact\":{},\"gameplay_scene\":{},\"render_verified\":{},\"playable\":{},\"frame\":{},\"input_activity\":{},\"audio\":{}}}",
         if optimized { "optimized" } else { "tracked" },
         load_elapsed_ms,
         fast_forward_elapsed_ms,
@@ -7839,7 +8722,8 @@ fn run_native_startup_probe(
         render_verified,
         playable,
         frame_stats.json(),
-        emulator.input_activity().json()
+        emulator.input_activity().json(),
+        emulator.audio_stats_json()
     );
 
     if !playable {
@@ -7852,7 +8736,9 @@ fn native_enter_probe_transition_ready(stats: NativeFrameStats) -> bool {
     stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
         && stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
         && stats.has_visible_content()
+        && stats.has_scene_detail()
         && !native_play_stats_is_stale_title_like_frame(stats)
+        && !stats.has_periodic_horizontal_ghosting()
         && !stats.has_blocking_display_artifact()
         && !native_play_frame_has_blocking_render_artifact(stats)
 }
@@ -7883,17 +8769,20 @@ fn run_native_enter_probe(
         "skipped_native_enter_probe_boot_timeout",
         NativeScriptExecutionPolicy::HIDDEN_FAST_FORWARD,
     );
-    emulator.capture_vblank_presented_frame();
-    let title_frame =
-        native_play_present_native_resolution_actual_frame(&emulator.fast_gameplay_display_frame());
+    let title_frame = native_play_title_tail_frame_for_emulator(&emulator);
     let title_stats = NativeFrameStats::from_frame(&title_frame);
-    let title_ready = boot_progress.summary.stop_reason == "title_screen_ready"
-        || native_play_title_screen_ready_from_frame(&title_frame)
-        || native_title_runtime_input_ready(emulator.input_activity(), &title_frame);
+    // Do not inject Enter into a sparse title fragment. The credit adapter can
+    // accept Coin before the title task has opened its Start poll, which makes
+    // the probe report a false input failure and mirrors an unresponsive GUI.
+    let title_ready = native_play_title_tail_ready_from_frame(&title_frame)
+        && native_title_render_probe_ready(emulator.input_activity());
     if !title_ready {
         return Err(format!(
-            "native Enter probe did not reach a title input state: stop_reason={}",
-            boot_progress.summary.stop_reason
+            "native Enter probe did not reach a title input state: stop_reason={} title_frame={} input_activity={} state={}",
+            boot_progress.summary.stop_reason,
+            title_stats.json(),
+            emulator.input_activity_json(),
+            native_emulator_compact_state_json(&emulator),
         ));
     }
 
@@ -7902,6 +8791,7 @@ fn run_native_enter_probe(
     let input_activity_before = emulator.input_activity();
     let mut input_latch = NativeInputLatch::default();
     let mut physical_input_latch = NativeInputLatch::default();
+    let mut test_input_latch = NativeInputLatch::default();
     let mut physical_enter = NativePhysicalEnterSequencer::default();
     physical_enter.set_enabled(true);
     let mut observed_buttons = ActionButtons::default();
@@ -7921,15 +8811,13 @@ fn run_native_enter_probe(
         let enter_edge = if !coin_press_sent {
             coin_press_sent = true;
             true
-        } else if credit_accepted_now && physical_enter.is_empty() && !start_press_sent {
-            start_press_sent = true;
-            true
         } else {
-            false
+            credit_accepted_now && physical_enter.is_empty() && !start_press_sent
         };
         let resolved = native_play_resolve_input_poll(
             &mut input_latch,
             &mut physical_input_latch,
+            &mut test_input_latch,
             &mut physical_enter,
             NativeWindowButtonSample {
                 raw_window_active: true,
@@ -7949,6 +8837,7 @@ fn run_native_enter_probe(
                     .br2_native_credit_hle_game_start_accepted_count(),
             },
         );
+        start_press_sent |= resolved.physical_buttons.start;
         observed_buttons = merge_action_buttons(observed_buttons, resolved.physical_buttons);
         emulator.set_input(resolved.effective_buttons);
         frame_attempts = frame_attempts.saturating_add(1);
@@ -7956,6 +8845,7 @@ fn run_native_enter_probe(
             enter_frames = enter_frames.saturating_add(1);
             input_latch.advance_frame();
             physical_input_latch.advance_frame();
+            test_input_latch.advance_frame();
             physical_enter.advance_frame();
         }
     }
@@ -8027,7 +8917,7 @@ fn run_native_enter_probe(
         transition_observed,
         final_stats.json(),
         input_activity.json(),
-        emulator.gui_runtime_probe_json(),
+        native_emulator_compact_state_json(&emulator),
     );
 
     if !success {
@@ -9006,6 +9896,68 @@ fn native_play_present_native_resolution_actual_frame(
     native_play_window_frame_without_deinterlace(frame)
 }
 
+#[cfg(test)]
+fn native_play_present_native_resolution_actual_frame_with_checksum(
+    frame: NativeDisplayFrame,
+    checksum: u32,
+) -> (NativeDisplayFrame, u32) {
+    if matches!(
+        frame.width,
+        NATIVE_PLAY_WINDOW_WIDTH | NATIVE_PLAY_SCALED_WINDOW_WIDTH
+    ) && frame.height == NATIVE_PLAY_MIN_WINDOW_HEIGHT
+    {
+        return (frame, checksum);
+    }
+
+    let width = NATIVE_PLAY_WINDOW_WIDTH;
+    let height = NATIVE_PLAY_MIN_WINDOW_HEIGHT;
+    let mut pixels = vec![0; width.saturating_mul(height)];
+    let mut normalized_checksum = native_frame_checksum_seed(width, height);
+    if frame.width == 0
+        || frame.height == 0
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        for &pixel in &pixels {
+            normalized_checksum = native_frame_checksum_pixel(normalized_checksum, pixel);
+        }
+        return (
+            NativeDisplayFrame {
+                width,
+                height,
+                pixels,
+            },
+            normalized_checksum,
+        );
+    }
+
+    for y in 0..height {
+        let source_y = y
+            .saturating_mul(frame.height)
+            .checked_div(height)
+            .unwrap_or_default()
+            .min(frame.height.saturating_sub(1));
+        for x in 0..width {
+            let source_x = x
+                .saturating_mul(frame.width)
+                .checked_div(width)
+                .unwrap_or_default()
+                .min(frame.width.saturating_sub(1));
+            let pixel = frame.pixels[source_y * frame.width + source_x];
+            pixels[y * width + x] = pixel;
+            normalized_checksum = native_frame_checksum_pixel(normalized_checksum, pixel);
+        }
+    }
+
+    (
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
+        },
+        normalized_checksum,
+    )
+}
+
 fn native_play_aspect_corrected_gui_frame(frame: &NativeDisplayFrame) -> NativeDisplayFrame {
     native_aspect_corrected_gui_frame(frame)
 }
@@ -9142,6 +10094,7 @@ fn native_play_fast_gui_frame_stats_are_safe(
     if stats.width < NATIVE_PLAY_MIN_WINDOW_WIDTH
         || stats.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
         || !stats.has_visible_content()
+        || stats.has_periodic_horizontal_ghosting()
         || native_play_frame_has_blocking_render_artifact(stats)
         || stats.has_blocking_display_artifact()
     {
@@ -9156,6 +10109,23 @@ fn native_play_fast_gui_frame_stats_are_safe(
             gpu_gameplay_context,
             stats,
         )
+}
+
+fn native_play_fresh_actual_replacement_frame_passes_artifact_checks(
+    stats: NativeFrameStats,
+) -> bool {
+    if native_play_control_relevant_low_palette_active_field_stats(stats) {
+        return true;
+    }
+
+    let title_warning_false_positive = native_play_sparse_stage_title_warning_false_positive(stats);
+    stats.has_visible_content()
+        && (!stats.has_blocking_display_artifact() || title_warning_false_positive)
+        && !native_play_frame_has_blocking_render_artifact(stats)
+        && !stats.has_repeating_tile_grid_artifact()
+        && !stats.has_periodic_horizontal_ghosting()
+        && !stats.has_low_palette_noise()
+        && !stats.has_low_palette_logo_transition()
 }
 
 fn native_play_preserved_gui_handoff_frame_is_safe(
@@ -9179,9 +10149,18 @@ fn native_play_fast_initial_gui_frame(
     native_playable_candidate: bool,
     gpu_gameplay_context: bool,
 ) -> Option<(NativeDisplayFrame, NativeFrameStats)> {
-    let frame =
-        native_play_present_native_resolution_actual_frame(&emulator.fast_gameplay_display_frame());
+    let fast_source = emulator.fast_gameplay_display_frame();
+    let frame = native_play_present_native_resolution_actual_frame(&fast_source);
     let stats = NativeFrameStats::from_frame(&frame);
+    if native_play_title_stats_input_ready(stats) {
+        let raw_actual = emulator.raw_actual_display_frame();
+        let actual = emulator.actual_display_frame();
+        if let Some(raw_title) =
+            native_play_preferred_full_height_raw_title(&raw_actual, &actual, stats)
+        {
+            return Some(raw_title);
+        }
+    }
     native_play_fast_gui_frame_stats_are_safe(
         native_playable_candidate,
         gpu_gameplay_context,
@@ -9264,19 +10243,32 @@ fn native_play_gui_display_frames_with_context(
         (actual_window.clone(), actual_stats)
     } else if let Some(raw_actual) = preferred_raw_actual {
         raw_actual
-    } else if native_play_should_prefer_actual_display(&actual, &stable, native_playable_candidate)
-        || (native_playable_candidate
-            && gpu_gameplay_context
-            && !native_play_frame_has_blocking_render_artifact(actual_stats)
-            && native_play_gpu_verified_window_stats_with_context(
-                native_playable_candidate,
-                gpu_gameplay_context,
-                actual_stats,
-            ))
+    } else if native_play_fresh_actual_replacement_frame_passes_artifact_checks(actual_stats)
+        && (native_play_should_prefer_actual_display(&actual, &stable, native_playable_candidate)
+            || (native_playable_candidate
+                && gpu_gameplay_context
+                && native_play_gpu_verified_window_stats_with_context(
+                    native_playable_candidate,
+                    gpu_gameplay_context,
+                    actual_stats,
+                )))
     {
         (actual_window.clone(), actual_stats)
     } else {
         (stable_window, stable_stats)
+    };
+    let fast =
+        native_play_present_native_resolution_actual_frame(&emulator.fast_gameplay_display_frame());
+    let fast_stats = NativeFrameStats::from_frame(&fast);
+    let (selected, selected_stats) = if native_play_gui_fast_expensive_frame_should_replace(
+        fast_stats,
+        selected_stats,
+        native_playable_candidate,
+        gpu_gameplay_context,
+    ) {
+        (fast, fast_stats)
+    } else {
+        (selected, selected_stats)
     };
 
     NativePlayGuiDisplayFrames {
@@ -9285,6 +10277,46 @@ fn native_play_gui_display_frames_with_context(
         actual: actual_window,
         actual_stats,
     }
+}
+
+fn native_play_gui_fast_expensive_frame_should_replace(
+    fast_stats: NativeFrameStats,
+    selected_stats: NativeFrameStats,
+    native_playable_candidate: bool,
+    gpu_gameplay_context: bool,
+) -> bool {
+    if !native_play_fast_gui_frame_stats_are_safe(
+        native_playable_candidate,
+        gpu_gameplay_context,
+        fast_stats,
+    ) {
+        return false;
+    }
+
+    let selected_is_blocking = selected_stats.has_blocking_display_artifact()
+        || native_play_frame_has_blocking_render_artifact(selected_stats);
+    if selected_is_blocking
+        || !selected_stats.has_visible_content()
+        || !selected_stats.has_scene_detail()
+    {
+        return true;
+    }
+
+    if fast_stats.has_gameplay_scene() && !selected_stats.has_gameplay_scene() {
+        return true;
+    }
+    if fast_stats.has_handoff_scene()
+        && !selected_stats.has_handoff_scene()
+        && !selected_stats.has_gameplay_scene()
+    {
+        return true;
+    }
+
+    fast_stats.has_gameplay_scene()
+        && selected_stats.has_gameplay_scene()
+        && fast_stats.occupied_row_span.saturating_add(4) >= selected_stats.occupied_row_span
+        && fast_stats.horizontal_color_changes.saturating_mul(100)
+            >= selected_stats.horizontal_color_changes.saturating_mul(108)
 }
 
 fn native_play_should_prefer_raw_actual_display(
@@ -9329,7 +10361,7 @@ fn native_play_preferred_raw_actual_display(
         gpu_gameplay_context,
     );
     let raw_window = if native_play_title_screen_ready_from_frame(&raw_without_deinterlace) {
-        raw_without_deinterlace
+        raw_without_deinterlace.clone()
     } else {
         raw_context_window
     };
@@ -9346,6 +10378,16 @@ fn native_play_preferred_raw_actual_display(
         return (actual_is_weaker && stable_is_weaker).then_some((raw_window, raw_stats));
     }
 
+    if native_play_full_height_raw_scene_beats_field_projection(
+        raw_without_deinterlace_stats,
+        actual_stats,
+        stable_stats,
+        native_playable_candidate,
+        gpu_gameplay_context,
+    ) {
+        return Some((raw_without_deinterlace, raw_without_deinterlace_stats));
+    }
+
     if native_play_should_prefer_raw_scene_frame(
         raw_stats,
         raw_without_deinterlace_stats,
@@ -9360,6 +10402,44 @@ fn native_play_preferred_raw_actual_display(
     None
 }
 
+fn native_play_full_height_raw_scene_beats_field_projection(
+    raw_stats: NativeFrameStats,
+    actual_stats: NativeFrameStats,
+    stable_stats: NativeFrameStats,
+    native_playable_candidate: bool,
+    gpu_gameplay_context: bool,
+) -> bool {
+    if !native_playable_candidate
+        || !gpu_gameplay_context
+        || raw_stats.width < NATIVE_PLAY_WINDOW_WIDTH
+        || raw_stats.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        || raw_stats.occupied_row_span.saturating_mul(10) < raw_stats.height.saturating_mul(9)
+        || !raw_stats.has_gameplay_scene()
+        || !native_play_raw_projection_is_safe_scene(raw_stats, native_playable_candidate)
+    {
+        return false;
+    }
+
+    let strongest_projection_changes = actual_stats
+        .horizontal_color_changes
+        .max(stable_stats.horizontal_color_changes);
+    let strongest_projection_span = actual_stats
+        .occupied_row_span
+        .max(stable_stats.occupied_row_span);
+    let raw_has_more_spatial_detail = raw_stats.horizontal_color_changes.saturating_mul(100)
+        >= strongest_projection_changes.saturating_mul(108)
+        && raw_stats.occupied_row_span.saturating_add(4) >= strongest_projection_span;
+    let projection_is_field_derived = [actual_stats, stable_stats].into_iter().any(|candidate| {
+        candidate.height == raw_stats.height
+            && candidate.has_visible_content()
+            && candidate.has_scene_detail()
+            && candidate.horizontal_color_changes.saturating_mul(108)
+                <= raw_stats.horizontal_color_changes.saturating_mul(100)
+    });
+
+    raw_has_more_spatial_detail && projection_is_field_derived
+}
+
 fn native_play_window_frame_is_weaker_than_raw_title(
     candidate: NativeFrameStats,
     raw_title: NativeFrameStats,
@@ -9367,6 +10447,121 @@ fn native_play_window_frame_is_weaker_than_raw_title(
     !candidate.has_title_screen_frame()
         || candidate.nonzero_pixels.saturating_mul(3) < raw_title.nonzero_pixels
         || candidate.occupied_row_span.saturating_add(64) < raw_title.occupied_row_span
+        || native_play_title_candidate_has_weaker_geometry_than_raw(candidate, raw_title)
+}
+
+fn native_play_title_candidate_has_weaker_geometry_than_raw(
+    candidate: NativeFrameStats,
+    raw_title: NativeFrameStats,
+) -> bool {
+    if !candidate.has_title_screen_frame()
+        || !raw_title.has_title_screen_frame()
+        || raw_title.width < NATIVE_PLAY_WINDOW_WIDTH
+        || raw_title.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        || candidate.width < NATIVE_PLAY_WINDOW_WIDTH
+        || candidate.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+    {
+        return false;
+    }
+
+    let raw_has_full_title_coverage = raw_title.occupied_row_span.saturating_mul(100)
+        >= raw_title.height.saturating_mul(75)
+        && raw_title.nonzero_pixels.saturating_mul(100)
+            >= raw_title.total_pixels.saturating_mul(18)
+        && raw_title.unique_colors >= candidate.unique_colors;
+    if !raw_has_full_title_coverage {
+        return false;
+    }
+
+    let candidate_has_less_vertical_coverage = candidate.occupied_rows.saturating_mul(100)
+        < raw_title.occupied_rows.saturating_mul(90)
+        || candidate.occupied_row_span.saturating_mul(100)
+            < raw_title.occupied_row_span.saturating_mul(90);
+    let candidate_has_less_ink =
+        candidate.nonzero_pixels.saturating_mul(100) < raw_title.nonzero_pixels.saturating_mul(90);
+    let raw_has_material_coverage_advantage = raw_title.nonzero_pixels.saturating_mul(100)
+        >= candidate.nonzero_pixels.saturating_mul(120)
+        && raw_title.occupied_row_span.saturating_mul(100)
+            >= candidate.occupied_row_span.saturating_mul(105);
+
+    (candidate_has_less_vertical_coverage && candidate_has_less_ink)
+        || raw_has_material_coverage_advantage
+}
+
+fn native_play_preferred_full_height_raw_title(
+    raw_actual: &NativeDisplayFrame,
+    active_actual: &NativeDisplayFrame,
+    projected_stats: NativeFrameStats,
+) -> Option<(NativeDisplayFrame, NativeFrameStats)> {
+    // Dense BR2 logo art overlaps the sparse-warning probe region. Classify
+    // the complete raw title before applying sparse warning cleanup, otherwise
+    // the wolf/logo body is erased and the valid 480-line title loses to the
+    // doubled 240-line footer field.
+    let raw_title = native_play_window_frame_without_deinterlace(raw_actual);
+    let raw_stats = NativeFrameStats::from_frame(&raw_title);
+    let decision = native_play_full_height_raw_title_stats_should_replace_projection(
+        raw_actual.width,
+        raw_actual.height,
+        active_actual.width,
+        active_actual.height,
+        raw_stats,
+        projected_stats,
+    );
+    if env::var_os("BR2_NATIVE_TRACE_TITLE_SELECTION").is_some() {
+        eprintln!(
+            "BR2 title selection: raw={}x{} active={}x{} projected={}x{} raw_title_ready={} raw_scene_detail={} raw_blocking={} raw_render_blocking={} projected_title_ready={} raw_nonzero={} projected_nonzero={} raw_span={} projected_span={} decision={}",
+            raw_actual.width,
+            raw_actual.height,
+            active_actual.width,
+            active_actual.height,
+            projected_stats.width,
+            projected_stats.height,
+            native_play_title_stats_input_ready(raw_stats),
+            raw_stats.has_scene_detail(),
+            raw_stats.has_blocking_display_artifact(),
+            native_play_frame_has_blocking_render_artifact(raw_stats),
+            native_play_title_stats_input_ready(projected_stats),
+            raw_stats.nonzero_pixels,
+            projected_stats.nonzero_pixels,
+            raw_stats.occupied_row_span,
+            projected_stats.occupied_row_span,
+            decision,
+        );
+    }
+    decision.then_some((raw_title, raw_stats))
+}
+
+fn native_play_full_height_raw_title_stats_should_replace_projection(
+    raw_width: usize,
+    raw_height: usize,
+    active_width: usize,
+    active_height: usize,
+    raw_stats: NativeFrameStats,
+    projected_stats: NativeFrameStats,
+) -> bool {
+    let dimensions_match = raw_width == active_width
+        && active_height > 0
+        && active_height.saturating_mul(2) == raw_height;
+    if !dimensions_match
+        || !native_play_title_stats_input_ready(raw_stats)
+        || !raw_stats.has_scene_detail()
+        || raw_stats.has_blocking_display_artifact()
+        || native_play_frame_has_blocking_render_artifact(raw_stats)
+        || !native_play_title_stats_input_ready(projected_stats)
+    {
+        return false;
+    }
+
+    let raw_is_substantially_richer = raw_stats.nonzero_pixels
+        >= projected_stats.nonzero_pixels.saturating_mul(2)
+        && raw_stats.occupied_row_span
+            >= projected_stats
+                .occupied_row_span
+                .saturating_add(raw_stats.height / 5)
+        && raw_stats.unique_colors >= projected_stats.unique_colors;
+
+    raw_is_substantially_richer
+        && native_play_window_frame_is_weaker_than_raw_title(projected_stats, raw_stats)
 }
 
 fn native_play_should_prefer_raw_scene_frame(
@@ -9391,15 +10586,11 @@ fn native_play_should_prefer_raw_scene_frame(
     if !gpu_gameplay_context {
         return false;
     }
-    if !raw_stats.has_visible_content()
-        || !raw_stats.has_scene_detail()
+    if !raw_stats.has_scene_detail()
+        || !native_play_fresh_actual_replacement_frame_passes_artifact_checks(raw_stats)
         || raw_stats.has_title_screen_frame()
         || raw_stats.has_warning_text_overlay()
-        || raw_stats.has_blocking_display_artifact()
-        || raw_stats.has_low_palette_noise()
-        || raw_stats.has_low_palette_logo_transition()
         || raw_stats.has_corrupt_title_texture_fragment()
-        || raw_stats.has_repeating_tile_grid_artifact()
         || raw_stats.has_saturated_transition_planes()
         || raw_stats.has_warm_dominant_fill_frame()
     {
@@ -9627,7 +10818,8 @@ fn native_play_should_prefer_gpu_verified_actual_display(
     let stable_window = native_play_window_frame(stable);
     let actual_stats = NativeFrameStats::from_frame(&actual_window);
     let stable_stats = NativeFrameStats::from_frame(&stable_window);
-    let actual_visibly_usable = native_play_gpu_verified_frame_stats(actual_stats);
+    let actual_visibly_usable = native_play_gpu_verified_frame_stats(actual_stats)
+        && native_play_fresh_actual_replacement_frame_passes_artifact_checks(actual_stats);
     let stable_is_stale_or_blocking = stable_stats.has_title_screen_frame()
         || stable_stats.has_corrupt_title_texture_fragment()
         || stable_stats.has_blocking_display_artifact()
@@ -9658,6 +10850,22 @@ fn step_until_next_vblank_checked_with_wall_timeout(
     started_at: Instant,
     wall_timeout: Option<Duration>,
 ) -> NativeScriptVblankStep {
+    step_until_next_vblank_checked_with_wall_timeout_policy(
+        emulator,
+        instructions_per_frame,
+        started_at,
+        wall_timeout,
+        true,
+    )
+}
+
+fn step_until_next_vblank_checked_with_wall_timeout_policy(
+    emulator: &mut NativeEmulator,
+    instructions_per_frame: u64,
+    started_at: Instant,
+    wall_timeout: Option<Duration>,
+    track_last_step: bool,
+) -> NativeScriptVblankStep {
     let start_vblank = emulator.vblank_count();
     let mut remaining = instructions_per_frame.max(1);
 
@@ -9670,7 +10878,11 @@ fn step_until_next_vblank_checked_with_wall_timeout(
         }
 
         let slice = remaining.min(NATIVE_SCRIPT_VBLANK_POLL_INSTRUCTION_SLICE);
-        emulator.step_instructions(slice);
+        if track_last_step {
+            emulator.step_instructions(slice);
+        } else {
+            emulator.step_instructions_until_vblank_untracked(slice);
+        }
         remaining = remaining.saturating_sub(slice);
     }
 
@@ -9685,6 +10897,7 @@ fn step_until_next_vblank_checked_with_wall_timeout(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativePlayWindowStep {
     vblank_advanced: bool,
+    input_timing_advanced: bool,
     window_closed_or_escape: bool,
     raw_buttons: ActionButtons,
     latched_buttons: ActionButtons,
@@ -9694,6 +10907,7 @@ struct NativePlayWindowStep {
     test_input_buttons: ActionButtons,
     test_guest_buttons: ActionButtons,
     test_input_activity: NativeInputActivity,
+    guest_input_activity: NativeInputActivity,
     buttons: ActionButtons,
     manual_override: bool,
     raw_manual_override: bool,
@@ -9716,7 +10930,7 @@ fn native_play_gui_idle_fast_path_allowed(
         && physical_input_latch.is_empty()
         && physical_enter.is_empty()
         && !input_trace.is_enabled()
-        && !test_input_script.is_enabled()
+        && !test_input_script.is_active()
         && !defer_edge_key_sample
         && !input_sample.quit_requested
         && !input_sample.physical_enter_down
@@ -9729,23 +10943,82 @@ fn native_play_gui_should_sample_platform_input(input_poll_index: u64) -> bool {
     input_poll_index.is_multiple_of(NATIVE_PLAY_GUI_PLATFORM_INPUT_SAMPLE_POLL_SLICES)
 }
 
+fn native_play_gui_should_pump_window_event(
+    input_poll_index: u64,
+    polls_since_last_pump: u64,
+    elapsed_since_last_pump: Duration,
+) -> bool {
+    input_poll_index == 0
+        || polls_since_last_pump >= NATIVE_PLAY_GUI_EVENT_PUMP_MAX_POLL_SLICES
+        || elapsed_since_last_pump >= NATIVE_PLAY_GUI_EVENT_PUMP_INTERVAL
+}
+
+fn native_play_gui_advance_poll_counters(
+    input_poll_index: &mut u64,
+    polls_since_last_pump: &mut u64,
+) {
+    *input_poll_index = input_poll_index.saturating_add(1);
+    *polls_since_last_pump = polls_since_last_pump.saturating_add(1);
+}
+
+#[cfg(test)]
+fn native_play_gui_should_sample_platform_input_for_pump(
+    input_poll_index: u64,
+    window_event_pumped: bool,
+) -> bool {
+    window_event_pumped && native_play_gui_should_sample_platform_input(input_poll_index)
+}
+
+#[cfg(test)]
+fn native_play_gui_event_pump_count_for_instruction_budget(
+    instructions_per_frame: u64,
+    poll_instruction_slice: u64,
+    idle_fast_path: bool,
+) -> u64 {
+    let total_input_polls = native_play_gui_poll_count_for_instruction_budget(
+        instructions_per_frame,
+        poll_instruction_slice,
+        idle_fast_path,
+    );
+    let mut event_pumps = 0u64;
+    let mut polls_since_last_pump = NATIVE_PLAY_GUI_EVENT_PUMP_MAX_POLL_SLICES;
+    for poll in 0..total_input_polls {
+        if native_play_gui_should_pump_window_event(poll, polls_since_last_pump, Duration::ZERO) {
+            event_pumps = event_pumps.saturating_add(1);
+            polls_since_last_pump = 0;
+        }
+        polls_since_last_pump = polls_since_last_pump.saturating_add(1);
+    }
+    event_pumps
+}
+
 #[allow(clippy::too_many_arguments)]
-fn step_native_play_window_frame_checked(
+fn step_native_play_window_frame_checked<F>(
     emulator: &mut NativeEmulator,
     instructions_per_frame: u64,
-    window: &mut Window,
+    input_sample: NativeWindowButtonSample,
     scripted_action: Option<Action>,
     manual_takeover_enabled: bool,
     input_latch: &mut NativeInputLatch,
     physical_input_latch: &mut NativeInputLatch,
+    test_input_latch: &mut NativeInputLatch,
     physical_enter: &mut NativePhysicalEnterSequencer,
     input_trace: &mut NativeGuiInputTrace,
     test_input_script: &NativeGuiTestInputScript,
+    exclusive_test_input: bool,
     defer_edge_key_sample: bool,
-) -> Result<NativePlayWindowStep, String> {
+    mut resample_input: F,
+) -> Result<NativePlayWindowStep, String>
+where
+    F: FnMut(u64) -> Option<NativeWindowButtonSample>,
+{
     let start_vblank = emulator.vblank_count();
     let mut remaining = instructions_per_frame.max(1);
     let poll_instruction_slice = native_play_gui_poll_instruction_slice();
+    let mut current_input_sample = input_sample;
+    let mut input_poll_index = 0u64;
+    let mut polls_since_last_pump = 0u64;
+    let mut last_window_event_pump = Instant::now();
 
     let mut manual_override = false;
     let mut raw_manual_override = false;
@@ -9758,42 +11031,36 @@ fn step_native_play_window_frame_checked(
     let mut test_input_buttons = ActionButtons::default();
     let mut test_guest_buttons = ActionButtons::default();
     let mut test_input_activity = NativeInputActivity::default();
+    let mut guest_input_activity = NativeInputActivity::default();
     let mut buttons = ActionButtons::default();
-    let mut input_poll_index = 0u64;
-    let mut cached_platform_context = None;
     let mut quit_requested = false;
+    let mut guest_input_activity_observed = false;
     while remaining > 0
         && emulator.vblank_count() == start_vblank
         && !emulator.is_terminal()
-        && window.is_open()
         && !quit_requested
     {
-        window.update();
-        let raw_window_active = window.is_active();
-        let window_active = native_play_window_is_active(window, raw_window_active);
-        // Activation retries must not discard Enter/coin/attack edge events.
-        // Held-state polling alone is insufficient for normal short taps.
-        let consume_pressed_edges = true;
-        let sampled_platform_input = native_play_gui_should_sample_platform_input(input_poll_index);
-        let mut input_sample = native_window_button_sample(
-            window,
-            window_active,
-            consume_pressed_edges,
-            sampled_platform_input,
-        );
-        if sampled_platform_input {
-            cached_platform_context = Some(input_sample);
-        } else {
-            input_sample = native_window_button_sample_with_cached_platform_context(
-                input_sample,
-                cached_platform_context,
-            );
+        if input_poll_index > 0
+            && native_play_gui_should_pump_window_event(
+                input_poll_index,
+                polls_since_last_pump,
+                last_window_event_pump.elapsed(),
+            )
+        {
+            if let Some(sample) = resample_input(input_poll_index) {
+                current_input_sample = sample;
+            }
+            polls_since_last_pump = 0;
+            last_window_event_pump = Instant::now();
         }
-        input_poll_index = input_poll_index.saturating_add(1);
         let input_sample = native_window_button_sample_with_test_sidecar(
-            input_sample,
-            raw_window_active,
+            current_input_sample,
+            current_input_sample.raw_window_active,
             test_input_script.current_buttons(),
+        );
+        let input_sample = native_window_button_sample_for_exclusive_test_input(
+            input_sample,
+            exclusive_test_input,
         );
         quit_requested |= input_sample.quit_requested;
         if quit_requested {
@@ -9814,11 +11081,16 @@ fn step_native_play_window_frame_checked(
                 native_play_gui_idle_fast_path_instruction_slice(remaining, poll_instruction_slice);
             emulator.step_instructions_until_vblank_untracked(slice);
             remaining = remaining.saturating_sub(slice);
+            native_play_gui_advance_poll_counters(
+                &mut input_poll_index,
+                &mut polls_since_last_pump,
+            );
             continue;
         }
         let resolved = native_play_resolve_input_poll(
             input_latch,
             physical_input_latch,
+            test_input_latch,
             physical_enter,
             input_sample,
             scripted_action,
@@ -9844,6 +11116,8 @@ fn step_native_play_window_frame_checked(
         emulator.step_instructions_until_vblank_untracked(slice);
         let activity_after = emulator.input_activity();
         let activity_delta = activity_after.saturating_subtracted(activity_before);
+        guest_input_activity = guest_input_activity.saturating_added(activity_delta);
+        guest_input_activity_observed |= activity_delta.has_any_control_activity();
         if action_buttons_any(resolved.physical_buttons) {
             let filtered_physical_activity =
                 native_input_activity_for_buttons(activity_delta, resolved.physical_buttons);
@@ -9857,13 +11131,13 @@ fn step_native_play_window_frame_checked(
             physical_input_activity =
                 physical_input_activity.saturating_added(filtered_physical_activity);
         }
-        if action_buttons_any(input_sample.test_sidecar) {
+        if action_buttons_any(resolved.test_latched_buttons) {
             let filtered_test_activity =
-                native_input_activity_for_buttons(activity_delta, input_sample.test_sidecar);
+                native_input_activity_for_buttons(activity_delta, resolved.test_latched_buttons);
             test_guest_buttons = merge_action_buttons(
                 test_guest_buttons,
                 native_guest_observed_buttons_for_input_activity(
-                    input_sample.test_sidecar,
+                    resolved.test_latched_buttons,
                     filtered_test_activity,
                 ),
             );
@@ -9878,18 +11152,25 @@ fn step_native_play_window_frame_checked(
             activity_after,
         );
         remaining = remaining.saturating_sub(slice);
+        native_play_gui_advance_poll_counters(&mut input_poll_index, &mut polls_since_last_pump);
     }
-    if emulator.vblank_count() != start_vblank {
+    let vblank_advanced = emulator.vblank_count() != start_vblank;
+    let input_timing_advanced = native_play_gui_should_advance_input_timing(
+        vblank_advanced,
+        guest_input_activity_observed,
+        remaining == 0,
+    );
+    if input_timing_advanced {
         input_latch.advance_frame();
         physical_input_latch.advance_frame();
+        test_input_latch.advance_frame();
         physical_enter.advance_frame();
     }
 
     Ok(NativePlayWindowStep {
-        vblank_advanced: emulator.vblank_count() != start_vblank,
-        window_closed_or_escape: !window.is_open()
-            || window.is_key_down(Key::Escape)
-            || quit_requested,
+        vblank_advanced,
+        input_timing_advanced,
+        window_closed_or_escape: quit_requested,
         raw_buttons,
         latched_buttons,
         physical_buttons,
@@ -9898,6 +11179,7 @@ fn step_native_play_window_frame_checked(
         test_input_buttons,
         test_guest_buttons,
         test_input_activity,
+        guest_input_activity,
         buttons,
         manual_override,
         raw_manual_override,
@@ -10523,7 +11805,7 @@ fn run_native_health_check(
         NativeDirectInputProbe::skipped("skipped_checkpoint_not_playable")
     } else {
         let mut direct_input = checkpoint.clone();
-        run_native_direct_input_probe(&mut direct_input, native_health_branch_actions())
+        run_native_direct_input_probe(&mut direct_input, native_full_input_probe_actions())
     };
 
     let mut branches = Vec::new();
@@ -10613,14 +11895,15 @@ fn run_native_health_check(
         native_combined_play_controls_active(checkpoint_activity, combined_control_activity);
     let full_controls_active =
         native_combined_full_controls_active(checkpoint_activity, combined_control_activity);
+    let combined_full_controls_active = total_input_activity.has_combined_full_control_activity();
     let branch_count = native_health_branch_actions().len();
     let all_branch_actions_attempted = branch_attempt_count == branch_count;
     let all_branch_actions_read =
         all_branch_actions_attempted && branch_action_read_count == branch_count;
     let control_sweep_actions_read = full_controls_active;
-    let direct_input_actions_read = direct_input_probe.action_read_count == branch_count;
-    let all_control_actions_read =
-        all_branch_actions_read || control_sweep_actions_read || direct_input_actions_read;
+    let direct_input_actions_read =
+        direct_input_probe.action_read_count == native_full_input_probe_actions().len();
+    let all_control_actions_read = direct_input_actions_read && combined_full_controls_active;
     let all_branches_native_playable = branch_native_playable_count == branch_count;
     let rendering_present =
         checkpoint_stats.has_visible_content() || control_sweep_stats.has_visible_content();
@@ -10647,7 +11930,10 @@ fn run_native_health_check(
     let render_ready = native_core_running
         && assets_complete
         && (checkpoint_render_ready || control_sweep_render_ready || match_entry_render_ready);
-    let input_poll_ready = play_controls_active && full_controls_active && all_control_actions_read;
+    let input_poll_ready = play_controls_active
+        && full_controls_active
+        && combined_full_controls_active
+        && all_control_actions_read;
     let credit_probe_ready = native_credit_probe_ready(total_input_activity);
     let credit_register_ready = native_credit_register_ready(total_input_activity);
     let credit_transition_verified = native_credit_transition_verified(
@@ -10688,12 +11974,43 @@ fn run_native_health_check(
         match_entry_rendering_complete,
         known_rendering_gap,
     );
+    let (audio_source, audio_health, audio_stats_json) = [
+        (
+            "checkpoint",
+            checkpoint.audio_health(),
+            checkpoint.audio_stats_json(),
+        ),
+        (
+            "control_sweep",
+            control_sweep.audio_health(),
+            control_sweep.audio_stats_json(),
+        ),
+        (
+            "match_entry",
+            match_entry.audio_health(),
+            match_entry.audio_stats_json(),
+        ),
+    ]
+    .into_iter()
+    .max_by_key(|(_, health, _)| {
+        health.map_or(0u8, |health| {
+            u8::from(health.render_progressing).saturating_add(u8::from(health.pcm_nonzero) * 2)
+        })
+    })
+    .expect("native health audio candidates");
+    let audio_health_json = audio_health.map_or_else(
+        || "{\"state\":\"unavailable\",\"reason\":\"sound_board_not_loaded\",\"audible\":false,\"render_progressing\":false,\"pcm_nonzero\":false,\"realtime_output_seen\":false,\"realtime_ok\":false}".to_string(),
+        |health| health.json(),
+    );
+    let audio_ready =
+        audio_health.is_some_and(|health| health.render_progressing && health.pcm_nonzero);
     let health_wall_timed_out = health_started_at.elapsed() >= health_wall_timeout;
     let overall_pass = native_core_running
         && assets_complete
         && manual_checkpoint_ready
         && input_ready
         && render_ready
+        && audio_ready
         && gameplay_ready;
     let overall_status = if overall_pass {
         "pass"
@@ -10704,7 +12021,7 @@ fn run_native_health_check(
     };
 
     println!(
-        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"health_script_instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"health_wall_timeout_secs\":{},\"health_wall_timed_out\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"manual_checkpoint_ready\":{},\"render_ready\":{},\"input_ready\":{},\"input_poll_ready\":{},\"credit_ready\":{},\"credit_probe_ready\":{},\"credit_register_ready\":{},\"credit_transition_verified\":{},\"credit_adapter_ready\":{},\"credit_system_port_ready\":{},\"credit_gap_reason\":\"{}\",\"total_input_activity\":{},\"gameplay_ready\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"all_branch_actions_attempted\":{},\"all_branch_actions_read\":{},\"control_sweep_actions_read\":{},\"direct_input_actions_read\":{},\"all_control_actions_read\":{},\"branch_attempt_count\":{},\"branch_action_read_count\":{},\"direct_input_action_read_count\":{},\"all_branches_native_playable\":{},\"control_sweep_reaches_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_render_ready\":{},\"checkpoint_full_scene\":{},\"checkpoint_runtime_limited\":{},\"checkpoint_followup_blocked\":{},\"control_sweep_render_ready\":{},\"control_sweep_full_scene\":{},\"match_entry_render_ready\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"match_entry_rendering_complete\":{},\"native_play_handoff_full_scene\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"input_ok_rendering_gap\":{},\"rendering_gap_reason\":\"{}\",\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"direct_input_probe\":{},\"match_entry\":{},\"branches\":[{}]}}",
+        "{{\"overall_status\":\"{}\",\"overall_pass\":{},\"instructions_per_frame\":{},\"health_script_instructions_per_frame\":{},\"branch_frames\":{},\"settle_frames\":{},\"health_wall_timeout_secs\":{},\"health_wall_timed_out\":{},\"assets_complete\":{},\"exact_mame_assets\":{},\"rom_compatibility\":{},\"native_core_running\":{},\"manual_checkpoint_ready\":{},\"render_ready\":{},\"input_ready\":{},\"input_poll_ready\":{},\"credit_ready\":{},\"credit_probe_ready\":{},\"credit_register_ready\":{},\"credit_transition_verified\":{},\"credit_adapter_ready\":{},\"credit_system_port_ready\":{},\"credit_gap_reason\":\"{}\",\"total_input_activity\":{},\"audio_source\":\"{}\",\"audio\":{},\"audio_health\":{},\"audio_ready\":{},\"gameplay_ready\":{},\"play_controls_active\":{},\"full_controls_active\":{},\"combined_full_controls_active\":{},\"all_branch_actions_attempted\":{},\"all_branch_actions_read\":{},\"control_sweep_actions_read\":{},\"direct_input_actions_read\":{},\"all_control_actions_read\":{},\"branch_attempt_count\":{},\"branch_action_read_count\":{},\"direct_input_action_read_count\":{},\"direct_input_action_count\":{},\"all_branches_native_playable\":{},\"control_sweep_reaches_playable\":{},\"rendering_present\":{},\"display_detail_present\":{},\"checkpoint_render_ready\":{},\"checkpoint_full_scene\":{},\"checkpoint_runtime_limited\":{},\"checkpoint_followup_blocked\":{},\"control_sweep_render_ready\":{},\"control_sweep_full_scene\":{},\"match_entry_render_ready\":{},\"match_entry_full_scene\":{},\"match_entry_known_rendering_gap\":{},\"match_entry_rendering_complete\":{},\"native_play_handoff_full_scene\":{},\"full_scene_rendering\":{},\"known_rendering_gap\":{},\"input_ok_rendering_gap\":{},\"rendering_gap_reason\":\"{}\",\"branch_native_playable_count\":{},\"branch_full_scene_count\":{},\"branch_count\":{},\"checkpoint\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"control_sweep\":{{\"run\":{},\"segments\":[{}],\"executed_steps\":{},\"terminal\":{},\"native_playable_candidate\":{},\"input_activity\":{},\"frame\":{},\"state\":{}}},\"direct_input_probe\":{},\"match_entry\":{},\"branches\":[{}]}}",
         overall_status,
         overall_pass,
         instructions_per_frame,
@@ -10729,9 +12046,14 @@ fn run_native_health_check(
         credit_system_port_ready,
         credit_gap_reason,
         total_input_activity.json(),
+        audio_source,
+        audio_stats_json,
+        audio_health_json,
+        audio_ready,
         gameplay_ready,
         play_controls_active,
         full_controls_active,
+        combined_full_controls_active,
         all_branch_actions_attempted,
         all_branch_actions_read,
         control_sweep_actions_read,
@@ -10740,6 +12062,7 @@ fn run_native_health_check(
         branch_attempt_count,
         branch_action_read_count,
         direct_input_probe.action_read_count,
+        native_full_input_probe_actions().len(),
         all_branches_native_playable,
         control_sweep_reaches_playable,
         rendering_present,
@@ -12452,7 +13775,7 @@ impl NativeFrameStats {
     }
 
     fn from_frame_with_checksum(frame: &NativeDisplayFrame) -> (Self, u32) {
-        let mut unique_colors = Vec::new();
+        let mut unique_colors = Vec::with_capacity(257);
         let mut color_buckets = [0usize; 4096];
         let mut checksum = 0x811c_9dc5_u32;
         checksum ^= frame.width as u32;
@@ -12491,6 +13814,7 @@ impl NativeFrameStats {
             let row = y.saturating_mul(frame.width);
             let mut row_nonzero_pixels = 0usize;
             let mut row_warning_text_pixels = 0usize;
+            let mut previous_color = None;
             for x in 0..frame.width {
                 let color = frame.pixels.get(row + x).copied().unwrap_or_default() & 0x00ff_ffff;
                 checksum ^= color;
@@ -12559,13 +13883,10 @@ impl NativeFrameStats {
                     | (((green >> 4) as usize) << 4)
                     | ((blue >> 4) as usize);
                 color_buckets[bucket] += 1;
-                if x > 0 {
-                    let previous =
-                        frame.pixels.get(row + x - 1).copied().unwrap_or_default() & 0x00ff_ffff;
-                    if previous != color {
-                        horizontal_color_changes += 1;
-                    }
+                if previous_color.is_some_and(|previous| previous != color) {
+                    horizontal_color_changes += 1;
                 }
+                previous_color = Some(color);
             }
             if row_nonzero_pixels >= row_content_cutoff {
                 occupied_rows += 1;
@@ -12695,7 +14016,7 @@ impl NativeFrameStats {
             && !self.has_br2_low_palette_vertical_stage_strip_artifact()
             && !self.has_br2_title_caption_live_atlas_mixture()
             && !self.has_br2_character_select_title_atlas_mixture()
-            && !self.has_bottom_caption_band()
+            && (!self.has_bottom_caption_band() || self.has_transient_native_combat_effect())
             && !self.has_periodic_horizontal_ghosting()
     }
 
@@ -12737,10 +14058,11 @@ impl NativeFrameStats {
             return false;
         }
 
-        !self.has_intro_caption_band()
-            && (!self.has_bottom_caption_band()
-                || self.horizontal_color_changes.saturating_mul(100)
-                    >= self.total_pixels.saturating_mul(35))
+        self.has_transient_native_combat_effect()
+            || (!self.has_intro_caption_band()
+                && (!self.has_bottom_caption_band()
+                    || self.horizontal_color_changes.saturating_mul(100)
+                        >= self.total_pixels.saturating_mul(35)))
     }
 
     fn has_gameplay_scene(self) -> bool {
@@ -12765,7 +14087,7 @@ impl NativeFrameStats {
             || self.has_periodic_horizontal_ghosting()
             || self.has_missing_texture_recovery_artifact()
             || self.warm_pixels.saturating_mul(100) > self.total_pixels.saturating_mul(72)
-            || self.has_bottom_caption_band()
+            || (self.has_bottom_caption_band() && !self.has_transient_native_combat_effect())
             || (self.black_pixels.saturating_mul(100) > self.total_pixels.saturating_mul(40)
                 && self.dominant_color_bucket_pixels.saturating_mul(100)
                     > self.total_pixels.saturating_mul(45))
@@ -12946,6 +14268,41 @@ impl NativeFrameStats {
                 >= self.total_pixels.saturating_mul(2)
     }
 
+    fn has_transient_native_combat_effect(self) -> bool {
+        if self.total_pixels == 0
+            || self.width < NATIVE_PLAY_WINDOW_WIDTH
+            || self.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+            || !self.has_scene_detail()
+            || !self.has_title_logo_overlay()
+            || !self.has_intro_caption_band()
+            || self.has_large_bottom_caption_video_band()
+            || self.has_title_screen_frame()
+            || self.has_warning_text_overlay()
+        {
+            return false;
+        }
+
+        let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        let title_mark_pixels = self
+            .right_title_red_pixels
+            .saturating_add(self.right_title_bright_pixels);
+        bottom_band_pixels > 0
+            && self.unique_colors >= 192
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(70)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(30)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(35)
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(20)
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(90)
+            && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(25)
+            && self.bottom_dark_pixels.saturating_mul(100) <= bottom_band_pixels.saturating_mul(45)
+            && self.bottom_caption_pixels.saturating_mul(100)
+                <= bottom_band_pixels.saturating_mul(10)
+            && title_mark_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(2)
+            && self.periodic_horizontal_match_per_mille < 300
+    }
+
     fn has_title_logo_overlay(self) -> bool {
         if self.total_pixels == 0 || !self.has_native_actual_artifact_size() {
             return false;
@@ -12961,6 +14318,48 @@ impl NativeFrameStats {
             && self.black_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(10)
             && self.horizontal_color_changes.saturating_mul(100)
                 >= self.total_pixels.saturating_mul(20)
+    }
+
+    fn has_br2_full_logo_title_frame(self) -> bool {
+        if self.total_pixels == 0
+            || self.width < NATIVE_PLAY_MIN_WINDOW_WIDTH
+            || self.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        {
+            return false;
+        }
+
+        let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        let title_mark_pixels = self
+            .right_title_red_pixels
+            .saturating_add(self.right_title_bright_pixels);
+        bottom_band_pixels > 0
+            && self.unique_colors >= 192
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(35)
+            && self.nonzero_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(60)
+            && self.black_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(40)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(65)
+            && self.warm_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(10)
+            && self.red_dominant_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(12)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(45)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(68)
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(20)
+            && self.horizontal_color_changes.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(45)
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(75)
+            && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(85)
+            && self.bottom_caption_pixels.saturating_mul(1_000)
+                >= self.total_pixels.saturating_mul(3)
+            && self.bottom_caption_pixels.saturating_mul(100)
+                <= bottom_band_pixels.saturating_mul(8)
+            && title_mark_pixels.saturating_mul(1_000) >= self.total_pixels.saturating_mul(4)
+            && self.right_title_red_pixels.saturating_mul(1_000)
+                >= self.total_pixels.saturating_mul(2)
+            && self.right_title_bright_pixels.saturating_mul(1_000)
+                >= self.total_pixels.saturating_mul(2)
+            && self.periodic_horizontal_match_per_mille < 100
     }
 
     fn has_title_screen_frame(self) -> bool {
@@ -12996,6 +14395,26 @@ impl NativeFrameStats {
             && caption_band_allowed
             && intro_caption_allowed
             && !sparse_captioned_native_field
+            || self.has_br2_full_logo_title_frame()
+    }
+
+    fn has_complete_sparse_title_frame(self) -> bool {
+        self.has_title_screen_frame()
+            && self.total_pixels > 0
+            && self.width == NATIVE_PLAY_WINDOW_WIDTH
+            && self.height == NATIVE_PLAY_MIN_WINDOW_HEIGHT
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(3)
+            && self.nonzero_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(8)
+            && self.unique_colors >= 16
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(2)
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(25)
+            && self.occupied_row_span.saturating_mul(100) <= self.height.saturating_mul(45)
+            && self.right_title_bright_pixels.saturating_mul(1_000)
+                >= self.total_pixels.saturating_mul(5)
+            && self.periodic_horizontal_match_per_mille < 100
+            && !self.has_bottom_caption_band()
+            && !self.has_intro_caption_band()
     }
 
     fn has_br2_insert_coin_title_frame(self) -> bool {
@@ -13240,15 +14659,50 @@ impl NativeFrameStats {
     fn has_br2_character_select_texture_atlas_overlay(self) -> bool {
         if self.total_pixels == 0
             || !self.has_native_actual_artifact_size()
-            || !self.has_scene_detail()
+            || !self.has_visible_content()
             || self.has_title_screen_frame()
-            || self.has_bottom_caption_band()
             || self.has_strong_context_stage_hud()
         {
             return false;
         }
 
         let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        let title_mark_pixels = self
+            .right_title_red_pixels
+            .saturating_add(self.right_title_bright_pixels);
+        let incomplete_red_select_transition = bottom_band_pixels > 0
+            && self.unique_colors >= 24
+            && self.unique_colors <= 257
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(68)
+            && self.nonzero_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(82)
+            && self.black_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(18)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(32)
+            && self.red_dominant_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(20)
+            && self.red_dominant_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(50)
+            && self.warm_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(12)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(28)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(65)
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(25)
+            && self.horizontal_color_changes.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(34)
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(95)
+            && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(88)
+            && self.bottom_caption_pixels.saturating_mul(1_000)
+                <= self.total_pixels.saturating_mul(8)
+            && self.top_left_warning_text_rows <= 4
+            && self.top_left_warning_text_pixels.saturating_mul(1_000)
+                <= self.total_pixels.saturating_mul(2)
+            && title_mark_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(2);
+        if incomplete_red_select_transition {
+            return true;
+        }
+        if !self.has_scene_detail() || self.has_bottom_caption_band() {
+            return false;
+        }
+
         let warning_region_width = self
             .width
             .saturating_mul(48)
@@ -14016,9 +15470,34 @@ impl NativeFrameStats {
             || self.has_br2_red_cave_replay_artifact()
             || self.has_low_information_fill_frame()
             || self.has_warm_dominant_fill_frame()
+            || self.has_large_magenta_recovery_corruption()
             || self.has_br2_low_palette_vertical_stage_strip_artifact()
             || self.has_br2_title_caption_live_atlas_mixture()
             || self.has_br2_character_select_title_atlas_mixture()
+    }
+
+    fn has_large_magenta_recovery_corruption(self) -> bool {
+        if self.total_pixels == 0
+            || self.width < NATIVE_PLAY_MIN_WINDOW_WIDTH
+            || self.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
+            || !self.has_visible_content()
+        {
+            return false;
+        }
+
+        let large_magenta_fill = self.magenta_dominant_pixels.saturating_mul(100)
+            >= self.total_pixels.saturating_mul(55);
+        let periodic_match = self.periodic_horizontal_match_per_mille >= 500
+            || self.has_periodic_horizontal_ghosting();
+        let detailed_low_change_fill = self.has_scene_detail()
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(45)
+            && self.horizontal_color_changes.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(12);
+
+        large_magenta_fill
+            && !self.has_transient_native_combat_effect()
+            && (periodic_match || detailed_low_change_fill)
     }
 
     fn has_repeating_tile_grid_artifact(self) -> bool {
@@ -14046,12 +15525,42 @@ impl NativeFrameStats {
         if self.total_pixels == 0
             || self.width < NATIVE_PLAY_MIN_WINDOW_WIDTH
             || self.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
-            || !self.has_scene_detail()
+            || !self.has_visible_content()
         {
             return false;
         }
 
         let bottom_band_pixels = self.width.saturating_mul((self.height / 5).max(1));
+        let full_red_stage_transition = bottom_band_pixels > 0
+            && self.unique_colors >= 32
+            && self.unique_colors <= 96
+            && self.nonzero_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(98)
+            && self.black_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(2)
+            && self.red_dominant_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(82)
+            && self.warm_pixels.saturating_mul(100) >= self.total_pixels.saturating_mul(10)
+            && self.warm_pixels.saturating_mul(100) <= self.total_pixels.saturating_mul(20)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(20)
+            && self.dominant_color_bucket_pixels.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(35)
+            && self.horizontal_color_changes.saturating_mul(100)
+                >= self.total_pixels.saturating_mul(30)
+            && self.horizontal_color_changes.saturating_mul(100)
+                <= self.total_pixels.saturating_mul(36)
+            && self.periodic_horizontal_match_per_mille >= 300
+            && self.periodic_horizontal_match_per_mille <= 380
+            && self.occupied_row_span.saturating_mul(100) >= self.height.saturating_mul(95)
+            && self.right_title_bright_pixels.saturating_mul(100) <= self.total_pixels
+            && self.top_left_warning_text_rows <= 2
+            && self.bottom_caption_pixels.saturating_mul(1_000) <= self.total_pixels
+            && self.bottom_dark_pixels.saturating_mul(100) >= bottom_band_pixels.saturating_mul(85);
+        if full_red_stage_transition {
+            return true;
+        }
+        if !self.has_scene_detail() {
+            return false;
+        }
+
         bottom_band_pixels > 0
             && self.unique_colors >= 192
             && self.unique_colors <= 257
@@ -14098,6 +15607,10 @@ impl NativeFrameStats {
         // A live fight HUD can resemble both the title mark and caption-band
         // classifiers because of PRESS START and the bottom power gauges.
         if self.has_dense_native_fight_hud() {
+            return true;
+        }
+
+        if self.has_transient_native_combat_effect() {
             return true;
         }
 
@@ -14405,16 +15918,24 @@ impl NativeFrameStats {
 }
 
 fn native_frame_checksum(frame: &NativeDisplayFrame) -> u32 {
-    let mut checksum = 0x811c_9dc5_u32;
-    checksum ^= frame.width as u32;
-    checksum = checksum.wrapping_mul(16_777_619);
-    checksum ^= frame.height as u32;
-    checksum = checksum.wrapping_mul(16_777_619);
+    let mut checksum = native_frame_checksum_seed(frame.width, frame.height);
     for &pixel in &frame.pixels {
-        checksum ^= pixel & 0x00ff_ffff;
-        checksum = checksum.wrapping_mul(16_777_619);
+        checksum = native_frame_checksum_pixel(checksum, pixel);
     }
     checksum
+}
+
+fn native_frame_checksum_seed(width: usize, height: usize) -> u32 {
+    let mut checksum = 0x811c_9dc5_u32;
+    checksum ^= width as u32;
+    checksum = checksum.wrapping_mul(16_777_619);
+    checksum ^= height as u32;
+    checksum.wrapping_mul(16_777_619)
+}
+
+fn native_frame_checksum_pixel(mut checksum: u32, pixel: u32) -> u32 {
+    checksum ^= pixel & 0x00ff_ffff;
+    checksum.wrapping_mul(16_777_619)
 }
 
 fn native_frame_compact_stats_json(stats: NativeFrameStats) -> String {
@@ -14672,8 +16193,51 @@ const NATIVE_HEALTH_BRANCH_ACTIONS: [Action; 8] = [
     Action::Guard,
 ];
 
+const NATIVE_FULL_INPUT_PROBE_ACTIONS: [Action; 20] = [
+    Action::Coin,
+    Action::Start,
+    Action::Up,
+    Action::Down,
+    Action::Left,
+    Action::Right,
+    Action::Punch,
+    Action::Kick,
+    Action::Beast,
+    Action::Guard,
+    Action::P2Coin,
+    Action::P2Start,
+    Action::P2Up,
+    Action::P2Down,
+    Action::P2Left,
+    Action::P2Right,
+    Action::P2Punch,
+    Action::P2Kick,
+    Action::P2Beast,
+    Action::P2Guard,
+];
+
 fn native_health_branch_actions() -> &'static [Action] {
     &NATIVE_HEALTH_BRANCH_ACTIONS
+}
+
+fn native_full_input_probe_actions() -> &'static [Action] {
+    &NATIVE_FULL_INPUT_PROBE_ACTIONS
+}
+
+fn native_input_proof_json(activity: NativeInputActivity) -> String {
+    format!(
+        "{{\"p1_any\":{},\"p1_direction\":{},\"p1_play_controls\":{},\"p1_full_controls\":{},\"p2_any\":{},\"p2_direction\":{},\"p2_play_controls\":{},\"p2_full_controls\":{},\"combined_any\":{},\"combined_full_controls\":{}}}",
+        activity.has_p1_any_control_activity(),
+        activity.has_p1_direction_activity(),
+        activity.has_p1_play_control_activity(),
+        activity.has_p1_full_control_activity(),
+        activity.has_p2_any_control_activity(),
+        activity.has_p2_direction_activity(),
+        activity.has_p2_play_control_activity(),
+        activity.has_p2_full_control_activity(),
+        activity.has_any_control_activity(),
+        activity.has_combined_full_control_activity(),
+    )
 }
 
 fn native_control_sweep_script(branch_frames: u64, settle_frames: u64) -> Vec<NativeScriptSegment> {
@@ -14766,8 +16330,23 @@ impl NativeGuiTestInputScript {
         !self.frames.is_empty()
     }
 
+    fn is_active(&self) -> bool {
+        self.is_enabled() && self.frame_index as usize <= self.frames.len()
+    }
+
     fn len(&self) -> usize {
         self.frames.len()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.frame_index as usize >= self.frames.len()
+    }
+
+    fn requested_buttons(&self) -> ActionButtons {
+        self.frames
+            .iter()
+            .copied()
+            .fold(ActionButtons::default(), merge_action_buttons)
     }
 
     fn current_buttons(&self) -> ActionButtons {
@@ -14778,7 +16357,7 @@ impl NativeGuiTestInputScript {
     }
 
     fn advance_frame(&mut self) {
-        if self.is_enabled() {
+        if self.is_active() {
             self.frame_index = self.frame_index.saturating_add(1);
         }
     }
@@ -14860,7 +16439,10 @@ fn native_action_activity_observed(activity: NativeInputActivity, action: Action
         && (!buttons.p2_kick || activity.p2_kick_active_reads > 0)
         && (!buttons.p2_beast || activity.p2_beast_active_reads > 0)
         && (!buttons.p2_guard || activity.p2_guard_active_reads > 0)
-        && (!buttons.p2_coin || activity.system_p2_coin_active_reads > 0)
+        && (!buttons.p2_coin
+            || activity.system_p2_coin_active_reads > 0
+            || activity.p2_coin_insert_edges > 0
+            || activity.coin_counter_1_edges > 0)
         && (!buttons.p2_start || activity.system_p2_start_active_reads > 0)
 }
 
@@ -14906,9 +16488,15 @@ struct NativeWindowButtonSample {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativePlatformInputState {
+    previous: NativeWindowKeySample,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NativeResolvedGuiInputPoll {
     raw_buttons: ActionButtons,
     latched_buttons: ActionButtons,
+    test_latched_buttons: ActionButtons,
     physical_buttons: ActionButtons,
     effective_buttons: ActionButtons,
     raw_manual_override: bool,
@@ -14927,6 +16515,23 @@ fn native_window_button_sample_with_test_sidecar(
     sample
 }
 
+fn native_window_button_sample_for_exclusive_test_input(
+    mut sample: NativeWindowButtonSample,
+    exclusive_test_input: bool,
+) -> NativeWindowButtonSample {
+    if !exclusive_test_input {
+        return sample;
+    }
+
+    sample.minifb = ActionButtons::default();
+    sample.platform = ActionButtons::default();
+    sample.physical_enter_down = false;
+    sample.physical_enter_pressed = false;
+    sample.merged = sample.test_sidecar;
+    sample
+}
+
+#[cfg(test)]
 fn native_window_button_sample_with_cached_platform_context(
     mut sample: NativeWindowButtonSample,
     cached: Option<NativeWindowButtonSample>,
@@ -14944,9 +16549,14 @@ fn native_window_button_sample_with_cached_platform_context(
     sample
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent input-source latches stay explicit for attribution and release timing"
+)]
 fn native_play_resolve_input_poll(
     input_latch: &mut NativeInputLatch,
     physical_input_latch: &mut NativeInputLatch,
+    test_input_latch: &mut NativeInputLatch,
     physical_enter: &mut NativePhysicalEnterSequencer,
     input_sample: NativeWindowButtonSample,
     scripted_action: Option<Action>,
@@ -14954,10 +16564,12 @@ fn native_play_resolve_input_poll(
     coin_start_feedback: NativeCoinStartFeedback,
 ) -> NativeResolvedGuiInputPoll {
     // Keep physical input verification independent from the opt-in sidecar.
-    // Both reach the guest through the combined latch, but only window-local
-    // or platform input may trigger manual takeover and manual-input proof.
+    // Both reach the guest through the combined latch, but sidecar attribution
+    // also needs its own latch so late guest polls after a scripted release are
+    // still credited to the requested test control.
     let physical_buttons = merge_action_buttons(input_sample.minifb, input_sample.platform);
     let physical_latched_buttons = physical_input_latch.buttons(physical_buttons);
+    let test_latched_buttons = test_input_latch.buttons(input_sample.test_sidecar);
     let enter_buttons = physical_enter.buttons(
         input_sample.physical_enter_down,
         input_sample.physical_enter_pressed,
@@ -14974,13 +16586,14 @@ fn native_play_resolve_input_poll(
     NativeResolvedGuiInputPoll {
         raw_buttons,
         latched_buttons,
+        test_latched_buttons,
         physical_buttons: physical_latched_buttons,
         effective_buttons,
         raw_manual_override: action_buttons_any(physical_buttons)
             || input_sample.physical_enter_down
             || input_sample.physical_enter_pressed,
         manual_override: action_buttons_any(physical_latched_buttons),
-        test_input_override: action_buttons_any(input_sample.test_sidecar),
+        test_input_override: action_buttons_any(test_latched_buttons),
     }
 }
 
@@ -14997,8 +16610,8 @@ struct NativeGuiInputTrace {
 impl NativeGuiInputTrace {
     fn from_env(activity_baseline: NativeInputActivity) -> Self {
         Self {
-            enabled: env::var_os(NATIVE_PLAY_GUI_INPUT_TRACE_ENV).is_some()
-                || env::var_os(NATIVE_PLAY_GUI_INPUT_TRACE_COMPAT_ENV).is_some(),
+            enabled: native_env_flag_enabled(NATIVE_PLAY_GUI_INPUT_TRACE_ENV)
+                || native_env_flag_enabled(NATIVE_PLAY_GUI_INPUT_TRACE_COMPAT_ENV),
             last_sample: NativeWindowButtonSample::default(),
             last_latched: ActionButtons::default(),
             last_effective: ActionButtons::default(),
@@ -15127,9 +16740,12 @@ struct NativeCoinStartFeedback {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NativeInputLatch {
-    direction_buttons: ActionButtons,
+    movement_buttons: ActionButtons,
+    combat_buttons: ActionButtons,
     edge_buttons: ActionButtons,
-    direction_frames_remaining: u16,
+    previous_edge_buttons: ActionButtons,
+    movement_frames_remaining: u16,
+    combat_frames_remaining: u16,
     edge_frames_remaining: u16,
 }
 
@@ -15139,36 +16755,55 @@ impl NativeInputLatch {
     }
 
     fn is_empty(&self) -> bool {
-        !action_buttons_any(self.direction_buttons)
+        !action_buttons_any(self.movement_buttons)
+            && !action_buttons_any(self.combat_buttons)
             && !action_buttons_any(self.edge_buttons)
-            && self.direction_frames_remaining == 0
+            && self.movement_frames_remaining == 0
+            && self.combat_frames_remaining == 0
             && self.edge_frames_remaining == 0
     }
 
     fn buttons(&mut self, current: ActionButtons) -> ActionButtons {
-        let current_directions = native_direction_buttons(current);
+        let current_movement = native_movement_buttons(current);
+        let current_combat = native_combat_buttons(current);
         let current_edges = native_edge_buttons(current);
-        let has_current_directions = action_buttons_any(current_directions);
-        let has_current_edges = action_buttons_any(current_edges);
+        let rising_edges = native_rising_edge_buttons(current_edges, self.previous_edge_buttons);
+        let has_current_movement = action_buttons_any(current_movement);
+        let has_current_combat = action_buttons_any(current_combat);
+        let has_rising_edges = action_buttons_any(rising_edges);
 
-        if has_current_directions {
-            self.direction_buttons = current_directions;
-            self.direction_frames_remaining = NATIVE_PLAY_INPUT_LATCH_FRAMES;
+        if has_current_movement {
+            self.movement_buttons = current_movement;
+            self.movement_frames_remaining = NATIVE_PLAY_INPUT_LATCH_FRAMES;
+        }
+        if has_current_combat {
+            self.combat_buttons = current_combat;
+            self.combat_frames_remaining = NATIVE_PLAY_INPUT_LATCH_FRAMES;
         }
 
-        if has_current_edges {
-            self.edge_buttons = current_edges;
+        if has_rising_edges {
+            self.edge_buttons = merge_action_buttons(self.edge_buttons, rising_edges);
             self.edge_frames_remaining = NATIVE_PLAY_INPUT_LATCH_FRAMES;
         }
+        self.previous_edge_buttons = current_edges;
 
-        merge_action_buttons(self.direction_buttons, self.edge_buttons)
+        merge_action_buttons(
+            merge_action_buttons(self.movement_buttons, self.combat_buttons),
+            self.edge_buttons,
+        )
     }
 
     fn advance_frame(&mut self) {
-        if self.direction_frames_remaining > 0 {
-            self.direction_frames_remaining -= 1;
-            if self.direction_frames_remaining == 0 {
-                self.direction_buttons = ActionButtons::default();
+        if self.movement_frames_remaining > 0 {
+            self.movement_frames_remaining -= 1;
+            if self.movement_frames_remaining == 0 {
+                self.movement_buttons = ActionButtons::default();
+            }
+        }
+        if self.combat_frames_remaining > 0 {
+            self.combat_frames_remaining -= 1;
+            if self.combat_frames_remaining == 0 {
+                self.combat_buttons = ActionButtons::default();
             }
         }
         if self.edge_frames_remaining > 0 {
@@ -15247,18 +16882,20 @@ impl NativePhysicalEnterSequencer {
     }
 
     fn apply_feedback(&mut self, feedback: NativeCoinStartFeedback) {
-        if feedback.game_start_accepted_count > self.observed_game_start_accepted_count {
+        let credit_advanced = feedback.credit_accepted_count > self.observed_credit_accepted_count;
+        let game_start_advanced =
+            feedback.game_start_accepted_count > self.observed_game_start_accepted_count;
+        if game_start_advanced {
             self.credit_ready = false;
-        } else if feedback.credit_accepted_count > self.observed_credit_accepted_count {
+        } else if credit_advanced {
             self.credit_ready = true;
         }
         self.observed_credit_accepted_count = feedback.credit_accepted_count;
         self.observed_game_start_accepted_count = feedback.game_start_accepted_count;
 
-        if matches!(
-            self.phase,
-            NativeCoinStartPhase::Start | NativeCoinStartPhase::StartGap
-        ) && feedback.game_start_accepted_count > self.game_start_accepted_baseline
+        if self.phase != NativeCoinStartPhase::Idle
+            && game_start_advanced
+            && feedback.game_start_accepted_count > self.game_start_accepted_baseline
         {
             self.credit_ready = false;
             self.finish();
@@ -15267,10 +16904,14 @@ impl NativePhysicalEnterSequencer {
         if matches!(
             self.phase,
             NativeCoinStartPhase::Coin | NativeCoinStartPhase::CoinGap
-        ) && feedback.credit_accepted_count > self.credit_accepted_baseline
+        ) && credit_advanced
+            && feedback.credit_accepted_count > self.credit_accepted_baseline
         {
             self.credit_ready = true;
-            self.finish();
+            self.coin_attempts = 0;
+            self.start_attempts = 1;
+            self.phase = NativeCoinStartPhase::CoinGap;
+            self.frames_remaining = NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES;
         }
     }
 
@@ -15311,7 +16952,9 @@ impl NativePhysicalEnterSequencer {
                 NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES,
             ),
             NativeCoinStartPhase::CoinGap => {
-                if self.coin_attempts < NATIVE_PLAY_ENTER_MAX_COIN_ATTEMPTS {
+                if self.credit_ready {
+                    (NativeCoinStartPhase::Start, NATIVE_PLAY_ENTER_START_FRAMES)
+                } else if self.coin_attempts < NATIVE_PLAY_ENTER_MAX_COIN_ATTEMPTS {
                     self.coin_attempts = self.coin_attempts.saturating_add(1);
                     (NativeCoinStartPhase::Coin, NATIVE_PLAY_ENTER_COIN_FRAMES)
                 } else {
@@ -15338,18 +16981,39 @@ impl NativePhysicalEnterSequencer {
     }
 }
 
-fn native_direction_buttons(buttons: ActionButtons) -> ActionButtons {
+fn native_movement_buttons(buttons: ActionButtons) -> ActionButtons {
     ActionButtons {
         up: buttons.up,
         down: buttons.down,
         left: buttons.left,
         right: buttons.right,
+        guard: buttons.guard,
         p2_up: buttons.p2_up,
         p2_down: buttons.p2_down,
         p2_left: buttons.p2_left,
         p2_right: buttons.p2_right,
+        p2_guard: buttons.p2_guard,
         ..ActionButtons::default()
     }
+}
+
+fn native_combat_buttons(buttons: ActionButtons) -> ActionButtons {
+    ActionButtons {
+        punch: buttons.punch,
+        kick: buttons.kick,
+        beast: buttons.beast,
+        p2_punch: buttons.p2_punch,
+        p2_kick: buttons.p2_kick,
+        p2_beast: buttons.p2_beast,
+        ..ActionButtons::default()
+    }
+}
+
+fn native_level_buttons(buttons: ActionButtons) -> ActionButtons {
+    merge_action_buttons(
+        native_movement_buttons(buttons),
+        native_combat_buttons(buttons),
+    )
 }
 
 fn native_edge_buttons(buttons: ActionButtons) -> ActionButtons {
@@ -15357,16 +17021,19 @@ fn native_edge_buttons(buttons: ActionButtons) -> ActionButtons {
         start: buttons.start,
         coin: buttons.coin,
         service: buttons.service,
-        punch: buttons.punch,
-        kick: buttons.kick,
-        beast: buttons.beast,
-        guard: buttons.guard,
         p2_start: buttons.p2_start,
         p2_coin: buttons.p2_coin,
-        p2_punch: buttons.p2_punch,
-        p2_kick: buttons.p2_kick,
-        p2_beast: buttons.p2_beast,
-        p2_guard: buttons.p2_guard,
+        ..ActionButtons::default()
+    }
+}
+
+fn native_rising_edge_buttons(current: ActionButtons, previous: ActionButtons) -> ActionButtons {
+    ActionButtons {
+        start: current.start && !previous.start,
+        coin: current.coin && !previous.coin,
+        service: current.service && !previous.service,
+        p2_start: current.p2_start && !previous.p2_start,
+        p2_coin: current.p2_coin && !previous.p2_coin,
         ..ActionButtons::default()
     }
 }
@@ -15405,6 +17072,39 @@ fn action_buttons_have_combat_control_coverage(buttons: ActionButtons) -> bool {
 
 fn action_buttons_have_play_control_coverage(buttons: ActionButtons) -> bool {
     action_buttons_have_combat_control_coverage(buttons) && buttons.coin && buttons.start
+}
+
+fn action_buttons_have_p2_direction_coverage(buttons: ActionButtons) -> bool {
+    buttons.p2_up && buttons.p2_down && buttons.p2_left && buttons.p2_right
+}
+
+fn action_buttons_have_p2_combat_control_coverage(buttons: ActionButtons) -> bool {
+    buttons.p2_punch && buttons.p2_kick && buttons.p2_beast && buttons.p2_guard
+}
+
+fn action_buttons_have_p2_play_control_coverage(buttons: ActionButtons) -> bool {
+    action_buttons_have_p2_combat_control_coverage(buttons) && buttons.p2_coin && buttons.p2_start
+}
+
+fn action_buttons_have_any_attack(buttons: ActionButtons) -> bool {
+    buttons.punch
+        || buttons.kick
+        || buttons.beast
+        || buttons.guard
+        || buttons.p2_punch
+        || buttons.p2_kick
+        || buttons.p2_beast
+        || buttons.p2_guard
+}
+
+fn action_buttons_have_full_direction_coverage(buttons: ActionButtons) -> bool {
+    action_buttons_have_direction_coverage(buttons)
+        && action_buttons_have_p2_direction_coverage(buttons)
+}
+
+fn action_buttons_have_full_play_control_coverage(buttons: ActionButtons) -> bool {
+    action_buttons_have_play_control_coverage(buttons)
+        && action_buttons_have_p2_play_control_coverage(buttons)
 }
 
 fn action_buttons_cover(observed: ActionButtons, required: ActionButtons) -> bool {
@@ -15595,7 +17295,7 @@ fn native_input_activity_for_buttons(
             .then_some(activity.coin_counter_0_edges)
             .unwrap_or(0),
         coin_counter_1_edges: buttons
-            .coin
+            .p2_coin
             .then_some(activity.coin_counter_1_edges)
             .unwrap_or(0),
         legacy_system_coin_latch_edges: buttons
@@ -15649,7 +17349,9 @@ fn native_guest_observed_buttons_for_input_activity(
         guard: buttons.guard && activity.p3_guard_active_reads > 0,
         p2_start: buttons.p2_start && activity.system_p2_start_active_reads > 0,
         p2_coin: buttons.p2_coin
-            && (activity.system_p2_coin_active_reads > 0 || activity.p2_coin_insert_edges > 0),
+            && (activity.system_p2_coin_active_reads > 0
+                || activity.p2_coin_insert_edges > 0
+                || activity.coin_counter_1_edges > 0),
         p2_up: buttons.p2_up && activity.p2_up_active_reads > 0,
         p2_down: buttons.p2_down && activity.p2_down_active_reads > 0,
         p2_left: buttons.p2_left && activity.p2_left_active_reads > 0,
@@ -15916,12 +17618,13 @@ fn native_window_button_sample(
     window_active: bool,
     consume_pressed_edges: bool,
     _sample_platform_input: bool,
+    _platform_input_state: &mut NativePlatformInputState,
 ) -> NativeWindowButtonSample {
     if !window_active {
         return NativeWindowButtonSample::default();
     }
     let pressed = native_pressed_window_key_sample(consume_pressed_edges, || {
-        window.get_keys_pressed(KeyRepeat::Yes)
+        window.get_keys_pressed(KeyRepeat::No)
     });
     let held = native_keys_down_to_window_key_sample(|key| window.is_key_down(key));
     let minifb = merge_action_buttons(held.buttons, pressed.buttons);
@@ -15944,12 +17647,13 @@ fn native_window_button_sample(
     window_active: bool,
     consume_pressed_edges: bool,
     sample_platform_input: bool,
+    platform_input_state: &mut NativePlatformInputState,
 ) -> NativeWindowButtonSample {
     // minifb's macOS active flag is inverted in 0.28 and can lag AppKit focus
     // changes. Its key state is window-local, so always keep it available.
     // Only the Quartz global fallback must require the AppKit key/main window.
     let pressed = native_pressed_window_key_sample(consume_pressed_edges, || {
-        window.get_keys_pressed(KeyRepeat::Yes)
+        window.get_keys_pressed(KeyRepeat::No)
     });
     let held = native_keys_down_to_window_key_sample(|key| window.is_key_down(key));
     let minifb = merge_action_buttons(held.buttons, pressed.buttons);
@@ -15980,25 +17684,30 @@ fn native_window_button_sample(
         window_visible,
     );
     let quartz_sampled = sample_platform_input && quartz_fallback_active;
-    let platform = if quartz_sampled {
+    let platform_down = if quartz_sampled {
         native_macos_window_key_sample(window, quartz_fallback_active)
     } else {
         NativeWindowKeySample::default()
     };
+    let platform_edges =
+        native_window_key_sample_rising_edges(platform_down, platform_input_state.previous);
+    platform_input_state.previous = platform_down;
+    let platform_buttons =
+        native_macos_platform_buttons_for_gui_sample(platform_down.buttons, platform_edges.buttons);
     let mut sample = native_macos_window_button_sample_from_sources_with_quartz_gate(
         window_active,
         quartz_fallback_active,
         minifb,
-        platform.buttons,
+        platform_buttons,
     );
     sample.window_is_key_or_main = window_is_key_or_main;
     sample.application_active = application_active;
     sample.window_visible = window_visible;
     sample.quartz_sampled = quartz_sampled;
     sample.quartz_fallback_active = quartz_fallback_active;
-    sample.quit_requested = held.escape || pressed.escape || platform.escape;
-    sample.physical_enter_down = held.enter || pressed.enter || platform.enter;
-    sample.physical_enter_pressed = pressed.enter;
+    sample.quit_requested = held.escape || pressed.escape || platform_down.escape;
+    sample.physical_enter_down = held.enter || pressed.enter || platform_down.enter;
+    sample.physical_enter_pressed = pressed.enter || platform_edges.enter;
     sample
 }
 
@@ -16102,16 +17811,16 @@ fn native_macos_application_is_active() -> bool {
 
 #[cfg(any(target_os = "macos", test))]
 fn native_macos_quartz_fallback_active(
-    window_active: bool,
+    _window_active: bool,
     window_is_key_or_main: bool,
     application_active: bool,
     window_visible: bool,
 ) -> bool {
     // Quartz reports session-global HID state. Sampling it for a merely visible
-    // window can leak keys held in other applications into the guest. Accept
-    // either native AppKit focus or the corrected minifb focus signal, but only
-    // while this application is active and the game window is visible.
-    window_visible && application_active && (window_is_key_or_main || window_active)
+    // window can leak keys held in other applications into the guest. AppKit
+    // can briefly fail to mark a CLI-created minifb window as key/main even
+    // after activation, so the foreground application state is also sufficient.
+    window_visible && (window_is_key_or_main || application_active)
 }
 
 #[cfg(test)]
@@ -16203,6 +17912,29 @@ struct NativeWindowKeySample {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn native_window_key_sample_rising_edges(
+    current: NativeWindowKeySample,
+    previous: NativeWindowKeySample,
+) -> NativeWindowKeySample {
+    NativeWindowKeySample {
+        buttons: native_rising_edge_buttons(
+            native_edge_buttons(current.buttons),
+            native_edge_buttons(previous.buttons),
+        ),
+        enter: current.enter && !previous.enter,
+        escape: current.escape && !previous.escape,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn native_macos_platform_buttons_for_gui_sample(
+    current: ActionButtons,
+    rising_edges: ActionButtons,
+) -> ActionButtons {
+    merge_action_buttons(native_level_buttons(current), rising_edges)
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn native_macos_key_states_to_window_key_sample(
     mut is_key_down: impl FnMut(u16) -> bool,
 ) -> NativeWindowKeySample {
@@ -16221,7 +17953,12 @@ fn native_macos_key_states_to_window_key_sample(
         (49, Action::Punch),
         (7, Action::Kick),
         (12, Action::Beast),
+        (11, Action::Beast),
+        (37, Action::Beast),
         (14, Action::Guard),
+        (3, Action::Guard),
+        (5, Action::Guard),
+        (4, Action::Guard),
         (13, Action::P2Up),
         (1, Action::P2Down),
         (0, Action::P2Left),
@@ -16280,7 +18017,7 @@ fn native_pressed_key_buttons(
 fn native_keys_down_to_window_key_sample(
     mut is_key_down: impl FnMut(Key) -> bool,
 ) -> NativeWindowKeySample {
-    let mut keys = Vec::new();
+    let mut sample = NativeWindowKeySample::default();
     for key in [
         Key::Escape,
         Key::Enter,
@@ -16313,10 +18050,10 @@ fn native_keys_down_to_window_key_sample(
         Key::U,
     ] {
         if is_key_down(key) {
-            keys.push(key);
+            native_window_key_sample_add_key(&mut sample, key);
         }
     }
-    native_keys_to_window_key_sample(keys)
+    sample
 }
 
 #[cfg(test)]
@@ -16366,16 +18103,19 @@ where
 {
     let mut sample = NativeWindowKeySample::default();
     for key in keys {
-        match key {
-            Key::Enter => sample.enter = true,
-            Key::Escape => sample.escape = true,
-            _ => {
-                sample.buttons =
-                    merge_action_buttons(sample.buttons, native_keys_to_buttons([key]));
-            }
-        }
+        native_window_key_sample_add_key(&mut sample, key);
     }
     sample
+}
+
+fn native_window_key_sample_add_key(sample: &mut NativeWindowKeySample, key: Key) {
+    match key {
+        Key::Enter => sample.enter = true,
+        Key::Escape => sample.escape = true,
+        _ => {
+            sample.buttons = merge_action_buttons(sample.buttons, native_keys_to_buttons([key]));
+        }
+    }
 }
 
 fn native_keys_to_buttons<I>(keys: I) -> ActionButtons
@@ -16395,8 +18135,8 @@ where
             Key::Right => buttons.right = true,
             Key::Z | Key::Space => buttons.punch = true,
             Key::X => buttons.kick = true,
-            Key::Q => buttons.beast = true,
-            Key::E => buttons.guard = true,
+            Key::Q | Key::L | Key::B => buttons.beast = true,
+            Key::E | Key::F | Key::G | Key::H => buttons.guard = true,
             Key::W => buttons.p2_up = true,
             Key::S => buttons.p2_down = true,
             Key::A => buttons.p2_left = true,
@@ -16490,6 +18230,9 @@ fn print_help() {
     );
     println!(
         "  native-display-diagnose <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
+    );
+    println!(
+        "  native-match-tail-timeline-compact <rom_zip_or_dir> <instructions_per_frame> [action:frames...]"
     );
     println!(
         "  native-scripted-playability-diagnose <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
@@ -16755,6 +18498,30 @@ fn native_warning_skip_to_title_script() -> Vec<NativeScriptSegment> {
         },
     ];
 
+    // BR2 has multiple independently skippable warning and intro phases.
+    // Released retry pulses let whichever phase is currently polling advance;
+    // without credit they remain harmless once the title has been reached.
+    for _ in 0..NATIVE_WARNING_SKIP_RETRY_CYCLES {
+        segments.extend([
+            NativeScriptSegment {
+                action: Action::Start,
+                frames: NATIVE_WARNING_SKIP_PULSE_FRAMES,
+            },
+            NativeScriptSegment {
+                action: Action::Noop,
+                frames: NATIVE_WARNING_SKIP_RETRY_GAP_FRAMES,
+            },
+            NativeScriptSegment {
+                action: Action::Punch,
+                frames: NATIVE_WARNING_SKIP_PULSE_FRAMES,
+            },
+            NativeScriptSegment {
+                action: Action::Noop,
+                frames: NATIVE_WARNING_SKIP_RETRY_GAP_FRAMES,
+            },
+        ]);
+    }
+
     segments.push(NativeScriptSegment {
         action: Action::Noop,
         frames: NATIVE_PLAY_TITLE_ENTRY_FRAMES,
@@ -16796,42 +18563,7 @@ fn native_health_checkpoint_script() -> Vec<NativeScriptSegment> {
 
 #[cfg(test)]
 fn native_input_check_checkpoint_script() -> Vec<NativeScriptSegment> {
-    let mut segments = native_warning_skip_to_title_script();
-    segments.extend([
-        NativeScriptSegment {
-            action: Action::Coin,
-            frames: 12,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 24,
-        },
-        NativeScriptSegment {
-            action: Action::Coin,
-            frames: 12,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 72,
-        },
-        NativeScriptSegment {
-            action: Action::Start,
-            frames: 18,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 24,
-        },
-        NativeScriptSegment {
-            action: Action::Start,
-            frames: 18,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: 90,
-        },
-    ]);
-    segments
+    native_snapshot_match_entry_script()
 }
 
 fn native_input_check_gameplay_wait_script() -> Vec<NativeScriptSegment> {
@@ -17122,6 +18854,18 @@ fn parse_native_play_tail(
     if gui_test_input_requested && gui_test_input_segments.is_empty() {
         return Err("--gui-test-input requires at least one <action:frames> segment".to_string());
     }
+    if let Some(max_frames) = max_frames {
+        let scripted_frames = gui_test_input_segments
+            .iter()
+            .map(|segment| segment.frames)
+            .sum::<u64>();
+        let required_frames = scripted_frames.saturating_add(1);
+        if gui_test_input_requested && max_frames < required_frames {
+            return Err(format!(
+                "max_frames {max_frames} is too short for --gui-test-input: {scripted_frames} scripted frames plus 1 release-observation frame requires at least {required_frames}"
+            ));
+        }
+    }
     if gui_draw_capture.predicates.is_empty() && gui_draw_capture.arm_gui_frame.is_some() {
         return Err(
             "--draw-capture-arm-gui-frame requires at least one --draw-capture-predicate"
@@ -17224,6 +18968,151 @@ fn write_output_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), Stri
     }
     std::fs::write(path, contents)
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativePcmStats {
+    frames: usize,
+    nonzero_frames: usize,
+    peak_abs_left: u32,
+    peak_abs_right: u32,
+    rms_left: u32,
+    rms_right: u32,
+}
+
+impl NativePcmStats {
+    fn from_frames(frames: &[StereoSample]) -> Self {
+        let mut nonzero_frames = 0usize;
+        let mut peak_abs_left = 0u32;
+        let mut peak_abs_right = 0u32;
+        let mut square_sum_left = 0u128;
+        let mut square_sum_right = 0u128;
+
+        for frame in frames {
+            let left = i64::from(frame.left);
+            let right = i64::from(frame.right);
+            nonzero_frames =
+                nonzero_frames.saturating_add(usize::from(frame.left != 0 || frame.right != 0));
+            peak_abs_left = peak_abs_left.max(left.unsigned_abs() as u32);
+            peak_abs_right = peak_abs_right.max(right.unsigned_abs() as u32);
+            square_sum_left = square_sum_left.saturating_add((left * left) as u128);
+            square_sum_right = square_sum_right.saturating_add((right * right) as u128);
+        }
+
+        let count = frames.len() as u128;
+        let rms_left = square_sum_left
+            .checked_div(count)
+            .map_or(0, |mean| (mean as f64).sqrt().round() as u32);
+        let rms_right = square_sum_right
+            .checked_div(count)
+            .map_or(0, |mean| (mean as f64).sqrt().round() as u32);
+
+        Self {
+            frames: frames.len(),
+            nonzero_frames,
+            peak_abs_left,
+            peak_abs_right,
+            rms_left,
+            rms_right,
+        }
+    }
+
+    fn json(self) -> String {
+        format!(
+            "{{\"frames\":{},\"nonzero_frames\":{},\"nonzero\":{},\"peak_abs_left\":{},\"peak_abs_right\":{},\"rms_left\":{},\"rms_right\":{}}}",
+            self.frames,
+            self.nonzero_frames,
+            self.nonzero_frames > 0,
+            self.peak_abs_left,
+            self.peak_abs_right,
+            self.rms_left,
+            self.rms_right
+        )
+    }
+
+    fn verified_nonzero(self) -> bool {
+        self.frames > 0
+            && self.nonzero_frames > 0
+            && (self.peak_abs_left > 0 || self.peak_abs_right > 0)
+            && (self.rms_left > 0 || self.rms_right > 0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeAudioSnapshot {
+    json: String,
+    verified: bool,
+}
+
+fn write_native_pcm_wav(
+    output: &Path,
+    sample_rate_hz: u32,
+    frames: &[StereoSample],
+) -> Result<NativePcmStats, String> {
+    const CHANNELS: u16 = 2;
+    const BITS_PER_SAMPLE: u16 = 16;
+    const BYTES_PER_FRAME: u32 = 4;
+
+    let data_bytes = u32::try_from(frames.len())
+        .ok()
+        .and_then(|count| count.checked_mul(BYTES_PER_FRAME))
+        .ok_or_else(|| "PCM snapshot is too large for a RIFF/WAVE file".to_string())?;
+    let riff_bytes = 36u32
+        .checked_add(data_bytes)
+        .ok_or_else(|| "PCM snapshot RIFF length overflow".to_string())?;
+    let byte_rate = sample_rate_hz
+        .checked_mul(BYTES_PER_FRAME)
+        .ok_or_else(|| "PCM snapshot byte rate overflow".to_string())?;
+    let mut wav = Vec::with_capacity(44usize.saturating_add(data_bytes as usize));
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_bytes.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&CHANNELS.to_le_bytes());
+    wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&(BYTES_PER_FRAME as u16).to_le_bytes());
+    wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for frame in frames {
+        wav.extend_from_slice(&frame.left.to_le_bytes());
+        wav.extend_from_slice(&frame.right.to_le_bytes());
+    }
+    write_output_file(output, wav)?;
+    Ok(NativePcmStats::from_frames(frames))
+}
+
+fn write_native_audio_snapshot(
+    emulator: &NativeEmulator,
+    output_prefix: &Path,
+) -> Result<NativeAudioSnapshot, String> {
+    let Some(frames) = emulator.audio_pcm_snapshot(YMF271_SAMPLE_RATE_HZ as usize * 10) else {
+        return Ok(NativeAudioSnapshot {
+            json: "{\"available\":false,\"written\":false,\"verified\":false,\"reason\":\"sound_board_unavailable\"}".to_string(),
+            verified: false,
+        });
+    };
+    let output = suffixed_path(output_prefix, "audio.wav");
+    let stats = write_native_pcm_wav(&output, YMF271_SAMPLE_RATE_HZ, &frames)?;
+    let duration_ms = (stats.frames as u128)
+        .saturating_mul(1_000)
+        .checked_div(u128::from(YMF271_SAMPLE_RATE_HZ))
+        .unwrap_or(0);
+    let verified = stats.verified_nonzero();
+    Ok(NativeAudioSnapshot {
+        json: format!(
+            "{{\"available\":true,\"written\":true,\"verified\":{},\"path\":\"{}\",\"format\":\"pcm_s16le\",\"sample_rate_hz\":{},\"channels\":2,\"duration_ms\":{},\"pcm\":{}}}",
+            verified,
+            escape_json(&output.display().to_string()),
+            YMF271_SAMPLE_RATE_HZ,
+            duration_ms,
+            stats.json()
+        ),
+        verified,
+    })
 }
 
 fn native_script_filename_action(action: Action) -> String {
@@ -17371,6 +19260,45 @@ fn write_draw_captures(
             ));
         }
         let texture_candidate_outputs_json = texture_candidate_outputs.join(",");
+        let mut palette_candidate_outputs = Vec::new();
+        for candidate in &capture.palette_candidate_images {
+            let label = filename_token(&candidate.label);
+            let decoded_output = suffixed_path(
+                output_prefix,
+                &format!(
+                    "seq-{:06}.palette-candidate-{}-x{}-y{}-{}.decoded.png",
+                    capture.sequence,
+                    label,
+                    candidate.x,
+                    candidate.y,
+                    if candidate.tiled { "tiled" } else { "linear" }
+                ),
+            );
+            let palette_candidate_output = suffixed_path(
+                output_prefix,
+                &format!(
+                    "seq-{:06}.palette-candidate-{}-x{}-y{}-{}.palette.png",
+                    capture.sequence,
+                    label,
+                    candidate.x,
+                    candidate.y,
+                    if candidate.tiled { "tiled" } else { "linear" }
+                ),
+            );
+            write_output_file(&decoded_output, &candidate.decoded_png)?;
+            write_output_file(&palette_candidate_output, &candidate.palette_png)?;
+            palette_candidate_outputs.push(format!(
+                "{{\"label\":\"{}\",\"x\":{},\"y\":{},\"entries\":{},\"tiled\":{},\"decoded_output\":\"{}\",\"palette_output\":\"{}\"}}",
+                escape_json(&candidate.label),
+                candidate.x,
+                candidate.y,
+                candidate.entries,
+                candidate.tiled,
+                escape_json(&decoded_output.display().to_string()),
+                escape_json(&palette_candidate_output.display().to_string())
+            ));
+        }
+        let palette_candidate_outputs_json = palette_candidate_outputs.join(",");
         write_output_file(&display_output, &capture.display_png)?;
         write_output_file(&actual_display_output, &capture.actual_display_png)?;
         write_output_file(&raw_actual_display_output, &capture.raw_actual_display_png)?;
@@ -17413,6 +19341,7 @@ fn write_draw_captures(
                     .map(|output| output.display().to_string())
                     .as_deref(),
                 &texture_candidate_outputs_json,
+                &palette_candidate_outputs_json,
             ),
         );
     }
@@ -18225,6 +20154,31 @@ fn apply_native_play_gui_render_recovery(emulator: &mut NativeEmulator) {
     emulator.set_unlinked_primitive_replay_interval(replay_interval);
 }
 
+fn set_native_play_gui_render_recovery_phase(
+    emulator: &mut NativeEmulator,
+    otc_enabled: bool,
+    primitive_replay_enabled: bool,
+) {
+    emulator.set_native_otc_dma_recovery_suppressed(!otc_enabled);
+    let (replay_enabled, replay_interval) = native_play_gui_unlinked_primitive_replay_settings();
+    let replay_enabled = primitive_replay_enabled && replay_enabled;
+    emulator.set_unlinked_primitive_replay_enabled(replay_enabled);
+    emulator.set_unlinked_primitive_replay_interval(
+        replay_enabled.then_some(replay_interval).flatten(),
+    );
+}
+
+fn native_play_gui_render_recovery_phase(
+    native_playable_candidate: bool,
+    native_3d_gameplay_signal: bool,
+    player_session_started: bool,
+) -> (bool, bool) {
+    (
+        native_playable_candidate || player_session_started,
+        native_3d_gameplay_signal || player_session_started,
+    )
+}
+
 fn native_play_gui_unlinked_primitive_replay_settings() -> (bool, Option<u64>) {
     (true, None)
 }
@@ -18337,15 +20291,18 @@ type NativeScriptFrameObserver<'a> =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeScriptExecutionPolicy {
     capture_final_frame: bool,
+    track_last_step: bool,
 }
 
 impl NativeScriptExecutionPolicy {
     const DEFAULT: Self = Self {
         capture_final_frame: true,
+        track_last_step: true,
     };
 
     const HIDDEN_FAST_FORWARD: Self = Self {
         capture_final_frame: false,
+        track_last_step: false,
     };
 }
 
@@ -18428,11 +20385,12 @@ fn run_native_script_observed_with_stop_and_timeout_execution_policy(
                 stopped = true;
                 break 'script;
             }
-            let step = step_until_next_vblank_checked_with_wall_timeout(
+            let step = step_until_next_vblank_checked_with_wall_timeout_policy(
                 emulator,
                 instructions_per_frame,
                 started_at,
                 wall_timeout,
+                execution_policy.track_last_step,
             );
             if step.wall_timeout {
                 stop_reason = "wall_timeout";
@@ -18464,9 +20422,12 @@ fn run_native_script_observed_with_stop_and_timeout_execution_policy(
             total_frames += 1;
             segment_frame += 1;
             if stop_mode == NativeScriptStopMode::TitleScreen
-                && native_title_runtime_poll_ready(emulator.input_activity())
+                && native_title_runtime_activity_allows_tail(
+                    emulator.input_activity(),
+                    total_frames,
+                )
             {
-                stop_reason = "title_screen_ready";
+                stop_reason = "title_runtime_ready";
                 stopped = true;
                 break 'script;
             }
@@ -18611,11 +20572,12 @@ fn run_native_script_observed_with_stop_and_timeout_execution_policy(
                 stop_reason = "wall_timeout";
                 break;
             }
-            let step = step_until_next_vblank_checked_with_wall_timeout(
+            let step = step_until_next_vblank_checked_with_wall_timeout_policy(
                 emulator,
                 instructions_per_frame,
                 started_at,
                 wall_timeout,
+                execution_policy.track_last_step,
             );
             if step.wall_timeout {
                 stop_reason = "wall_timeout";
@@ -18743,6 +20705,12 @@ fn run_native_script_observed_with_stop_and_timeout_execution_policy(
             _ => stop_reason,
         };
     }
+    if stop_reason == "wall_timeout"
+        && stop_mode == NativeScriptStopMode::TitleScreen
+        && native_title_runtime_activity_allows_tail(emulator.input_activity(), total_frames)
+    {
+        stop_reason = "title_runtime_ready";
+    }
     if let Some(original_diagnostics_settings) = original_diagnostics_settings {
         restore_native_script_diagnostics(emulator, original_diagnostics_settings);
     }
@@ -18799,16 +20767,13 @@ fn native_script_stop_observation_ready(
     match stop_mode {
         NativeScriptStopMode::TitleScreen => {
             let activity = emulator.input_activity();
-            if native_title_runtime_poll_ready(activity) {
-                return true;
-            }
             // Full display resolution runs several VRAM-sized artifact scans.
             // Before BR2 has begun polling the title controls, none of those
             // scans can produce a usable handoff and they dominate cold boot.
             if !native_title_render_probe_ready(activity) {
                 return false;
             }
-            native_play_emulator_title_screen_input_ready_fast(emulator)
+            native_play_emulator_title_tail_ready_fast(emulator)
                 || native_title_runtime_input_ready(
                     activity,
                     &native_play_unsanitized_window_frame_for_emulator(emulator),
@@ -18984,15 +20949,6 @@ fn native_script_can_early_advance_title_wait(
     )
 }
 
-fn native_play_emulator_title_screen_input_ready(emulator: &NativeEmulator) -> bool {
-    if native_play_emulator_title_screen_input_ready_fast(emulator) {
-        return true;
-    }
-
-    let frame = native_play_unsanitized_window_frame_for_emulator(emulator);
-    native_play_title_screen_input_ready_from_frame(&frame)
-}
-
 fn native_play_emulator_title_screen_input_ready_fast(emulator: &NativeEmulator) -> bool {
     let raw_actual = emulator.raw_actual_display_frame();
     let raw_without_deinterlace = native_play_window_frame_without_deinterlace(&raw_actual);
@@ -19004,9 +20960,48 @@ fn native_play_emulator_title_screen_input_ready_fast(emulator: &NativeEmulator)
     native_play_title_screen_input_ready_from_frame(&raw_window)
 }
 
+fn native_play_emulator_title_tail_ready(emulator: &NativeEmulator) -> bool {
+    if native_play_emulator_title_tail_ready_fast(emulator) {
+        return true;
+    }
+
+    let frame = native_play_unsanitized_window_frame_for_emulator(emulator);
+    native_play_title_tail_ready_from_frame(&frame)
+}
+
+fn native_play_emulator_title_tail_ready_fast(emulator: &NativeEmulator) -> bool {
+    let raw_actual = emulator.raw_actual_display_frame();
+    let raw_without_deinterlace = native_play_window_frame_without_deinterlace(&raw_actual);
+    if native_play_title_tail_ready_from_frame(&raw_without_deinterlace) {
+        return true;
+    }
+
+    let raw_window = native_play_window_frame_with_context(&raw_actual, false, false);
+    native_play_title_tail_ready_from_frame(&raw_window)
+}
+
+fn native_play_title_tail_frame_for_emulator(emulator: &NativeEmulator) -> NativeDisplayFrame {
+    let raw_actual = emulator.raw_actual_display_frame();
+    let raw_without_deinterlace = native_play_window_frame_without_deinterlace(&raw_actual);
+    if native_play_title_tail_ready_from_frame(&raw_without_deinterlace) {
+        return raw_without_deinterlace;
+    }
+
+    let raw_window = native_play_window_frame_with_context(&raw_actual, false, false);
+    if native_play_title_tail_ready_from_frame(&raw_window) {
+        return raw_window;
+    }
+
+    native_play_unsanitized_window_frame_for_emulator(emulator)
+}
+
 fn native_play_title_screen_input_ready_from_frame(frame: &NativeDisplayFrame) -> bool {
     let stats = NativeFrameStats::from_frame(frame);
     native_play_title_stats_input_ready(stats)
+}
+
+fn native_play_title_tail_ready_from_frame(frame: &NativeDisplayFrame) -> bool {
+    native_play_title_stats_tail_ready(NativeFrameStats::from_frame(frame))
 }
 
 fn native_play_title_stats_input_ready(stats: NativeFrameStats) -> bool {
@@ -19015,7 +21010,18 @@ fn native_play_title_stats_input_ready(stats: NativeFrameStats) -> bool {
         && !stats.has_intro_caption_band()
         && !stats.has_sparse_warning_text_overlay()
         && !stats.has_warning_text_overlay())
+        || (stats.has_br2_full_logo_title_frame() && !stats.has_warning_text_overlay())
         || (stats.has_br2_insert_coin_title_frame() && !stats.has_warning_text_overlay())
+}
+
+fn native_play_title_stats_tail_ready(stats: NativeFrameStats) -> bool {
+    native_play_title_stats_input_ready(stats)
+        && !stats.has_blocking_display_artifact()
+        && !native_play_frame_has_blocking_render_artifact(stats)
+        && (stats.has_title_logo_overlay()
+            || stats.has_br2_full_logo_title_frame()
+            || (stats.has_title_screen_frame() && stats.has_scene_detail())
+            || stats.has_complete_sparse_title_frame())
 }
 
 fn native_play_title_screen_ready_from_frame(frame: &NativeDisplayFrame) -> bool {
@@ -19023,6 +21029,7 @@ fn native_play_title_screen_ready_from_frame(frame: &NativeDisplayFrame) -> bool
     ((stats.has_title_screen_frame()
         && !stats.has_sparse_warning_text_overlay()
         && !stats.has_warning_text_overlay())
+        || (stats.has_br2_full_logo_title_frame() && !stats.has_warning_text_overlay())
         || (stats.has_br2_insert_coin_title_frame() && !stats.has_warning_text_overlay()))
         && !stats.has_corrupt_title_texture_fragment()
 }
@@ -19320,8 +21327,7 @@ fn native_play_gui_post_start_frame(
             && stats.has_visible_content()
             && stats.has_scene_detail()
             && !native_play_stats_is_stale_title_like_frame(stats)
-            && !stats.has_blocking_display_artifact()
-            && !native_play_frame_has_blocking_render_artifact(stats)
+            && native_play_fresh_actual_replacement_frame_passes_artifact_checks(stats)
     };
 
     if usable(candidate_stats) {
@@ -19374,7 +21380,14 @@ fn native_play_select_visible_window_frame_for_gui_with_stats(
         };
     }
     if actual_supports_playable
+        && native_play_fresh_actual_replacement_frame_passes_artifact_checks(actual_stats)
         && !actual_blocking
+        && !native_play_projected_active_field_actual_should_hold_window_candidate(
+            &actual_window,
+            actual_stats,
+            &candidate,
+            candidate_stats,
+        )
         && native_play_gpu_verified_window_stats_with_context(
             native_playable_candidate,
             gpu_gameplay_context,
@@ -19557,6 +21570,9 @@ fn native_play_native_resolution_actual_should_replace_window_candidate(
     ) {
         return false;
     }
+    if !native_play_fresh_actual_replacement_frame_passes_artifact_checks(actual_stats) {
+        return false;
+    }
 
     let scaled_candidate_has_false_overlay = (candidate_stats.has_title_screen_frame()
         && !actual_stats.has_title_screen_frame())
@@ -19571,6 +21587,145 @@ fn native_play_native_resolution_actual_should_replace_window_candidate(
     scaled_candidate_has_false_overlay || scaled_candidate_blocking || scaled_candidate_weaker
 }
 
+fn native_play_native_resolution_actual_should_replace_window_candidate_for_gui(
+    native_playable_candidate: bool,
+    gpu_gameplay_context: bool,
+    actual_supports_playable: bool,
+    actual_frame: &NativeDisplayFrame,
+    actual_stats: NativeFrameStats,
+    candidate_frame: &NativeDisplayFrame,
+    candidate_stats: NativeFrameStats,
+) -> bool {
+    if native_play_projected_active_field_actual_should_hold_window_candidate(
+        actual_frame,
+        actual_stats,
+        candidate_frame,
+        candidate_stats,
+    ) {
+        return false;
+    }
+
+    native_play_native_resolution_actual_should_replace_window_candidate(
+        native_playable_candidate,
+        gpu_gameplay_context,
+        actual_supports_playable,
+        actual_stats,
+        candidate_stats,
+    )
+}
+
+fn native_play_projected_active_field_actual_should_hold_window_candidate(
+    actual_frame: &NativeDisplayFrame,
+    actual_stats: NativeFrameStats,
+    candidate_frame: &NativeDisplayFrame,
+    candidate_stats: NativeFrameStats,
+) -> bool {
+    native_play_actual_frame_is_projected_active_field(actual_frame, actual_stats)
+        && native_play_full_height_candidate_can_survive_projected_actual(
+            candidate_frame,
+            candidate_stats,
+        )
+}
+
+fn native_play_actual_frame_is_projected_active_field(
+    frame: &NativeDisplayFrame,
+    stats: NativeFrameStats,
+) -> bool {
+    if stats.width >= 512 && stats.height == 240 {
+        return true;
+    }
+    if frame.width < 512
+        || frame.height != NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+        || !stats.has_visible_content()
+        || !native_play_gpu_context_scene_detail(stats)
+    {
+        return false;
+    }
+
+    let step = (frame.width / 160).max(1);
+    let mut content_pairs = 0usize;
+    let mut duplicated_content_pairs = 0usize;
+    for y in (0..frame.height.saturating_sub(1)).step_by(2) {
+        let upper = y * frame.width;
+        let lower = (y + 1) * frame.width;
+        let mut samples = 0usize;
+        let mut same = 0usize;
+        let mut content = 0usize;
+        for x in (0..frame.width).step_by(step) {
+            let a = frame.pixels[upper + x] & 0x00ff_ffff;
+            let b = frame.pixels[lower + x] & 0x00ff_ffff;
+            samples += 1;
+            if a == b {
+                same += 1;
+            }
+            if a != 0 || b != 0 {
+                content += 1;
+            }
+        }
+        if samples > 0 && content.saturating_mul(20) >= samples {
+            content_pairs += 1;
+            if same.saturating_mul(100) >= samples.saturating_mul(98) {
+                duplicated_content_pairs += 1;
+            }
+        }
+    }
+
+    content_pairs >= (frame.height / 8).max(48)
+        && duplicated_content_pairs.saturating_mul(100) >= content_pairs.saturating_mul(85)
+}
+
+fn native_play_full_height_candidate_can_survive_projected_actual(
+    frame: &NativeDisplayFrame,
+    stats: NativeFrameStats,
+) -> bool {
+    stats.width >= 512
+        && stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        && frame.width >= 512
+        && frame.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
+        && stats.has_visible_content()
+        && native_play_gpu_context_scene_detail(stats)
+        && stats.unique_colors >= 32
+        && stats.occupied_row_span.saturating_mul(100) >= stats.height.saturating_mul(70)
+        && stats.occupied_rows.saturating_mul(100) >= stats.height.saturating_mul(35)
+        && !native_play_actual_frame_is_projected_active_field(frame, stats)
+        && !native_play_full_height_candidate_has_hard_projected_actual_artifact(stats)
+}
+
+fn native_play_full_height_candidate_has_hard_projected_actual_artifact(
+    stats: NativeFrameStats,
+) -> bool {
+    stats.has_low_information_fill_frame()
+        || stats.has_warm_dominant_fill_frame()
+        || stats.has_saturated_transition_planes()
+        || stats.has_low_palette_noise()
+        || stats.has_low_palette_logo_transition()
+        || stats.has_stage_texture_field_smear()
+        || stats.has_stage_texture_replay_fragment_artifact()
+        || stats.has_br2_character_select_texture_atlas_overlay()
+        || stats.has_br2_select_name_texture_atlas_overlay()
+        || stats.has_br2_low_color_select_texture_atlas_overlay()
+        || stats.has_br2_caption_stalled_select_ui_artifact()
+        || stats.has_br2_low_color_stage_texture_atlas_artifact()
+        || stats.has_br2_warm_stage_name_texture_atlas_artifact()
+        || stats.has_br2_high_vertical_field_pair_texture_atlas_artifact()
+        || stats.has_br2_dense_live_field_texture_atlas_artifact()
+        || stats.has_br2_sparse_high_vertical_mixed_field_artifact()
+        || stats.has_br2_high_palette_sparse_title_field_fragment()
+        || stats.has_br2_red_warning_backdrop_texture_artifact()
+        || stats.has_br2_red_cave_replay_artifact()
+        || stats.has_full_window_texture_atlas_fragment_artifact()
+        || stats.has_sparse_title_texture_atlas_fragment_artifact()
+        || stats.has_cropped_safe_field_texture_fragment()
+        || stats.has_sparse_texture_fragment_handoff_artifact()
+        || stats.has_corrupt_title_texture_fragment()
+        || stats.has_repeating_tile_grid_artifact()
+        || stats.has_missing_texture_recovery_artifact()
+        || stats.has_br2_low_palette_vertical_stage_strip_artifact()
+        || stats.has_br2_title_caption_live_atlas_mixture()
+        || stats.has_br2_character_select_title_atlas_mixture()
+}
+
 fn native_play_select_visible_window_frame(
     candidate: NativeDisplayFrame,
     candidate_gpu_verified: bool,
@@ -19580,7 +21735,7 @@ fn native_play_select_visible_window_frame(
 ) -> NativeDisplayFrame {
     if let Some(actual_window) = gpu_verified_actual {
         let actual_stats = NativeFrameStats::from_frame(&actual_window);
-        if !native_play_frame_has_blocking_render_artifact(actual_stats) {
+        if native_play_fresh_actual_replacement_frame_passes_artifact_checks(actual_stats) {
             return actual_window;
         }
     }
@@ -19677,24 +21832,19 @@ fn native_play_gpu_context_actual_should_replace_stale_title(
 ) -> bool {
     if !native_playable_candidate
         || !gpu_gameplay_context
+        || !native_play_fresh_actual_replacement_frame_passes_artifact_checks(actual_stats)
         || actual_stats.width < NATIVE_PLAY_MIN_WINDOW_WIDTH
         || actual_stats.height < NATIVE_PLAY_MIN_WINDOW_HEIGHT
         || !actual_stats.has_visible_content()
         || !native_play_gpu_context_scene_detail(actual_stats)
-        || native_play_frame_has_blocking_render_artifact(actual_stats)
-        || actual_stats.has_blocking_display_artifact()
         || actual_stats.has_title_screen_frame()
         || actual_stats.has_warning_text_overlay()
         || actual_stats.has_bottom_caption_band()
         || actual_stats.has_corrupt_title_texture_fragment()
         || actual_stats.has_sparse_texture_fragment_handoff_artifact()
-        || actual_stats.has_repeating_tile_grid_artifact()
         || actual_stats.has_low_information_fill_frame()
         || actual_stats.has_warm_dominant_fill_frame()
         || actual_stats.has_saturated_transition_planes()
-        || actual_stats.has_low_palette_noise()
-        || actual_stats.has_low_palette_logo_transition()
-        || actual_stats.has_periodic_horizontal_ghosting()
     {
         return false;
     }
@@ -19859,6 +22009,7 @@ fn native_play_gameplay_scene_with_context(
 fn native_play_frame_has_blocking_render_artifact(stats: NativeFrameStats) -> bool {
     if native_play_scaled_active_field_artifact_false_positive(stats)
         || native_play_sparse_captioned_native_field_false_positive(stats)
+        || stats.has_complete_sparse_title_frame()
     {
         return false;
     }
@@ -19895,6 +22046,7 @@ fn native_play_frame_has_blocking_render_artifact(stats: NativeFrameStats) -> bo
         || stats.has_repeating_tile_grid_artifact()
         || stats.has_low_information_fill_frame()
         || stats.has_warm_dominant_fill_frame()
+        || stats.has_large_magenta_recovery_corruption()
         || stats.has_missing_texture_recovery_artifact()
         || stats.has_br2_low_palette_vertical_stage_strip_artifact()
         || stats.has_br2_title_caption_live_atlas_mixture()
@@ -20947,9 +23099,84 @@ fn native_play_gui_instructions_per_frame(requested: u64) -> u64 {
     } else {
         requested.clamp(
             NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME,
-            NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME,
+            NATIVE_PLAY_GUI_MAX_INSTRUCTIONS_PER_FRAME,
         )
     }
+}
+
+fn native_play_gui_should_advance_input_timing(
+    vblank_advanced: bool,
+    guest_input_activity_observed: bool,
+    instruction_budget_exhausted: bool,
+) -> bool {
+    vblank_advanced || guest_input_activity_observed || instruction_budget_exhausted
+}
+
+fn native_play_gui_max_frame_attempts(max_frames: Option<u64>) -> Option<u64> {
+    max_frames.map(|frames| {
+        frames
+            .max(1)
+            .saturating_mul(NATIVE_PLAY_GUI_FRAME_ATTEMPT_MULTIPLIER)
+    })
+}
+
+fn native_play_gui_wall_timeout(max_frames: Option<u64>) -> Option<Duration> {
+    if let Some(seconds) = env::var(NATIVE_PLAY_GUI_WALL_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    max_frames.map(|frames| {
+        let nominal_seconds = frames.max(1).saturating_add(59) / 60;
+        let timeout_seconds = nominal_seconds
+            .saturating_mul(NATIVE_PLAY_GUI_FRAME_ATTEMPT_MULTIPLIER)
+            .saturating_add(60)
+            .clamp(
+                NATIVE_PLAY_GUI_MIN_WALL_TIMEOUT_SECS,
+                NATIVE_PLAY_GUI_MAX_WALL_TIMEOUT_SECS,
+            );
+        Duration::from_secs(timeout_seconds)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_play_gui_stop_reason(
+    window_open: bool,
+    escape_down: bool,
+    terminal: bool,
+    max_frames: Option<u64>,
+    rendered_frames: u64,
+    max_frame_attempts: Option<u64>,
+    frame_attempts: u64,
+    wall_timeout: Option<Duration>,
+    wall_elapsed: Duration,
+) -> &'static str {
+    if !window_open || escape_down {
+        "window_closed_or_escape"
+    } else if terminal {
+        "terminal"
+    } else if max_frames.is_some_and(|max_frames| rendered_frames >= max_frames) {
+        "max_frames"
+    } else if max_frame_attempts
+        .is_some_and(|max_frame_attempts| frame_attempts >= max_frame_attempts)
+    {
+        "max_frame_attempts"
+    } else if wall_timeout.is_some_and(|wall_timeout| wall_elapsed >= wall_timeout) {
+        "wall_timeout"
+    } else {
+        "loop_condition"
+    }
+}
+
+fn native_input_activity_has_poll(activity: NativeInputActivity) -> bool {
+    activity.p1_input_reads > 0
+        || activity.p2_input_reads > 0
+        || activity.p3_input_reads > 0
+        || activity.system_input_reads > 0
+        || activity.coin_register_reads > 0
 }
 
 fn native_play_gui_display_refresh_frames() -> u64 {
@@ -20972,6 +23199,10 @@ fn native_play_gui_present_interval(display_refresh_frames: u64) -> Duration {
     Duration::from_secs_f64(
         display_refresh_frames.max(1) as f64 / NATIVE_PLAY_WINDOW_TARGET_FPS as f64,
     )
+}
+
+fn native_play_minifb_target_fps() -> usize {
+    NATIVE_PLAY_MINIFB_TARGET_FPS
 }
 
 fn native_play_gui_present_frame(rendered_frames: u64, vblank_advanced: bool) -> u64 {
@@ -21043,11 +23274,11 @@ fn native_play_gui_should_refresh_display(
     buttons_changed: bool,
     display_refresh_frames: u64,
 ) -> bool {
-    buttons_changed
-        || (vblank_advanced
-            && (rendered_frames == 0
-                || !has_visible_content
-                || rendered_frames.is_multiple_of(display_refresh_frames.max(1))))
+    vblank_advanced
+        && (buttons_changed
+            || rendered_frames == 0
+            || !has_visible_content
+            || rendered_frames.is_multiple_of(display_refresh_frames.max(1)))
 }
 
 fn native_play_gui_should_refresh_expensive_display(
@@ -21059,7 +23290,9 @@ fn native_play_gui_should_refresh_expensive_display(
     forced
         || !has_visible_content
         || rendered_frames == 0
-        || fast_rejection_streak >= NATIVE_PLAY_GUI_FAST_REJECTION_REFRESH_THRESHOLD
+        || (fast_rejection_streak >= NATIVE_PLAY_GUI_FAST_REJECTION_REFRESH_THRESHOLD
+            && rendered_frames
+                .is_multiple_of(u64::from(NATIVE_PLAY_GUI_FAST_REJECTION_REFRESH_THRESHOLD)))
         || rendered_frames.is_multiple_of(NATIVE_PLAY_GUI_EXPENSIVE_DISPLAY_REFRESH_FRAMES)
 }
 
@@ -21071,35 +23304,57 @@ fn native_play_gui_should_classify_fast_frame(
     current_stats: NativeFrameStats,
 ) -> bool {
     forced
-        || buttons_changed
+        || (buttons_changed && !native_play_gui_can_defer_input_frame_classification(current_stats))
         || fast_rejection_streak > 0
         || !current_stats.has_visible_content()
         || rendered_frames.is_multiple_of(NATIVE_PLAY_GUI_FAST_FRAME_CLASSIFICATION_STRIDE)
 }
 
+fn native_play_gui_can_defer_input_frame_classification(current_stats: NativeFrameStats) -> bool {
+    current_stats.has_scene_detail()
+        && !current_stats.has_blocking_display_artifact()
+        && !native_play_frame_has_blocking_render_artifact(current_stats)
+}
+
 fn native_play_gui_can_reuse_fast_frame_classification(
+    player_session_started: bool,
     current_stats: NativeFrameStats,
     current_checksum: u32,
     frame: &NativeDisplayFrame,
     frame_checksum: u32,
 ) -> bool {
-    frame.width == current_stats.width
+    let same_shape = frame.width == current_stats.width
         && frame.height == current_stats.height
-        && frame.pixels.len() == current_stats.total_pixels
-        && frame_checksum == current_checksum
+        && frame.pixels.len() == current_stats.total_pixels;
+    let reusable_detailed_scene = current_stats.has_scene_detail()
+        && !current_stats.has_blocking_display_artifact()
+        && !native_play_frame_has_blocking_render_artifact(current_stats);
+    let reusable_static_title = native_play_title_stats_input_ready(current_stats);
+
+    same_shape
         && current_stats.has_visible_content()
         && !current_stats.has_blocking_display_artifact()
-        && !native_play_frame_has_blocking_render_artifact(current_stats)
+        && ((player_session_started && reusable_detailed_scene)
+            || (current_checksum == frame_checksum
+                && (reusable_detailed_scene || reusable_static_title)))
 }
 
-fn native_play_gui_should_submit_buffer(
+fn native_play_gui_should_rebuild_presented_buffer(
     frame_changed: bool,
     retried_window_activation: bool,
     rendered_frames: u64,
 ) -> bool {
-    frame_changed
-        || retried_window_activation
-        || rendered_frames.is_multiple_of(NATIVE_PLAY_GUI_BUFFER_RESUBMIT_FRAMES)
+    frame_changed || retried_window_activation || rendered_frames == 0
+}
+
+fn native_play_gui_should_submit_buffer(
+    _frame_changed: bool,
+    _retried_window_activation: bool,
+    _rendered_frames: u64,
+) -> bool {
+    // With minifb, update_with_buffer is also the event pump. Never fall back
+    // to Window::update on the same window just because the pixels are static.
+    true
 }
 
 fn native_play_gui_game_start_transition(
@@ -21129,7 +23384,13 @@ fn native_play_gui_should_cache_last_safe_frame(
     frame_presentable: bool,
     stats: NativeFrameStats,
 ) -> bool {
+    let pre_start_title =
+        !player_session_started && native_play_stats_is_stale_title_like_frame(stats);
     frame_presentable
+        && (pre_start_title
+            || (!stats.has_blocking_display_artifact()
+                && !native_play_frame_has_blocking_render_artifact(stats)
+                && !stats.has_periodic_horizontal_ghosting()))
         && !native_play_gui_post_start_stale_title(player_session_started, stats)
         && (!player_session_started || native_play_presentable_frame_stats(stats))
 }
@@ -21504,14 +23765,15 @@ mod tests {
         NATIVE_PLAY_MIN_WINDOW_WIDTH, NATIVE_PLAY_TEST_FIXTURE_WIDTH,
         NATIVE_PLAY_TITLE_ENTRY_FRAMES, NATIVE_PLAY_WINDOW_WIDTH,
         NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES, NativeFrameStats, NativeGpuDrawCapturePredicate,
-        NativeGuiInputTrace, NativeGuiTestInputScript, NativeInputActivity, NativeInputLatch,
-        NativePlayGuiDrawCapture, NativeScriptProgress, NativeScriptRunSummary,
-        NativeScriptSegment, NativeScriptStopMode, NativeWindowButtonSample,
-        default_native_play_script, native_action_activity_observed, native_control_sweep_script,
-        native_credit_adapter_ready, native_credit_gap_reason, native_credit_probe_ready,
-        native_credit_ready, native_credit_register_ready, native_credit_system_port_ready,
-        native_credit_transition_verified, native_fast_forward_instructions_per_frame,
-        native_frame_checksum, native_gap_observed_frame_score, native_gap_probe_wall_timeout,
+        NativeGuiInputTrace, NativeGuiTestInputScript, NativeGuiTimingStats, NativeInputActivity,
+        NativeInputLatch, NativePcmStats, NativePlayGuiDrawCapture, NativeScriptProgress,
+        NativeScriptRunSummary, NativeScriptSegment, NativeScriptStopMode,
+        NativeWindowButtonSample, default_native_play_script, native_action_activity_observed,
+        native_control_sweep_script, native_credit_adapter_ready, native_credit_gap_reason,
+        native_credit_probe_ready, native_credit_ready, native_credit_register_ready,
+        native_credit_system_port_ready, native_credit_transition_verified,
+        native_fast_forward_instructions_per_frame, native_frame_checksum,
+        native_gap_observed_frame_score, native_gap_probe_wall_timeout,
         native_health_checkpoint_script, native_health_match_entry_tail_script,
         native_health_stage_wall_timeout_with_reserve_for_elapsed,
         native_input_branch_visual_response, native_input_check_checkpoint_script,
@@ -21537,6 +23799,7 @@ mod tests {
         native_play_gui_present_frame, native_play_gui_present_interval,
         native_play_gui_should_capture_presented_frame, native_play_gui_should_refresh_display,
         native_play_gui_window_frame_change, native_play_manual_takeover,
+        native_play_minifb_target_fps,
         native_play_native_resolution_actual_should_replace_window_candidate,
         native_play_native_resolution_stage_frame_stats_with_context,
         native_play_present_native_resolution_actual_frame, native_play_presentable_frame_stats,
@@ -21560,12 +23823,14 @@ mod tests {
         native_script_tail_progress_to_original_position, native_script_wall_timeout,
         native_snapshot_handoff_script, native_snapshot_instructions_per_frame,
         native_title_render_probe_ready, native_title_runtime_input_ready,
+        native_window_button_sample_for_exclusive_test_input,
         native_window_button_sample_with_test_sidecar, next_native_rom_source_or_default,
         next_scripted_action, parse_action_token, parse_native_autoplay_tail,
         parse_native_credit_state_probe_options, parse_native_gui_test_input_script,
         parse_native_play_tail, parse_native_script_segments, parse_native_trace_options,
         parse_native_watch_followup_trace_options, parse_native_window_scale,
         remaining_native_script_segments, remaining_native_script_segments_after_title_ready,
+        write_native_pcm_wav,
     };
     use bloodyroar2_gym::native::bus::Bus;
     use bloodyroar2_gym::{Action, ActionButtons, NativeDisplayFrame};
@@ -21576,6 +23841,26 @@ mod tests {
             width: 640,
             height: 480,
             pixels: vec![color; 640 * 480],
+        }
+    }
+
+    fn test_periodic_horizontal_ghosting_frame() -> NativeDisplayFrame {
+        let width = 640;
+        let height = 480;
+        let mut pixels = vec![0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let source_x = x % 64;
+                let red = 24 + ((source_x * 7 + y * 3) % 208) as u32;
+                let green = 40 + ((source_x * 11 + y * 5) % 176) as u32;
+                let blue = 56 + ((source_x * 13 + y * 17) % 160) as u32;
+                pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        NativeDisplayFrame {
+            width,
+            height,
+            pixels,
         }
     }
 
@@ -21672,6 +23957,30 @@ mod tests {
     }
 
     #[test]
+    fn native_play_owned_native_frame_preserves_pixels_and_checksum() {
+        let width = super::NATIVE_PLAY_WINDOW_WIDTH;
+        let height = super::NATIVE_PLAY_MIN_WINDOW_HEIGHT;
+        let source = NativeDisplayFrame {
+            width,
+            height,
+            pixels: (0..width * height)
+                .map(|index| (index as u32).wrapping_mul(0x0001_0203) & 0x00ff_ffff)
+                .collect(),
+        };
+        let checksum = native_frame_checksum(&source);
+        let source_buffer = source.pixels.as_ptr();
+
+        let (normalized, normalized_checksum) =
+            super::native_play_present_native_resolution_actual_frame_with_checksum(
+                source, checksum,
+            );
+
+        assert_eq!((normalized.width, normalized.height), (width, height));
+        assert_eq!(normalized.pixels.as_ptr(), source_buffer);
+        assert_eq!(normalized_checksum, native_frame_checksum(&normalized));
+    }
+
+    #[test]
     fn native_play_gui_aspect_update_reuses_presented_buffer_allocation() {
         let width = 512;
         let height = 480;
@@ -21745,7 +24054,7 @@ mod tests {
     }
 
     #[test]
-    fn native_play_gui_active_input_polls_six_times_per_default_budget() {
+    fn native_play_gui_active_input_poll_count_matches_platform_policy() {
         let mut remaining = super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME;
         let mut polls = 0;
         while remaining > 0 {
@@ -21757,7 +24066,7 @@ mod tests {
             remaining = remaining.saturating_sub(slice);
             polls += 1;
         }
-        assert_eq!(polls, 6);
+        assert_eq!(polls, 15);
     }
 
     #[test]
@@ -21771,8 +24080,24 @@ mod tests {
     }
 
     #[test]
-    fn native_play_gui_refreshes_input_without_waiting_for_guest_vblank() {
-        assert!(native_play_gui_should_refresh_display(
+    fn native_play_gui_enables_otc_recovery_after_game_start_without_render_proof() {
+        assert_eq!(
+            super::native_play_gui_render_recovery_phase(false, true, false),
+            (false, true)
+        );
+        assert_eq!(
+            super::native_play_gui_render_recovery_phase(false, true, true),
+            (true, true)
+        );
+        assert_eq!(
+            super::native_play_gui_render_recovery_phase(true, false, false),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn native_play_gui_refreshes_only_after_guest_vblank() {
+        assert!(!native_play_gui_should_refresh_display(
             false, 0, false, true, 2,
         ));
         assert!(!native_play_gui_should_refresh_display(
@@ -21793,6 +24118,69 @@ mod tests {
     }
 
     #[test]
+    fn native_play_gui_input_timing_waits_for_guest_progress() {
+        assert!(!super::native_play_gui_should_advance_input_timing(
+            false, false, false
+        ));
+        assert!(super::native_play_gui_should_advance_input_timing(
+            true, false, false
+        ));
+        assert!(super::native_play_gui_should_advance_input_timing(
+            false, true, false
+        ));
+        assert!(super::native_play_gui_should_advance_input_timing(
+            false, false, true
+        ));
+
+        let mut latch = NativeInputLatch::default();
+        let punch = Action::Punch.buttons();
+        assert_eq!(latch.buttons(punch), punch);
+        for _ in 0..32 {
+            if super::native_play_gui_should_advance_input_timing(false, false, false) {
+                latch.advance_frame();
+            }
+            assert_eq!(latch.buttons(ActionButtons::default()), punch);
+        }
+    }
+
+    #[test]
+    fn native_play_gui_bounded_watchdogs_count_host_attempts() {
+        assert_eq!(
+            super::native_play_gui_max_frame_attempts(Some(120)),
+            Some(480)
+        );
+        assert_eq!(super::native_play_gui_max_frame_attempts(None), None);
+        assert_eq!(
+            super::native_play_gui_stop_reason(
+                true,
+                false,
+                false,
+                Some(120),
+                119,
+                Some(480),
+                480,
+                Some(std::time::Duration::from_secs(120)),
+                std::time::Duration::from_secs(30),
+            ),
+            "max_frame_attempts"
+        );
+        assert_eq!(
+            super::native_play_gui_stop_reason(
+                true,
+                false,
+                false,
+                Some(120),
+                120,
+                Some(480),
+                120,
+                Some(std::time::Duration::from_secs(120)),
+                std::time::Duration::from_secs(2),
+            ),
+            "max_frames"
+        );
+    }
+
+    #[test]
     fn native_play_gui_input_change_does_not_force_expensive_display_scan() {
         assert!(!super::native_play_gui_should_refresh_expensive_display(
             1, true, false, 0,
@@ -21810,7 +24198,7 @@ mod tests {
             1, true, true, 0,
         ));
         assert!(super::native_play_gui_should_refresh_expensive_display(
-            1,
+            u64::from(super::NATIVE_PLAY_GUI_FAST_REJECTION_REFRESH_THRESHOLD),
             true,
             false,
             super::NATIVE_PLAY_GUI_FAST_REJECTION_REFRESH_THRESHOLD,
@@ -21832,8 +24220,25 @@ mod tests {
     }
 
     #[test]
+    fn native_play_gui_expensive_refresh_keeps_complete_fast_gameplay() {
+        let fast = NativeFrameStats::from_frame(&test_gradient_playfield_frame());
+        let weaker = test_br2_caption_stalled_select_window_stats();
+
+        assert!(fast.has_gameplay_scene(), "{fast:?}");
+        assert!(!weaker.has_gameplay_scene(), "{weaker:?}");
+        assert!(super::native_play_gui_fast_expensive_frame_should_replace(
+            fast, weaker, true, true,
+        ));
+        assert!(
+            !super::native_play_gui_fast_expensive_frame_should_replace(fast, fast, true, true,),
+            "an equally detailed selected frame must not churn the GUI candidate"
+        );
+    }
+
+    #[test]
     fn native_play_gui_fast_frame_classification_is_sparse_but_transition_safe() {
         let safe = NativeFrameStats::from_frame(&test_gradient_playfield_frame());
+        let title = NativeFrameStats::from_frame(&test_title_screen_frame());
 
         assert!(super::native_play_gui_should_classify_fast_frame(
             0, false, false, 0, safe,
@@ -21841,8 +24246,11 @@ mod tests {
         assert!(!super::native_play_gui_should_classify_fast_frame(
             1, false, false, 0, safe,
         ));
-        assert!(super::native_play_gui_should_classify_fast_frame(
+        assert!(!super::native_play_gui_should_classify_fast_frame(
             1, true, false, 0, safe,
+        ));
+        assert!(super::native_play_gui_should_classify_fast_frame(
+            1, true, false, 0, title,
         ));
         assert!(super::native_play_gui_should_classify_fast_frame(
             1, false, true, 0, safe,
@@ -21860,7 +24268,7 @@ mod tests {
     }
 
     #[test]
-    fn native_play_gui_reuses_only_matching_safe_frame_classification() {
+    fn native_play_gui_reuses_safe_gameplay_classification_until_the_heartbeat() {
         let frame = test_gradient_playfield_frame();
         let safe = NativeFrameStats::from_frame(&frame);
         let checksum = native_frame_checksum(&frame);
@@ -21874,22 +24282,82 @@ mod tests {
         let blocked = test_br2_character_select_texture_atlas_overlay_stats();
 
         assert!(super::native_play_gui_can_reuse_fast_frame_classification(
-            safe, checksum, &frame, checksum,
+            true, safe, checksum, &frame, checksum,
         ));
         assert!(!super::native_play_gui_can_reuse_fast_frame_classification(
+            true,
             safe,
             checksum,
             &wrong_size,
             native_frame_checksum(&wrong_size),
         ));
-        assert!(!super::native_play_gui_can_reuse_fast_frame_classification(
+        assert!(super::native_play_gui_can_reuse_fast_frame_classification(
+            true,
             safe,
             checksum,
             &changed,
             native_frame_checksum(&changed),
         ));
         assert!(!super::native_play_gui_can_reuse_fast_frame_classification(
-            blocked, checksum, &frame, checksum,
+            true, blocked, checksum, &frame, checksum,
+        ));
+        assert!(!super::native_play_gui_can_reuse_fast_frame_classification(
+            false,
+            safe,
+            checksum,
+            &changed,
+            native_frame_checksum(&changed),
+        ));
+
+        let dark_match = test_dark_native_match_frame();
+        let dark_match_stats = NativeFrameStats::from_frame(&dark_match);
+        let dark_match_checksum = native_frame_checksum(&dark_match);
+        let mut changed_dark_match = dark_match.clone();
+        changed_dark_match.pixels[0] ^= 0x00ff_ffff;
+        assert!(
+            dark_match_stats.has_render_ready_scene(),
+            "{dark_match_stats:?}"
+        );
+        assert!(
+            !dark_match_stats.has_gameplay_scene(),
+            "{dark_match_stats:?}"
+        );
+        assert!(
+            !dark_match_stats.has_blocking_display_artifact(),
+            "{dark_match_stats:?}"
+        );
+        assert!(
+            !super::native_play_frame_has_blocking_render_artifact(dark_match_stats),
+            "{dark_match_stats:?}"
+        );
+        assert!(super::native_play_gui_can_reuse_fast_frame_classification(
+            true,
+            dark_match_stats,
+            dark_match_checksum,
+            &changed_dark_match,
+            native_frame_checksum(&changed_dark_match),
+        ));
+
+        let title = test_title_screen_frame();
+        let title_stats = NativeFrameStats::from_frame(&title);
+        let title_checksum = native_frame_checksum(&title);
+        let mut changed_title = title.clone();
+        changed_title.pixels[0] ^= 0x00ff_ffff;
+        assert!(title_stats.has_visible_content(), "{title_stats:?}");
+        assert!(!title_stats.has_scene_detail(), "{title_stats:?}");
+        assert!(super::native_play_gui_can_reuse_fast_frame_classification(
+            false,
+            title_stats,
+            title_checksum,
+            &title,
+            title_checksum,
+        ));
+        assert!(!super::native_play_gui_can_reuse_fast_frame_classification(
+            true,
+            title_stats,
+            title_checksum,
+            &changed_title,
+            native_frame_checksum(&changed_title),
         ));
     }
 
@@ -21902,9 +24370,35 @@ mod tests {
             super::NATIVE_PLAY_GUI_BUFFER_RESUBMIT_FRAMES,
         ));
         assert!(super::native_play_gui_should_submit_buffer(true, false, 1));
-        assert!(!super::native_play_gui_should_submit_buffer(
-            false, false, 1,
+        assert!(
+            super::native_play_gui_should_submit_buffer(false, false, 1),
+            "update_with_buffer is the sole window event pump, even for unchanged pixels"
+        );
+    }
+
+    #[test]
+    fn native_play_gui_rebuilds_presented_buffer_only_when_pixels_or_focus_require_it() {
+        assert!(super::native_play_gui_should_rebuild_presented_buffer(
+            true, false, 1,
         ));
+        assert!(super::native_play_gui_should_rebuild_presented_buffer(
+            false, true, 1,
+        ));
+        assert!(super::native_play_gui_should_rebuild_presented_buffer(
+            false, false, 0,
+        ));
+        assert!(
+            !super::native_play_gui_should_rebuild_presented_buffer(
+                false,
+                false,
+                super::NATIVE_PLAY_GUI_BUFFER_RESUBMIT_FRAMES,
+            ),
+            "static frames still submit update_with_buffer, but must not rebuild unchanged pixels"
+        );
+        assert!(
+            !super::native_play_gui_should_rebuild_presented_buffer(false, false, 1),
+            "static frames still submit the existing buffer, but avoid pixel conversion work"
+        );
     }
 
     #[test]
@@ -21912,10 +24406,44 @@ mod tests {
         let title = NativeFrameStats::from_frame(&test_title_screen_frame());
         let gameplay = NativeFrameStats::from_frame(&test_gradient_playfield_frame());
         let blocked = test_br2_character_select_texture_atlas_overlay_stats();
+        let periodic_red_transition = NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 244_117,
+            black_pixels: 1_643,
+            warm_pixels: 0,
+            red_dominant_pixels: 163_371,
+            magenta_dominant_pixels: 0,
+            unique_colors: 34,
+            dominant_color_bucket_pixels: 65_536,
+            horizontal_color_changes: 61_440,
+            periodic_horizontal_match_per_mille: 400,
+            occupied_rows: 480,
+            occupied_row_span: 480,
+            right_title_red_pixels: 0,
+            right_title_bright_pixels: 0,
+            top_left_warning_region_dark_pixels: 0,
+            top_left_warning_text_pixels: 0,
+            top_left_warning_text_rows: 0,
+            bottom_caption_pixels: 0,
+            bottom_dark_pixels: 0,
+        };
 
         assert!(!super::native_enter_probe_transition_ready(title));
         assert!(super::native_enter_probe_transition_ready(gameplay));
         assert!(!super::native_enter_probe_transition_ready(blocked));
+        assert!(
+            periodic_red_transition.has_periodic_horizontal_ghosting(),
+            "{periodic_red_transition:?}"
+        );
+        assert!(
+            !periodic_red_transition.has_scene_detail(),
+            "{periodic_red_transition:?}"
+        );
+        assert!(!super::native_enter_probe_transition_ready(
+            periodic_red_transition
+        ));
     }
 
     #[test]
@@ -21968,6 +24496,125 @@ mod tests {
         assert!(!super::native_play_gui_should_cache_last_safe_frame(
             true, true, stats,
         ));
+    }
+
+    #[test]
+    fn native_play_gui_never_caches_blocking_render_artifacts() {
+        let stats = test_br2_character_select_texture_atlas_overlay_stats();
+
+        assert!(stats.has_blocking_display_artifact(), "{stats:?}");
+        assert!(!super::native_play_gui_should_cache_last_safe_frame(
+            false, true, stats,
+        ));
+        assert!(!super::native_play_gui_should_cache_last_safe_frame(
+            true, true, stats,
+        ));
+    }
+
+    #[test]
+    fn native_play_gui_never_accepts_or_caches_periodic_horizontal_ghosting() {
+        let frame = test_periodic_horizontal_ghosting_frame();
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(stats.has_periodic_horizontal_ghosting(), "{stats:?}");
+        assert!(!super::native_play_fast_gui_frame_stats_are_safe(
+            true, true, stats,
+        ));
+        assert!(!super::native_play_gui_should_cache_last_safe_frame(
+            true, true, stats,
+        ));
+    }
+
+    #[test]
+    fn native_play_fresh_actual_replacement_guard_rejects_hard_artifacts() {
+        let clean = NativeFrameStats::from_frame(&test_gradient_playfield_frame());
+        let atlas = test_br2_character_select_texture_atlas_overlay_stats();
+        let repeating = NativeFrameStats::from_frame(&test_repeating_tile_grid_artifact_frame());
+        let ghosting = NativeFrameStats::from_frame(&test_periodic_horizontal_ghosting_frame());
+        let low_palette_transition =
+            NativeFrameStats::from_frame(&test_low_palette_logo_transition_frame());
+        let control_relevant_low_palette = test_br2_confirm_punch_low_palette_actual_field_stats();
+
+        assert!(
+            super::native_play_fresh_actual_replacement_frame_passes_artifact_checks(clean),
+            "{clean:?}"
+        );
+        assert!(
+            !super::native_play_fresh_actual_replacement_frame_passes_artifact_checks(atlas),
+            "{atlas:?}"
+        );
+        assert!(
+            repeating.has_repeating_tile_grid_artifact(),
+            "{repeating:?}"
+        );
+        assert!(
+            !super::native_play_fresh_actual_replacement_frame_passes_artifact_checks(repeating),
+            "{repeating:?}"
+        );
+        assert!(ghosting.has_periodic_horizontal_ghosting(), "{ghosting:?}");
+        assert!(
+            !super::native_play_fresh_actual_replacement_frame_passes_artifact_checks(ghosting),
+            "{ghosting:?}"
+        );
+        assert!(
+            low_palette_transition.has_low_palette_logo_transition(),
+            "{low_palette_transition:?}"
+        );
+        assert!(
+            !super::native_play_fresh_actual_replacement_frame_passes_artifact_checks(
+                low_palette_transition,
+            ),
+            "{low_palette_transition:?}"
+        );
+        assert!(
+            super::native_play_control_relevant_low_palette_active_field_stats(
+                control_relevant_low_palette,
+            ),
+            "{control_relevant_low_palette:?}"
+        );
+        assert!(
+            super::native_play_fresh_actual_replacement_frame_passes_artifact_checks(
+                control_relevant_low_palette,
+            ),
+            "{control_relevant_low_palette:?}"
+        );
+    }
+
+    #[test]
+    fn native_play_visible_selection_keeps_cached_frame_over_ghosted_gpu_actual() {
+        let cached = test_title_screen_frame();
+        let candidate = test_texture_page_fragment_frame();
+        let ghosted_actual = test_periodic_horizontal_ghosting_frame();
+        let ghosted_stats = NativeFrameStats::from_frame(&ghosted_actual);
+
+        assert!(
+            ghosted_stats.has_periodic_horizontal_ghosting(),
+            "{ghosted_stats:?}"
+        );
+        assert!(
+            !super::native_play_frame_has_blocking_render_artifact(ghosted_stats),
+            "{ghosted_stats:?}"
+        );
+        assert!(
+            !super::native_play_fresh_actual_replacement_frame_passes_artifact_checks(
+                ghosted_stats,
+            ),
+            "{ghosted_stats:?}"
+        );
+
+        let selected = native_play_select_visible_window_frame(
+            candidate,
+            false,
+            Some(ghosted_actual),
+            &Some(cached.clone()),
+            &cached,
+        );
+
+        assert_eq!(
+            native_frame_checksum(&selected),
+            native_frame_checksum(&native_play_present_native_resolution_actual_frame(&cached))
+        );
     }
 
     #[test]
@@ -22119,6 +24766,29 @@ mod tests {
     }
 
     #[test]
+    fn native_play_uses_self_pacing_not_minifb_throttle() {
+        assert_eq!(
+            native_play_minifb_target_fps(),
+            0,
+            "minifb throttling must stay disabled because native_play_gui_pacing_delay owns the GUI deadline"
+        );
+        assert_eq!(
+            native_play_gui_present_interval(1),
+            Duration::from_secs_f64(1.0 / 60.0)
+        );
+    }
+
+    #[test]
+    fn native_env_flag_parser_accepts_explicit_false_values() {
+        for value in ["", "0", "false", "FALSE", "no", "off", " Off "] {
+            assert!(!super::native_env_flag_value_enabled(value), "{value:?}");
+        }
+        for value in ["1", "true", "yes", "on", "debug"] {
+            assert!(super::native_env_flag_value_enabled(value), "{value:?}");
+        }
+    }
+
+    #[test]
     fn native_play_gui_pacing_uses_actual_presented_vblank_gap() {
         assert_eq!(native_play_gui_present_frame(0, true), 1);
         assert_eq!(native_play_gui_present_elapsed_frames(0, 0, true), 1);
@@ -22197,16 +24867,49 @@ mod tests {
             true,
         );
 
-        assert_eq!(active_poll_count, 6);
-        assert_eq!(idle_poll_count, 2);
+        let expected_poll_count = 15;
+
+        assert_eq!(active_poll_count, expected_poll_count);
+        assert_eq!(idle_poll_count, expected_poll_count);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                native_play_gui_idle_fast_path_instruction_slice(
+                    super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+                    super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+                ),
+                super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE
+                    * super::NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES,
+                "idle frames may coalesce empty polls, but only while no input is observed"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_play_gui_macos_coalesces_input_slices_without_losing_poll_coverage() {
         assert_eq!(
-            native_play_gui_idle_fast_path_instruction_slice(
+            super::native_play_gui_active_input_instruction_slice(
+                super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+                super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+            ),
+            super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE
+                * super::NATIVE_PLAY_GUI_ACTIVE_INPUT_POLL_SLICES,
+        );
+        assert_eq!(
+            super::native_play_gui_idle_fast_path_instruction_slice(
                 super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
                 super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
             ),
             super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE
                 * super::NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES,
-            "idle frames may coalesce empty polls, but only while no input is observed"
+        );
+        assert_eq!(
+            (0..16)
+                .filter(|poll| super::native_play_gui_should_sample_platform_input(*poll))
+                .collect::<Vec<_>>(),
+            vec![0, 8],
+            "macOS physical HID fallback is sampled on a bounded event-pump cadence"
         );
     }
 
@@ -22215,8 +24918,65 @@ mod tests {
         let sampled_polls = (0..12)
             .filter(|poll| super::native_play_gui_should_sample_platform_input(*poll))
             .collect::<Vec<_>>();
+        let expected_polls = (0_u64..12)
+            .filter(|poll| {
+                (*poll).is_multiple_of(super::NATIVE_PLAY_GUI_PLATFORM_INPUT_SAMPLE_POLL_SLICES)
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(sampled_polls, (0..12).collect::<Vec<_>>());
+        assert_eq!(sampled_polls, expected_polls);
+        #[cfg(target_os = "macos")]
+        assert_eq!(sampled_polls, vec![0, 8]);
+    }
+
+    #[test]
+    fn native_play_gui_bounds_window_event_pumps_per_guest_frame() {
+        let active_poll_count = native_play_gui_poll_count_for_instruction_budget(
+            super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+            super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+            false,
+        );
+        let active_event_pumps = super::native_play_gui_event_pump_count_for_instruction_budget(
+            super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+            super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+            false,
+        );
+
+        assert_eq!(active_poll_count, 15);
+        assert!(
+            active_event_pumps >= 2,
+            "a guest frame must pump events repeatedly: {active_event_pumps}"
+        );
+        assert_eq!(active_event_pumps, 2);
+        let idle_event_pumps = super::native_play_gui_event_pump_count_for_instruction_budget(
+            super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME,
+            super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
+            true,
+        );
+        assert_eq!(
+            idle_event_pumps, active_event_pumps,
+            "idle frames must advance poll counters and pump physical input at the same cadence"
+        );
+        assert!(super::native_play_gui_should_pump_window_event(
+            0,
+            0,
+            Duration::ZERO,
+        ));
+        assert!(!super::native_play_gui_should_pump_window_event(
+            1,
+            1,
+            Duration::ZERO,
+        ));
+        assert!(super::native_play_gui_should_pump_window_event(
+            1,
+            1,
+            super::NATIVE_PLAY_GUI_EVENT_PUMP_INTERVAL,
+        ));
+
+        let legacy_single_slice_poll_count = super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME
+            / super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE;
+        assert_eq!(legacy_single_slice_poll_count, 120);
+        assert!(!super::native_play_gui_should_sample_platform_input_for_pump(0, false));
     }
 
     #[test]
@@ -22439,6 +25199,32 @@ mod tests {
             top_left_warning_text_rows: 58,
             bottom_caption_pixels: 508,
             bottom_dark_pixels: 52_500,
+        }
+    }
+
+    fn test_br2_incomplete_red_select_transition_stats() -> NativeFrameStats {
+        NativeFrameStats {
+            width: 640,
+            height: 480,
+            total_pixels: 307_200,
+            nonzero_pixels: 240_624,
+            black_pixels: 66_576,
+            warm_pixels: 18_840,
+            red_dominant_pixels: 122_436,
+            magenta_dominant_pixels: 0,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 109_757,
+            horizontal_color_changes: 90_932,
+            periodic_horizontal_match_per_mille: 223,
+            occupied_rows: 478,
+            occupied_row_span: 480,
+            right_title_red_pixels: 4_134,
+            right_title_bright_pixels: 0,
+            top_left_warning_region_dark_pixels: 32_738,
+            top_left_warning_text_pixels: 51,
+            top_left_warning_text_rows: 1,
+            bottom_caption_pixels: 728,
+            bottom_dark_pixels: 58_771,
         }
     }
 
@@ -22936,6 +25722,32 @@ mod tests {
         }
     }
 
+    fn test_br2_full_red_stage_transition_stats() -> NativeFrameStats {
+        NativeFrameStats {
+            width: 640,
+            height: 480,
+            total_pixels: 307_200,
+            nonzero_pixels: 305_347,
+            black_pixels: 1_853,
+            warm_pixels: 43_458,
+            red_dominant_pixels: 269_429,
+            magenta_dominant_pixels: 0,
+            unique_colors: 61,
+            dominant_color_bucket_pixels: 80_237,
+            horizontal_color_changes: 100_144,
+            periodic_horizontal_match_per_mille: 342,
+            occupied_rows: 480,
+            occupied_row_span: 480,
+            right_title_red_pixels: 15_311,
+            right_title_bright_pixels: 0,
+            top_left_warning_region_dark_pixels: 34_835,
+            top_left_warning_text_pixels: 0,
+            top_left_warning_text_rows: 0,
+            bottom_caption_pixels: 0,
+            bottom_dark_pixels: 56_071,
+        }
+    }
+
     fn test_br2_initial_warning_caption_stats() -> NativeFrameStats {
         NativeFrameStats {
             width: 640,
@@ -22959,6 +25771,84 @@ mod tests {
             top_left_warning_text_rows: 6,
             bottom_caption_pixels: 992,
             bottom_dark_pixels: 58_672,
+        }
+    }
+
+    fn test_br2_complete_dense_logo_title_stats() -> NativeFrameStats {
+        NativeFrameStats {
+            width: 640,
+            height: 480,
+            total_pixels: 307_200,
+            nonzero_pixels: 138_120,
+            black_pixels: 169_080,
+            warm_pixels: 53_142,
+            red_dominant_pixels: 64_979,
+            magenta_dominant_pixels: 11,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 174_350,
+            horizontal_color_changes: 81_039,
+            periodic_horizontal_match_per_mille: 10,
+            occupied_rows: 288,
+            occupied_row_span: 414,
+            right_title_red_pixels: 916,
+            right_title_bright_pixels: 1_145,
+            top_left_warning_region_dark_pixels: 14_196,
+            top_left_warning_text_pixels: 3_311,
+            top_left_warning_text_rows: 83,
+            bottom_caption_pixels: 1_929,
+            bottom_dark_pixels: 59_190,
+        }
+    }
+
+    fn test_br2_complete_native_logo_title_stats() -> NativeFrameStats {
+        NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 110_534,
+            black_pixels: 135_226,
+            warm_pixels: 42_536,
+            red_dominant_pixels: 52_031,
+            magenta_dominant_pixels: 8,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 139_415,
+            horizontal_color_changes: 81_039,
+            periodic_horizontal_match_per_mille: 8,
+            occupied_rows: 288,
+            occupied_row_span: 414,
+            right_title_red_pixels: 724,
+            right_title_bright_pixels: 921,
+            top_left_warning_region_dark_pixels: 11_327,
+            top_left_warning_text_pixels: 2_642,
+            top_left_warning_text_rows: 90,
+            bottom_caption_pixels: 1_557,
+            bottom_dark_pixels: 47_332,
+        }
+    }
+
+    fn test_br2_sparse_native_title_projection_stats() -> NativeFrameStats {
+        NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 11_180,
+            black_pixels: 234_580,
+            warm_pixels: 766,
+            red_dominant_pixels: 766,
+            magenta_dominant_pixels: 0,
+            unique_colors: 25,
+            dominant_color_bucket_pixels: 236_952,
+            horizontal_color_changes: 7_108,
+            periodic_horizontal_match_per_mille: 7,
+            occupied_rows: 96,
+            occupied_row_span: 146,
+            right_title_red_pixels: 0,
+            right_title_bright_pixels: 1_710,
+            top_left_warning_region_dark_pixels: 31_240,
+            top_left_warning_text_pixels: 0,
+            top_left_warning_text_rows: 0,
+            bottom_caption_pixels: 0,
+            bottom_dark_pixels: 49_152,
         }
     }
 
@@ -23219,6 +26109,32 @@ mod tests {
             top_left_warning_text_rows: 0,
             bottom_caption_pixels: 1_929,
             bottom_dark_pixels: 59_190,
+        }
+    }
+
+    fn test_br2_beast_transformation_effect_stats() -> NativeFrameStats {
+        NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 201_612,
+            black_pixels: 44_148,
+            warm_pixels: 25_045,
+            red_dominant_pixels: 43_947,
+            magenta_dominant_pixels: 209,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 48_390,
+            horizontal_color_changes: 78_189,
+            periodic_horizontal_match_per_mille: 84,
+            occupied_rows: 472,
+            occupied_row_span: 472,
+            right_title_red_pixels: 2_404,
+            right_title_bright_pixels: 4_527,
+            top_left_warning_region_dark_pixels: 8_415,
+            top_left_warning_text_pixels: 2_768,
+            top_left_warning_text_rows: 84,
+            bottom_caption_pixels: 1_962,
+            bottom_dark_pixels: 15_352,
         }
     }
 
@@ -24094,7 +27010,7 @@ mod tests {
     }
 
     #[test]
-    fn native_play_gui_honors_requested_budget_and_caps_oversized_frames() {
+    fn native_play_gui_guarantees_vblank_budget_and_caps_oversized_frames() {
         assert_eq!(
             native_play_gui_instructions_per_frame(0),
             super::NATIVE_PLAY_GUI_DEFAULT_INSTRUCTIONS_PER_FRAME
@@ -24103,10 +27019,14 @@ mod tests {
             native_play_gui_instructions_per_frame(1),
             super::NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME
         );
-        assert_eq!(native_play_gui_instructions_per_frame(120_000), 120_000);
         assert_eq!(
-            native_play_gui_instructions_per_frame(600_000),
-            super::NATIVE_PLAY_FAST_FORWARD_INSTRUCTIONS_PER_FRAME
+            native_play_gui_instructions_per_frame(120_000),
+            super::NATIVE_PLAY_GUI_MIN_INSTRUCTIONS_PER_FRAME
+        );
+        assert_eq!(native_play_gui_instructions_per_frame(600_000), 600_000);
+        assert_eq!(
+            native_play_gui_instructions_per_frame(2_000_000),
+            super::NATIVE_PLAY_GUI_MAX_INSTRUCTIONS_PER_FRAME
         );
 
         assert_eq!(
@@ -24115,7 +27035,7 @@ mod tests {
                 super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
                 false,
             ),
-            6
+            15
         );
         assert_eq!(
             native_play_gui_poll_count_for_instruction_budget(
@@ -24123,7 +27043,7 @@ mod tests {
                 super::NATIVE_PLAY_GUI_POLL_INSTRUCTION_SLICE,
                 false,
             ),
-            3
+            15
         );
     }
 
@@ -24273,6 +27193,83 @@ mod tests {
     }
 
     #[test]
+    fn native_play_prefers_complete_raw_title_over_sparse_doubled_active_field() {
+        let raw = test_br2_complete_native_logo_title_stats();
+        let projected = test_br2_sparse_native_title_projection_stats();
+
+        assert!(raw.has_br2_full_logo_title_frame(), "{raw:?}");
+        assert!(raw.has_scene_detail(), "{raw:?}");
+        assert!(super::native_play_title_stats_tail_ready(raw), "{raw:?}");
+        assert!(
+            super::native_play_snapshot_cached_frame_is_safe(raw),
+            "the complete title is a safe presentation cache despite its minor caption bands: {raw:?}"
+        );
+        assert!(projected.has_title_screen_frame(), "{projected:?}");
+        assert!(!projected.has_scene_detail(), "{projected:?}");
+        assert!(
+            super::native_play_full_height_raw_title_stats_should_replace_projection(
+                512, 480, 512, 240, raw, projected,
+            ),
+            "the complete 480-line logo must replace the doubled 240-line footer"
+        );
+    }
+
+    #[test]
+    fn native_play_raw_title_replaces_half_height_title_even_when_title_classifier_matches() {
+        let raw = test_br2_complete_native_logo_title_stats();
+        let candidate = NativeFrameStats {
+            nonzero_pixels: 90_000,
+            black_pixels: 155_760,
+            occupied_rows: 250,
+            occupied_row_span: 360,
+            ..raw
+        };
+
+        assert!(raw.has_title_screen_frame(), "{raw:?}");
+        assert!(candidate.has_title_screen_frame(), "{candidate:?}");
+        assert!(
+            candidate.nonzero_pixels.saturating_mul(3) >= raw.nonzero_pixels,
+            "fixture must bypass the old sparse-pixel check"
+        );
+        assert!(
+            candidate.occupied_row_span.saturating_add(64) >= raw.occupied_row_span,
+            "fixture must bypass the old row-span check"
+        );
+        assert!(
+            super::native_play_window_frame_is_weaker_than_raw_title(candidate, raw),
+            "full-height raw title must beat a half-height/low-coverage title projection"
+        );
+    }
+
+    #[test]
+    fn native_play_raw_title_does_not_replace_equivalent_title_geometry() {
+        let raw = test_br2_complete_native_logo_title_stats();
+
+        assert!(raw.has_title_screen_frame(), "{raw:?}");
+        assert!(
+            !super::native_play_window_frame_is_weaker_than_raw_title(raw, raw),
+            "equivalent complete title geometry must not be treated as weaker"
+        );
+    }
+
+    #[test]
+    fn native_play_raw_title_override_requires_matching_half_height_active_field() {
+        let raw = test_br2_complete_native_logo_title_stats();
+        let projected = test_br2_sparse_native_title_projection_stats();
+
+        assert!(
+            !super::native_play_full_height_raw_title_stats_should_replace_projection(
+                512, 480, 512, 480, raw, projected,
+            )
+        );
+        assert!(
+            !super::native_play_full_height_raw_title_stats_should_replace_projection(
+                512, 480, 640, 240, raw, projected,
+            )
+        );
+    }
+
+    #[test]
     fn native_title_screen_ready_accepts_low_ink_insert_coin_boot_frame() {
         let stats = NativeFrameStats {
             width: 640,
@@ -24304,6 +27301,36 @@ mod tests {
             super::native_play_title_stats_input_ready(stats),
             "{stats:?}"
         );
+    }
+
+    #[test]
+    fn native_title_screen_ready_accepts_complete_dense_br2_logo_frame() {
+        let stats = test_br2_complete_dense_logo_title_stats();
+
+        assert!(stats.has_br2_full_logo_title_frame(), "{stats:?}");
+        assert!(stats.has_title_screen_frame(), "{stats:?}");
+        assert!(stats.has_intro_caption_band(), "{stats:?}");
+        assert!(
+            super::native_play_title_stats_input_ready(stats),
+            "{stats:?}"
+        );
+        assert!(
+            super::native_play_title_stats_tail_ready(stats),
+            "{stats:?}"
+        );
+        assert!(!stats.has_render_ready_scene(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+    }
+
+    #[test]
+    fn native_dense_title_signature_rejects_stage_and_select_artifacts() {
+        for stats in [
+            test_br2_stage_texture_replay_fragment_stats(),
+            test_br2_character_select_texture_atlas_overlay_stats(),
+            test_br2_initial_warning_caption_stats(),
+        ] {
+            assert!(!stats.has_br2_full_logo_title_frame(), "{stats:?}");
+        }
     }
 
     #[test]
@@ -24350,6 +27377,7 @@ mod tests {
         assert!(stats.has_title_screen_frame(), "{stats:?}");
         assert!(stats.has_scene_detail(), "{stats:?}");
         assert!(stats.has_corrupt_title_texture_fragment(), "{stats:?}");
+        assert!(!stats.has_complete_sparse_title_frame(), "{stats:?}");
         assert!(stats.has_blocking_display_artifact(), "{stats:?}");
         assert!(
             native_play_title_screen_input_ready_from_frame(&corrupt),
@@ -24478,6 +27506,23 @@ mod tests {
     }
 
     #[test]
+    fn native_frame_stats_rejects_br2_full_red_stage_transition() {
+        let stats = test_br2_full_red_stage_transition_stats();
+
+        assert!(stats.has_visible_content(), "{stats:?}");
+        assert!(!stats.has_scene_detail(), "{stats:?}");
+        assert!(stats.has_br2_red_cave_replay_artifact(), "{stats:?}");
+        assert!(stats.has_blocking_display_artifact(), "{stats:?}");
+        assert!(
+            super::native_play_frame_has_blocking_render_artifact(stats),
+            "{stats:?}"
+        );
+        assert!(!stats.has_render_ready_scene(), "{stats:?}");
+        assert!(!stats.has_handoff_scene(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+    }
+
+    #[test]
     fn native_frame_stats_rejects_br2_full_window_texture_atlas_fragment_false_positive() {
         let stats = test_br2_full_window_texture_atlas_fragment_stats();
 
@@ -24547,6 +27592,30 @@ mod tests {
             !native_play_gpu_verified_active_stage_window_stats(true, true, stats),
             "{stats:?}"
         );
+    }
+
+    #[test]
+    fn native_frame_stats_rejects_br2_incomplete_red_select_transition() {
+        let stats = test_br2_incomplete_red_select_transition_stats();
+
+        assert!(stats.has_visible_content(), "{stats:?}");
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(
+            stats.has_br2_character_select_texture_atlas_overlay(),
+            "{stats:?}"
+        );
+        assert!(
+            stats.has_blocking_texture_page_fragment_artifact(),
+            "{stats:?}"
+        );
+        assert!(stats.has_blocking_display_artifact(), "{stats:?}");
+        assert!(
+            super::native_play_frame_has_blocking_render_artifact(stats),
+            "{stats:?}"
+        );
+        assert!(!stats.has_render_ready_scene(), "{stats:?}");
+        assert!(!stats.has_handoff_scene(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
     }
 
     #[test]
@@ -25810,9 +28879,14 @@ mod tests {
     fn default_native_play_script_reaches_match_handoff() {
         let segments = default_native_play_script();
         let snapshot = super::native_snapshot_match_entry_script();
+        let boot = native_play_boot_wait_segments(&segments);
 
         assert_eq!(segments, snapshot);
-        assert!(segments.starts_with(&super::native_warning_skip_to_title_script()));
+        assert_eq!(boot.iter().map(|segment| segment.frames).sum::<u64>(), 666);
+        assert!(
+            boot.iter()
+                .all(|segment| !super::native_script_segment_is_credit_attempt(*segment))
+        );
         assert!(
             segments
                 .iter()
@@ -25828,7 +28902,7 @@ mod tests {
                 .iter()
                 .filter(|segment| segment.action == Action::Punch)
                 .count(),
-            4 + super::NATIVE_WARNING_SKIP_RETRY_CYCLES
+            4
         );
         assert!(
             segments
@@ -25858,10 +28932,11 @@ mod tests {
         let segments = native_snapshot_handoff_script(true);
         let baseline = native_match_entry_script();
         let snapshot = super::native_snapshot_match_entry_script();
-        let entry_tail = &segments[native_play_boot_wait_segments(&segments).len()..];
+        let boot = native_play_boot_wait_segments(&segments);
+        let entry_tail = &segments[boot.len()..];
 
         assert_eq!(segments, snapshot);
-        assert!(segments.starts_with(&super::native_warning_skip_to_title_script()));
+        assert_eq!(boot.iter().map(|segment| segment.frames).sum::<u64>(), 666);
         assert!(
             native_script_max_frames_for_segments(&segments)
                 < native_script_max_frames_for_segments(&baseline)
@@ -25953,7 +29028,7 @@ mod tests {
     }
 
     #[test]
-    fn native_title_runtime_input_ready_accepts_polled_controls_after_warning() {
+    fn native_title_runtime_input_ready_accepts_polled_controls_with_complete_title() {
         let activity = NativeInputActivity {
             p1_input_reads: 8,
             p1_punch_active_reads: 1,
@@ -25962,13 +29037,40 @@ mod tests {
             system_start_active_reads: 1,
             ..NativeInputActivity::default()
         };
-        let frame = test_gradient_playfield_frame();
+        let width = 640;
+        let height = 480;
+        let mut frame = NativeDisplayFrame {
+            width,
+            height,
+            pixels: vec![0; width * height],
+        };
+        for y in 180..245 {
+            let red = 24 + ((y * 3) % 48) as u32;
+            let green = 40 + ((y * 5) % 72) as u32;
+            let blue = 64 + ((y * 7) % 96) as u32;
+            let color = (red << 16) | (green << 8) | blue;
+            frame.pixels[y * width..(y + 1) * width].fill(color);
+        }
+        for y in 245..305 {
+            for x in 355..635 {
+                let red = 160 + ((x * 11 + y * 5) % 95) as u32;
+                let green = 8 + ((x * 7 + y * 3) % 88) as u32;
+                let blue = 4 + ((x * 5 + y * 13) % 72) as u32;
+                frame.pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
 
-        assert!(native_title_runtime_input_ready(activity, &frame));
+        let stats = NativeFrameStats::from_frame(&frame);
+        assert!(stats.has_title_screen_frame(), "{stats:?}");
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(
+            native_title_runtime_input_ready(activity, &frame),
+            "{stats:?}"
+        );
     }
 
     #[test]
-    fn native_title_runtime_input_ready_accepts_mature_runtime_with_black_frame() {
+    fn native_title_runtime_input_ready_rejects_mature_runtime_with_black_frame() {
         let activity = NativeInputActivity {
             p1_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS,
             p3_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS,
@@ -25986,7 +29088,69 @@ mod tests {
             pixels: vec![0; 640 * 480 * 3],
         };
 
-        assert!(native_title_runtime_input_ready(activity, &frame));
+        assert!(!native_title_runtime_input_ready(activity, &frame));
+    }
+
+    #[test]
+    fn native_title_tail_ready_rejects_sparse_partial_title() {
+        let partial_title = test_title_screen_frame();
+        let stats = NativeFrameStats::from_frame(&partial_title);
+
+        assert!(stats.has_title_screen_frame(), "{stats:?}");
+        assert!(
+            super::native_play_title_screen_input_ready_from_frame(&partial_title),
+            "{stats:?}"
+        );
+        assert!(
+            !super::native_play_title_tail_ready_from_frame(&partial_title),
+            "a visible insert-coin fragment is not a complete title handoff: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn native_title_tail_ready_accepts_complete_sparse_insert_coin_logo() {
+        let stats = NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 9_758,
+            black_pixels: 236_002,
+            warm_pixels: 674,
+            red_dominant_pixels: 674,
+            magenta_dominant_pixels: 0,
+            unique_colors: 25,
+            dominant_color_bucket_pixels: 237_896,
+            horizontal_color_changes: 5_908,
+            periodic_horizontal_match_per_mille: 6,
+            occupied_rows: 96,
+            occupied_row_span: 146,
+            right_title_red_pixels: 0,
+            right_title_bright_pixels: 1_598,
+            top_left_warning_region_dark_pixels: 31_240,
+            top_left_warning_text_pixels: 0,
+            top_left_warning_text_rows: 0,
+            bottom_caption_pixels: 0,
+            bottom_dark_pixels: 49_152,
+        };
+
+        assert!(stats.has_title_screen_frame(), "{stats:?}");
+        assert!(stats.has_complete_sparse_title_frame(), "{stats:?}");
+        assert!(
+            super::native_play_title_stats_input_ready(stats),
+            "complete sparse title must accept input: {stats:?}"
+        );
+        assert!(
+            !stats.has_blocking_display_artifact(),
+            "complete sparse title must not be classified as a display artifact: {stats:?}"
+        );
+        assert!(
+            !super::native_play_frame_has_blocking_render_artifact(stats),
+            "complete sparse title must not be classified as a render artifact: {stats:?}"
+        );
+        assert!(
+            super::native_play_title_stats_tail_ready(stats),
+            "{stats:?}"
+        );
     }
 
     #[test]
@@ -26018,6 +29182,126 @@ mod tests {
         assert!(!native_title_runtime_input_ready(
             NativeInputActivity::default(),
             &frame
+        ));
+    }
+
+    #[test]
+    fn native_title_runtime_boot_progress_allows_tail_after_mature_adapter_polling() {
+        let activity = NativeInputActivity {
+            p1_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS,
+            p3_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS,
+            p1_punch_active_reads: 1,
+            p1_start_active_reads: 1,
+            system_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS * 3,
+            system_start_active_reads: 1,
+            coin_register_writes: 1,
+            native_credit_adapter_writes: 2,
+            native_credit_adapter_edges: 1,
+            ..NativeInputActivity::default()
+        };
+        let progress = NativeScriptProgress {
+            summary: NativeScriptRunSummary {
+                total_frames: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES,
+                frame_attempts: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES,
+                missed_vblank_frames: 0,
+                observed_native_playable_candidate: false,
+                first_native_playable_frame: None,
+                last_native_playable_frame: None,
+                stop_reason: "script_completed",
+            },
+            segment_index: 0,
+            segment_frame: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES,
+        };
+
+        assert!(super::native_title_runtime_boot_progress_allows_tail(
+            activity, progress
+        ));
+        assert!(super::native_title_runtime_activity_allows_tail(
+            activity,
+            progress.summary.total_frames
+        ));
+    }
+
+    #[test]
+    fn native_title_runtime_boot_progress_rejects_bios_or_warning_false_positives() {
+        let mature_activity = NativeInputActivity {
+            p1_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS,
+            p3_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS,
+            p1_punch_active_reads: 1,
+            p1_start_active_reads: 1,
+            system_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS * 3,
+            system_start_active_reads: 1,
+            coin_register_writes: 1,
+            native_credit_adapter_writes: 2,
+            native_credit_adapter_edges: 1,
+            ..NativeInputActivity::default()
+        };
+        let immature_progress = NativeScriptProgress {
+            summary: NativeScriptRunSummary {
+                total_frames: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES - 1,
+                frame_attempts: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES - 1,
+                missed_vblank_frames: 0,
+                observed_native_playable_candidate: false,
+                first_native_playable_frame: None,
+                last_native_playable_frame: None,
+                stop_reason: "script_completed",
+            },
+            segment_index: 0,
+            segment_frame: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES - 1,
+        };
+        let warning_activity = NativeInputActivity {
+            p1_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS - 1,
+            p3_input_reads: super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS - 1,
+            p1_punch_active_reads: 12,
+            p1_start_active_reads: 24,
+            system_input_reads: (super::NATIVE_TITLE_RUNTIME_MIN_P1_POLLS - 1) * 3,
+            system_start_active_reads: 72,
+            coin_register_writes: 5,
+            native_credit_adapter_writes: 28,
+            native_credit_adapter_edges: 0,
+            ..NativeInputActivity::default()
+        };
+        let mature_progress = NativeScriptProgress {
+            summary: NativeScriptRunSummary {
+                total_frames: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES,
+                frame_attempts: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES,
+                missed_vblank_frames: 0,
+                observed_native_playable_candidate: false,
+                first_native_playable_frame: None,
+                last_native_playable_frame: None,
+                stop_reason: "script_completed",
+            },
+            segment_index: 0,
+            segment_frame: super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES,
+        };
+
+        assert!(!super::native_title_runtime_boot_progress_allows_tail(
+            mature_activity,
+            immature_progress
+        ));
+        assert!(!super::native_title_runtime_boot_progress_allows_tail(
+            warning_activity,
+            mature_progress
+        ));
+        assert!(!super::native_title_runtime_activity_allows_tail(
+            NativeInputActivity::default(),
+            super::NATIVE_TITLE_RUNTIME_READY_MIN_BOOT_FRAMES * 2
+        ));
+    }
+
+    #[test]
+    fn native_title_runtime_stop_reason_allows_gui_tail_gate() {
+        assert!(super::native_title_ready_stop_reason_allows_tail(
+            "title_screen_ready"
+        ));
+        assert!(super::native_title_ready_stop_reason_allows_tail(
+            "title_runtime_ready"
+        ));
+        assert!(!super::native_title_ready_stop_reason_allows_tail(
+            "script_completed"
+        ));
+        assert!(!super::native_title_ready_stop_reason_allows_tail(
+            "wall_timeout"
         ));
     }
 
@@ -26065,9 +29349,14 @@ mod tests {
             .iter()
             .map(|segment| segment.frames)
             .sum::<u64>();
+        let warning_skip_frames = super::native_warning_skip_to_title_script()
+            .iter()
+            .map(|segment| segment.frames)
+            .sum::<u64>();
 
+        assert_eq!(boot_wait_frames, warning_skip_frames);
         assert!(
-            (600..=700).contains(&boot_wait_frames),
+            (600..=1_800).contains(&boot_wait_frames),
             "warning skip should reach the credit tail before bounded macOS smoke timeouts while still delaying coin past warning skip pulses"
         );
     }
@@ -26132,7 +29421,7 @@ mod tests {
                 .iter()
                 .filter(|segment| segment.action == Action::Punch)
                 .count(),
-            2
+            2 + super::NATIVE_WARNING_SKIP_RETRY_CYCLES
         );
     }
 
@@ -26351,6 +29640,29 @@ mod tests {
             !native_play_snapshot_should_run_tail(true, false, false, false, false, boot_summary),
             "handoff-only snapshots should still wait for the title-ready gate"
         );
+    }
+
+    #[test]
+    fn native_match_tail_timeline_compact_json_omits_image_outputs() {
+        let frame = test_title_screen_frame();
+        let stats = NativeFrameStats::from_frame_with_checksum(&frame);
+        let json =
+            super::native_match_tail_timeline_frame_stats_json(stats, stats, stats, stats, stats);
+
+        assert_eq!(
+            super::native_match_tail_timeline_usage(true),
+            "usage: bloodyroar2-gym native-match-tail-timeline-compact <rom_zip_or_dir> <instructions_per_frame> [action:frames...]"
+        );
+        assert!(
+            super::native_match_tail_timeline_usage(false).contains("<output_prefix>"),
+            "image timeline usage must keep the existing output prefix"
+        );
+        assert!(json.contains("\"actual_frame\""), "{json}");
+        assert!(json.contains("\"window_frame\""), "{json}");
+        assert!(json.contains("\"checksum\""), "{json}");
+        assert!(json.contains("\"stats\""), "{json}");
+        assert!(!json.contains("_output"), "{json}");
+        assert!(!json.contains(".png"), "{json}");
     }
 
     #[test]
@@ -27059,6 +30371,113 @@ mod tests {
         assert!(!native_play_should_prefer_raw_actual_display(
             &raw, &sparse, &raw, true, true
         ));
+    }
+
+    #[test]
+    fn native_play_display_prefers_complete_raw_gameplay_over_doubled_active_field() {
+        let width = 512;
+        let height = 480;
+        let field_height = height / 2;
+        let mut raw_pixels = vec![0; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let horizontal = if y < field_height { x } else { x / 8 };
+                let red = 16 + ((horizontal * 17 + y * 11) % 184) as u32;
+                let green = 24 + ((horizontal * 7 + y * 19) % 176) as u32;
+                let blue = 32 + ((horizontal * 13 + y * 5) % 192) as u32;
+                raw_pixels[y * width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        let raw = NativeDisplayFrame {
+            width,
+            height,
+            pixels: raw_pixels,
+        };
+        let actual = NativeDisplayFrame {
+            width,
+            height: field_height,
+            pixels: raw.pixels[field_height * width..].to_vec(),
+        };
+        let mut stable_pixels = vec![0; width * height];
+        for y in 0..height {
+            let source = (y / 2) * width;
+            let target = y * width;
+            stable_pixels[target..target + width]
+                .copy_from_slice(&actual.pixels[source..source + width]);
+        }
+        let stable = NativeDisplayFrame {
+            width,
+            height,
+            pixels: stable_pixels,
+        };
+        let actual_window = native_play_window_frame_with_context(&actual, true, true);
+        let stable_window = native_play_window_frame_with_context(&stable, true, true);
+        let raw_window = super::native_play_window_frame_without_deinterlace(&raw);
+        let raw_stats = NativeFrameStats::from_frame(&raw_window);
+        let actual_stats = NativeFrameStats::from_frame(&actual_window);
+        let stable_stats = NativeFrameStats::from_frame(&stable_window);
+        assert!(raw_stats.has_gameplay_scene(), "{raw_stats:?}");
+        assert!(
+            super::native_play_full_height_raw_scene_beats_field_projection(
+                raw_stats,
+                actual_stats,
+                stable_stats,
+                true,
+                true,
+            ),
+            "raw={raw_stats:?} actual={actual_stats:?} stable={stable_stats:?}"
+        );
+        let preferred = super::native_play_preferred_raw_actual_display(
+            &raw,
+            true,
+            true,
+            actual_stats,
+            stable_stats,
+        )
+        .expect("complete raw gameplay frame should replace a doubled active field");
+
+        assert!(
+            raw_stats.horizontal_color_changes.saturating_mul(100)
+                >= stable_stats.horizontal_color_changes.saturating_mul(108),
+            "fixture must preserve the detail advantage: raw={raw_stats:?} stable={stable_stats:?}"
+        );
+        assert_eq!(
+            native_frame_checksum(&preferred.0),
+            native_frame_checksum(&raw_window)
+        );
+    }
+
+    #[test]
+    fn native_play_raw_detail_override_rejects_single_field_high_vertical_raw() {
+        let raw = test_high_vertical_single_field_handoff_frame();
+        let actual = NativeDisplayFrame {
+            width: raw.width,
+            height: raw.height / 2,
+            pixels: raw.pixels[raw.width * (raw.height / 2)..].to_vec(),
+        };
+        let stable = super::native_play_window_frame_without_deinterlace(&actual);
+        let actual_window = native_play_window_frame_with_context(&actual, true, true);
+        let stable_window = native_play_window_frame_with_context(&stable, true, true);
+        let raw_window = super::native_play_window_frame_without_deinterlace(&raw);
+        let raw_stats = NativeFrameStats::from_frame(&raw_window);
+        let actual_stats = NativeFrameStats::from_frame(&actual_window);
+        let stable_stats = NativeFrameStats::from_frame(&stable_window);
+
+        assert!(raw_stats.has_visible_content(), "{raw_stats:?}");
+        assert!(
+            raw_stats.occupied_row_span.saturating_mul(10) < raw_stats.height.saturating_mul(9),
+            "{raw_stats:?}"
+        );
+        assert!(
+            !super::native_play_full_height_raw_scene_beats_field_projection(
+                raw_stats,
+                actual_stats,
+                stable_stats,
+                true,
+                true,
+            ),
+            "{raw_stats:?}"
+        );
     }
 
     #[test]
@@ -29526,6 +32945,79 @@ mod tests {
     }
 
     #[test]
+    fn native_play_beast_transformation_effect_does_not_freeze_gui() {
+        let stats = test_br2_beast_transformation_effect_stats();
+
+        assert!(stats.has_title_logo_overlay(), "{stats:?}");
+        assert!(stats.has_bottom_caption_band(), "{stats:?}");
+        assert!(stats.has_intro_caption_band(), "{stats:?}");
+        assert!(stats.has_transient_native_combat_effect(), "{stats:?}");
+        assert!(!stats.has_large_magenta_recovery_corruption(), "{stats:?}");
+        assert!(stats.has_title_logo_stage_context(), "{stats:?}");
+        assert!(!stats.has_blocking_title_logo_overlay(), "{stats:?}");
+        assert!(!stats.has_blocking_display_artifact(), "{stats:?}");
+        assert!(
+            !super::native_play_frame_has_blocking_render_artifact(stats),
+            "{stats:?}"
+        );
+        assert!(stats.has_render_ready_scene(), "{stats:?}");
+        assert!(stats.has_presentable_scene(), "{stats:?}");
+        assert!(stats.has_handoff_scene(), "{stats:?}");
+        assert!(stats.has_gameplay_scene(), "{stats:?}");
+        assert!(
+            super::native_play_fast_gui_frame_stats_are_safe(false, false, stats),
+            "{stats:?}"
+        );
+        assert!(
+            super::native_play_snapshot_caption_ui_allows_gameplay(stats),
+            "{stats:?}"
+        );
+    }
+
+    #[test]
+    fn native_frame_stats_rejects_large_magenta_periodic_recovery_corruption() {
+        let stats = NativeFrameStats {
+            width: 640,
+            height: 480,
+            total_pixels: 307_200,
+            nonzero_pixels: 300_203,
+            black_pixels: 6_997,
+            warm_pixels: 9_106,
+            red_dominant_pixels: 13_394,
+            magenta_dominant_pixels: 224_555,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 224_555,
+            horizontal_color_changes: 25_577,
+            periodic_horizontal_match_per_mille: 654,
+            occupied_rows: 480,
+            occupied_row_span: 480,
+            right_title_red_pixels: 883,
+            right_title_bright_pixels: 481,
+            top_left_warning_region_dark_pixels: 2_486,
+            top_left_warning_text_pixels: 5,
+            top_left_warning_text_rows: 0,
+            bottom_caption_pixels: 0,
+            bottom_dark_pixels: 7_486,
+        };
+
+        assert!(stats.has_scene_detail(), "{stats:?}");
+        assert!(
+            !stats.has_periodic_horizontal_ghosting(),
+            "the 640-wide presented capture was missed because ghosting stayed false: {stats:?}"
+        );
+        assert!(stats.has_large_magenta_recovery_corruption(), "{stats:?}");
+        assert!(stats.has_blocking_display_artifact(), "{stats:?}");
+        assert!(
+            super::native_play_frame_has_blocking_render_artifact(stats),
+            "{stats:?}"
+        );
+        assert!(
+            !native_play_frame_ready_stats_with_context(true, stats),
+            "{stats:?}"
+        );
+    }
+
+    #[test]
     fn native_play_gpu_context_does_not_replace_stale_title_with_stage_smear() {
         let frame = test_letterboxed_stage_field_smear_frame();
         let stats = NativeFrameStats::from_frame(&frame);
@@ -29884,6 +33376,89 @@ mod tests {
     }
 
     #[test]
+    fn native_play_gui_detects_projected_240_line_actual_frame() {
+        let projected = native_play_present_native_resolution_actual_frame(
+            &test_contextual_live_stage_field_frame(),
+        );
+        let projected_stats = NativeFrameStats::from_frame(&projected);
+        let full_height = test_dark_native_match_frame();
+        let full_height_stats = NativeFrameStats::from_frame(&full_height);
+
+        assert_eq!(
+            (projected.width, projected.height),
+            (NATIVE_PLAY_WINDOW_WIDTH, NATIVE_PLAY_MIN_WINDOW_HEIGHT)
+        );
+        assert!(
+            super::native_play_actual_frame_is_projected_active_field(&projected, projected_stats,),
+            "{projected_stats:?}"
+        );
+        assert!(
+            !super::native_play_actual_frame_is_projected_active_field(
+                &full_height,
+                full_height_stats,
+            ),
+            "{full_height_stats:?}"
+        );
+    }
+
+    #[test]
+    fn native_play_gui_keeps_full_height_yugo_overlay_over_projected_actual_field() {
+        let actual = native_play_present_native_resolution_actual_frame(
+            &test_contextual_live_stage_field_frame(),
+        );
+        let actual_stats = NativeFrameStats::from_frame(&actual);
+        let candidate = test_dark_native_match_frame();
+        let candidate_stats = test_br2_yugo_long_character_select_name_overlay_stats();
+
+        assert!(
+            super::native_play_actual_frame_is_projected_active_field(&actual, actual_stats),
+            "{actual_stats:?}"
+        );
+        assert!(
+            candidate_stats.has_br2_character_select_name_overlay_artifact(),
+            "{candidate_stats:?}"
+        );
+        assert!(
+            super::native_play_projected_active_field_actual_should_hold_window_candidate(
+                &actual,
+                actual_stats,
+                &candidate,
+                candidate_stats,
+            ),
+            "full-height stale Yugo/name overlays should beat a vertically doubled active field: actual={actual_stats:?} candidate={candidate_stats:?}"
+        );
+        assert!(
+            !super::native_play_native_resolution_actual_should_replace_window_candidate_for_gui(
+                true,
+                true,
+                true,
+                &actual,
+                actual_stats,
+                &candidate,
+                candidate_stats,
+            )
+        );
+
+        let selected = super::native_play_select_visible_window_frame_for_gui_with_stats(
+            candidate.clone(),
+            candidate_stats,
+            actual,
+            actual_stats,
+            true,
+            true,
+            false,
+            true,
+            &Some(candidate.clone()),
+            &candidate,
+            candidate_stats,
+        );
+        assert_eq!(
+            native_frame_checksum(&selected.frame),
+            native_frame_checksum(&candidate)
+        );
+    }
+
+    #[test]
     fn native_play_presents_512x240_active_actual_as_full_window_frame() {
         let mut source = test_contextual_live_stage_field_frame();
         source.pixels[0] = 0x0012_3456;
@@ -30187,9 +33762,8 @@ mod tests {
         );
         assert!(broken_window_stats.has_stage_texture_field_smear());
         assert!(broken_window_stats.has_blocking_title_logo_overlay());
-        assert!(broken_window_stats.has_br2_title_caption_live_atlas_mixture());
         assert!(
-            !super::native_play_frame_has_blocking_render_artifact(broken_window_stats),
+            super::native_play_frame_has_blocking_render_artifact(broken_window_stats),
             "{broken_window_stats:?}"
         );
         assert!(
@@ -30517,7 +34091,7 @@ mod tests {
     }
 
     #[test]
-    fn native_input_latch_preserves_combat_edge_while_direction_remains_held() {
+    fn native_input_latch_preserves_combat_level_while_direction_remains_held() {
         let mut latch = NativeInputLatch::default();
         let right = ActionButtons {
             right: true,
@@ -30532,6 +34106,66 @@ mod tests {
         assert_eq!(latch.buttons(right), right);
         assert_eq!(latch.buttons(right_punch), right_punch);
         assert_eq!(latch.buttons(right), right_punch);
+    }
+
+    #[test]
+    fn native_input_latch_keeps_held_beast_active_until_release_latch_expires() {
+        let mut latch = NativeInputLatch::default();
+        let beast = Action::Beast.buttons();
+
+        assert_eq!(latch.buttons(beast), beast);
+        for _ in 0..(super::NATIVE_PLAY_INPUT_LATCH_FRAMES * 2) {
+            latch.advance_frame();
+            assert_eq!(latch.buttons(beast), beast);
+        }
+        assert_eq!(latch.buttons(ActionButtons::default()), beast);
+        for _ in 0..super::NATIVE_PLAY_INPUT_LATCH_FRAMES - 1 {
+            latch.advance_frame();
+            assert_eq!(latch.buttons(ActionButtons::default()), beast);
+        }
+        latch.advance_frame();
+        assert_eq!(
+            latch.buttons(ActionButtons::default()),
+            ActionButtons::default()
+        );
+    }
+
+    #[test]
+    fn native_input_latch_held_beast_does_not_freeze_later_controls() {
+        let mut latch = NativeInputLatch::default();
+        let beast = Action::Beast.buttons();
+
+        assert_eq!(latch.buttons(beast), beast);
+        for _ in 0..super::NATIVE_PLAY_INPUT_LATCH_FRAMES {
+            latch.advance_frame();
+            latch.buttons(beast);
+        }
+
+        let held_beast_with_new_attack = ActionButtons {
+            right: true,
+            punch: true,
+            beast: true,
+            ..ActionButtons::default()
+        };
+        let buttons = latch.buttons(held_beast_with_new_attack);
+
+        assert!(buttons.right);
+        assert!(buttons.punch);
+        assert!(
+            buttons.beast,
+            "held Beast must remain active at guest polls"
+        );
+    }
+
+    #[test]
+    fn native_input_latch_keeps_guard_level_active_while_held() {
+        let mut latch = NativeInputLatch::default();
+        let guard = Action::Guard.buttons();
+
+        for _ in 0..(super::NATIVE_PLAY_INPUT_LATCH_FRAMES + 2) {
+            assert_eq!(latch.buttons(guard), guard);
+            latch.advance_frame();
+        }
     }
 
     #[test]
@@ -30551,7 +34185,7 @@ mod tests {
     }
 
     #[test]
-    fn native_physical_enter_requires_distinct_coin_and_start_presses() {
+    fn native_physical_enter_resolves_coin_then_start_from_one_press() {
         let mut enter = super::NativePhysicalEnterSequencer::default();
         let coin = Action::Coin.buttons();
         let start = Action::Start.buttons();
@@ -30570,15 +34204,51 @@ mod tests {
             enter.buttons(false, false, credit_accepted),
             ActionButtons::default()
         );
-        enter.advance_frame();
-        assert!(enter.is_empty());
-        assert_eq!(enter.buttons(true, true, credit_accepted), start);
+        assert!(!enter.is_empty());
+        for _ in 0..super::NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES {
+            enter.advance_frame();
+        }
+        assert_eq!(enter.buttons(false, false, credit_accepted), start);
         assert_eq!(
             enter.buttons(false, false, game_started),
             ActionButtons::default()
         );
         enter.advance_frame();
         assert!(enter.is_empty());
+    }
+
+    #[test]
+    fn native_physical_enter_repeated_credit_feedback_does_not_reset_start_gap() {
+        let mut enter = super::NativePhysicalEnterSequencer::default();
+        let credit_accepted = super::NativeCoinStartFeedback {
+            credit_accepted_count: 1,
+            game_start_accepted_count: 0,
+        };
+
+        assert_eq!(
+            enter.buttons(true, true, super::NativeCoinStartFeedback::default()),
+            Action::Coin.buttons()
+        );
+        assert_eq!(
+            enter.buttons(false, false, credit_accepted),
+            ActionButtons::default()
+        );
+        for _ in 0..super::NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES {
+            enter.advance_frame();
+            assert_eq!(
+                enter.buttons(false, false, credit_accepted),
+                if enter.phase == super::NativeCoinStartPhase::Start {
+                    Action::Start.buttons()
+                } else {
+                    ActionButtons::default()
+                }
+            );
+        }
+        assert_eq!(enter.phase, super::NativeCoinStartPhase::Start);
+        assert_eq!(
+            enter.buttons(false, false, credit_accepted),
+            Action::Start.buttons()
+        );
     }
 
     #[test]
@@ -30607,12 +34277,14 @@ mod tests {
             enter.buttons(false, false, credit_accepted),
             ActionButtons::default()
         );
-        enter.advance_frame();
-        assert!(enter.is_empty());
+        for _ in 0..super::NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES {
+            enter.advance_frame();
+        }
         assert_eq!(
-            enter.buttons(true, true, credit_accepted),
+            enter.buttons(false, false, credit_accepted),
             Action::Start.buttons()
         );
+        assert!(!enter.is_empty());
     }
 
     #[test]
@@ -30752,13 +34424,15 @@ mod tests {
     }
 
     #[test]
-    fn native_window_button_sample_reuses_platform_context_between_quartz_polls() {
+    fn native_window_button_sample_reuses_platform_context_without_stale_buttons() {
         let cached = NativeWindowButtonSample {
             window_is_key_or_main: true,
             application_active: true,
             window_visible: true,
             quartz_sampled: true,
             quartz_fallback_active: true,
+            platform: Action::Kick.buttons(),
+            merged: Action::Kick.buttons(),
             ..NativeWindowButtonSample::default()
         };
         let current = NativeWindowButtonSample {
@@ -30775,6 +34449,29 @@ mod tests {
         assert!(resolved.window_visible);
         assert!(resolved.quartz_fallback_active);
         assert!(!resolved.quartz_sampled);
+        assert_eq!(resolved.platform, ActionButtons::default());
+        assert_eq!(resolved.merged, Action::Punch.buttons());
+    }
+
+    #[test]
+    fn native_window_button_sample_does_not_reuse_gated_platform_buttons() {
+        let cached = NativeWindowButtonSample {
+            quartz_sampled: true,
+            quartz_fallback_active: false,
+            platform: Action::Kick.buttons(),
+            merged: Action::Kick.buttons(),
+            ..NativeWindowButtonSample::default()
+        };
+        let current = NativeWindowButtonSample {
+            minifb: Action::Punch.buttons(),
+            merged: Action::Punch.buttons(),
+            ..NativeWindowButtonSample::default()
+        };
+
+        let resolved =
+            super::native_window_button_sample_with_cached_platform_context(current, Some(cached));
+
+        assert_eq!(resolved.platform, ActionButtons::default());
         assert_eq!(resolved.merged, Action::Punch.buttons());
     }
 
@@ -30855,6 +34552,31 @@ mod tests {
             &physical_enter,
             &trace,
             &scripted,
+            false,
+            sample,
+        ));
+
+        let mut completed_script = scripted.clone();
+        completed_script.advance_frame();
+        assert!(completed_script.is_complete());
+        assert!(!native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &physical_enter,
+            &trace,
+            &completed_script,
+            false,
+            sample,
+        ));
+        completed_script.advance_frame();
+        assert!(native_play_gui_idle_fast_path_allowed(
+            None,
+            &input_latch,
+            &physical_latch,
+            &physical_enter,
+            &trace,
+            &completed_script,
             false,
             sample,
         ));
@@ -30962,6 +34684,15 @@ mod tests {
 
         let mut script = NativeGuiTestInputScript::from_segments(&segments);
         assert_eq!(script.len(), 4);
+        assert!(!script.is_complete());
+        assert_eq!(
+            script.requested_buttons(),
+            ActionButtons {
+                right: true,
+                punch: true,
+                ..ActionButtons::default()
+            }
+        );
         assert_eq!(script.current_buttons(), Action::Punch.buttons());
         script.advance_frame();
         assert_eq!(script.current_buttons(), Action::Punch.buttons());
@@ -30971,6 +34702,7 @@ mod tests {
         assert_eq!(script.current_buttons(), Action::RightPunch.buttons());
         script.advance_frame();
         assert_eq!(script.current_buttons(), ActionButtons::default());
+        assert!(script.is_complete());
     }
 
     #[test]
@@ -31021,6 +34753,21 @@ mod tests {
                 action: Action::RightPunch,
                 frames: 4,
             }]
+        );
+    }
+
+    #[test]
+    fn native_play_tail_rejects_gui_test_input_frame_limit_before_release_poll() {
+        assert_eq!(
+            parse_native_play_tail(vec![
+                "900".to_string(),
+                "--gui-test-input".to_string(),
+                "punch:924".to_string(),
+            ]),
+            Err(
+                "max_frames 900 is too short for --gui-test-input: 924 scripted frames plus 1 release-observation frame requires at least 925"
+                    .to_string()
+            )
         );
     }
 
@@ -31153,11 +34900,13 @@ mod tests {
             native_window_button_sample_with_test_sidecar(production_sample, true, sidecar_buttons);
         let mut latch = NativeInputLatch::default();
         let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
         let mut physical_enter = super::NativePhysicalEnterSequencer::default();
 
         let resolved = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut test_latch,
             &mut physical_enter,
             sample,
             Some(Action::Start),
@@ -31166,6 +34915,7 @@ mod tests {
         );
         assert_eq!(resolved.raw_buttons, sidecar_buttons);
         assert_eq!(resolved.latched_buttons, sidecar_buttons);
+        assert_eq!(resolved.test_latched_buttons, sidecar_buttons);
         assert_eq!(resolved.effective_buttons, sidecar_buttons);
         assert!(!resolved.raw_manual_override);
         assert!(!resolved.manual_override);
@@ -31184,6 +34934,176 @@ mod tests {
             guest_delta,
         ));
         assert!(native_action_activity_observed(guest_delta, Action::Punch));
+    }
+
+    #[test]
+    fn native_gui_exclusive_test_input_ignores_physical_controls_but_preserves_quit() {
+        let physical_buttons = ActionButtons {
+            left: true,
+            p2_kick: true,
+            ..ActionButtons::default()
+        };
+        let sidecar_buttons = Action::Beast.buttons();
+        let sample = native_window_button_sample_for_exclusive_test_input(
+            native_window_button_sample_with_test_sidecar(
+                NativeWindowButtonSample {
+                    raw_window_active: true,
+                    window_active: true,
+                    quit_requested: true,
+                    minifb: physical_buttons,
+                    platform: Action::Punch.buttons(),
+                    physical_enter_down: true,
+                    physical_enter_pressed: true,
+                    merged: super::merge_action_buttons(physical_buttons, Action::Punch.buttons()),
+                    ..NativeWindowButtonSample::default()
+                },
+                true,
+                sidecar_buttons,
+            ),
+            true,
+        );
+
+        assert!(sample.quit_requested);
+        assert_eq!(sample.minifb, ActionButtons::default());
+        assert_eq!(sample.platform, ActionButtons::default());
+        assert!(!sample.physical_enter_down);
+        assert!(!sample.physical_enter_pressed);
+        assert_eq!(sample.test_sidecar, sidecar_buttons);
+        assert_eq!(sample.merged, sidecar_buttons);
+
+        let mut latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
+        let resolved = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut test_latch,
+            &mut physical_enter,
+            sample,
+            Some(Action::Start),
+            true,
+            super::NativeCoinStartFeedback::default(),
+        );
+
+        assert_eq!(resolved.physical_buttons, ActionButtons::default());
+        assert!(!resolved.raw_manual_override);
+        assert!(!resolved.manual_override);
+        assert!(resolved.test_input_override);
+        assert_eq!(resolved.effective_buttons, sidecar_buttons);
+    }
+
+    #[test]
+    fn native_gui_test_input_latched_release_keeps_p1_left_and_p2_guest_attribution() {
+        let sidecar_buttons = ActionButtons {
+            left: true,
+            p2_start: true,
+            p2_coin: true,
+            p2_up: true,
+            p2_down: true,
+            p2_left: true,
+            p2_right: true,
+            p2_punch: true,
+            p2_kick: true,
+            p2_beast: true,
+            p2_guard: true,
+            ..ActionButtons::default()
+        };
+        let pressed_sample = native_window_button_sample_with_test_sidecar(
+            NativeWindowButtonSample {
+                raw_window_active: true,
+                window_active: true,
+                ..NativeWindowButtonSample::default()
+            },
+            true,
+            sidecar_buttons,
+        );
+        let released_sample = native_window_button_sample_with_test_sidecar(
+            NativeWindowButtonSample {
+                raw_window_active: true,
+                window_active: true,
+                ..NativeWindowButtonSample::default()
+            },
+            true,
+            ActionButtons::default(),
+        );
+        let mut latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
+
+        let pressed = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut test_latch,
+            &mut physical_enter,
+            pressed_sample,
+            None,
+            true,
+            super::NativeCoinStartFeedback::default(),
+        );
+        assert_eq!(pressed.test_latched_buttons, sidecar_buttons);
+        assert_eq!(pressed.physical_buttons, ActionButtons::default());
+        assert!(!pressed.manual_override);
+
+        latch.advance_frame();
+        physical_latch.advance_frame();
+        test_latch.advance_frame();
+        physical_enter.advance_frame();
+
+        let released = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut test_latch,
+            &mut physical_enter,
+            released_sample,
+            None,
+            true,
+            super::NativeCoinStartFeedback::default(),
+        );
+        assert_eq!(released.raw_buttons, ActionButtons::default());
+        assert_eq!(released.test_latched_buttons, sidecar_buttons);
+        assert_eq!(released.effective_buttons, sidecar_buttons);
+        assert!(released.test_input_override);
+        assert!(!released.manual_override);
+
+        let late_guest_activity = NativeInputActivity {
+            p1_input_reads: 1,
+            p1_left_active_reads: 1,
+            p2_input_reads: 1,
+            p2_up_active_reads: 1,
+            p2_down_active_reads: 1,
+            p2_left_active_reads: 1,
+            p2_right_active_reads: 1,
+            p2_punch_active_reads: 1,
+            p2_kick_active_reads: 1,
+            p2_beast_active_reads: 1,
+            p3_input_reads: 1,
+            p2_guard_active_reads: 1,
+            system_input_reads: 1,
+            system_p2_coin_active_reads: 1,
+            system_p2_start_active_reads: 1,
+            p2_coin_insert_edges: 1,
+            coin_counter_1_edges: 1,
+            native_credit_adapter_writes: 1,
+            native_credit_adapter_edges: 1,
+            ..NativeInputActivity::default()
+        };
+        let current_sidecar_filtered = super::native_input_activity_for_buttons(
+            late_guest_activity,
+            released_sample.test_sidecar,
+        );
+        assert!(!current_sidecar_filtered.has_any_control_activity());
+
+        let latched_filtered = super::native_input_activity_for_buttons(
+            late_guest_activity,
+            released.test_latched_buttons,
+        );
+        let observed = super::native_guest_observed_buttons_for_input_activity(
+            released.test_latched_buttons,
+            latched_filtered,
+        );
+        assert!(super::action_buttons_cover(observed, sidecar_buttons));
     }
 
     #[test]
@@ -31206,11 +35126,13 @@ mod tests {
         );
         let mut latch = NativeInputLatch::default();
         let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
         let mut physical_enter = super::NativePhysicalEnterSequencer::default();
 
         let resolved = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut test_latch,
             &mut physical_enter,
             sample,
             Some(Action::Start),
@@ -31232,9 +35154,10 @@ mod tests {
     }
 
     #[test]
-    fn native_physical_enter_resolves_as_separated_coin_then_start() {
+    fn native_physical_enter_resolves_one_press_as_separated_coin_then_start() {
         let mut latch = NativeInputLatch::default();
         let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
         let mut physical_enter = super::NativePhysicalEnterSequencer::default();
         let enter_sample = NativeWindowButtonSample {
             raw_window_active: true,
@@ -31247,6 +35170,7 @@ mod tests {
         let first = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut test_latch,
             &mut physical_enter,
             enter_sample,
             None,
@@ -31266,6 +35190,7 @@ mod tests {
         let released = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut test_latch,
             &mut physical_enter,
             NativeWindowButtonSample::default(),
             None,
@@ -31273,12 +35198,15 @@ mod tests {
             credit_feedback,
         );
         assert_eq!(released.latched_buttons, ActionButtons::default());
-        physical_enter.advance_frame();
+        for _ in 0..super::NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES {
+            physical_enter.advance_frame();
+        }
         let first_start = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut test_latch,
             &mut physical_enter,
-            enter_sample,
+            NativeWindowButtonSample::default(),
             None,
             true,
             credit_feedback,
@@ -31291,6 +35219,7 @@ mod tests {
     fn native_api_coin_start_remains_simultaneous_without_physical_enter() {
         let mut latch = NativeInputLatch::default();
         let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
         let mut physical_enter = super::NativePhysicalEnterSequencer::default();
         let buttons = Action::CoinStart.buttons();
         let sample = NativeWindowButtonSample {
@@ -31302,6 +35231,7 @@ mod tests {
         let resolved = native_play_resolve_input_poll(
             &mut latch,
             &mut physical_latch,
+            &mut test_latch,
             &mut physical_enter,
             sample,
             None,
@@ -31916,6 +35846,47 @@ mod tests {
     }
 
     #[test]
+    fn physical_full_input_coverage_requires_both_players() {
+        let full = ActionButtons {
+            start: true,
+            coin: true,
+            up: true,
+            down: true,
+            left: true,
+            right: true,
+            punch: true,
+            kick: true,
+            beast: true,
+            guard: true,
+            p2_start: true,
+            p2_coin: true,
+            p2_up: true,
+            p2_down: true,
+            p2_left: true,
+            p2_right: true,
+            p2_punch: true,
+            p2_kick: true,
+            p2_beast: true,
+            p2_guard: true,
+            ..ActionButtons::default()
+        };
+        assert!(super::action_buttons_have_full_direction_coverage(full));
+        assert!(super::action_buttons_have_full_play_control_coverage(full));
+
+        let mut missing_p2_down = full;
+        missing_p2_down.p2_down = false;
+        assert!(!super::action_buttons_have_full_direction_coverage(
+            missing_p2_down
+        ));
+
+        let mut missing_p2_guard = full;
+        missing_p2_guard.p2_guard = false;
+        assert!(!super::action_buttons_have_full_play_control_coverage(
+            missing_p2_guard
+        ));
+    }
+
+    #[test]
     fn gui_test_input_coverage_requires_only_requested_controls() {
         let requested = ActionButtons {
             up: true,
@@ -31975,6 +35946,51 @@ mod tests {
     }
 
     #[test]
+    fn native_macos_key_state_fallback_maps_all_combat_aliases() {
+        for key in [12u16, 11, 37] {
+            let sample =
+                super::native_macos_key_states_to_window_key_sample(|pressed| pressed == key);
+            assert!(sample.buttons.beast, "keycode {key} must map to Beast");
+        }
+        for key in [14u16, 3, 5, 4] {
+            let sample =
+                super::native_macos_key_states_to_window_key_sample(|pressed| pressed == key);
+            assert!(sample.buttons.guard, "keycode {key} must map to Guard");
+        }
+    }
+
+    #[test]
+    fn native_macos_key_state_fallback_maps_every_p2_control() {
+        let sample = super::native_macos_key_states_to_window_key_sample(|key| {
+            matches!(key, 13 | 1 | 0 | 2 | 38 | 40 | 32 | 34 | 31 | 45)
+        });
+
+        assert!(sample.buttons.p2_up);
+        assert!(sample.buttons.p2_down);
+        assert!(sample.buttons.p2_left);
+        assert!(sample.buttons.p2_right);
+        assert!(sample.buttons.p2_punch);
+        assert!(sample.buttons.p2_kick);
+        assert!(sample.buttons.p2_beast);
+        assert!(sample.buttons.p2_guard);
+        assert!(sample.buttons.p2_start);
+        assert!(sample.buttons.p2_coin);
+        assert!(!sample.buttons.punch);
+        assert!(!sample.enter);
+        assert!(!sample.escape);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_macos_quartz_sampled_on_bounded_guest_frame_event_pumps() {
+        assert!(super::native_play_gui_should_sample_platform_input_for_pump(0, true));
+        assert!(!super::native_play_gui_should_sample_platform_input_for_pump(1, true));
+        assert!(super::native_play_gui_should_sample_platform_input_for_pump(8, true));
+        assert!(!super::native_play_gui_should_sample_platform_input_for_pump(30, true));
+        assert!(!super::native_play_gui_should_sample_platform_input_for_pump(30, false));
+    }
+
+    #[test]
     fn native_macos_enter_keycode_uses_physical_sequence_channel() {
         let pressed = [123u16, 6, 36];
         let sample =
@@ -31986,6 +36002,51 @@ mod tests {
         assert!(sample.buttons.punch);
         assert!(!sample.buttons.coin);
         assert!(!sample.buttons.start);
+    }
+
+    #[test]
+    fn native_macos_quartz_enter_and_system_buttons_are_edges_but_combat_is_level_held() {
+        let current = super::NativeWindowKeySample {
+            buttons: ActionButtons {
+                right: true,
+                punch: true,
+                beast: true,
+                guard: true,
+                ..ActionButtons::default()
+            },
+            enter: true,
+            escape: false,
+        };
+        let previous = super::NativeWindowKeySample {
+            buttons: ActionButtons {
+                right: true,
+                beast: true,
+                guard: true,
+                ..ActionButtons::default()
+            },
+            enter: true,
+            escape: false,
+        };
+
+        let rising = super::native_window_key_sample_rising_edges(current, previous);
+        let platform_buttons =
+            super::native_macos_platform_buttons_for_gui_sample(current.buttons, rising.buttons);
+
+        assert!(!rising.enter, "held Enter must not restart coin/start");
+        assert!(!rising.buttons.punch);
+        assert!(!rising.buttons.beast);
+        assert!(platform_buttons.right, "directions remain level-held");
+        assert!(platform_buttons.guard, "guard remains level-held");
+        assert!(platform_buttons.punch, "combat remains level-held");
+        assert!(platform_buttons.beast, "Beast remains level-held");
+
+        let first = super::native_window_key_sample_rising_edges(
+            current,
+            super::NativeWindowKeySample::default(),
+        );
+        assert!(first.enter);
+        assert!(!first.buttons.punch);
+        assert!(!first.buttons.beast);
     }
 
     #[test]
@@ -32019,14 +36080,11 @@ mod tests {
     }
 
     #[test]
-    fn native_macos_quartz_fallback_requires_active_visible_game_window() {
+    fn native_macos_quartz_fallback_requires_foreground_or_key_visible_game_window() {
         assert!(!super::native_macos_quartz_fallback_active(
             false, false, true, false
         ));
-        assert!(!super::native_macos_quartz_fallback_active(
-            false, true, false, true
-        ));
-        assert!(!super::native_macos_quartz_fallback_active(
+        assert!(super::native_macos_quartz_fallback_active(
             false, false, true, true
         ));
         assert!(!super::native_macos_quartz_fallback_active(
@@ -32034,6 +36092,9 @@ mod tests {
         ));
         assert!(super::native_macos_quartz_fallback_active(
             false, true, true, true
+        ));
+        assert!(super::native_macos_quartz_fallback_active(
+            false, true, false, true
         ));
         assert!(super::native_macos_quartz_fallback_active(
             true, false, true, true
@@ -32044,7 +36105,7 @@ mod tests {
     }
 
     #[test]
-    fn native_window_activation_retries_while_window_remains_inactive() {
+    fn native_window_activation_retries_are_bounded_to_initial_focus_handoff() {
         assert!(super::native_play_should_retry_window_activation(0, false));
         assert!(super::native_play_should_retry_window_activation(5, false));
         assert!(!super::native_play_should_retry_window_activation(4, false));
@@ -32052,7 +36113,37 @@ mod tests {
         assert!(!super::native_play_should_retry_window_activation(
             30, false
         ));
-        assert!(super::native_play_should_retry_window_activation(60, false));
+        assert!(!super::native_play_should_retry_window_activation(
+            60, false
+        ));
+        assert!(!super::native_play_should_retry_window_activation(
+            600, false
+        ));
+    }
+
+    #[test]
+    fn native_window_pressed_edges_wait_until_focus_handoff_completes() {
+        assert!(!super::native_play_should_consume_pressed_key_edges(
+            0, false, false, false
+        ));
+        assert!(!super::native_play_should_consume_pressed_key_edges(
+            0, false, false, true
+        ));
+        assert!(!super::native_play_should_consume_pressed_key_edges(
+            0, true, true, true
+        ));
+        assert!(!super::native_play_should_consume_pressed_key_edges(
+            4, true, false, false
+        ));
+        assert!(super::native_play_should_consume_pressed_key_edges(
+            super::NATIVE_PLAY_WINDOW_ACTIVATION_RETRY_FRAMES,
+            true,
+            false,
+            false
+        ));
+        assert!(super::native_play_should_consume_pressed_key_edges(
+            4, true, true, false
+        ));
     }
 
     #[test]
@@ -32174,6 +36265,172 @@ mod tests {
     }
 
     #[test]
+    fn native_macos_quartz_only_p1_p2_controls_resolve_as_physical_input() {
+        let platform = ActionButtons {
+            left: true,
+            kick: true,
+            p2_right: true,
+            p2_beast: true,
+            p2_coin: true,
+            p2_start: true,
+            ..ActionButtons::default()
+        };
+        let sample = native_macos_window_button_sample_from_sources(
+            true,
+            ActionButtons::default(),
+            platform,
+        );
+        let mut latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
+
+        let resolved = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut test_latch,
+            &mut physical_enter,
+            sample,
+            None,
+            true,
+            super::NativeCoinStartFeedback::default(),
+        );
+
+        assert_eq!(resolved.raw_buttons, platform);
+        assert_eq!(resolved.latched_buttons, platform);
+        assert_eq!(resolved.physical_buttons, platform);
+        assert_eq!(resolved.effective_buttons, platform);
+        assert!(resolved.raw_manual_override);
+        assert!(resolved.manual_override);
+        assert!(!resolved.test_input_override);
+    }
+
+    #[test]
+    fn native_macos_focused_gui_sample_verifies_enter_p1_and_p2_guest_input_path() {
+        let minifb = ActionButtons {
+            right: true,
+            punch: true,
+            ..ActionButtons::default()
+        };
+        let platform = ActionButtons {
+            p2_left: true,
+            p2_kick: true,
+            ..ActionButtons::default()
+        };
+        let physical_buttons = super::merge_action_buttons(minifb, platform);
+        let sample = NativeWindowButtonSample {
+            raw_window_active: true,
+            window_active: true,
+            window_is_key_or_main: true,
+            application_active: true,
+            window_visible: true,
+            quartz_sampled: true,
+            quartz_fallback_active: true,
+            minifb,
+            platform,
+            physical_enter_down: true,
+            physical_enter_pressed: true,
+            merged: physical_buttons,
+            ..NativeWindowButtonSample::default()
+        };
+        let mut latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
+
+        let resolved = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut test_latch,
+            &mut physical_enter,
+            sample,
+            None,
+            true,
+            super::NativeCoinStartFeedback::default(),
+        );
+
+        assert!(resolved.raw_manual_override);
+        assert!(resolved.manual_override);
+        assert!(resolved.physical_buttons.right);
+        assert!(resolved.physical_buttons.punch);
+        assert!(resolved.physical_buttons.p2_left);
+        assert!(resolved.physical_buttons.p2_kick);
+        assert!(resolved.physical_buttons.coin);
+        assert!(!resolved.test_input_override);
+
+        let guest_activity = NativeInputActivity {
+            p1_input_reads: 1,
+            p1_right_active_reads: 1,
+            p1_punch_active_reads: 1,
+            p2_input_reads: 1,
+            p2_left_active_reads: 1,
+            p2_kick_active_reads: 1,
+            system_input_reads: 1,
+            system_coin_active_reads: 1,
+            coin_insert_edges: 1,
+            native_credit_adapter_writes: 1,
+            native_credit_adapter_edges: 1,
+            ..NativeInputActivity::default()
+        };
+        let observed = super::native_guest_observed_buttons_for_input_activity(
+            resolved.physical_buttons,
+            guest_activity,
+        );
+
+        assert!(observed.right);
+        assert!(observed.punch);
+        assert!(observed.p2_left);
+        assert!(observed.p2_kick);
+        assert!(observed.coin);
+
+        let credit_feedback = super::NativeCoinStartFeedback {
+            credit_accepted_count: 1,
+            game_start_accepted_count: 0,
+        };
+        let released = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut test_latch,
+            &mut physical_enter,
+            NativeWindowButtonSample::default(),
+            None,
+            true,
+            credit_feedback,
+        );
+        assert!(!released.physical_buttons.coin);
+        assert!(!released.physical_buttons.start);
+        for _ in 0..super::NATIVE_PLAY_ENTER_COIN_START_GAP_FRAMES {
+            physical_enter.advance_frame();
+            physical_latch.advance_frame();
+            latch.advance_frame();
+        }
+        let start = native_play_resolve_input_poll(
+            &mut latch,
+            &mut physical_latch,
+            &mut test_latch,
+            &mut physical_enter,
+            NativeWindowButtonSample::default(),
+            None,
+            true,
+            credit_feedback,
+        );
+        assert!(start.physical_buttons.start);
+
+        let observed_start = super::native_guest_observed_buttons_for_input_activity(
+            start.physical_buttons,
+            NativeInputActivity {
+                p1_input_reads: 1,
+                p1_start_active_reads: 1,
+                system_input_reads: 1,
+                system_start_active_reads: 1,
+                legacy_system_start_latch_edges: 1,
+                ..NativeInputActivity::default()
+            },
+        );
+        assert!(observed_start.start);
+    }
+
+    #[test]
     fn native_held_keys_map_to_play_buttons_without_key_event_list() {
         let buttons = native_keys_down_to_buttons(|key| {
             matches!(
@@ -32189,5 +36446,270 @@ mod tests {
         assert!(buttons.kick);
         assert!(buttons.beast);
         assert!(buttons.guard);
+    }
+
+    #[test]
+    fn native_held_keys_map_every_p1_p2_control_without_repeat_events() {
+        let sample = super::native_keys_down_to_window_key_sample(|key| {
+            matches!(
+                key,
+                Key::P
+                    | Key::C
+                    | Key::Up
+                    | Key::Down
+                    | Key::Left
+                    | Key::Right
+                    | Key::Z
+                    | Key::X
+                    | Key::Q
+                    | Key::E
+                    | Key::O
+                    | Key::N
+                    | Key::W
+                    | Key::S
+                    | Key::A
+                    | Key::D
+                    | Key::J
+                    | Key::K
+                    | Key::U
+                    | Key::I
+            )
+        });
+
+        assert!(!sample.enter);
+        assert!(!sample.escape);
+        assert!(super::action_buttons_have_full_direction_coverage(
+            sample.buttons
+        ));
+        assert!(super::action_buttons_have_full_play_control_coverage(
+            sample.buttons
+        ));
+    }
+
+    #[test]
+    fn native_held_physical_controls_keep_directions_without_retriggering_edges() {
+        let held = ActionButtons {
+            start: true,
+            coin: true,
+            up: true,
+            down: true,
+            left: true,
+            right: true,
+            punch: true,
+            kick: true,
+            beast: true,
+            guard: true,
+            p2_start: true,
+            p2_coin: true,
+            p2_up: true,
+            p2_down: true,
+            p2_left: true,
+            p2_right: true,
+            p2_punch: true,
+            p2_kick: true,
+            p2_beast: true,
+            p2_guard: true,
+            ..ActionButtons::default()
+        };
+        let sample = NativeWindowButtonSample {
+            raw_window_active: true,
+            window_active: true,
+            minifb: held,
+            merged: held,
+            ..NativeWindowButtonSample::default()
+        };
+        let mut latch = NativeInputLatch::default();
+        let mut physical_latch = NativeInputLatch::default();
+        let mut test_latch = NativeInputLatch::default();
+        let mut physical_enter = super::NativePhysicalEnterSequencer::default();
+
+        for frame in 0..8 {
+            let expected_latched = if frame < u64::from(super::NATIVE_PLAY_INPUT_LATCH_FRAMES) {
+                held
+            } else {
+                super::native_level_buttons(held)
+            };
+            let resolved = native_play_resolve_input_poll(
+                &mut latch,
+                &mut physical_latch,
+                &mut test_latch,
+                &mut physical_enter,
+                sample,
+                None,
+                true,
+                super::NativeCoinStartFeedback::default(),
+            );
+            assert_eq!(resolved.raw_buttons, held, "raw frame {frame}");
+            assert_eq!(
+                resolved.latched_buttons, expected_latched,
+                "latched frame {frame}"
+            );
+            assert_eq!(
+                resolved.physical_buttons, expected_latched,
+                "physical frame {frame}"
+            );
+            assert_eq!(
+                resolved.effective_buttons, expected_latched,
+                "effective frame {frame}"
+            );
+            assert!(resolved.raw_manual_override);
+            assert!(resolved.manual_override);
+
+            latch.advance_frame();
+            physical_latch.advance_frame();
+            test_latch.advance_frame();
+            physical_enter.advance_frame();
+        }
+    }
+
+    #[test]
+    fn native_escape_remains_quit_only_without_dropping_held_play_keys() {
+        let sample = super::native_keys_down_to_window_key_sample(|key| {
+            matches!(key, Key::Escape | Key::Z | Key::U)
+        });
+
+        assert!(sample.escape);
+        assert!(!sample.enter);
+        assert!(sample.buttons.punch);
+        assert!(sample.buttons.p2_beast);
+        assert_eq!(
+            super::native_keys_to_window_key_sample([Key::Escape]).buttons,
+            ActionButtons::default()
+        );
+    }
+
+    #[test]
+    fn native_pcm_wav_writes_stereo_s16le_and_reports_signal() {
+        let frames = [
+            bloodyroar2_gym::StereoSample {
+                left: 1_000,
+                right: -2_000,
+            },
+            bloodyroar2_gym::StereoSample {
+                left: -3_000,
+                right: 4_000,
+            },
+            bloodyroar2_gym::StereoSample::default(),
+        ];
+        let output = std::env::temp_dir().join(format!(
+            "bloodyroar2-native-audio-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+
+        let stats = write_native_pcm_wav(&output, 44_100, &frames).expect("write WAV");
+        let bytes = std::fs::read(&output).expect("read WAV");
+        let _ = std::fs::remove_file(&output);
+
+        assert_eq!(
+            stats,
+            NativePcmStats {
+                frames: 3,
+                nonzero_frames: 2,
+                peak_abs_left: 3_000,
+                peak_abs_right: 4_000,
+                rms_left: 1_826,
+                rms_right: 2_582,
+            }
+        );
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(&bytes[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            44_100
+        );
+        assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 16);
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 12);
+        assert_eq!(i16::from_le_bytes(bytes[44..46].try_into().unwrap()), 1_000);
+        assert_eq!(
+            i16::from_le_bytes(bytes[46..48].try_into().unwrap()),
+            -2_000
+        );
+        assert!(stats.verified_nonzero());
+        assert!(!NativePcmStats::default().verified_nonzero());
+    }
+
+    #[test]
+    fn native_gui_timing_reports_tail_latency_thresholds_and_percentiles() {
+        let mut stats = NativeGuiTimingStats::default();
+        stats.record(Duration::from_micros(10_000));
+        stats.record(Duration::from_micros(17_000));
+        stats.record(Duration::from_micros(40_000));
+
+        assert_eq!(stats.total_samples, 3);
+        assert_eq!(stats.max_us, 40_000);
+        assert_eq!(stats.over_16_67_ms, 2);
+        assert_eq!(stats.over_33_33_ms, 1);
+        assert_eq!(stats.percentile_us(95), 40_000);
+        assert_eq!(stats.percentile_us(99), 40_000);
+        let json = stats.json();
+        assert!(json.contains("\"samples\":3"), "{json}");
+        assert!(json.contains("\"over_33_33_ms\":1"), "{json}");
+    }
+
+    #[test]
+    fn native_gui_performance_gate_requires_attack_beast_and_vblank_progress() {
+        let mut frame = NativeGuiTimingStats::default();
+        let mut attack = NativeGuiTimingStats::default();
+        let mut beast = NativeGuiTimingStats::default();
+        for _ in 0..19 {
+            frame.record(Duration::from_micros(16_667));
+            attack.record(Duration::from_micros(16_667));
+            beast.record(Duration::from_micros(16_667));
+        }
+        frame.record(Duration::from_micros(40_000));
+        attack.record(Duration::from_micros(40_000));
+        beast.record(Duration::from_micros(40_000));
+        let required = ActionButtons {
+            punch: true,
+            beast: true,
+            ..ActionButtons::default()
+        };
+
+        let healthy = super::native_gui_performance_gate(&frame, &attack, &beast, required, 0);
+        assert!(healthy.verified, "{}", healthy.json());
+
+        let missed_vblank =
+            super::native_gui_performance_gate(&frame, &attack, &beast, required, 1);
+        assert!(!missed_vblank.verified);
+        assert!(!missed_vblank.no_missed_vblank_attempts);
+
+        let missing_beast = super::native_gui_performance_gate(
+            &frame,
+            &attack,
+            &NativeGuiTimingStats::default(),
+            required,
+            0,
+        );
+        assert!(!missing_beast.verified);
+        assert!(!missing_beast.beast_samples_present);
+    }
+
+    #[test]
+    fn native_gui_performance_gate_rejects_repeated_frame_stalls() {
+        let mut frame = NativeGuiTimingStats::default();
+        for _ in 0..18 {
+            frame.record(Duration::from_micros(16_667));
+        }
+        frame.record(Duration::from_micros(80_000));
+        frame.record(Duration::from_micros(300_000));
+
+        let gate = super::native_gui_performance_gate(
+            &frame,
+            &NativeGuiTimingStats::default(),
+            &NativeGuiTimingStats::default(),
+            ActionButtons::default(),
+            0,
+        );
+
+        assert!(!gate.verified, "{}", gate.json());
+        assert!(!gate.frame_over_33_ms_ratio_within_budget);
+        assert!(!gate.frame_max_stall_within_budget);
     }
 }

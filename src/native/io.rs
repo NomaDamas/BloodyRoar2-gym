@@ -33,6 +33,7 @@ pub const SIO_STATUS: u32 = 0x1f80_1044;
 pub const SIO_MODE: u32 = 0x1f80_1048;
 pub const SIO_CONTROL: u32 = 0x1f80_104a;
 pub const SIO_BAUD: u32 = 0x1f80_104e;
+const SIO_CONTROL_SLOT_2_SELECT: u16 = 0x2000;
 
 pub const RAM_SIZE_CONTROL: u32 = 0x1f80_1060;
 pub const IRQ_STATUS: u32 = 0x1f80_1070;
@@ -99,6 +100,46 @@ const GP1_RECENT_COMMAND_LIMIT: usize = 16;
 // Retain a full BR2 boot-to-match transfer window so missing fighter CLUT
 // uploads can be diagnosed without losing the earlier palette commands.
 const GPU_RECENT_TRANSFER_LIMIT: usize = 512;
+// Captured live fighter material packets occupy this compact low-RAM pool.
+// Stage recovery packets using the same 0x001c/0x7994 descriptor live outside
+// it, so command provenance can disambiguate the palette without weakening
+// the stage relocation globally.
+const BR2_RECOVERY_FIGHTER_MATERIAL_START: u32 = 0x0003_d000;
+const BR2_RECOVERY_FIGHTER_MATERIAL_END: u32 = 0x0003_e400;
+const BR2_RETAINED_PORTRAIT_TEXTURE_X: i32 = 832;
+const BR2_RETAINED_PORTRAIT_TEXTURE_Y: i32 = 256;
+const BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH: usize = 24;
+const BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT: usize = 97;
+const BR2_RETAINED_PORTRAIT_TEXTURE_WORDS: usize =
+    (BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH * BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT).div_ceil(64);
+const BR2_RETAINED_PORTRAIT_TEXTURE_MIN_COVERAGE_PER_MILLE: usize = 900;
+const BR2_RETAINED_PORTRAIT_CLUT_X: i32 = 464;
+const BR2_RETAINED_PORTRAIT_CLUT_Y: i32 = 496;
+const BR2_RETAINED_PORTRAIT_CLUT_WIDTH: usize = 16;
+const BR2_RETAINED_PORTRAIT_CLUT_HEIGHT: usize = 1;
+const BR2_RETAINED_PORTRAIT_CLUT_WORDS: usize =
+    (BR2_RETAINED_PORTRAIT_CLUT_WIDTH * BR2_RETAINED_PORTRAIT_CLUT_HEIGHT).div_ceil(64);
+const BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X: i32 = 512;
+const BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y: i32 = 0;
+const BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH: usize = 96;
+const BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT: usize = 256;
+const BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WORDS: usize = (BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH
+    * BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT)
+    .div_ceil(64);
+const BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_X: i32 = 608;
+const BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_Y: i32 = 0;
+const BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WIDTH: usize = 96;
+const BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_HEIGHT: usize = 256;
+const BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WORDS: usize =
+    (BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WIDTH
+        * BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_HEIGHT)
+        .div_ceil(64);
+const BR2_RETAINED_LARGE_PORTRAIT_CLUT_X: i32 = 0;
+const BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y: i32 = 496;
+const BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH: usize = 256;
+const BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT: usize = 1;
+const BR2_RETAINED_LARGE_PORTRAIT_CLUT_WORDS: usize =
+    (BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH * BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT).div_ceil(64);
 const GPU_RECENT_DRAW_LIMIT: usize = 128;
 const GPU_TOP_DRAW_LIMIT: usize = 12;
 // A BR2 gameplay frame submits both fighters plus the stage and HUD in one
@@ -107,10 +148,12 @@ const GPU_TOP_DRAW_LIMIT: usize = 12;
 const GPU_FOCUS_DRAW_LIMIT: usize = 512;
 const GPU_OVERLAP_DRAW_LIMIT: usize = 96;
 const GPU_DRAW_CAPTURE_LIMIT: usize = 64;
+const GPU_PREDICATE_DRAW_CAPTURE_LIMIT: usize = 8;
 const GPU_DISPLAY_AREA_HISTORY_LIMIT: usize = 32;
 const GPU_IMAGE_UPLOAD_RECT_LIMIT: usize = 128;
-const GPU_DISPLAY_COLOR_STATS_CACHE_LIMIT: usize = 8;
-const GPU_TITLE_LOGO_OVERLAY_SIGNAL_CACHE_LIMIT: usize = 8;
+const GPU_DISPLAY_COLOR_STATS_CACHE_LIMIT: usize = 32;
+const GPU_DISPLAY_ANALYSIS_CACHE_LIMIT: usize = 32;
+const GPU_TITLE_LOGO_OVERLAY_SIGNAL_CACHE_LIMIT: usize = 32;
 const GPU_FIELD_COMPOSED_SLICE_VALIDATION_CACHE_LIMIT: usize = 32;
 const GP0_BEST_OBSERVATION_EAGER_COMMANDS: u64 = 64;
 const GP0_BEST_OBSERVATION_COMMAND_INTERVAL: u64 = 32_768;
@@ -195,6 +238,355 @@ impl<'a> IntoIterator for &'a GpuDrawTraceBuffer {
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetainedTransferCoverage {
+    portrait_texture: [u64; BR2_RETAINED_PORTRAIT_TEXTURE_WORDS],
+    portrait_clut: [u64; BR2_RETAINED_PORTRAIT_CLUT_WORDS],
+    portrait_texture_generation: u64,
+    large_portrait_texture: [u64; BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WORDS],
+    right_large_portrait_texture: [u64; BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WORDS],
+    large_portrait_clut: [u64; BR2_RETAINED_LARGE_PORTRAIT_CLUT_WORDS],
+    large_portrait_texture_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingBr2LargePortraitAssets {
+    texture: FrameBufferRegionSnapshot,
+    transfer_sequence: u64,
+    vblank: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RetainedBr2LargePortraitAssets {
+    texture: FrameBufferRegionSnapshot,
+    clut: FrameBufferRegionSnapshot,
+}
+
+#[derive(Clone, Debug)]
+struct PendingBr2RightLargePortraitAssets {
+    texture: FrameBufferRegionSnapshot,
+    transfer_sequence: u64,
+    vblank: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RetainedBr2RightLargePortraitAssets {
+    texture: FrameBufferRegionSnapshot,
+    clut: FrameBufferRegionSnapshot,
+}
+
+impl Default for RetainedTransferCoverage {
+    fn default() -> Self {
+        Self {
+            portrait_texture: [0; BR2_RETAINED_PORTRAIT_TEXTURE_WORDS],
+            portrait_clut: [0; BR2_RETAINED_PORTRAIT_CLUT_WORDS],
+            portrait_texture_generation: 0,
+            large_portrait_texture: [0; BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WORDS],
+            right_large_portrait_texture: [0; BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WORDS],
+            large_portrait_clut: [0; BR2_RETAINED_LARGE_PORTRAIT_CLUT_WORDS],
+            large_portrait_texture_generation: 0,
+        }
+    }
+}
+
+impl RetainedTransferCoverage {
+    fn mark_transfer(&mut self, x: i32, y: i32, width: i32, height: i32) {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+
+        let (x_ranges, x_range_count) = split_wrapped_transfer_axis(x, width, VRAM_WIDTH as i32);
+        let (y_ranges, y_range_count) =
+            split_wrapped_transfer_axis(y, height, PSX_VRAM_HEIGHT as i32);
+        let mut portrait_texture_touched = false;
+        let mut large_portrait_texture_touched = false;
+        for &(left, right) in &x_ranges[..x_range_count] {
+            for &(top, bottom) in &y_ranges[..y_range_count] {
+                let transfer = DrawBounds {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+                portrait_texture_touched |= mark_retained_transfer_region(
+                    &mut self.portrait_texture,
+                    BR2_RETAINED_PORTRAIT_TEXTURE_X,
+                    BR2_RETAINED_PORTRAIT_TEXTURE_Y,
+                    BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH,
+                    BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT,
+                    transfer,
+                );
+                mark_retained_transfer_region(
+                    &mut self.portrait_clut,
+                    BR2_RETAINED_PORTRAIT_CLUT_X,
+                    BR2_RETAINED_PORTRAIT_CLUT_Y,
+                    BR2_RETAINED_PORTRAIT_CLUT_WIDTH,
+                    BR2_RETAINED_PORTRAIT_CLUT_HEIGHT,
+                    transfer,
+                );
+                large_portrait_texture_touched |= mark_retained_transfer_region(
+                    &mut self.large_portrait_texture,
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X,
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y,
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH,
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+                    transfer,
+                );
+                mark_retained_transfer_region(
+                    &mut self.right_large_portrait_texture,
+                    BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_X,
+                    BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_Y,
+                    BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WIDTH,
+                    BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+                    transfer,
+                );
+                mark_retained_transfer_region(
+                    &mut self.large_portrait_clut,
+                    BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+                    BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+                    BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
+                    BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+                    transfer,
+                );
+            }
+        }
+        if portrait_texture_touched {
+            self.portrait_texture_generation = self.portrait_texture_generation.saturating_add(1);
+        }
+        if large_portrait_texture_touched {
+            self.large_portrait_texture_generation =
+                self.large_portrait_texture_generation.saturating_add(1);
+        }
+    }
+
+    fn portrait_texture_generation(&self) -> u64 {
+        self.portrait_texture_generation
+    }
+
+    fn portrait_texture_coverage_per_mille(&self) -> usize {
+        let bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_PORTRAIT_TEXTURE_X,
+                y: BR2_RETAINED_PORTRAIT_TEXTURE_Y,
+            },
+            BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH as i32,
+            BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT as i32,
+        );
+        retained_transfer_region_coverage_per_mille(
+            &self.portrait_texture,
+            BR2_RETAINED_PORTRAIT_TEXTURE_X,
+            BR2_RETAINED_PORTRAIT_TEXTURE_Y,
+            BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH,
+            BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT,
+            bounds,
+        )
+        .unwrap_or(0)
+    }
+
+    fn covers(&self, bounds: DrawBounds) -> Option<bool> {
+        retained_transfer_region_coverage_per_mille(
+            &self.portrait_texture,
+            BR2_RETAINED_PORTRAIT_TEXTURE_X,
+            BR2_RETAINED_PORTRAIT_TEXTURE_Y,
+            BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH,
+            BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT,
+            bounds,
+        )
+        .map(|coverage| coverage >= BR2_RETAINED_PORTRAIT_TEXTURE_MIN_COVERAGE_PER_MILLE)
+        .or_else(|| {
+            retained_transfer_region_coverage_per_mille(
+                &self.portrait_clut,
+                BR2_RETAINED_PORTRAIT_CLUT_X,
+                BR2_RETAINED_PORTRAIT_CLUT_Y,
+                BR2_RETAINED_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_PORTRAIT_CLUT_HEIGHT,
+                bounds,
+            )
+            .map(|coverage| coverage == 1_000)
+        })
+    }
+
+    fn covers_large_portrait_clut(&self, bounds: DrawBounds) -> Option<bool> {
+        retained_transfer_region_coverage_per_mille(
+            &self.large_portrait_clut,
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+            bounds,
+        )
+        .map(|coverage| coverage == 1_000)
+    }
+
+    fn right_large_portrait_texture_coverage_per_mille(&self) -> usize {
+        let bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_X,
+                y: BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_Y,
+            },
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WIDTH as i32,
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_HEIGHT as i32,
+        );
+        retained_transfer_region_coverage_per_mille(
+            &self.right_large_portrait_texture,
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_X,
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_Y,
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WIDTH,
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+            bounds,
+        )
+        .unwrap_or(0)
+    }
+
+    fn json(&self) -> String {
+        let texture_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_PORTRAIT_TEXTURE_X,
+                y: BR2_RETAINED_PORTRAIT_TEXTURE_Y,
+            },
+            BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH as i32,
+            BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT as i32,
+        );
+        let clut_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_PORTRAIT_CLUT_X,
+                y: BR2_RETAINED_PORTRAIT_CLUT_Y,
+            },
+            BR2_RETAINED_PORTRAIT_CLUT_WIDTH as i32,
+            BR2_RETAINED_PORTRAIT_CLUT_HEIGHT as i32,
+        );
+        let large_texture_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X,
+                y: BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y,
+            },
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH as i32,
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT as i32,
+        );
+        let large_clut_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+                y: BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+            },
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH as i32,
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT as i32,
+        );
+        format!(
+            "{{\"portrait_texture_generation\":{},\"portrait_texture_covered_pixels\":{},\"portrait_texture_total_pixels\":{},\"portrait_texture_coverage_per_mille\":{},\"portrait_texture_samples_covered\":{},\"portrait_texture_fully_covered\":{},\"portrait_clut_covered_pixels\":{},\"portrait_clut_total_pixels\":{},\"portrait_clut_coverage_per_mille\":{},\"portrait_clut_samples_covered\":{},\"portrait_clut_fully_covered\":{},\"large_portrait_texture_generation\":{},\"large_portrait_texture_covered_pixels\":{},\"large_portrait_texture_total_pixels\":{},\"large_portrait_texture_coverage_per_mille\":{},\"large_portrait_texture_samples_covered\":{},\"large_portrait_texture_fully_covered\":{},\"large_portrait_clut_covered_pixels\":{},\"large_portrait_clut_total_pixels\":{},\"large_portrait_clut_coverage_per_mille\":{},\"large_portrait_clut_samples_covered\":{},\"large_portrait_clut_fully_covered\":{}}}",
+            self.portrait_texture_generation,
+            retained_transfer_covered_pixel_count(&self.portrait_texture),
+            BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH * BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT,
+            self.portrait_texture_coverage_per_mille(),
+            retained_transfer_region_samples_covered(
+                &self.portrait_texture,
+                BR2_RETAINED_PORTRAIT_TEXTURE_X,
+                BR2_RETAINED_PORTRAIT_TEXTURE_Y,
+                BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH,
+                BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT,
+                texture_bounds,
+            )
+            .unwrap_or(false),
+            retained_transfer_region_fully_covered(
+                &self.portrait_texture,
+                BR2_RETAINED_PORTRAIT_TEXTURE_X,
+                BR2_RETAINED_PORTRAIT_TEXTURE_Y,
+                BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH,
+                BR2_RETAINED_PORTRAIT_TEXTURE_HEIGHT,
+                texture_bounds,
+            )
+            .unwrap_or(false),
+            retained_transfer_covered_pixel_count(&self.portrait_clut),
+            BR2_RETAINED_PORTRAIT_CLUT_WIDTH * BR2_RETAINED_PORTRAIT_CLUT_HEIGHT,
+            retained_transfer_region_coverage_per_mille(
+                &self.portrait_clut,
+                BR2_RETAINED_PORTRAIT_CLUT_X,
+                BR2_RETAINED_PORTRAIT_CLUT_Y,
+                BR2_RETAINED_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_PORTRAIT_CLUT_HEIGHT,
+                clut_bounds,
+            )
+            .unwrap_or(0),
+            retained_transfer_region_samples_covered(
+                &self.portrait_clut,
+                BR2_RETAINED_PORTRAIT_CLUT_X,
+                BR2_RETAINED_PORTRAIT_CLUT_Y,
+                BR2_RETAINED_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_PORTRAIT_CLUT_HEIGHT,
+                clut_bounds,
+            )
+            .unwrap_or(false),
+            retained_transfer_region_fully_covered(
+                &self.portrait_clut,
+                BR2_RETAINED_PORTRAIT_CLUT_X,
+                BR2_RETAINED_PORTRAIT_CLUT_Y,
+                BR2_RETAINED_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_PORTRAIT_CLUT_HEIGHT,
+                clut_bounds,
+            )
+            .unwrap_or(false),
+            self.large_portrait_texture_generation,
+            retained_transfer_covered_pixel_count(&self.large_portrait_texture),
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH * BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+            retained_transfer_region_coverage_per_mille(
+                &self.large_portrait_texture,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+                large_texture_bounds,
+            )
+            .unwrap_or(0),
+            retained_transfer_region_samples_covered(
+                &self.large_portrait_texture,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+                large_texture_bounds,
+            )
+            .unwrap_or(false),
+            retained_transfer_region_fully_covered(
+                &self.large_portrait_texture,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+                large_texture_bounds,
+            )
+            .unwrap_or(false),
+            retained_transfer_covered_pixel_count(&self.large_portrait_clut),
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH * BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+            retained_transfer_region_coverage_per_mille(
+                &self.large_portrait_clut,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+                large_clut_bounds,
+            )
+            .unwrap_or(0),
+            retained_transfer_region_samples_covered(
+                &self.large_portrait_clut,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+                large_clut_bounds,
+            )
+            .unwrap_or(false),
+            retained_transfer_region_fully_covered(
+                &self.large_portrait_clut,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+                large_clut_bounds,
+            )
+            .unwrap_or(false),
+        )
     }
 }
 
@@ -826,7 +1218,7 @@ impl Io {
         let screenshot_window = self.gpu.screenshot_window();
         let (display_width, display_height) = self.gpu.display_dimensions();
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"gpu_gp0_pending_words\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_vram_nonzero_bounds\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_invalid_fill_rect_commands\":{},\"gpu_invalid_image_upload_commands\":{},\"gpu_invalid_vram_copy_commands\":{},\"gpu_gp0_command_counts\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_focus_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{}}}",
+            "{{\"irq_status\":{},\"irq_mask\":{},\"dma_control\":{},\"dma_interrupt\":{},\"gpu_status\":{},\"gpu_commands_seen\":{},\"gpu_gp0_pending_words\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_vram_nonzero_bounds\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_retained_transfer_coverage\":{},\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_invalid_fill_rect_commands\":{},\"gpu_invalid_image_upload_commands\":{},\"gpu_invalid_vram_copy_commands\":{},\"gpu_gp0_command_counts\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_focus_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{}}}",
             self.irq.status,
             self.irq.mask,
             self.dma.control,
@@ -858,6 +1250,7 @@ impl Io {
             self.gpu.drawing_area_bottom_right,
             self.gpu.drawing_offset,
             self.gpu.texture_page,
+            self.gpu.retained_transfer_coverage.json(),
             self.gpu.fill_rect_commands,
             self.gpu.flat_triangle_commands,
             self.gpu.textured_triangle_commands,
@@ -896,9 +1289,10 @@ impl Io {
         let screenshot_window = self.gpu.screenshot_window();
         let (display_width, display_height) = self.gpu.display_dimensions();
         format!(
-            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_recovery_raster_cache\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{},\"controller\":{}}}",
+            "{{\"irq_status\":{},\"irq_mask\":{},\"gpu_status_probe\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_frame_nonzero_pixels\":{},\"gpu_frame_checksum\":{},\"gpu_vram_nonzero_pixels\":{},\"gpu_vram_checksum\":{},\"gpu_screenshot_x\":{},\"gpu_screenshot_y\":{},\"gpu_screenshot_nonzero_pixels\":{},\"gpu_screenshot_checksum\":{},\"gpu_display_width\":{},\"gpu_display_height\":{},\"gpu_window_diagnostics\":{},\"gpu_resolved_display\":{},\"gpu_best_observation_window\":{},\"gpu_presented_frame_window\":{},\"gpu_presentation_captures\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_horizontal_range\":{},\"gpu_vertical_range\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_offset\":{},\"gpu_texture_page\":{},\"gpu_recent_gp0_commands\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_recent_transfer_commands\":[{}],\"gpu_fill_rect_commands\":{},\"gpu_flat_triangle_commands\":{},\"gpu_textured_triangle_commands\":{},\"gpu_textured_rect_commands\":{},\"gpu_flat_line_commands\":{},\"gpu_textured_sampled_pixels\":{},\"gpu_textured_drawn_pixels\":{},\"gpu_textured_written_pixels\":{},\"gpu_textured_clipped_pixels\":{},\"gpu_textured_transparent_pixels\":{},\"gpu_textured_stats\":{},\"gpu_recovery_raster_cache\":{},\"gpu_image_upload_commands\":{},\"gpu_vram_copy_commands\":{},\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"mdec\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"p1_state\":{},\"zn_mcu\":{},\"controller\":{}}}",
             self.irq.status,
             self.irq.mask,
+            self.gpu.status_probe_json(),
             self.gpu.commands_seen,
             self.gpu.draw_sequence,
             framebuffer_stats.nonzero_pixels,
@@ -958,13 +1352,14 @@ impl Io {
 
     pub fn runtime_compact_probe_json(&self) -> String {
         format!(
-            "{{\"irq_status\":{},\"irq_status_hex\":\"0x{:04x}\",\"irq_mask\":{},\"irq_mask_hex\":\"0x{:04x}\",\"dma_interrupt\":{},\"dma_interrupt_hex\":\"0x{:08x}\",\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_top_left_hex\":\"0x{:08x}\",\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_area_bottom_right_hex\":\"0x{:08x}\",\"gpu_drawing_offset\":{},\"gpu_drawing_offset_hex\":\"0x{:08x}\",\"gpu_texture_page\":{},\"gpu_texture_page_hex\":\"0x{:04x}\",\"gpu_texture_window\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_textured_stats\":{},\"gpu_recent_transfer_commands\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"playability\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"sio_status_hex\":\"0x{:04x}\",\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"zn_mcu\":{},\"controller\":{}}}",
+            "{{\"irq_status\":{},\"irq_status_hex\":\"0x{:04x}\",\"irq_mask\":{},\"irq_mask_hex\":\"0x{:04x}\",\"dma_interrupt\":{},\"dma_interrupt_hex\":\"0x{:08x}\",\"gpu_status_probe\":{},\"gpu_commands_seen\":{},\"gpu_draw_sequence\":{},\"gpu_drawing_area_top_left\":{},\"gpu_drawing_area_top_left_hex\":\"0x{:08x}\",\"gpu_drawing_area_bottom_right\":{},\"gpu_drawing_area_bottom_right_hex\":\"0x{:08x}\",\"gpu_drawing_offset\":{},\"gpu_drawing_offset_hex\":\"0x{:08x}\",\"gpu_texture_page\":{},\"gpu_texture_page_hex\":\"0x{:04x}\",\"gpu_texture_window\":{},\"gpu_display_area_start\":{},\"gpu_display_area_history\":[{}],\"gpu_recent_gp1_commands\":[{}],\"gpu_textured_stats\":{},\"gpu_recent_transfer_commands\":[{}],\"gpu_largest_draw_command\":{},\"gpu_top_draw_commands\":[{}],\"gpu_recent_draw_commands\":[{}],\"gpu_recent_overlap_draw_commands\":[{}],\"playability\":{},\"timer0_counter\":{},\"timer1_counter\":{},\"timer2_counter\":{},\"sio_status\":{},\"sio_status_hex\":\"0x{:04x}\",\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"zn_mcu\":{},\"controller\":{}}}",
             self.irq.status,
             self.irq.status,
             self.irq.mask,
             self.irq.mask,
             self.dma.interrupt,
             self.dma.interrupt,
+            self.gpu.status_probe_json(),
             self.gpu.commands_seen,
             self.gpu.draw_sequence,
             self.gpu.drawing_area_top_left,
@@ -1048,6 +1443,11 @@ impl Io {
         self.gpu.native_replay_preserves_visible_scene(before)
     }
 
+    pub(crate) fn native_replay_preserves_current_display_scene(&self, before: &Gpu) -> bool {
+        self.gpu
+            .native_replay_preserves_current_display_scene(before)
+    }
+
     pub fn display_candidate_summary_json(&self) -> String {
         self.gpu.display_candidate_summary_json()
     }
@@ -1062,6 +1462,10 @@ impl Io {
 
     pub fn stable_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
         self.gpu.stable_display_rgb_frame()
+    }
+
+    pub fn fast_gameplay_display_rgb_frame_with_checksum(&self) -> (usize, usize, Vec<u32>, u32) {
+        self.gpu.fast_gameplay_display_rgb_frame_with_checksum()
     }
 
     fn read(&self, address: u32, access_len: usize) -> u32 {
@@ -1381,6 +1785,11 @@ pub struct Gpu {
     recent_gp0_commands: Vec<Gp0CommandTrace>,
     recent_gp1_commands: Vec<Gp1CommandTrace>,
     recent_transfer_commands: Vec<GpuTransferTrace>,
+    retained_transfer_coverage: RetainedTransferCoverage,
+    pending_br2_large_portrait_assets: Option<PendingBr2LargePortraitAssets>,
+    retained_br2_large_portrait_assets: Option<RetainedBr2LargePortraitAssets>,
+    pending_br2_right_large_portrait_assets: Option<PendingBr2RightLargePortraitAssets>,
+    retained_br2_right_large_portrait_assets: Option<RetainedBr2RightLargePortraitAssets>,
     transfer_sequence: u64,
     image_upload_rects: Vec<DrawBounds>,
     recent_draw_commands: GpuDrawTraceBuffer,
@@ -1393,6 +1802,7 @@ pub struct Gpu {
     draw_capture_range: Option<(u64, u64)>,
     draw_capture_predicates: Vec<NativeGpuDrawCapturePredicate>,
     draw_captures: Vec<NativeGpuDrawCapture>,
+    draw_capture_keys: Vec<Option<GpuDrawCaptureKey>>,
     best_observation_png: Option<Vec<u8>>,
     best_observation_rgb: Option<Vec<u32>>,
     best_observation_window: Option<FrameBufferWindow>,
@@ -1422,9 +1832,18 @@ pub struct Gpu {
     field_composed_display_height: usize,
     field_composed_display_capture_index: u64,
     stable_display_frame_cache: RefCell<Option<StableDisplayFrameCache>>,
+    display_output_window_cache: RefCell<Option<DisplayOutputWindowCache>>,
     display_resolve_cache: RefCell<Option<DisplayResolveCache>>,
     visibility_cache: RefCell<Option<VisiblePresentationCache>>,
     display_color_stats_cache: RefCell<VecDeque<DisplayColorStatsCache>>,
+    display_dominant_bucket_cache: RefCell<VecDeque<DisplayDominantBucketCache>>,
+    glyph_texture_grid_cache: RefCell<VecDeque<DisplayBoolAnalysisCache>>,
+    primitive_tearing_cache: RefCell<VecDeque<DisplayBoolAnalysisCache>>,
+    periodic_horizontal_ghosting_cache: RefCell<VecDeque<DisplayBoolAnalysisCache>>,
+    repeating_rock_atlas_cache: RefCell<VecDeque<DisplayBoolAnalysisCache>>,
+    saturated_logo_transition_cache: RefCell<VecDeque<DisplayBoolAnalysisCache>>,
+    high_vertical_static_title_screen_cache: RefCell<VecDeque<DisplayBoolAnalysisCache>>,
+    high_vertical_warning_text_overlay_cache: RefCell<VecDeque<DisplayBoolAnalysisCache>>,
     title_logo_overlay_signal_cache: RefCell<VecDeque<DisplayTitleLogoOverlaySignalCache>>,
     field_composed_slice_validation_cache: RefCell<VecDeque<FieldComposedSliceValidationCache>>,
     visibility_cache_in_progress: Cell<bool>,
@@ -1490,6 +1909,11 @@ impl Default for Gpu {
             recent_gp0_commands: Vec::new(),
             recent_gp1_commands: Vec::new(),
             recent_transfer_commands: Vec::new(),
+            retained_transfer_coverage: RetainedTransferCoverage::default(),
+            pending_br2_large_portrait_assets: None,
+            retained_br2_large_portrait_assets: None,
+            pending_br2_right_large_portrait_assets: None,
+            retained_br2_right_large_portrait_assets: None,
             transfer_sequence: 0,
             image_upload_rects: Vec::new(),
             recent_draw_commands: GpuDrawTraceBuffer::new(),
@@ -1502,6 +1926,7 @@ impl Default for Gpu {
             draw_capture_range: None,
             draw_capture_predicates: Vec::new(),
             draw_captures: Vec::new(),
+            draw_capture_keys: Vec::new(),
             best_observation_png: None,
             best_observation_rgb: None,
             best_observation_window: None,
@@ -1531,10 +1956,35 @@ impl Default for Gpu {
             field_composed_display_height: 0,
             field_composed_display_capture_index: 0,
             stable_display_frame_cache: RefCell::new(None),
+            display_output_window_cache: RefCell::new(None),
             display_resolve_cache: RefCell::new(None),
             visibility_cache: RefCell::new(None),
             display_color_stats_cache: RefCell::new(VecDeque::with_capacity(
                 GPU_DISPLAY_COLOR_STATS_CACHE_LIMIT,
+            )),
+            display_dominant_bucket_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
+            )),
+            glyph_texture_grid_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
+            )),
+            primitive_tearing_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
+            )),
+            periodic_horizontal_ghosting_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
+            )),
+            repeating_rock_atlas_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
+            )),
+            saturated_logo_transition_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
+            )),
+            high_vertical_static_title_screen_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
+            )),
+            high_vertical_warning_text_overlay_cache: RefCell::new(VecDeque::with_capacity(
+                GPU_DISPLAY_ANALYSIS_CACHE_LIMIT,
             )),
             title_logo_overlay_signal_cache: RefCell::new(VecDeque::with_capacity(
                 GPU_TITLE_LOGO_OVERLAY_SIGNAL_CACHE_LIMIT,
@@ -1627,6 +2077,57 @@ impl Gpu {
         ));
     }
 
+    pub(crate) fn commit_recovery_scene_snapshot_if_current_is_presented(&mut self) -> bool {
+        let (x, y) = display_area_start_xy(self.display_area_start);
+        let (width, height) = self.display_dimensions();
+        let current = FrameBufferWindow {
+            x,
+            y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                x,
+                y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
+        };
+        self.commit_recovery_scene_snapshot_if_presented_window(current, width, height)
+    }
+
+    fn commit_recovery_scene_snapshot_if_presented_window(
+        &mut self,
+        current: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let current_is_presented = self.presented_frame_window.is_some_and(|presented| {
+            presented.x == current.x
+                && presented.y == current.y
+                && presented.stats.checksum == current.stats.checksum
+                && self.presented_frame_width == width
+                && self.presented_frame_height == height
+        });
+        if !current_is_presented {
+            return false;
+        }
+
+        self.commit_recovery_scene_snapshot();
+        true
+    }
+
+    pub(crate) fn commit_recovery_scene_snapshot_if_current_is_stable_presented(&mut self) -> bool {
+        let current = self.current_display_window();
+        let (width, height) = self.display_dimensions();
+        let stable_profile = has_native_recovery_snapshot_profile(current.stats);
+        if !stable_profile
+            || self.recovery_window_has_blocking_artifact(current, width, height, true)
+        {
+            return false;
+        }
+
+        self.commit_recovery_scene_snapshot_if_presented_window(current, width, height)
+    }
+
     pub(crate) fn restore_recovery_scene_snapshot(&mut self) -> bool {
         let Some(snapshot) = self.recovery_scene_snapshot.as_ref() else {
             return false;
@@ -1639,7 +2140,16 @@ impl Gpu {
     pub fn read_status(&self) -> u32 {
         let reads = self.status_reads.get().wrapping_add(1);
         self.status_reads.set(reads);
-        let mut status = if self.field_parity.get() {
+        self.effective_status()
+    }
+
+    fn effective_status(&self) -> u32 {
+        let field_parity = if self.status & (1 << 22) != 0 {
+            self.status & (1 << 13) != 0
+        } else {
+            self.field_parity.get()
+        };
+        let mut status = if field_parity {
             self.status | 0x8000_0000
         } else {
             self.status & !0x8000_0000
@@ -1655,7 +2165,26 @@ impl Gpu {
         status
     }
 
-    pub fn advance_vblank_field(&self) {
+    fn status_probe_json(&self) -> String {
+        let status = self.effective_status();
+        format!(
+            "{{\"value\":{},\"value_hex\":\"0x{status:08x}\",\"reads\":{},\"dma_request\":{},\"ready_command\":{},\"ready_vram_to_cpu\":{},\"ready_dma_block\":{},\"dma_direction\":{}}}",
+            status,
+            self.status_reads.get(),
+            status & (1 << 25) != 0,
+            status & (1 << 26) != 0,
+            status & (1 << 27) != 0,
+            status & (1 << 28) != 0,
+            (status >> 29) & 0x3,
+        )
+    }
+
+    pub fn advance_vblank_field(&mut self) {
+        if self.status & (1 << 22) != 0 {
+            self.status ^= 1 << 13;
+        } else {
+            self.status |= 1 << 13;
+        }
         self.field_parity.set(!self.field_parity.get());
     }
 
@@ -1795,10 +2324,12 @@ impl Gpu {
                 let draw_capture_range = self.draw_capture_range;
                 let draw_capture_predicates = std::mem::take(&mut self.draw_capture_predicates);
                 let draw_captures = std::mem::take(&mut self.draw_captures);
+                let draw_capture_keys = std::mem::take(&mut self.draw_capture_keys);
                 *self = Self::default();
                 self.draw_capture_range = draw_capture_range;
                 self.draw_capture_predicates = draw_capture_predicates;
                 self.draw_captures = draw_captures;
+                self.draw_capture_keys = draw_capture_keys;
             }
             0x01 => {
                 self.gp0_read = 0;
@@ -1838,9 +2369,11 @@ impl Gpu {
                 }
             }
             0x08 => {
-                let previous_display_mode = self.status & 0x007e_0000;
-                self.status = (self.status & !0x007f_0000) | ((value & 0x3f) << 17);
-                if previous_display_mode != self.status & 0x007e_0000 {
+                let previous_display_mode = self.status & 0x007f_0000;
+                self.status = (self.status & !0x007f_0000)
+                    | ((value & 0x3f) << 17)
+                    | (((value & 0x40) >> 6) << 16);
+                if previous_display_mode != self.status & 0x007f_0000 {
                     self.invalidate_field_composed_display_cache();
                     self.display_area_history.clear();
                 }
@@ -2232,6 +2765,35 @@ impl Gpu {
         let output = self.current_display_output_window();
         let resolved = self.display_resolve();
         let visibility_resolved = self.display_resolve_for_visibility_with_strict(resolved);
+        if display_window_wraps_vram_horizontally(output.window, output.width) {
+            let (fallback_width, fallback_height) = self.display_dimensions();
+            if let Some(presented) = self.presented_frame_window
+                && self.presented_frame_is_safe_display_candidate(presented)
+            {
+                return self.cached_display_rgb_frame_or_capture(
+                    self.presented_frame_rgb.as_deref(),
+                    self.presented_frame_width,
+                    self.presented_frame_height,
+                    presented,
+                    fallback_width,
+                    fallback_height,
+                    true,
+                );
+            }
+            if let Some(best) = self.best_observation_window
+                && self.best_observation_is_safe_display_candidate(best)
+            {
+                return self.cached_display_rgb_frame_or_capture(
+                    self.best_observation_rgb.as_deref(),
+                    self.best_observation_width,
+                    self.best_observation_height,
+                    best,
+                    fallback_width,
+                    fallback_height,
+                    false,
+                );
+            }
+        }
         if let Some(gui_output) = self.cached_gui_field_composed_output_for_handoff(output) {
             return (
                 gui_output.width,
@@ -2399,6 +2961,20 @@ impl Gpu {
     }
 
     fn current_display_output_window(&self) -> DisplayOutputWindow {
+        let key = self.stable_display_frame_cache_key();
+        if let Some(cached) = self.display_output_window_cache.borrow().as_ref().copied()
+            && cached.key == key
+        {
+            return cached.output;
+        }
+
+        let output = self.current_display_output_window_uncached();
+        *self.display_output_window_cache.borrow_mut() =
+            Some(DisplayOutputWindowCache { key, output });
+        output
+    }
+
+    fn current_display_output_window_uncached(&self) -> DisplayOutputWindow {
         let (register_width, height) = self.display_dimensions();
         let clear_width_hint = self.display_clear_width_hint(register_width, height);
         if clear_width_hint.is_some()
@@ -2735,6 +3311,7 @@ impl Gpu {
             || output.cached
             || output.width == 0
             || output.height == 0
+            || display_window_wraps_vram_horizontally(output.window, output.width)
         {
             return false;
         }
@@ -2750,6 +3327,9 @@ impl Gpu {
         output: DisplayOutputWindow,
     ) -> bool {
         if output.width == 0 || output.height == 0 {
+            return true;
+        }
+        if display_window_wraps_vram_horizontally(output.window, output.width) {
             return true;
         }
         if self.display_window_is_texture_atlas_with_dimensions(
@@ -3770,6 +4350,7 @@ impl Gpu {
             display_width,
             display_height,
             display_24bit: self.display_24bit_enabled(),
+            framebuffer_revision: self.framebuffer.display_stats_revision(),
             fill_rect_commands: self.fill_rect_commands,
             flat_triangle_commands: self.flat_triangle_commands,
             textured_triangle_commands: self.textured_triangle_commands,
@@ -4266,14 +4847,19 @@ impl Gpu {
         &self,
         output: DisplayOutputWindow,
     ) -> bool {
+        let horizontally_wrapped =
+            display_window_wraps_vram_horizontally(output.window, output.width);
         if output.source != DISPLAY_SOURCE_ACTIVE_FIELD
             || output.field_composed
             || output.cached
             || output.width == 0
             || output.height == 0
-            || self.active_field_output_is_live_gui_frame(output)
+            || (!horizontally_wrapped && self.active_field_output_is_live_gui_frame(output))
         {
             return false;
+        }
+        if horizontally_wrapped {
+            return self.actual_display_has_safe_stable_fallback();
         }
 
         let resolved = self.display_resolve();
@@ -4582,18 +5168,6 @@ impl Gpu {
 
     pub fn fast_gameplay_display_rgb_frame(&self) -> (usize, usize, Vec<u32>) {
         let (width, height) = self.display_dimensions();
-        if let Some(field_height) = self.interlaced_field_pair_height(height)
-            && let Some(cached) = self.cached_field_composed_display_output_window()
-            && cached.width == width
-            && cached.height == field_height.saturating_mul(2)
-            && self.cached_field_composed_output_matches_active_field_pair(cached, field_height)
-            && self.should_use_cached_field_composed_output(cached)
-            && let Some(rgb) = self.field_composed_display_rgb.as_ref()
-            && rgb.len() == cached.width.saturating_mul(cached.height)
-        {
-            return (cached.width, cached.height, rgb.clone());
-        }
-
         let (x, y) = display_area_start_xy(self.display_area_start);
         (
             width,
@@ -4606,6 +5180,21 @@ impl Gpu {
                 self.display_24bit_enabled(),
             ),
         )
+    }
+
+    pub fn fast_gameplay_display_rgb_frame_with_checksum(&self) -> (usize, usize, Vec<u32>, u32) {
+        let (width, height) = self.display_dimensions();
+        let (x, y) = display_area_start_xy(self.display_area_start);
+        let (rgb, checksum) = self
+            .framebuffer
+            .psx_display_rgb_window_with_depth_and_checksum(
+                x,
+                y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            );
+        (width, height, rgb, checksum)
     }
 
     pub fn raw_actual_display_png(&self) -> Vec<u8> {
@@ -5086,39 +5675,56 @@ impl Gpu {
             return false;
         }
 
-        if self.display_window_has_title_logo_overlay(
-            output.window,
-            output.width,
-            output.height,
-            true,
-        ) || self.display_window_has_title_logo_overlay(top, output.width, field_height, true)
-            || self.display_window_has_title_logo_overlay(bottom, output.width, field_height, true)
-            || self.display_window_has_high_vertical_static_title_screen(
+        let top_color = self.display_window_color_stats(top, output.width, field_height, true);
+        let bottom_color =
+            self.display_window_color_stats(bottom, output.width, field_height, true);
+        let rich_live_halves = has_native_gameplay_display_profile(top.stats)
+            && has_native_gameplay_display_profile(bottom.stats)
+            && top_color.has_scene_color_diversity()
+            && bottom_color.has_scene_color_diversity()
+            && !top_color.has_intro_caption_band()
+            && !top_color.has_caption_text_band()
+            && !bottom_color.has_intro_caption_band()
+            && !bottom_color.has_caption_text_band();
+        if !rich_live_halves {
+            if self.display_window_has_title_logo_overlay(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            ) || self.display_window_has_title_logo_overlay(
                 top,
                 output.width,
                 field_height,
                 true,
-            )
-            || self.display_window_has_high_vertical_static_title_screen(
+            ) || self.display_window_has_title_logo_overlay(
                 bottom,
                 output.width,
                 field_height,
                 true,
-            )
-            || self.display_window_has_title_logo_overlay_artifact(
+            ) || self.display_window_has_high_vertical_static_title_screen(
                 top,
                 output.width,
                 field_height,
                 true,
-            )
-            || self.display_window_has_title_logo_overlay_artifact(
+            ) || self.display_window_has_high_vertical_static_title_screen(
                 bottom,
                 output.width,
                 field_height,
                 true,
-            )
-        {
-            return false;
+            ) || self.display_window_has_title_logo_overlay_artifact(
+                top,
+                output.width,
+                field_height,
+                true,
+            ) || self.display_window_has_title_logo_overlay_artifact(
+                bottom,
+                output.width,
+                field_height,
+                true,
+            ) {
+                return false;
+            }
         }
 
         !self.display_window_has_glyph_texture_grid(top, output.width, field_height)
@@ -5285,6 +5891,9 @@ impl Gpu {
         output: DisplayOutputWindow,
         resolved: DisplayResolve,
     ) -> bool {
+        if display_window_wraps_vram_horizontally(output.window, output.width) {
+            return false;
+        }
         if self.output_is_in_bounds_field_from_overflowing_high_vertical_display(output) {
             return true;
         }
@@ -5724,6 +6333,9 @@ impl Gpu {
         {
             return false;
         }
+        if display_window_wraps_vram_horizontally(output.window, output.width) {
+            return false;
+        }
         if self.display_window_is_texture_atlas_with_dimensions(
             output.window,
             output.width,
@@ -5758,10 +6370,13 @@ impl Gpu {
     }
 
     fn should_use_field_composed_output(&self, output: DisplayOutputWindow) -> bool {
+        let preserve_title_intro =
+            self.field_composed_output_should_preserve_br2_title_intro_full_frame(output);
         output.field_composed
             && has_native_full_scene_detail(output.window.stats)
-            && !self.field_composed_output_is_intro_video_caption(output)
-            && !self.field_composed_output_has_texture_atlas_half(output)
+            && (preserve_title_intro
+                || (!self.field_composed_output_is_intro_video_caption(output)
+                    && !self.field_composed_output_has_texture_atlas_half(output)))
             && (output.cached
                 || self.display_output_matches_recent_field_pair(output)
                 || !self.display_window_is_texture_atlas_with_dimensions(
@@ -5769,6 +6384,116 @@ impl Gpu {
                     output.width,
                     output.height,
                 ))
+    }
+
+    fn field_composed_output_should_preserve_br2_title_intro_full_frame(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        if !output.field_composed
+            || output.cached
+            || output.width < 512
+            || output.height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !output.height.is_multiple_of(2)
+            || output.height > PSX_VRAM_HEIGHT
+            || (output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+                && output.source != "gp1_display_area_fields"
+                && output.source != "gp1_display_area_high_vertical_fields")
+            || !screen_observation_worth_saving(output.window.stats)
+            || !is_detailed_observation(output.window.stats)
+            || self.display_window_is_texture_atlas_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            )
+        {
+            return false;
+        }
+
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(output)
+        else {
+            return false;
+        };
+        if field_height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(top.stats)
+            || !screen_observation_worth_saving(bottom.stats)
+        {
+            return false;
+        }
+
+        let raw_color =
+            self.display_window_color_stats(output.window, output.width, output.height, false);
+        let psx_color =
+            self.display_window_color_stats(output.window, output.width, output.height, true);
+        if !(raw_color.has_intro_caption_band()
+            || raw_color.has_caption_text_band()
+            || psx_color.has_intro_caption_band()
+            || psx_color.has_caption_text_band())
+        {
+            return false;
+        }
+
+        if self.display_window_has_glyph_texture_grid(top, output.width, field_height)
+            || self.display_window_has_glyph_texture_grid(bottom, output.width, field_height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                top,
+                output.width,
+                field_height,
+            )
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                bottom,
+                output.width,
+                field_height,
+            )
+        {
+            return false;
+        }
+
+        let top_color = self.display_window_color_stats(top, output.width, field_height, true);
+        let bottom_color =
+            self.display_window_color_stats(bottom, output.width, field_height, true);
+        self.field_half_is_dense_br2_title_logo_art(top, top_color)
+            && self.field_half_is_sparse_br2_title_caption(bottom, bottom_color)
+            && top.stats.nonzero_pixels > bottom.stats.nonzero_pixels.saturating_mul(8)
+            && screen_observation_score(output.window.stats)
+                > screen_observation_score(bottom.stats).saturating_mul(3)
+    }
+
+    fn field_half_is_dense_br2_title_logo_art(
+        &self,
+        window: FrameBufferWindow,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        let pixel_count = window.stats.pixel_count.max(1);
+        let dense_logo_art = window.stats.nonzero_pixels.saturating_mul(100)
+            >= pixel_count.saturating_mul(35)
+            && window.stats.bright_pixels.saturating_mul(100) >= pixel_count.saturating_mul(12)
+            && window.stats.detail_edges >= detail_edge_cutoff(window.stats).max(512);
+        let red_weighted_logo = color_stats.red_sum
+            >= color_stats.green_sum.saturating_mul(13).saturating_div(10)
+            && color_stats.red_sum >= color_stats.blue_sum.saturating_mul(13).saturating_div(10);
+        let rich_palette =
+            color_stats.has_scene_color_diversity() || color_stats.bucket_count >= 32;
+
+        dense_logo_art && red_weighted_logo && rich_palette
+    }
+
+    fn field_half_is_sparse_br2_title_caption(
+        &self,
+        window: FrameBufferWindow,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        let pixel_count = window.stats.pixel_count.max(1);
+        let sparse_caption = window.stats.nonzero_pixels.saturating_mul(100)
+            <= pixel_count.saturating_mul(12)
+            && window.stats.bright_pixels.saturating_mul(100) >= pixel_count
+            && window.stats.max_luma >= 128
+            && window.stats.detail_edges >= 256;
+        let mostly_dark = average_luma(window.stats) <= 24;
+        let low_palette_text =
+            !color_stats.has_scene_color_diversity() && color_stats.bucket_count <= 24;
+
+        sparse_caption && mostly_dark && low_palette_text
     }
 
     fn should_use_gui_field_composed_output(&self, output: DisplayOutputWindow) -> bool {
@@ -5791,6 +6516,9 @@ impl Gpu {
         output: DisplayOutputWindow,
     ) -> Option<DisplayOutputWindow> {
         if output.cached {
+            return None;
+        }
+        if self.field_composed_output_should_preserve_br2_title_intro_full_frame(output) {
             return None;
         }
         let (top, bottom, field_height) = self.field_composed_output_half_windows(output)?;
@@ -6127,6 +6855,23 @@ impl Gpu {
             return false;
         }
 
+        let rich_live_gameplay_field = has_native_gameplay_display_profile(window.stats)
+            && raw_color.has_scene_color_diversity()
+            && psx_color.has_scene_color_diversity()
+            && !raw_color.has_intro_caption_band()
+            && !raw_color.has_caption_text_band()
+            && !psx_color.has_intro_caption_band()
+            && !psx_color.has_caption_text_band()
+            && self.has_strong_native_3d_textured_playfield_activity()
+            && self.presentation_captures > 0
+            && self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
+            && !self.display_candidate_has_scene_upload_overlap(window)
+            && !self
+                .display_candidate_has_dominant_unpresented_texture_upload(window, width, height);
+        if rich_live_gameplay_field {
+            return false;
+        }
+
         if self.display_window_has_high_vertical_static_title_screen(window, width, height, true)
             || self
                 .display_window_has_high_vertical_warning_text_overlay(window, width, height, true)
@@ -6176,6 +6921,19 @@ impl Gpu {
             || height.saturating_mul(2) != self.display_dimensions().1
         {
             return false;
+        }
+
+        let key = self.display_color_stats_cache_key(window, width, height, psx_wrap);
+        {
+            let mut cache = self.high_vertical_warning_text_overlay_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("high vertical warning overlay cache index should exist");
+                let result = cached.result;
+                cache.push_back(cached);
+                return result;
+            }
         }
 
         let x_start = width / 16;
@@ -6241,11 +6999,17 @@ impl Gpu {
         let enough_text = bright_text_samples.saturating_mul(1_000) >= samples.saturating_mul(45);
         let sparse_text = bright_text_samples.saturating_mul(100) <= samples.saturating_mul(16);
 
-        dark_backdrop
+        let result = dark_backdrop
             && enough_text
             && sparse_text
             && text_rows >= min_text_rows
-            && text_rows <= max_text_rows
+            && text_rows <= max_text_rows;
+        let mut cache = self.high_vertical_warning_text_overlay_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayBoolAnalysisCache { key, result });
+        result
     }
 
     fn safe_field_output_matches_display_flow(&self, window: FrameBufferWindow) -> bool {
@@ -6302,8 +7066,9 @@ impl Gpu {
             window: self.current_display_window_with_dimensions(width, height),
         };
 
-        self.should_use_high_vertical_full_output(output)
-            .then_some(output)
+        (self.should_use_high_vertical_full_output(output)
+            || self.field_composed_output_should_preserve_br2_title_intro_full_frame(output))
+        .then_some(output)
     }
 
     fn cropped_high_vertical_full_has_blocked_register_counterpart(
@@ -6897,10 +7662,18 @@ impl Gpu {
             raw_color_stats.has_intro_caption_band() || raw_color_stats.has_caption_text_band();
         let psx_caption_like =
             psx_color_stats.has_intro_caption_band() || psx_color_stats.has_caption_text_band();
-        let raw_periodic =
-            self.display_window_has_periodic_horizontal_ghosting(window, width, height, false);
-        let psx_periodic =
-            self.display_window_has_periodic_horizontal_ghosting(window, width, height, true);
+        let periodic_analysis_needed = raw_caption_like
+            || psx_caption_like
+            || raw_color_stats.bucket_count <= 32
+            || psx_color_stats.bucket_count <= 32;
+        let (raw_periodic, psx_periodic) = if periodic_analysis_needed {
+            (
+                self.display_window_has_periodic_horizontal_ghosting(window, width, height, false),
+                self.display_window_has_periodic_horizontal_ghosting(window, width, height, true),
+            )
+        } else {
+            (false, false)
+        };
         if (raw_caption_like && raw_periodic || psx_caption_like && psx_periodic)
             && self.image_upload_commands >= DISPLAY_RESOLVE_MIN_IMAGE_UPLOAD_COMMANDS
             && self.has_native_play_3d_draw_signal()
@@ -8489,67 +9262,235 @@ impl Gpu {
         self.capture_current_presented_frame();
     }
 
+    #[cfg(test)]
     pub(crate) fn capture_recovered_presented_frame(&mut self) {
+        let _ = self.capture_recovered_presented_frame_with_guard(None);
+    }
+
+    pub(crate) fn capture_recovered_presented_frame_after_recovery(
+        &mut self,
+        before: &Gpu,
+    ) -> bool {
+        self.capture_recovered_presented_frame_with_guard(Some(before))
+    }
+
+    fn capture_recovered_presented_frame_with_guard(&mut self, before: Option<&Gpu>) -> bool {
         let (display_width, display_height) = self.display_dimensions();
         let (display_x, display_y) = display_area_start_xy(self.display_area_start);
-        let current = FrameBufferWindow {
-            x: display_x,
-            y: display_y,
-            stats: self.framebuffer.psx_display_stats_with_depth(
-                display_x,
-                display_y,
+        if display_x.saturating_add(display_width) > VRAM_WIDTH {
+            return false;
+        }
+        let before_current = before.map(Gpu::current_display_window);
+        let trusted_prior_live_scene =
+            before
+                .zip(before_current)
+                .is_some_and(|(before, before_current)| {
+                    before.display_dimensions() == (display_width, display_height)
+                        && has_native_gameplay_display_profile(before_current.stats)
+                });
+
+        // Recovery happens after a guest draw batch has already updated both
+        // interlaced fields. Resolve that pair once instead of first running the
+        // full-frame atlas classifier and then repeating the same analysis while
+        // selecting the safe output field.
+        let prefer_resolved_high_vertical_output = before.is_some()
+            && self.high_vertical_interlace_enabled()
+            && display_height >= DEFAULT_DISPLAY_HEIGHT * 2
+            && display_height.is_multiple_of(2);
+        let (width, height, window) = if prefer_resolved_high_vertical_output {
+            let current = FrameBufferWindow {
+                x: display_x,
+                y: display_y,
+                stats: self.framebuffer.psx_display_stats_with_depth(
+                    display_x,
+                    display_y,
+                    display_width,
+                    display_height,
+                    self.display_24bit_enabled(),
+                ),
+            };
+            let direct_full_window_rejection = if !trusted_prior_live_scene {
+                Some("untrusted_prior_scene")
+            } else if !has_native_gameplay_display_profile(current.stats) {
+                Some("gameplay_profile")
+            } else if !self.display_candidate_has_live_draw_overlap_with_dimensions(
+                current,
                 display_width,
                 display_height,
-                self.display_24bit_enabled(),
-            ),
-        };
-        let (width, height, window) = if screen_observation_worth_saving(current.stats) {
-            (display_width, display_height, current)
-        } else {
-            let output = self.current_display_output_window();
-            if output.cached
-                || !screen_observation_worth_saving(output.window.stats)
-                || self.display_window_is_texture_atlas_with_dimensions(
-                    output.window,
-                    output.width,
-                    output.height,
-                )
+            ) {
+                Some("live_draw_overlap")
+            } else if self.display_candidate_has_scene_upload_overlap(current) {
+                Some("scene_upload_overlap")
+            } else if self.recovery_window_has_blocking_artifact(
+                current,
+                display_width,
+                display_height,
+                false,
+            ) {
+                Some("blocking_artifact")
+            } else if before
+                .zip(before_current)
+                .is_some_and(|(before, before_current)| {
+                    self.recovered_presented_candidate_fails_prior_scene_guard(
+                        before,
+                        before_current,
+                        current,
+                        display_width,
+                        display_height,
+                    )
+                })
             {
-                return;
+                Some("prior_scene_guard")
+            } else {
+                None
+            };
+            if br2_native_trace_recovery_fast_path() {
+                eprintln!(
+                    "BR2 recovery fast path: result={} draw_sequence={} commands_seen={} checksum={:#010x}",
+                    direct_full_window_rejection.unwrap_or("accepted"),
+                    self.draw_sequence,
+                    self.commands_seen,
+                    current.stats.checksum,
+                );
             }
-            (output.width, output.height, output.window)
+            if direct_full_window_rejection.is_none() {
+                (display_width, display_height, current)
+            } else {
+                let output = self.current_display_output_window();
+                if output.cached
+                    || !screen_observation_worth_saving(output.window.stats)
+                    || self.display_window_is_texture_atlas_with_dimensions(
+                        output.window,
+                        output.width,
+                        output.height,
+                    )
+                    || self.recovery_window_has_blocking_artifact(
+                        output.window,
+                        output.width,
+                        output.height,
+                        output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+                    )
+                    || before
+                        .zip(before_current)
+                        .is_some_and(|(before, before_current)| {
+                            self.recovered_presented_candidate_fails_prior_scene_guard(
+                                before,
+                                before_current,
+                                output.window,
+                                output.width,
+                                output.height,
+                            )
+                        })
+                {
+                    return false;
+                }
+                (output.width, output.height, output.window)
+            }
+        } else {
+            let current = FrameBufferWindow {
+                x: display_x,
+                y: display_y,
+                stats: self.framebuffer.psx_display_stats_with_depth(
+                    display_x,
+                    display_y,
+                    display_width,
+                    display_height,
+                    self.display_24bit_enabled(),
+                ),
+            };
+            let current_is_safe = screen_observation_worth_saving(current.stats)
+                && !self.display_window_is_texture_atlas_with_dimensions(
+                    current,
+                    display_width,
+                    display_height,
+                )
+                && !self.recovery_window_has_blocking_artifact(
+                    current,
+                    display_width,
+                    display_height,
+                    true,
+                )
+                && before
+                    .zip(before_current)
+                    .is_none_or(|(before, before_current)| {
+                        !self.recovered_presented_candidate_fails_prior_scene_guard(
+                            before,
+                            before_current,
+                            current,
+                            display_width,
+                            display_height,
+                        )
+                    });
+            if current_is_safe {
+                (display_width, display_height, current)
+            } else {
+                let output = self.current_display_output_window();
+                if output.cached
+                    || !screen_observation_worth_saving(output.window.stats)
+                    || self.display_window_is_texture_atlas_with_dimensions(
+                        output.window,
+                        output.width,
+                        output.height,
+                    )
+                    || self.recovery_window_has_blocking_artifact(
+                        output.window,
+                        output.width,
+                        output.height,
+                        output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+                    )
+                    || before
+                        .zip(before_current)
+                        .is_some_and(|(before, before_current)| {
+                            self.recovered_presented_candidate_fails_prior_scene_guard(
+                                before,
+                                before_current,
+                                output.window,
+                                output.width,
+                                output.height,
+                            )
+                        })
+                {
+                    return false;
+                }
+                (output.width, output.height, output.window)
+            }
         };
 
-        self.presentation_captures = self.presentation_captures.saturating_add(1);
         let unchanged = self.presented_frame_window.is_some_and(|current| {
             current.x == window.x
                 && current.y == window.y
                 && current.stats.checksum == window.stats.checksum
+                && self.presented_frame_width == width
+                && self.presented_frame_height == height
         });
-        if !unchanged {
-            let rgb = self.framebuffer.psx_display_rgb_window_with_depth(
-                window.x,
-                window.y,
-                width,
-                height,
-                self.display_24bit_enabled(),
-            );
-            self.presented_frame_png = None;
-            self.presented_frame_rgb = Some(rgb.clone());
-            self.presented_frame_window = Some(window);
-            self.presented_frame_width = width;
-            self.presented_frame_height = height;
+        if unchanged {
+            self.presented_frame_draw_sequence = self.draw_sequence;
+            return true;
+        }
 
-            if self.high_vertical_interlace_enabled()
-                && height >= DEFAULT_DISPLAY_HEIGHT * 2
-                && height.is_multiple_of(2)
-            {
-                self.field_composed_display_png = None;
-                self.field_composed_display_rgb = Some(rgb);
-                self.field_composed_display_window = Some(window);
-                self.field_composed_display_width = width;
-                self.field_composed_display_height = height;
-            }
+        self.presentation_captures = self.presentation_captures.saturating_add(1);
+        let rgb = self.framebuffer.psx_display_rgb_window_with_depth(
+            window.x,
+            window.y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        );
+        self.presented_frame_png = None;
+        self.presented_frame_rgb = Some(rgb.clone());
+        self.presented_frame_window = Some(window);
+        self.presented_frame_width = width;
+        self.presented_frame_height = height;
+
+        if self.high_vertical_interlace_enabled()
+            && height >= DEFAULT_DISPLAY_HEIGHT * 2
+            && height.is_multiple_of(2)
+        {
+            self.field_composed_display_png = None;
+            self.field_composed_display_rgb = Some(rgb);
+            self.field_composed_display_window = Some(window);
+            self.field_composed_display_width = width;
+            self.field_composed_display_height = height;
         }
         self.presented_frame_capture_index = self.presentation_captures;
         self.presented_frame_draw_sequence = self.draw_sequence;
@@ -8557,7 +9498,116 @@ impl Gpu {
             self.field_composed_display_capture_index = self.presentation_captures;
         }
         *self.display_resolve_cache.borrow_mut() = None;
+        *self.display_output_window_cache.borrow_mut() = None;
         *self.visibility_cache.borrow_mut() = None;
+        true
+    }
+
+    fn recovery_window_has_blocking_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        let color_stats = self.display_window_color_stats(window, width, height, psx_wrap);
+        let structurally_detailed = has_native_full_scene_detail(window.stats);
+        let detailed_scene = structurally_detailed && color_stats.has_scene_color_diversity();
+        let title_logo_blocks = !detailed_scene
+            && self.display_window_has_title_logo_overlay(window, width, height, psx_wrap);
+        let caption_blocks = (color_stats.has_intro_caption_band()
+            || color_stats.has_caption_text_band())
+            && !detailed_scene;
+        let periodic_ghosting_blocks = !structurally_detailed
+            && (3..=48).contains(&color_stats.bucket_count)
+            && self
+                .display_window_has_periodic_horizontal_ghosting(window, width, height, psx_wrap);
+        let low_palette = self.low_palette_noise_candidate(window.stats, color_stats);
+        let red_warning = self.display_window_has_red_warning_backdrop_texture_artifact(
+            window,
+            width,
+            height,
+            color_stats,
+        );
+        let low_color_select = self.display_window_has_br2_low_color_select_texture_atlas_overlay(
+            window,
+            width,
+            height,
+            color_stats,
+        );
+        let red_cave = self.display_window_has_br2_red_cave_recovery_artifact(
+            window,
+            width,
+            height,
+            color_stats,
+            psx_wrap,
+        );
+        let repeating_rock_atlas = self.display_window_has_br2_repeating_rock_atlas_artifact(
+            window,
+            width,
+            height,
+            color_stats,
+            psx_wrap,
+        );
+        let saturated_logo =
+            self.display_window_has_saturated_logo_transition(window, width, height, psx_wrap);
+        let atlas_caption = self.display_window_has_atlas_caption_ghosting(
+            window,
+            width,
+            height,
+            psx_wrap,
+            color_stats,
+        );
+
+        #[cfg(test)]
+        if std::env::var_os("BR2_NATIVE_TRACE_RECOVERY_SNAPSHOT").is_some() {
+            eprintln!(
+                "BR2 recovery snapshot guard: stable_profile={} structurally_detailed={} detailed_scene={} low_palette={} red_warning={} low_color_select={} red_cave={} repeating_rock_atlas={} periodic={} saturated_logo={} atlas_caption={} title_logo={} caption={} stats={} color={}",
+                has_native_recovery_snapshot_profile(window.stats),
+                structurally_detailed,
+                detailed_scene,
+                low_palette,
+                red_warning,
+                low_color_select,
+                red_cave,
+                repeating_rock_atlas,
+                periodic_ghosting_blocks,
+                saturated_logo,
+                atlas_caption,
+                title_logo_blocks,
+                caption_blocks,
+                window.stats.json(),
+                color_stats.json(),
+            );
+        }
+
+        let blocked = low_palette
+            || red_warning
+            || low_color_select
+            || red_cave
+            || repeating_rock_atlas
+            || periodic_ghosting_blocks
+            || saturated_logo
+            || atlas_caption
+            || title_logo_blocks
+            || caption_blocks;
+        if blocked && br2_native_trace_recovery_fast_path() {
+            eprintln!(
+                "BR2 recovery blocker: low_palette={} red_warning={} low_color_select={} red_cave={} repeating_rock_atlas={} periodic={} saturated_logo={} atlas_caption={} title_logo={} caption={} checksum={:#010x}",
+                low_palette,
+                red_warning,
+                low_color_select,
+                red_cave,
+                repeating_rock_atlas,
+                periodic_ghosting_blocks,
+                saturated_logo,
+                atlas_caption,
+                title_logo_blocks,
+                caption_blocks,
+                window.stats.checksum,
+            );
+        }
+        blocked
     }
 
     pub fn begin_recovered_draw_page_tracking(&mut self) {
@@ -8584,6 +9634,7 @@ impl Gpu {
 
         self.invalidate_field_composed_display_cache();
         *self.display_resolve_cache.borrow_mut() = None;
+        *self.display_output_window_cache.borrow_mut() = None;
         *self.visibility_cache.borrow_mut() = None;
         *self.stable_display_frame_cache.borrow_mut() = None;
     }
@@ -8645,6 +9696,20 @@ impl Gpu {
         true
     }
 
+    fn capture_psx_display_rgb_cache(
+        framebuffer: &NativeFrameBuffer,
+        cache: &mut Option<Vec<u32>>,
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+        rgb24: bool,
+    ) {
+        let rgb = cache.get_or_insert_with(Vec::new);
+        framebuffer
+            .psx_display_rgb_window_with_depth_into(start_x, start_y, width, height, rgb24, rgb);
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_live_textured_playfield_for_test(&mut self, width: usize, height: usize) {
         self.commands_seen = self.commands_seen.max(1);
@@ -8674,6 +9739,41 @@ impl Gpu {
             &[Point { x: 0, y: 0 }],
             None,
         ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_framebuffer_raw_pixel_for_test(&mut self, x: i32, y: i32, value: u16) {
+        self.framebuffer.set_raw_pixel(x, y, value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn framebuffer_raw_pixel_for_test(&self, x: i32, y: i32) -> u16 {
+        self.framebuffer.raw_pixel(x, y)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_draw_first_word_for_test(&self, address: u32) -> Option<u32> {
+        self.recent_draw_commands
+            .iter()
+            .rev()
+            .find(|trace| {
+                trace
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.address == Some(address))
+            })
+            .and_then(|trace| trace.words.first().copied())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_recovery_draw_address_for_test(&self) -> Option<u32> {
+        self.recent_draw_commands.iter().rev().find_map(|trace| {
+            trace
+                .source
+                .as_ref()
+                .filter(|source| source.kind == "recovery_dma_linked_list")
+                .and_then(|source| source.address)
+        })
     }
 
     fn display_resolve(&self) -> DisplayResolve {
@@ -10316,9 +11416,15 @@ impl Gpu {
         width: usize,
         height: usize,
     ) -> bool {
-        if width < DEFAULT_DISPLAY_WIDTH
-            || height < DEFAULT_DISPLAY_HEIGHT
-            || self.image_upload_rects.is_empty()
+        if width < DEFAULT_DISPLAY_WIDTH || height < DEFAULT_DISPLAY_HEIGHT {
+            return false;
+        }
+        if display_window_wraps_vram_horizontally(candidate, width) {
+            return !self.image_upload_rects.is_empty()
+                || self.has_textured_scene_draws()
+                || self.has_visible_presentation();
+        }
+        if self.image_upload_rects.is_empty()
             || is_likely_texture_page_candidate(candidate.x, candidate.y, width, height)
             || self.display_candidate_was_recently_presented(candidate, height)
             || self.display_candidate_is_low_height_field_counterpart(candidate, width, height)
@@ -10620,7 +11726,9 @@ impl Gpu {
 
         let width = self.best_observation_width;
         let height = self.best_observation_height;
-        if self.display_candidate_is_unpresented_texture_page(best, width, height) {
+        if display_window_wraps_vram_horizontally(best, width)
+            || self.display_candidate_is_unpresented_texture_page(best, width, height)
+        {
             return false;
         }
         width > 0
@@ -10692,11 +11800,13 @@ impl Gpu {
     pub fn set_draw_capture_range(&mut self, start: u64, end: u64) {
         self.draw_capture_range = Some((start.min(end), start.max(end)));
         self.draw_captures.clear();
+        self.draw_capture_keys.clear();
     }
 
     pub fn set_draw_capture_predicates(&mut self, predicates: Vec<NativeGpuDrawCapturePredicate>) {
         self.draw_capture_predicates = predicates;
         self.draw_captures.clear();
+        self.draw_capture_keys.clear();
     }
 
     pub fn draw_sequence(&self) -> u64 {
@@ -10720,8 +11830,7 @@ impl Gpu {
     }
 
     pub fn recovery_raster_cache_stats_json(&self) -> String {
-        let (hits, misses, entries, writes) = self.framebuffer.recovery_raster_cache_stats();
-        format!("{{\"hits\":{hits},\"misses\":{misses},\"entries\":{entries},\"writes\":{writes}}}")
+        self.framebuffer.recovery_raster_cache_stats_json()
     }
 
     pub fn vram_stats(&self) -> FrameBufferStats {
@@ -10790,7 +11899,7 @@ impl Gpu {
                     self.invalid_fill_rect_commands += 1;
                     return;
                 }
-                if !source_ref.is_some_and(GpuCommandSource::is_replay_frame_clear) {
+                if !source_ref.is_some_and(GpuCommandSource::suppresses_presented_frame_capture) {
                     self.capture_presented_frame_before_clear(x, y, width, height);
                 }
                 self.fill_rect_commands += 1;
@@ -11081,6 +12190,8 @@ impl Gpu {
                             self.pixel_write_options(),
                         );
                     }
+                    self.retained_transfer_coverage
+                        .mark_transfer(dest_x, dest_y, width, height);
                     let dest_after =
                         gpu_transfer_region_stats(&self.framebuffer, dest_x, dest_y, width, height);
                     self.push_recent_transfer_command(GpuTransferTrace::vram_copy(
@@ -11097,6 +12208,7 @@ impl Gpu {
                         words,
                         source_ref,
                     ));
+                    self.track_br2_large_portrait_transfer(dest_x, dest_y, width, height);
                 } else {
                     self.invalid_vram_copy_commands += 1;
                     let (width, height) = raw_dimensions(words[3]);
@@ -11140,6 +12252,13 @@ impl Gpu {
                         &words[3..],
                         self.pixel_write_options(),
                     );
+                    self.retained_transfer_coverage.mark_transfer(
+                        x,
+                        y,
+                        width as i32,
+                        height as i32,
+                    );
+                    self.track_br2_large_portrait_transfer(x, y, width as i32, height as i32);
                 } else {
                     self.invalid_image_upload_commands += 1;
                     let (width, height) = raw_dimensions(words[2]);
@@ -11386,6 +12505,13 @@ impl Gpu {
         let b = self.textured_point(b, b_uv);
         let c = self.textured_point(c, c_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point]);
+        preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
         if should_allow_br2_gameplay_polygon_palette_fallback(words[0], texture_page, clut, bounds)
         {
             options.allow_palette_fallback = true;
@@ -11436,6 +12562,13 @@ impl Gpu {
         let b = self.textured_point(b, b_uv);
         let c = self.textured_point(c, c_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point]);
+        preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
         if should_allow_br2_gameplay_polygon_palette_fallback(words[0], texture_page, clut, bounds)
         {
             options.allow_palette_fallback = true;
@@ -11487,6 +12620,13 @@ impl Gpu {
         let c = self.textured_point(c, c_uv);
         let d = self.textured_point(d, d_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
+        preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
         if should_allow_br2_character_select_polygon_palette_fallback(
             words[0],
             texture_page,
@@ -11568,6 +12708,13 @@ impl Gpu {
         let c = self.textured_point(c, c_uv);
         let d = self.textured_point(d, d_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
+        preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
         if should_allow_br2_character_select_polygon_palette_fallback(
             words[0],
             texture_page,
@@ -11995,6 +13142,135 @@ impl Gpu {
         }
     }
 
+    fn track_br2_large_portrait_transfer(&mut self, x: i32, y: i32, width: i32, height: i32) {
+        if transfer_is_br2_large_portrait_texture_asset(x, y, width, height) {
+            self.pending_br2_large_portrait_assets = Some(PendingBr2LargePortraitAssets {
+                texture: self.framebuffer.snapshot_psx_display_region(
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X as usize,
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y as usize,
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH,
+                    BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+                ),
+                transfer_sequence: self.transfer_sequence,
+                vblank: self.presentation_captures,
+            });
+        }
+        if transfer_is_br2_right_large_portrait_texture_asset(x, y, width, height) {
+            self.pending_br2_right_large_portrait_assets =
+                Some(PendingBr2RightLargePortraitAssets {
+                    texture: self.framebuffer.snapshot_psx_display_region(
+                        BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_X as usize,
+                        BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_Y as usize,
+                        BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WIDTH,
+                        BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_HEIGHT,
+                    ),
+                    transfer_sequence: self.transfer_sequence,
+                    vblank: self.presentation_captures,
+                });
+        }
+
+        if transfer_is_br2_large_portrait_clut_asset(x, y, width, height) {
+            self.finalize_pending_br2_large_portrait_assets();
+        }
+        if transfer_is_br2_right_large_portrait_completion_asset(x, y, width, height) {
+            self.finalize_pending_br2_right_large_portrait_assets();
+        }
+    }
+
+    fn finalize_pending_br2_large_portrait_assets(&mut self) {
+        let Some(pending) = self.pending_br2_large_portrait_assets.take() else {
+            return;
+        };
+        if self.transfer_sequence != pending.transfer_sequence.saturating_add(1)
+            || self.presentation_captures != pending.vblank
+        {
+            return;
+        }
+
+        let texture_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X,
+                y: BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y,
+            },
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH as i32,
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT as i32,
+        );
+        let clut_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+                y: BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+            },
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH as i32,
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT as i32,
+        );
+        if !transfer_region_has_image_data(&self.framebuffer, texture_bounds)
+            || !transfer_region_has_palette_data(&self.framebuffer, clut_bounds)
+        {
+            return;
+        }
+
+        self.retained_br2_large_portrait_assets = Some(RetainedBr2LargePortraitAssets {
+            texture: pending.texture,
+            clut: self.framebuffer.snapshot_psx_display_region(
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_X as usize,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y as usize,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+            ),
+        });
+    }
+
+    fn finalize_pending_br2_right_large_portrait_assets(&mut self) {
+        let Some(pending) = self.pending_br2_right_large_portrait_assets.take() else {
+            return;
+        };
+        if self.transfer_sequence != pending.transfer_sequence.saturating_add(1)
+            || self.presentation_captures != pending.vblank
+        {
+            return;
+        }
+
+        let texture_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_X,
+                y: BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_Y,
+            },
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_WIDTH as i32,
+            BR2_RETAINED_RIGHT_LARGE_PORTRAIT_TEXTURE_HEIGHT as i32,
+        );
+        let clut_bounds = rect_bounds(
+            Point {
+                x: BR2_RETAINED_LARGE_PORTRAIT_CLUT_X,
+                y: BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y,
+            },
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH as i32,
+            BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT as i32,
+        );
+        if self
+            .retained_transfer_coverage
+            .right_large_portrait_texture_coverage_per_mille()
+            < BR2_RETAINED_PORTRAIT_TEXTURE_MIN_COVERAGE_PER_MILLE
+            || !self
+                .retained_transfer_coverage
+                .covers_large_portrait_clut(clut_bounds)
+                .unwrap_or(false)
+            || !transfer_region_has_image_data(&self.framebuffer, texture_bounds)
+            || !transfer_region_has_palette_data(&self.framebuffer, clut_bounds)
+        {
+            return;
+        }
+
+        self.retained_br2_right_large_portrait_assets = Some(RetainedBr2RightLargePortraitAssets {
+            texture: pending.texture,
+            clut: self.framebuffer.snapshot_psx_display_region(
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_X as usize,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y as usize,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
+                BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
+            ),
+        });
+    }
+
     fn push_image_upload_rect(&mut self, x: i32, y: i32, width: i32, height: i32) {
         if width <= 0 || height <= 0 {
             return;
@@ -12047,20 +13323,70 @@ impl Gpu {
     }
 
     fn capture_draw_if_requested(&mut self, trace: &GpuDrawTrace) {
+        self.normalize_draw_capture_keys();
         let range_matches = self
             .draw_capture_range
             .is_some_and(|(start, end)| trace.sequence >= start && trace.sequence <= end);
+        if range_matches {
+            if self.draw_captures.len() >= GPU_DRAW_CAPTURE_LIMIT {
+                return;
+            }
+            self.push_draw_capture(trace, None);
+            return;
+        }
+
         let predicate_matches = self
             .draw_capture_predicates
             .iter()
             .any(|predicate| predicate.matches(trace));
-        if !range_matches && !predicate_matches {
+        if !predicate_matches {
             return;
         };
-        if self.draw_captures.len() >= GPU_DRAW_CAPTURE_LIMIT {
+
+        let key = self.draw_capture_key(trace);
+        if self
+            .draw_capture_keys
+            .iter()
+            .any(|existing| existing.as_ref() == Some(&key))
+        {
             return;
         }
 
+        if self.predicate_draw_capture_count() >= GPU_PREDICATE_DRAW_CAPTURE_LIMIT {
+            self.evict_oldest_predicate_draw_capture();
+        }
+        if self.draw_captures.len() >= GPU_DRAW_CAPTURE_LIMIT {
+            if !self.evict_oldest_predicate_draw_capture() {
+                return;
+            }
+        }
+        self.push_draw_capture(trace, Some(key));
+    }
+
+    fn normalize_draw_capture_keys(&mut self) {
+        self.draw_capture_keys.truncate(self.draw_captures.len());
+        while self.draw_capture_keys.len() < self.draw_captures.len() {
+            self.draw_capture_keys.push(None);
+        }
+    }
+
+    fn predicate_draw_capture_count(&self) -> usize {
+        self.draw_capture_keys
+            .iter()
+            .filter(|key| key.is_some())
+            .count()
+    }
+
+    fn evict_oldest_predicate_draw_capture(&mut self) -> bool {
+        let Some(index) = self.draw_capture_keys.iter().position(|key| key.is_some()) else {
+            return false;
+        };
+        self.draw_capture_keys.remove(index);
+        self.draw_captures.remove(index);
+        true
+    }
+
+    fn push_draw_capture(&mut self, trace: &GpuDrawTrace, key: Option<GpuDrawCaptureKey>) {
         let (display_width, display_height) = self.display_dimensions();
         let (display_x, display_y) = display_area_start_xy(self.display_area_start);
         let (bounds_x, bounds_y, bounds_width, bounds_height) =
@@ -12102,7 +13428,16 @@ impl Gpu {
                     .texture_candidate_images(texture_page, clut)
             })
             .unwrap_or_default();
+        let palette_candidate_images = trace
+            .texture_page
+            .zip(trace.clut)
+            .map(|(texture_page, clut)| {
+                self.framebuffer
+                    .palette_candidate_images(texture_page, clut)
+            })
+            .unwrap_or_default();
         let transfer_provenance_json = self.draw_transfer_provenance_json(trace);
+        self.draw_capture_keys.push(key);
         self.draw_captures.push(NativeGpuDrawCapture {
             sequence: trace.sequence,
             trace_json: trace.json_with_transfer_provenance(&transfer_provenance_json),
@@ -12133,7 +13468,318 @@ impl Gpu {
             resolved_palette_png,
             texture_diagnostics_json,
             texture_candidate_images,
+            palette_candidate_images,
         });
+    }
+
+    fn draw_capture_key(&self, trace: &GpuDrawTrace) -> GpuDrawCaptureKey {
+        let texture_page = trace.texture_page.map(|texture_page| {
+            if trace.is_textured_polygon() {
+                texture_page & GP0_POLYGON_TEXPAGE_MASK
+            } else {
+                texture_page
+            }
+        });
+        let texture_generation = texture_raw_bounds_for_trace(trace).and_then(|bounds| {
+            self.latest_transfer_dest_overlap(bounds, trace.command_order)
+                .map(|transfer| transfer.sequence)
+        });
+        let clut_generation = clut_bounds_for_trace(trace).and_then(|bounds| {
+            self.latest_transfer_dest_overlap(bounds, trace.command_order)
+                .map(|transfer| transfer.sequence)
+        });
+        let clut_candidate_generation = clut_candidate_bounds_for_trace(trace)
+            .into_iter()
+            .filter_map(|candidate| {
+                self.latest_transfer_dest_overlap(candidate.bounds, trace.command_order)
+                    .map(|transfer| transfer.sequence)
+            })
+            .max();
+
+        GpuDrawCaptureKey {
+            kind: trace.kind,
+            texture_page,
+            clut: trace.clut,
+            color: trace.color,
+            bounds: trace.bounds,
+            stats: trace.stats,
+            words: trace.words.clone(),
+            points: trace.points.clone(),
+            uvs: trace.uvs.clone(),
+            texture_window: trace.texture_window,
+            texture_options: trace.texture_options,
+            source: trace.source.clone(),
+            texture_generation,
+            clut_generation,
+            clut_candidate_generation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_textured_polygon_transfer_generation_valid(
+        &self,
+        words: &[u32],
+    ) -> bool {
+        self.retained_textured_polygon_transfer_generation_valid_with_policy(words, false)
+    }
+
+    pub(crate) fn retained_br2_character_select_preview_transfer_generation_valid(
+        &self,
+        words: &[u32],
+    ) -> bool {
+        if words.len() != 9
+            || texture_page(words[4]) & !0x0200 != 0x000d
+            || clut(words[2]) != 0x7c1d
+        {
+            return false;
+        }
+
+        self.retained_textured_polygon_transfer_generation_valid_with_policy(words, true)
+    }
+
+    pub(crate) fn retained_br2_character_select_large_portrait_transfer_generation_valid(
+        &self,
+        words: &[u32],
+    ) -> bool {
+        if words.len() != 9
+            || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f)
+            || texture_page(words[4]) & !0x0200 != 0x0088
+            || clut(words[2]) != 0x7d40
+        {
+            return false;
+        }
+
+        let texture_uvs = [words[2], words[4], words[6], words[8]]
+            .map(texture_coordinate)
+            .map(|uv| (uv.u, uv.v));
+        if texture_uvs != [(0, 0), (191, 0), (0, 255), (191, 255)] {
+            return false;
+        }
+        if self.retained_br2_large_portrait_assets.is_some() {
+            return true;
+        }
+
+        let textured_points = [
+            (words[1], words[2]),
+            (words[3], words[4]),
+            (words[5], words[6]),
+            (words[7], words[8]),
+        ]
+        .map(|(position, uv)| {
+            let texture_uv = texture_coordinate(uv);
+            TexturedPoint {
+                point: point(position),
+                u: texture_uv.u,
+                v: texture_uv.v,
+            }
+        });
+        let points = textured_points.map(|point| point.point);
+        let trace = GpuDrawTrace::textured_with_options(
+            "textured_quad",
+            texture_page(words[4]),
+            clut(words[2]),
+            points_bounds(&points),
+            TexturedDrawStats::default(),
+            words,
+            &textured_points,
+            self.texture_window,
+            self.texture_draw_options(words[0], texture_page(words[4])),
+            None,
+        );
+        let Some(texture_bounds) = texture_raw_bounds_for_trace(&trace) else {
+            return false;
+        };
+        let Some(palette_bounds) = clut_candidate_bounds_for_trace(&trace)
+            .into_iter()
+            .find(|candidate| candidate.label == "requested_y16_base")
+            .map(|candidate| candidate.bounds)
+        else {
+            return false;
+        };
+        let draw_command_order = self.commands_seen.saturating_add(words.len() as u64);
+        let draw_vblank = self.presentation_captures;
+        let texture_provenance_valid = self
+            .latest_transfer_dest_overlap(texture_bounds, draw_command_order)
+            .is_some_and(|transfer| {
+                transfer.vblank <= draw_vblank
+                    && transfer_is_br2_large_portrait_texture_asset(
+                        transfer.dest_x,
+                        transfer.dest_y,
+                        transfer.width,
+                        transfer.height,
+                    )
+            });
+        let texture_has_data = transfer_region_has_image_data(&self.framebuffer, texture_bounds);
+        let palette_has_data = transfer_region_has_palette_data(&self.framebuffer, palette_bounds);
+
+        // The texture must come from the exact portrait upload. The exact CLUT
+        // may legitimately persist in VRAM after its transfer trace is evicted.
+        texture_provenance_valid && texture_has_data && palette_has_data
+    }
+
+    pub(crate) fn restore_retained_br2_character_select_large_portrait_assets(&mut self) -> bool {
+        let Some(assets) = self.retained_br2_large_portrait_assets.as_ref() else {
+            return false;
+        };
+        self.framebuffer.restore_region_snapshot(&assets.texture);
+        self.framebuffer.restore_region_snapshot(&assets.clut);
+        self.invalidate_recovery_presentation_caches();
+        true
+    }
+
+    pub(crate) fn retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+        &self,
+        words: &[u32],
+    ) -> bool {
+        if words.len() != 9 || (words[0] >> 24) as u8 != 0x2c || clut(words[2]) != 0x7d80 {
+            return false;
+        }
+
+        let descriptor = texture_page(words[4]) & !0x0200;
+        let texture_uvs = [words[2], words[4], words[6], words[8]]
+            .map(texture_coordinate)
+            .map(|uv| (uv.u, uv.v));
+        let points = [words[1], words[3], words[5], words[7]]
+            .map(point)
+            .map(|point| (point.x, point.y));
+        let exact_slice = match descriptor {
+            0x0088 => {
+                texture_uvs == [(192, 0), (255, 0), (192, 255), (255, 255)]
+                    && points == [(480, 113), (416, 113), (480, 368), (416, 368)]
+            }
+            0x008a => {
+                texture_uvs == [(0, 0), (127, 0), (0, 255), (127, 255)]
+                    && points == [(416, 113), (288, 113), (416, 368), (288, 368)]
+            }
+            _ => false,
+        };
+
+        exact_slice && self.retained_br2_right_large_portrait_assets.is_some()
+    }
+
+    pub(crate) fn restore_retained_br2_character_select_right_large_portrait_assets(
+        &mut self,
+    ) -> bool {
+        let Some(assets) = self.retained_br2_right_large_portrait_assets.as_ref() else {
+            return false;
+        };
+        self.framebuffer.restore_region_snapshot(&assets.texture);
+        self.framebuffer.restore_region_snapshot(&assets.clut);
+        self.invalidate_recovery_presentation_caches();
+        true
+    }
+
+    fn retained_textured_polygon_transfer_generation_valid_with_policy(
+        &self,
+        words: &[u32],
+        allow_persisted_clut_data: bool,
+    ) -> bool {
+        if words.len() != 9 || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f) {
+            return false;
+        }
+
+        let texture_page = texture_page(words[4]);
+        let clut = clut(words[2]);
+        let textured_points = [
+            (words[1], words[2]),
+            (words[3], words[4]),
+            (words[5], words[6]),
+            (words[7], words[8]),
+        ]
+        .map(|(position, uv)| {
+            let texture_uv = texture_coordinate(uv);
+            TexturedPoint {
+                point: point(position),
+                u: texture_uv.u,
+                v: texture_uv.v,
+            }
+        });
+        let points = textured_points.map(|point| point.point);
+        let trace = GpuDrawTrace::textured_with_options(
+            "textured_quad",
+            texture_page,
+            clut,
+            points_bounds(&points),
+            TexturedDrawStats::default(),
+            words,
+            &textured_points,
+            self.texture_window,
+            self.texture_draw_options(words[0], texture_page),
+            None,
+        );
+        let Some(texture_bounds) = texture_raw_bounds_for_trace(&trace) else {
+            return false;
+        };
+        let Some(clut_bounds) = clut_bounds_for_trace(&trace) else {
+            return false;
+        };
+        let draw_command_order = self.commands_seen.saturating_add(words.len() as u64);
+        let draw_vblank = self.presentation_captures;
+        let texture_provenance_valid =
+            self.transfer_provenance_covers_bounds(texture_bounds, draw_command_order, draw_vblank);
+        let clut_provenance_valid =
+            self.transfer_provenance_covers_bounds(clut_bounds, draw_command_order, draw_vblank);
+        let texture_has_data = transfer_region_has_image_data(&self.framebuffer, texture_bounds);
+        let clut_has_data = transfer_region_has_palette_data(&self.framebuffer, clut_bounds);
+        texture_provenance_valid
+            && texture_has_data
+            && (clut_provenance_valid || allow_persisted_clut_data)
+            && clut_has_data
+    }
+
+    pub(crate) fn retained_portrait_texture_generation(&self) -> u64 {
+        self.retained_transfer_coverage
+            .portrait_texture_generation()
+    }
+
+    pub(crate) fn retained_portrait_texture_coverage_per_mille(&self) -> usize {
+        self.retained_transfer_coverage
+            .portrait_texture_coverage_per_mille()
+    }
+
+    fn transfer_provenance_covers_bounds(
+        &self,
+        bounds: DrawBounds,
+        draw_command_order: u64,
+        draw_vblank: u64,
+    ) -> bool {
+        if let Some(covered) = self.retained_transfer_coverage.covers(bounds) {
+            return covered;
+        }
+
+        let center = Point {
+            x: bounds.left.saturating_add(bounds.right) / 2,
+            y: bounds.top.saturating_add(bounds.bottom) / 2,
+        };
+        [
+            Point {
+                x: bounds.left,
+                y: bounds.top,
+            },
+            Point {
+                x: bounds.right,
+                y: bounds.top,
+            },
+            center,
+            Point {
+                x: bounds.left,
+                y: bounds.bottom,
+            },
+            Point {
+                x: bounds.right,
+                y: bounds.bottom,
+            },
+        ]
+        .into_iter()
+        .all(|point| {
+            let point_bounds = rect_bounds(point, 1, 1);
+            self.recent_transfer_commands.iter().rev().any(|transfer| {
+                transfer.valid
+                    && transfer.command_order <= draw_command_order
+                    && transfer.vblank <= draw_vblank
+                    && transfer.dest_overlap_area(point_bounds) == 1
+            })
+        })
     }
 
     fn draw_transfer_provenance_json(&self, trace: &GpuDrawTrace) -> String {
@@ -12688,13 +14334,16 @@ impl Gpu {
         }
 
         self.best_observation_png = None;
-        self.best_observation_rgb = Some(self.framebuffer.psx_display_rgb_window_with_depth(
+        let rgb24 = self.display_24bit_enabled();
+        Self::capture_psx_display_rgb_cache(
+            &self.framebuffer,
+            &mut self.best_observation_rgb,
             candidate.x,
             candidate.y,
             width,
             height,
-            self.display_24bit_enabled(),
-        ));
+            rgb24,
+        );
         self.best_observation_window = Some(candidate);
         self.best_observation_width = width;
         self.best_observation_height = height;
@@ -13163,6 +14812,19 @@ impl Gpu {
             return false;
         }
 
+        let key = self.display_color_stats_cache_key(window, width, height, false);
+        {
+            let mut cache = self.primitive_tearing_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("primitive tearing cache index should exist");
+                let result = cached.result;
+                cache.push_back(cached);
+                return result;
+            }
+        }
+
         let x_step = (width / 128).max(2);
         let y_step = (height / 96).max(2);
         let cached_rgb = self.cached_rgb_for_display_color_stats(window, width, height);
@@ -13176,6 +14838,8 @@ impl Gpu {
 
         let mut tear_rows = 0_u64;
         let mut sampled_rows = 0_u64;
+        let total_rows = height.div_ceil(y_step) as u64;
+        let required_tear_rows = total_rows.saturating_mul(25).div_ceil(100).max(1);
         for y in (0..height).step_by(y_step) {
             let mut row_samples = 0_u64;
             let mut row_artifact_pixels = 0_u64;
@@ -13210,9 +14874,34 @@ impl Gpu {
                     tear_rows = tear_rows.saturating_add(1);
                 }
             }
+
+            if tear_rows >= required_tear_rows {
+                let mut cache = self.primitive_tearing_cache.borrow_mut();
+                if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+                    cache.pop_front();
+                }
+                cache.push_back(DisplayBoolAnalysisCache { key, result: true });
+                return true;
+            }
+            let remaining_rows = total_rows.saturating_sub(sampled_rows);
+            if tear_rows.saturating_add(remaining_rows) < required_tear_rows {
+                let mut cache = self.primitive_tearing_cache.borrow_mut();
+                if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+                    cache.pop_front();
+                }
+                cache.push_back(DisplayBoolAnalysisCache { key, result: false });
+                return false;
+            }
         }
 
-        sampled_rows > 0 && tear_rows.saturating_mul(100) >= sampled_rows.saturating_mul(25)
+        let result =
+            sampled_rows > 0 && tear_rows.saturating_mul(100) >= sampled_rows.saturating_mul(25);
+        let mut cache = self.primitive_tearing_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayBoolAnalysisCache { key, result });
+        result
     }
 
     fn display_candidate_has_texture_atlas_half_with_dimensions(
@@ -13463,6 +15152,9 @@ impl Gpu {
 
         let (display_width, display_height) = self.display_dimensions();
         let (start_x, start_y) = display_area_start_xy(self.display_area_start);
+        if start_x.saturating_add(display_width) > VRAM_WIDTH {
+            return;
+        }
         let stats = self.framebuffer.psx_display_stats_with_depth(
             start_x,
             start_y,
@@ -13507,13 +15199,16 @@ impl Gpu {
         }
 
         self.presented_frame_png = None;
-        self.presented_frame_rgb = Some(self.framebuffer.psx_display_rgb_window_with_depth(
+        let rgb24 = self.display_24bit_enabled();
+        Self::capture_psx_display_rgb_cache(
+            &self.framebuffer,
+            &mut self.presented_frame_rgb,
             start_x,
             start_y,
             display_width,
             display_height,
-            self.display_24bit_enabled(),
-        ));
+            rgb24,
+        );
         self.presented_frame_window = Some(candidate);
         self.presented_frame_width = display_width;
         self.presented_frame_height = display_height;
@@ -15113,13 +16808,305 @@ impl Gpu {
     fn native_replay_preserves_visible_scene(&self, before: &Gpu) -> bool {
         let before_current = before.current_display_window();
         let current = self.current_display_window();
+        let (width, height) = self.display_dimensions();
         if replay_window_has_catastrophic_regression(before_current.stats, current.stats) {
             return false;
         }
 
-        let before_output = before.current_display_output_window().window;
-        let output = self.current_display_output_window().window;
-        !replay_window_has_catastrophic_regression(before_output.stats, output.stats)
+        let current_occlusion = self.lower_playfield_occlusion_candidate(current, width, height);
+        let mut before_output = None;
+        let mut current_reference = None;
+        if let Some(candidate) = current_occlusion.as_ref() {
+            let output = before.current_display_output_window();
+            before_output = Some(output);
+            current_reference =
+                before.lower_playfield_occlusion_reference(before_current, output, width, height);
+            if current_reference
+                .as_ref()
+                .is_some_and(|reference| lower_playfield_occlusion_detected(candidate, reference))
+            {
+                return false;
+            }
+        }
+
+        let output = self.current_display_output_window();
+        let before_output = before_output.unwrap_or_else(|| before.current_display_output_window());
+        if replay_window_has_catastrophic_regression(
+            before_output.window.stats,
+            output.window.stats,
+        ) {
+            return false;
+        }
+
+        let Some(output_candidate) =
+            self.lower_playfield_occlusion_candidate(output.window, output.width, output.height)
+        else {
+            return true;
+        };
+        let output_reference = if output.width == width && output.height == height {
+            current_reference.or_else(|| {
+                before.lower_playfield_occlusion_reference(
+                    before_current,
+                    before_output,
+                    output.width,
+                    output.height,
+                )
+            })
+        } else {
+            before.lower_playfield_occlusion_reference(
+                before_current,
+                before_output,
+                output.width,
+                output.height,
+            )
+        };
+        output_reference.as_ref().is_none_or(|reference| {
+            !lower_playfield_occlusion_detected(&output_candidate, reference)
+        })
+    }
+
+    fn native_replay_preserves_current_display_scene(&self, before: &Gpu) -> bool {
+        let before_current = before.current_display_window();
+        let current = self.current_display_window();
+        let (width, height) = self.display_dimensions();
+        if replay_window_has_catastrophic_regression(before_current.stats, current.stats) {
+            return false;
+        }
+
+        let Some(candidate) = self.lower_playfield_occlusion_candidate(current, width, height)
+        else {
+            return true;
+        };
+        let (before_width, before_height) = before.display_dimensions();
+        if before_width != width || before_height != height {
+            return self.native_replay_preserves_visible_scene(before);
+        }
+        before
+            .lower_playfield_occlusion_reference_window(before_current, width, height)
+            .as_ref()
+            .is_none_or(|reference| !lower_playfield_occlusion_detected(&candidate, reference))
+    }
+
+    #[cfg(test)]
+    fn recovered_presented_candidate_has_lower_playfield_occlusion(
+        &self,
+        before: &Gpu,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let before_current = before.current_display_window();
+        let before_output = before.current_display_output_window();
+        self.recovered_presented_candidate_has_lower_playfield_occlusion_with_reference(
+            before,
+            before_current,
+            before_output,
+            candidate,
+            width,
+            height,
+        )
+    }
+
+    fn recovered_presented_candidate_fails_prior_scene_guard(
+        &self,
+        before: &Gpu,
+        before_current: FrameBufferWindow,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let current_is_direct_reference = before.display_dimensions() == (width, height)
+            && has_native_gameplay_display_profile(before_current.stats);
+        if current_is_direct_reference {
+            if recovered_presented_candidate_is_sparse_regression_against(before_current, candidate)
+            {
+                return true;
+            }
+            let Some(candidate) =
+                self.lower_playfield_occlusion_candidate(candidate, width, height)
+            else {
+                return false;
+            };
+            return before
+                .lower_playfield_occlusion_reference_window(before_current, width, height)
+                .as_ref()
+                .is_some_and(|reference| {
+                    lower_playfield_occlusion_detected(&candidate, reference)
+                });
+        }
+
+        let before_output = before.current_display_output_window();
+        if recovered_presented_candidate_is_sparse_regression_with_reference(
+            before_current,
+            before_output,
+            candidate,
+        ) {
+            return true;
+        }
+        self.recovered_presented_candidate_has_lower_playfield_occlusion_with_reference(
+            before,
+            before_current,
+            before_output,
+            candidate,
+            width,
+            height,
+        )
+    }
+
+    fn recovered_presented_candidate_has_lower_playfield_occlusion_with_reference(
+        &self,
+        before: &Gpu,
+        before_current: FrameBufferWindow,
+        before_output: DisplayOutputWindow,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let Some(candidate) = self.lower_playfield_occlusion_candidate(candidate, width, height)
+        else {
+            return false;
+        };
+        before
+            .lower_playfield_occlusion_reference(before_current, before_output, width, height)
+            .as_ref()
+            .is_some_and(|reference| lower_playfield_occlusion_detected(&candidate, reference))
+    }
+
+    fn lower_playfield_occlusion_candidate(
+        &self,
+        candidate: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> Option<LowerPlayfieldOcclusionBands> {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !presented_frame_has_live_scene(candidate.stats)
+            || !has_native_gameplay_display_profile(candidate.stats)
+            || !self.has_native_play_3d_draw_signal()
+        {
+            return None;
+        }
+
+        const SAMPLE_STEP: usize = 8;
+        let lower_start = height / 2;
+        let lower_end = height.saturating_mul(7) / 8;
+        let lower =
+            self.sampled_display_band_stats(candidate, width, lower_start, lower_end, SAMPLE_STEP);
+        if lower.samples == 0
+            || lower.unique_buckets > 48
+            || lower.nonzero_samples.saturating_mul(5) < lower.samples.saturating_mul(4)
+        {
+            return None;
+        }
+
+        let upper = self.sampled_display_band_stats(candidate, width, 0, height / 2, SAMPLE_STEP);
+        Some(LowerPlayfieldOcclusionBands { lower, upper })
+    }
+
+    fn lower_playfield_occlusion_reference(
+        &self,
+        current: FrameBufferWindow,
+        output: DisplayOutputWindow,
+        width: usize,
+        height: usize,
+    ) -> Option<LowerPlayfieldOcclusionBands> {
+        if !self.has_native_play_3d_draw_signal() {
+            return None;
+        }
+
+        let (current_width, current_height) = self.display_dimensions();
+        let before_window = [
+            (current, current_width, current_height),
+            (output.window, output.width, output.height),
+        ]
+        .into_iter()
+        .filter(|(window, before_width, before_height)| {
+            *before_width == width
+                && *before_height == height
+                && presented_frame_has_live_scene(window.stats)
+                && has_native_gameplay_display_profile(window.stats)
+        })
+        .max_by_key(|(window, _, _)| screen_observation_score(window.stats))
+        .map(|(window, _, _)| window)?;
+
+        self.lower_playfield_occlusion_reference_window(before_window, width, height)
+    }
+
+    fn lower_playfield_occlusion_reference_window(
+        &self,
+        before_window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> Option<LowerPlayfieldOcclusionBands> {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !presented_frame_has_live_scene(before_window.stats)
+            || !has_native_gameplay_display_profile(before_window.stats)
+            || !self.has_native_play_3d_draw_signal()
+        {
+            return None;
+        }
+
+        const SAMPLE_STEP: usize = 8;
+        let lower = self.sampled_display_band_stats(
+            before_window,
+            width,
+            height / 2,
+            height.saturating_mul(7) / 8,
+            SAMPLE_STEP,
+        );
+        let upper =
+            self.sampled_display_band_stats(before_window, width, 0, height / 2, SAMPLE_STEP);
+        Some(LowerPlayfieldOcclusionBands { lower, upper })
+    }
+
+    fn sampled_display_band_stats(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        start_y: usize,
+        end_y: usize,
+        step: usize,
+    ) -> SampledDisplayBandStats {
+        let mut stats = SampledDisplayBandStats::default();
+        let step = step.max(1);
+        for y in (start_y..end_y).step_by(step) {
+            let mut previous_luma = None;
+            for x in (0..width).step_by(step) {
+                let rgb = self.framebuffer.psx_display_pixel(
+                    window.x,
+                    window.y,
+                    x,
+                    y,
+                    self.display_24bit_enabled(),
+                );
+                let luma = rgb_luma(rgb);
+                stats.samples = stats.samples.saturating_add(1);
+                stats.nonzero_samples = stats.nonzero_samples.saturating_add(u64::from(rgb != 0));
+                stats.luma_sum = stats.luma_sum.saturating_add(u64::from(luma));
+                if previous_luma.is_some_and(|previous| luma.abs_diff(previous) >= 16) {
+                    stats.horizontal_edges = stats.horizontal_edges.saturating_add(1);
+                }
+                previous_luma = Some(luma);
+                stats.color_buckets[primitive_workspace_color_bucket(rgb) as usize] = true;
+            }
+        }
+        stats.unique_buckets = stats
+            .color_buckets
+            .iter()
+            .filter(|present| **present)
+            .count() as u64;
+        stats
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rollback_catastrophic_recovered_scene(&mut self, before: &Gpu) -> bool {
+        if self.native_replay_preserves_visible_scene(before) {
+            return false;
+        }
+
+        *self = before.clone();
+        true
     }
 
     fn native_replay_lightweight_validation_candidate(&self, before: &Gpu) -> bool {
@@ -16594,6 +18581,15 @@ impl Gpu {
         height: usize,
         color_stats: DisplayColorStats,
     ) -> bool {
+        let transient_combat_effect = self
+            .high_vertical_full_transient_combat_effect_allows_caption_overlay(
+                use_output,
+                output,
+                window,
+                width,
+                height,
+                color_stats,
+            );
         if !use_output
             || output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL
             || !output.field_composed
@@ -16614,7 +18610,7 @@ impl Gpu {
             || !has_native_full_scene_detail(window.stats)
             || !has_native_gameplay_display_profile(window.stats)
             || !color_stats.has_scene_color_diversity()
-            || color_stats.has_intro_caption_band()
+            || (color_stats.has_intro_caption_band() && !transient_combat_effect)
             || self.low_palette_noise_candidate(window.stats, color_stats)
             || self.display_window_has_saturated_logo_transition(window, width, height, true)
             || self.display_window_has_atlas_caption_ghosting(
@@ -16674,6 +18670,54 @@ impl Gpu {
                 width,
                 field_height,
             )
+    }
+
+    fn high_vertical_full_transient_combat_effect_allows_caption_overlay(
+        &self,
+        use_output: bool,
+        output: DisplayOutputWindow,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        if !use_output
+            || output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+            || !output.field_composed
+            || output.cached
+            || output.window.x != window.x
+            || output.window.y != window.y
+            || output.width != width
+            || output.height != height
+            || width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !self.high_vertical_interlace_enabled()
+            || !self.has_strong_native_3d_textured_playfield_activity()
+            || !screen_observation_worth_saving(window.stats)
+            || !is_detailed_observation(window.stats)
+            || !has_native_full_scene_detail(window.stats)
+            || !has_native_gameplay_display_profile(window.stats)
+            || !color_stats.has_scene_color_diversity()
+            || !color_stats.has_intro_caption_band()
+            || color_stats.bottom_band_samples == 0
+            || color_stats.bottom_dark_samples.saturating_mul(100)
+                < color_stats.bottom_band_samples.saturating_mul(25)
+            || color_stats.bottom_dark_samples.saturating_mul(100)
+                > color_stats.bottom_band_samples.saturating_mul(45)
+            || color_stats.bottom_caption_samples.saturating_mul(100)
+                > color_stats.bottom_band_samples.saturating_mul(10)
+            || !self.display_candidate_has_live_draw_overlap_with_dimensions(window, width, height)
+            || self.display_candidate_has_scene_upload_overlap(window)
+            || self.display_candidate_has_dominant_unpresented_texture_upload(window, width, height)
+        {
+            return false;
+        }
+
+        self.presentation_captures > 0
+            && self.textured_draw_stats.written_pixels
+                >= DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 16
+            && self.textured_draw_stats.color_changes
+                >= DISPLAY_RESOLVE_MIN_ACTIVE_FIELD_RENDER_READY_COLOR_CHANGES
     }
 
     fn high_vertical_active_field_stage_letterbox_live_scene(
@@ -17145,6 +19189,19 @@ impl Gpu {
             return false;
         }
 
+        let key = self.display_color_stats_cache_key(window, width, height, psx_wrap);
+        {
+            let mut cache = self.high_vertical_static_title_screen_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("high vertical title screen cache index should exist");
+                let result = cached.result;
+                cache.push_back(cached);
+                return result;
+            }
+        }
+
         #[derive(Default)]
         struct RegionSignal {
             samples: u64,
@@ -17233,10 +19290,16 @@ impl Gpu {
             && center_mark.bright.saturating_mul(100) >= center_mark.samples.saturating_mul(5)
             && center_mark.white.saturating_mul(100) >= center_mark.samples.saturating_mul(4);
 
-        mostly_black_scene
+        let result = mostly_black_scene
             && left_title_mass
             && top_title_text
-            && (right_title_mark || center_copyright_mark)
+            && (right_title_mark || center_copyright_mark);
+        let mut cache = self.high_vertical_static_title_screen_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayBoolAnalysisCache { key, result });
+        result
     }
 
     fn display_window_has_atlas_caption_ghosting(
@@ -17338,8 +19401,11 @@ impl Gpu {
         psx_wrap: bool,
         require_marked_dark_rows: bool,
     ) -> bool {
-        let x_step = (width / 320).max(1);
-        let y_step = (height / 240).max(1);
+        // The logo detector only needs region ratios. Sampling at roughly
+        // 160x120 retains those ratios while avoiding a near-full-frame scan
+        // for every animated recovery candidate.
+        let x_step = (width / 160).max(1);
+        let y_step = (height / 120).max(1);
         let title_region_x_start = width.saturating_mul(52) / 100;
         let title_region_x_end = width.saturating_mul(99) / 100;
         let title_region_y_start = height.saturating_mul(48) / 100;
@@ -17457,6 +19523,19 @@ impl Gpu {
             return false;
         }
 
+        let key = self.display_color_stats_cache_key(window, width, height, psx_wrap);
+        {
+            let mut cache = self.saturated_logo_transition_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("saturated logo transition cache index should exist");
+                let result = cached.result;
+                cache.push_back(cached);
+                return result;
+            }
+        }
+
         let x_step = (width / 160).max(1);
         let y_step = (height / 120).max(1);
         let mut samples = 0u64;
@@ -17522,20 +19601,26 @@ impl Gpu {
             }
         }
 
-        if samples == 0 || top_samples == 0 || logo_samples == 0 {
-            return false;
+        let result = if samples == 0 || top_samples == 0 || logo_samples == 0 {
+            false
+        } else {
+            let saturated_transition = high_saturation.saturating_mul(100)
+                >= samples.saturating_mul(45)
+                && top_high_saturation.saturating_mul(100) >= top_samples.saturating_mul(60)
+                && red_or_white.saturating_mul(100) >= samples.saturating_mul(10)
+                && black.saturating_mul(100) >= samples.saturating_mul(2);
+            let logo_like_corner = logo_red.saturating_mul(100) >= logo_samples.saturating_mul(6)
+                && logo_white.saturating_mul(100) >= logo_samples.saturating_mul(6)
+                && logo_nonblack.saturating_mul(100) >= logo_samples.saturating_mul(25);
+
+            saturated_transition && logo_like_corner
+        };
+        let mut cache = self.saturated_logo_transition_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
         }
-
-        let saturated_transition = high_saturation.saturating_mul(100)
-            >= samples.saturating_mul(45)
-            && top_high_saturation.saturating_mul(100) >= top_samples.saturating_mul(60)
-            && red_or_white.saturating_mul(100) >= samples.saturating_mul(10)
-            && black.saturating_mul(100) >= samples.saturating_mul(2);
-        let logo_like_corner = logo_red.saturating_mul(100) >= logo_samples.saturating_mul(6)
-            && logo_white.saturating_mul(100) >= logo_samples.saturating_mul(6)
-            && logo_nonblack.saturating_mul(100) >= logo_samples.saturating_mul(25);
-
-        saturated_transition && logo_like_corner
+        cache.push_back(DisplayBoolAnalysisCache { key, result });
+        result
     }
 
     fn narrow_field_intro_caption_band(
@@ -17767,6 +19852,166 @@ impl Gpu {
             && (620..=820).contains(&dominant_bucket)
     }
 
+    fn display_window_has_br2_red_cave_recovery_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        color_stats: DisplayColorStats,
+        psx_wrap: bool,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(window.stats)
+            || color_stats.samples < 64
+            || color_stats.bottom_band_samples == 0
+            || color_stats.has_intro_caption_band()
+            || color_stats.has_caption_text_band()
+            || color_stats.has_scene_color_diversity()
+        {
+            return false;
+        }
+
+        let pixel_count = window.stats.pixel_count.max(1);
+        let nearly_opaque =
+            window.stats.nonzero_pixels.saturating_mul(100) >= pixel_count.saturating_mul(95);
+        let red_dominant = color_stats.red_sum
+            >= color_stats
+                .green_sum
+                .saturating_add(color_stats.blue_sum)
+                .saturating_mul(3);
+        let dark_lower_band = color_stats.bottom_dark_samples.saturating_mul(100)
+            >= color_stats.bottom_band_samples.saturating_mul(80);
+        let low_palette = (4..=96).contains(&color_stats.bucket_count);
+        let dominant_bucket =
+            self.display_window_dominant_bucket_per_mille(window, width, height, psx_wrap);
+
+        nearly_opaque
+            && red_dominant
+            && dark_lower_band
+            && low_palette
+            && average_luma(window.stats) <= 64
+            && (160..=700).contains(&dominant_bucket)
+    }
+
+    fn display_window_has_br2_repeating_rock_atlas_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        color_stats: DisplayColorStats,
+        psx_wrap: bool,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(window.stats)
+            || color_stats.samples < 64
+            || color_stats.bottom_band_samples == 0
+            || color_stats.red_sum.saturating_mul(10) < color_stats.green_sum.saturating_mul(14)
+            || color_stats.red_sum.saturating_mul(4) < color_stats.blue_sum.saturating_mul(5)
+            || color_stats.bottom_dark_samples.saturating_mul(100)
+                < color_stats.bottom_band_samples.saturating_mul(60)
+        {
+            return false;
+        }
+
+        let key = self.display_color_stats_cache_key(window, width, height, psx_wrap);
+        {
+            let mut cache = self.repeating_rock_atlas_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("rock atlas cache index should exist");
+                let result = cached.result;
+                cache.push_back(cached);
+                return result;
+            }
+        }
+
+        let band_height = height / 3;
+        let top_match = self.display_window_periodic_band_match_per_mille(
+            window,
+            width,
+            0,
+            band_height,
+            64,
+            psx_wrap,
+        );
+        let bottom_match = self.display_window_periodic_band_match_per_mille(
+            window,
+            width,
+            height.saturating_sub(band_height),
+            height,
+            64,
+            psx_wrap,
+        );
+        let result = top_match >= 700 && bottom_match >= 700;
+        if br2_native_trace_recovery_fast_path() {
+            eprintln!(
+                "BR2 repeating rock probe: top_match={} bottom_match={} bucket_count={} color_diverse={} checksum={:#010x}",
+                top_match,
+                bottom_match,
+                color_stats.bucket_count,
+                color_stats.has_scene_color_diversity(),
+                window.stats.checksum,
+            );
+        }
+
+        let mut cache = self.repeating_rock_atlas_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayBoolAnalysisCache { key, result });
+        result
+    }
+
+    fn display_window_periodic_band_match_per_mille(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        start_y: usize,
+        end_y: usize,
+        period: usize,
+        psx_wrap: bool,
+    ) -> usize {
+        const SAMPLE_STEP: usize = 4;
+
+        if start_y >= end_y || end_y > usize::MAX / width.max(1) || period == 0 || period >= width {
+            return 0;
+        }
+
+        let cached_rgb = self.cached_rgb_for_display_color_stats(window, width, end_y);
+        let pixel_at = |x: usize, y: usize| -> u32 {
+            cached_rgb
+                .and_then(|rgb| rgb.get(y.saturating_mul(width).saturating_add(x)))
+                .copied()
+                .unwrap_or_else(|| self.display_window_pixel(window, x, y, psx_wrap))
+                & 0x00ff_ffff
+        };
+        let sampled_band_pixels = width
+            .div_ceil(SAMPLE_STEP)
+            .saturating_mul((end_y - start_y).div_ceil(SAMPLE_STEP));
+        let mut matches = 0usize;
+        let mut nonzero_samples = 0usize;
+        for y in (start_y..end_y).step_by(SAMPLE_STEP) {
+            for x in (0..width - period).step_by(SAMPLE_STEP) {
+                let left = pixel_at(x, y);
+                if left == 0 {
+                    continue;
+                }
+                nonzero_samples = nonzero_samples.saturating_add(1);
+                if left == pixel_at(x + period, y) {
+                    matches = matches.saturating_add(1);
+                }
+            }
+        }
+        if nonzero_samples.saturating_mul(4) < sampled_band_pixels {
+            0
+        } else {
+            matches.saturating_mul(1_000) / nonzero_samples.max(1)
+        }
+    }
+
     fn display_color_stats_cache_key(
         &self,
         window: FrameBufferWindow,
@@ -17780,12 +20025,6 @@ impl Gpu {
             height,
             psx_wrap,
             display_24bit: self.display_24bit_enabled(),
-            commands_seen: self.commands_seen,
-            draw_sequence: self.draw_sequence,
-            transfer_sequence: self.transfer_sequence,
-            presentation_captures: self.presentation_captures,
-            presented_frame_capture_index: self.presented_frame_capture_index,
-            field_composed_display_capture_index: self.field_composed_display_capture_index,
         }
     }
 
@@ -17880,7 +20119,39 @@ impl Gpu {
         if width == 0 || height == 0 {
             return 0;
         }
+        let key = self.display_color_stats_cache_key(window, width, height, psx_wrap);
+        {
+            let mut cache = self.display_dominant_bucket_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("dominant bucket cache index should exist");
+                let dominant_per_mille = cached.dominant_per_mille;
+                cache.push_back(cached);
+                return dominant_per_mille;
+            }
+        }
 
+        let dominant_per_mille =
+            self.compute_display_window_dominant_bucket_per_mille(window, width, height, psx_wrap);
+        let mut cache = self.display_dominant_bucket_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayDominantBucketCache {
+            key,
+            dominant_per_mille,
+        });
+        dominant_per_mille
+    }
+
+    fn compute_display_window_dominant_bucket_per_mille(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> u64 {
         let x_step = (width / 64).max(1);
         let y_step = (height / 64).max(1);
         let mut buckets = [0_u16; 512];
@@ -17910,13 +20181,6 @@ impl Gpu {
     }
 
     fn display_output_has_periodic_horizontal_ghosting(&self, output: DisplayOutputWindow) -> bool {
-        if output.cached
-            && let Some(rgb) = self.field_composed_display_rgb.as_ref()
-            && rgb.len() >= output.width.saturating_mul(output.height)
-        {
-            return rgb_frame_has_periodic_horizontal_ghosting(rgb, output.width, output.height);
-        }
-
         self.display_window_has_periodic_horizontal_ghosting(
             output.window,
             output.width,
@@ -17935,6 +20199,37 @@ impl Gpu {
         if width < 128 || height == 0 {
             return false;
         }
+        let key = self.display_color_stats_cache_key(window, width, height, psx_wrap);
+        {
+            let mut cache = self.periodic_horizontal_ghosting_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("periodic ghosting cache index should exist");
+                let result = cached.result;
+                cache.push_back(cached);
+                return result;
+            }
+        }
+
+        let result = self.compute_display_window_has_periodic_horizontal_ghosting(
+            window, width, height, psx_wrap,
+        );
+        let mut cache = self.periodic_horizontal_ghosting_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayBoolAnalysisCache { key, result });
+        result
+    }
+
+    fn compute_display_window_has_periodic_horizontal_ghosting(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
         if let Some(rgb) = self.cached_rgb_for_display_color_stats(window, width, height) {
             return rgb_frame_has_periodic_horizontal_ghosting(rgb, width, height);
         }
@@ -18040,7 +20335,42 @@ impl Gpu {
         if cols.saturating_mul(rows) < 64 {
             return false;
         }
+        let key = self.display_color_stats_cache_key(window, width, height, psx_wrap);
+        {
+            let mut cache = self.glyph_texture_grid_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|cached| cached.key == key) {
+                let cached = cache
+                    .remove(index)
+                    .expect("glyph texture grid cache index should exist");
+                let result = cached.result;
+                cache.push_back(cached);
+                return result;
+            }
+        }
 
+        let result = self.compute_display_window_has_glyph_texture_grid_with_mode(
+            window, width, height, psx_wrap,
+        );
+        let mut cache = self.glyph_texture_grid_cache.borrow_mut();
+        if cache.len() >= GPU_DISPLAY_ANALYSIS_CACHE_LIMIT {
+            cache.pop_front();
+        }
+        cache.push_back(DisplayBoolAnalysisCache { key, result });
+        result
+    }
+
+    fn compute_display_window_has_glyph_texture_grid_with_mode(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+    ) -> bool {
+        const CELL_WIDTH: usize = 16;
+        const CELL_HEIGHT: usize = 12;
+
+        let cols = width / CELL_WIDTH;
+        let rows = height / CELL_HEIGHT;
         let cached_rgb = self.cached_rgb_for_display_color_stats(window, width, height);
         let pixel_at = |x: usize, y: usize| -> u32 {
             cached_rgb
@@ -18051,18 +20381,20 @@ impl Gpu {
         };
         let mut sampled_cells = 0usize;
         let mut glyph_like_cells = 0usize;
+        let total_cells = cols.saturating_mul(rows);
+        let required_glyph_like_cells = total_cells.saturating_mul(18).div_ceil(100).max(12);
         for cell_y in 0..rows {
             for cell_x in 0..cols {
-                sampled_cells = sampled_cells.saturating_add(1);
+                sampled_cells += 1;
                 let mut samples = 0usize;
                 let mut ink_pixels = 0usize;
                 let mut dark_pixels = 0usize;
-                let mut ink_rows = [false; CELL_HEIGHT];
-                let mut ink_cols = [false; CELL_WIDTH];
+                let mut ink_rows = 0_u16;
+                let mut ink_cols = 0_u16;
 
                 for y in (0..CELL_HEIGHT).step_by(2) {
                     for x in (0..CELL_WIDTH).step_by(2) {
-                        samples = samples.saturating_add(1);
+                        samples += 1;
                         let rgb = pixel_at(cell_x * CELL_WIDTH + x, cell_y * CELL_HEIGHT + y);
                         let red = (rgb >> 16) & 0xff;
                         let green = (rgb >> 8) & 0xff;
@@ -18075,18 +20407,18 @@ impl Gpu {
                         let dark_background = luma < 40 && chroma < 32;
 
                         if ink {
-                            ink_pixels = ink_pixels.saturating_add(1);
-                            ink_rows[y] = true;
-                            ink_cols[x] = true;
+                            ink_pixels += 1;
+                            ink_rows |= 1 << y;
+                            ink_cols |= 1 << x;
                         }
                         if dark_background {
-                            dark_pixels = dark_pixels.saturating_add(1);
+                            dark_pixels += 1;
                         }
                     }
                 }
 
-                let ink_row_count = ink_rows.into_iter().filter(|present| *present).count();
-                let ink_col_count = ink_cols.into_iter().filter(|present| *present).count();
+                let ink_row_count = ink_rows.count_ones() as usize;
+                let ink_col_count = ink_cols.count_ones() as usize;
                 let enough_dark_background = dark_pixels.saturating_mul(2) >= samples;
                 let enough_ink = ink_pixels.saturating_mul(24) >= samples;
                 let not_filled = ink_pixels.saturating_mul(4) <= samples.saturating_mul(3);
@@ -18098,13 +20430,20 @@ impl Gpu {
                     && ink_col_count.saturating_mul(6) <= sampled_cols.saturating_mul(5);
 
                 if enough_dark_background && enough_ink && not_filled && strokes_are_localized {
-                    glyph_like_cells = glyph_like_cells.saturating_add(1);
+                    glyph_like_cells += 1;
+                    if glyph_like_cells >= required_glyph_like_cells {
+                        return true;
+                    }
+                }
+
+                let remaining_cells = total_cells.saturating_sub(sampled_cells);
+                if glyph_like_cells.saturating_add(remaining_cells) < required_glyph_like_cells {
+                    return false;
                 }
             }
         }
 
-        glyph_like_cells >= 12
-            && glyph_like_cells.saturating_mul(100) >= sampled_cells.saturating_mul(18)
+        glyph_like_cells >= required_glyph_like_cells
     }
 
     fn cached_rgb_for_display_color_stats(
@@ -18386,7 +20725,9 @@ impl Gpu {
     }
 
     fn presented_frame_is_safe_display_candidate(&self, presented: FrameBufferWindow) -> bool {
+        let (width, height) = self.presented_frame_dimensions();
         if self.display_window_is_texture_atlas(presented)
+            || display_window_wraps_vram_horizontally(presented, width)
             || self.presented_frame_has_high_vertical_mixed_artifact(presented)
             || self.presented_frame_has_high_vertical_single_field_scene_artifact(presented)
             || !screen_observation_worth_saving(presented.stats)
@@ -18394,7 +20735,6 @@ impl Gpu {
             return false;
         }
 
-        let (width, height) = self.presented_frame_dimensions();
         let color_stats = self.display_window_color_stats(presented, width, height, true);
         let high_detail_3d_scene_active = self.textured_triangle_commands
             >= DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4
@@ -18549,8 +20889,8 @@ impl GpuCommandSource {
         }
     }
 
-    fn is_replay_frame_clear(&self) -> bool {
-        self.kind == "replay_frame_clear"
+    fn suppresses_presented_frame_capture(&self) -> bool {
+        matches!(self.kind, "replay_frame_clear" | "recovery_dma_linked_list")
     }
 
     fn is_recovery_display_flip(&self) -> bool {
@@ -18621,6 +20961,25 @@ impl NativeGpuDisplayCandidate {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GpuDrawCaptureKey {
+    kind: &'static str,
+    texture_page: Option<u16>,
+    clut: Option<u16>,
+    color: Option<u32>,
+    bounds: DrawBounds,
+    stats: TexturedDrawStats,
+    words: Vec<u32>,
+    points: Vec<Point>,
+    uvs: Vec<TextureCoordinate>,
+    texture_window: Option<TextureWindow>,
+    texture_options: Option<TextureDrawOptions>,
+    source: Option<GpuCommandSource>,
+    texture_generation: Option<u64>,
+    clut_generation: Option<u64>,
+    clut_candidate_generation: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeGpuDrawCapture {
     pub sequence: u64,
@@ -18644,6 +21003,7 @@ pub struct NativeGpuDrawCapture {
     pub resolved_palette_png: Option<Vec<u8>>,
     pub texture_diagnostics_json: Option<String>,
     pub texture_candidate_images: Vec<TextureCandidateImage>,
+    pub palette_candidate_images: Vec<crate::native::framebuffer::PaletteCandidateImage>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -18741,9 +21101,10 @@ impl NativeGpuDrawCapture {
         palette_output: Option<&str>,
         resolved_palette_output: Option<&str>,
         texture_candidate_outputs_json: &str,
+        palette_candidate_outputs_json: &str,
     ) -> String {
         format!(
-            "{{\"sequence\":{},\"display_output\":\"{}\",\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"gui_display_output\":\"{}\",\"bounds_output\":\"{}\",\"texture_output\":{},\"raw_texture_output\":{},\"palette_output\":{},\"resolved_palette_output\":{},\"texture_candidate_outputs\":[{}],\"display_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"bounds_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"texture_diagnostics\":{},\"trace\":{}}}",
+            "{{\"sequence\":{},\"display_output\":\"{}\",\"actual_display_output\":\"{}\",\"raw_actual_display_output\":\"{}\",\"gui_display_output\":\"{}\",\"bounds_output\":\"{}\",\"texture_output\":{},\"raw_texture_output\":{},\"palette_output\":{},\"resolved_palette_output\":{},\"texture_candidate_outputs\":[{}],\"palette_candidate_outputs\":[{}],\"display_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"bounds_window\":{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\"texture_diagnostics\":{},\"trace\":{}}}",
             self.sequence,
             escape_json(display_output),
             escape_json(actual_display_output),
@@ -18755,6 +21116,7 @@ impl NativeGpuDrawCapture {
             optional_str_json(palette_output),
             optional_str_json(resolved_palette_output),
             texture_candidate_outputs_json,
+            palette_candidate_outputs_json,
             self.display_x,
             self.display_y,
             self.display_width,
@@ -18784,6 +21146,12 @@ struct DisplayOutputWindow {
     width: usize,
     height: usize,
     window: FrameBufferWindow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayOutputWindowCache {
+    key: StableDisplayFrameCacheKey,
+    output: DisplayOutputWindow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18861,6 +21229,7 @@ struct StableDisplayFrameCacheKey {
     display_width: usize,
     display_height: usize,
     display_24bit: bool,
+    framebuffer_revision: u64,
     fill_rect_commands: u64,
     flat_triangle_commands: u64,
     textured_triangle_commands: u64,
@@ -18938,18 +21307,24 @@ struct DisplayColorStatsCacheKey {
     height: usize,
     psx_wrap: bool,
     display_24bit: bool,
-    commands_seen: u64,
-    draw_sequence: u64,
-    transfer_sequence: u64,
-    presentation_captures: u64,
-    presented_frame_capture_index: u64,
-    field_composed_display_capture_index: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DisplayColorStatsCache {
     key: DisplayColorStatsCacheKey,
     stats: DisplayColorStats,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayDominantBucketCache {
+    key: DisplayColorStatsCacheKey,
+    dominant_per_mille: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayBoolAnalysisCache {
+    key: DisplayColorStatsCacheKey,
+    result: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18976,6 +21351,65 @@ struct FieldComposedSliceValidationCacheKey {
 struct FieldComposedSliceValidationCache {
     key: FieldComposedSliceValidationCacheKey,
     valid: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SampledDisplayBandStats {
+    samples: u64,
+    nonzero_samples: u64,
+    luma_sum: u64,
+    horizontal_edges: u64,
+    unique_buckets: u64,
+    color_buckets: [bool; 512],
+}
+
+impl Default for SampledDisplayBandStats {
+    fn default() -> Self {
+        Self {
+            samples: 0,
+            nonzero_samples: 0,
+            luma_sum: 0,
+            horizontal_edges: 0,
+            unique_buckets: 0,
+            color_buckets: [false; 512],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LowerPlayfieldOcclusionBands {
+    lower: SampledDisplayBandStats,
+    upper: SampledDisplayBandStats,
+}
+
+fn lower_playfield_occlusion_detected(
+    candidate: &LowerPlayfieldOcclusionBands,
+    reference: &LowerPlayfieldOcclusionBands,
+) -> bool {
+    let lower_palette_collapsed = reference.lower.unique_buckets >= 64
+        && candidate.lower.unique_buckets.saturating_mul(3)
+            <= reference.lower.unique_buckets.saturating_mul(2);
+    let lower_edges_collapsed = reference.lower.horizontal_edges > 0
+        && candidate.lower.horizontal_edges.saturating_mul(3)
+            <= reference.lower.horizontal_edges.saturating_mul(2);
+    let lower_remains_opaque = candidate.lower.nonzero_samples.saturating_mul(5)
+        >= reference.lower.nonzero_samples.saturating_mul(4);
+    let lower_did_not_fade =
+        candidate.lower.luma_sum.saturating_mul(10) >= reference.lower.luma_sum.saturating_mul(9);
+    if !(lower_palette_collapsed
+        && lower_edges_collapsed
+        && lower_remains_opaque
+        && lower_did_not_fade)
+    {
+        return false;
+    }
+
+    let upper_palette_preserved = candidate.upper.unique_buckets.saturating_mul(4)
+        >= reference.upper.unique_buckets.saturating_mul(3);
+    let upper_edges_preserved = candidate.upper.horizontal_edges.saturating_mul(4)
+        >= reference.upper.horizontal_edges.saturating_mul(3);
+
+    upper_palette_preserved && upper_edges_preserved
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -19902,6 +22336,282 @@ fn gpu_transfer_region_stats(
     stats
 }
 
+fn transfer_region_has_image_data(framebuffer: &NativeFrameBuffer, bounds: DrawBounds) -> bool {
+    let stats = gpu_transfer_region_stats(
+        framebuffer,
+        bounds.left,
+        bounds.top,
+        bounds.right.saturating_sub(bounds.left).saturating_add(1),
+        bounds.bottom.saturating_sub(bounds.top).saturating_add(1),
+    );
+    stats.nonzero_pixels > 0 && stats.unique_colors >= 2
+}
+
+fn transfer_region_has_palette_data(framebuffer: &NativeFrameBuffer, bounds: DrawBounds) -> bool {
+    let stats = gpu_transfer_region_stats(
+        framebuffer,
+        bounds.left,
+        bounds.top,
+        bounds.right.saturating_sub(bounds.left).saturating_add(1),
+        bounds.bottom.saturating_sub(bounds.top).saturating_add(1),
+    );
+    stats.nonzero_pixels >= 2 && stats.unique_colors >= 2
+}
+
+fn split_wrapped_transfer_axis(start: i32, extent: i32, limit: i32) -> ([(i32, i32); 2], usize) {
+    if extent <= 0 || limit <= 0 {
+        return ([(0, -1); 2], 0);
+    }
+
+    let start = start.rem_euclid(limit);
+    let extent = extent.min(limit);
+    let end = start.saturating_add(extent);
+    if end <= limit {
+        ([(start, end - 1), (0, -1)], 1)
+    } else {
+        ([(start, limit - 1), (0, end - limit - 1)], 2)
+    }
+}
+
+fn mark_retained_transfer_region(
+    bits: &mut [u64],
+    region_x: i32,
+    region_y: i32,
+    region_width: usize,
+    region_height: usize,
+    transfer: DrawBounds,
+) -> bool {
+    let region = rect_bounds(
+        Point {
+            x: region_x,
+            y: region_y,
+        },
+        region_width as i32,
+        region_height as i32,
+    );
+    let left = transfer.left.max(region.left);
+    let top = transfer.top.max(region.top);
+    let right = transfer.right.min(region.right);
+    let bottom = transfer.bottom.min(region.bottom);
+    if left > right || top > bottom {
+        return false;
+    }
+
+    let first_column = (left - region_x) as usize;
+    let end_column = (right - region_x) as usize + 1;
+    for row in (top - region_y) as usize..=(bottom - region_y) as usize {
+        set_retained_transfer_bits(
+            bits,
+            row.saturating_mul(region_width)
+                .saturating_add(first_column),
+            row.saturating_mul(region_width).saturating_add(end_column),
+        );
+    }
+    true
+}
+
+fn retained_transfer_region_samples_covered(
+    bits: &[u64],
+    region_x: i32,
+    region_y: i32,
+    region_width: usize,
+    region_height: usize,
+    bounds: DrawBounds,
+) -> Option<bool> {
+    let region = rect_bounds(
+        Point {
+            x: region_x,
+            y: region_y,
+        },
+        region_width as i32,
+        region_height as i32,
+    );
+    if bounds.left < region.left
+        || bounds.top < region.top
+        || bounds.right > region.right
+        || bounds.bottom > region.bottom
+    {
+        return None;
+    }
+
+    let center = Point {
+        x: bounds.left.saturating_add(bounds.right) / 2,
+        y: bounds.top.saturating_add(bounds.bottom) / 2,
+    };
+    Some(
+        [
+            Point {
+                x: bounds.left,
+                y: bounds.top,
+            },
+            Point {
+                x: bounds.right,
+                y: bounds.top,
+            },
+            center,
+            Point {
+                x: bounds.left,
+                y: bounds.bottom,
+            },
+            Point {
+                x: bounds.right,
+                y: bounds.bottom,
+            },
+        ]
+        .into_iter()
+        .all(|point| {
+            let index =
+                (point.y - region_y) as usize * region_width + (point.x - region_x) as usize;
+            retained_transfer_bit_is_set(bits, index)
+        }),
+    )
+}
+
+fn retained_transfer_region_coverage_per_mille(
+    bits: &[u64],
+    region_x: i32,
+    region_y: i32,
+    region_width: usize,
+    region_height: usize,
+    bounds: DrawBounds,
+) -> Option<usize> {
+    let region = rect_bounds(
+        Point {
+            x: region_x,
+            y: region_y,
+        },
+        region_width as i32,
+        region_height as i32,
+    );
+    if bounds.left < region.left
+        || bounds.top < region.top
+        || bounds.right > region.right
+        || bounds.bottom > region.bottom
+    {
+        return None;
+    }
+
+    let first_column = (bounds.left - region_x) as usize;
+    let end_column = (bounds.right - region_x) as usize + 1;
+    let mut covered = 0usize;
+    for row in (bounds.top - region_y) as usize..=(bounds.bottom - region_y) as usize {
+        covered = covered.saturating_add(retained_transfer_set_bit_count(
+            bits,
+            row.saturating_mul(region_width)
+                .saturating_add(first_column),
+            row.saturating_mul(region_width).saturating_add(end_column),
+        ));
+    }
+    Some(covered.saturating_mul(1_000) / (bounds.area().max(0) as usize).max(1))
+}
+
+fn retained_transfer_region_fully_covered(
+    bits: &[u64],
+    region_x: i32,
+    region_y: i32,
+    region_width: usize,
+    region_height: usize,
+    bounds: DrawBounds,
+) -> Option<bool> {
+    let region = rect_bounds(
+        Point {
+            x: region_x,
+            y: region_y,
+        },
+        region_width as i32,
+        region_height as i32,
+    );
+    if bounds.left < region.left
+        || bounds.top < region.top
+        || bounds.right > region.right
+        || bounds.bottom > region.bottom
+    {
+        return None;
+    }
+
+    let first_column = (bounds.left - region_x) as usize;
+    let end_column = (bounds.right - region_x) as usize + 1;
+    Some(
+        ((bounds.top - region_y) as usize..=(bounds.bottom - region_y) as usize).all(|row| {
+            retained_transfer_bits_are_set(
+                bits,
+                row.saturating_mul(region_width)
+                    .saturating_add(first_column),
+                row.saturating_mul(region_width).saturating_add(end_column),
+            )
+        }),
+    )
+}
+
+fn retained_transfer_covered_pixel_count(bits: &[u64]) -> usize {
+    bits.iter()
+        .map(|word| word.count_ones() as usize)
+        .sum::<usize>()
+}
+
+fn retained_transfer_bit_is_set(bits: &[u64], index: usize) -> bool {
+    bits.get(index / 64)
+        .is_some_and(|word| word & (1_u64 << (index % 64)) != 0)
+}
+
+fn retained_transfer_set_bit_count(bits: &[u64], start: usize, end: usize) -> usize {
+    let mut cursor = start;
+    let mut count = 0usize;
+    while cursor < end {
+        let word_index = cursor / 64;
+        let bit_offset = cursor % 64;
+        let take = (64 - bit_offset).min(end - cursor);
+        let mask = if take == 64 {
+            u64::MAX
+        } else {
+            ((1_u64 << take) - 1) << bit_offset
+        };
+        count = count.saturating_add(
+            bits.get(word_index)
+                .map_or(0, |word| (word & mask).count_ones() as usize),
+        );
+        cursor += take;
+    }
+    count
+}
+
+fn set_retained_transfer_bits(bits: &mut [u64], start: usize, end: usize) {
+    let mut cursor = start;
+    while cursor < end {
+        let word_index = cursor / 64;
+        let bit_offset = cursor % 64;
+        let take = (64 - bit_offset).min(end - cursor);
+        let mask = if take == 64 {
+            u64::MAX
+        } else {
+            ((1_u64 << take) - 1) << bit_offset
+        };
+        if let Some(word) = bits.get_mut(word_index) {
+            *word |= mask;
+        }
+        cursor += take;
+    }
+}
+
+fn retained_transfer_bits_are_set(bits: &[u64], start: usize, end: usize) -> bool {
+    let mut cursor = start;
+    while cursor < end {
+        let word_index = cursor / 64;
+        let bit_offset = cursor % 64;
+        let take = (64 - bit_offset).min(end - cursor);
+        let mask = if take == 64 {
+            u64::MAX
+        } else {
+            ((1_u64 << take) - 1) << bit_offset
+        };
+        if bits.get(word_index).is_none_or(|word| word & mask != mask) {
+            return false;
+        }
+        cursor += take;
+    }
+    true
+}
+
 fn texture_raw_bounds_for_trace(trace: &GpuDrawTrace) -> Option<DrawBounds> {
     let texture_page = trace.texture_page?;
     let (origin_x, origin_y) = trace.clut.map_or_else(
@@ -19979,7 +22689,9 @@ fn clut_candidate_bounds_for_trace(trace: &GpuDrawTrace) -> Vec<ClutCandidateBou
     let Some(entries) = texture_palette_entries_for_diagnostics(texture_page) else {
         return Vec::new();
     };
-    if entries != 16 || !br2_reused_texture_page_0039(texture_page) {
+    let br2_large_select_8bpp =
+        entries == 256 && texture_page & !0x0200 == 0x0088 && clut == 0x7d40;
+    if !br2_large_select_8bpp && (entries != 16 || !br2_reused_texture_page_0039(texture_page)) {
         return Vec::new();
     }
 
@@ -20006,6 +22718,9 @@ fn clut_candidate_bounds_for_trace(trace: &GpuDrawTrace) -> Vec<ClutCandidateBou
         requested_y & !0x1f,
         entries,
     );
+    if br2_large_select_8bpp {
+        return candidates;
+    }
 
     match clut {
         0x785a => {
@@ -20091,6 +22806,39 @@ fn transfer_overlap_area(transfer_bounds: DrawBounds, target_bounds: DrawBounds)
         return 0;
     }
     transfer_bounds.intersection_area(target_bounds)
+}
+
+fn transfer_is_br2_large_portrait_texture_asset(x: i32, y: i32, width: i32, height: i32) -> bool {
+    x == BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X
+        && y == BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y
+        && ((width == BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH as i32
+            && height == BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT as i32)
+            || (width == 128 && height == 240))
+}
+
+fn transfer_is_br2_large_portrait_clut_asset(x: i32, y: i32, width: i32, height: i32) -> bool {
+    x == BR2_RETAINED_LARGE_PORTRAIT_CLUT_X
+        && y == BR2_RETAINED_LARGE_PORTRAIT_CLUT_Y
+        && width == BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH as i32
+        && height == BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT as i32
+}
+
+fn transfer_is_br2_right_large_portrait_texture_asset(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
+    x == 640 && y == 0 && width == 128 && height == 240
+}
+
+fn transfer_is_br2_right_large_portrait_completion_asset(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
+    x == 0 && y == 497 && width == 256 && height == 1
 }
 
 fn transfer_rect_json(x: i32, y: i32, width: i32, height: i32) -> String {
@@ -20383,6 +23131,51 @@ fn first_command_source(sources: &[Option<GpuCommandSource>]) -> Option<GpuComma
     sources.first().and_then(Clone::clone)
 }
 
+fn preserve_br2_recovery_fighter_material_palette(
+    options: &mut TextureDrawOptions,
+    source: Option<&GpuCommandSource>,
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) {
+    if is_br2_recovery_fighter_material_draw(source, texture_page, clut, bounds) {
+        options.allow_texture_descriptor_alias = false;
+    }
+}
+
+fn is_br2_recovery_fighter_material_draw(
+    source: Option<&GpuCommandSource>,
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    let Some(address) = source.address.map(|address| address & 0x00ff_fffc) else {
+        return false;
+    };
+    if source.kind != "recovery_dma_linked_list"
+        || !(BR2_RECOVERY_FIGHTER_MATERIAL_START..BR2_RECOVERY_FIGHTER_MATERIAL_END)
+            .contains(&address)
+        || texture_page & !0x0600 != 0x001c
+        || clut != 0x7994
+    {
+        return false;
+    }
+
+    let width = bounds.right.saturating_sub(bounds.left).saturating_add(1);
+    let height = bounds.bottom.saturating_sub(bounds.top).saturating_add(1);
+    width > 1
+        && height > 1
+        && width <= 192
+        && height <= 224
+        && bounds.left <= 639
+        && bounds.right >= 0
+        && bounds.top >= 32
+        && bounds.bottom <= 431
+}
+
 fn fill_rect_dimensions_valid(width: i32, height: i32) -> bool {
     width > 0 && height > 0 && width <= VRAM_WIDTH as i32 && height <= VRAM_HEIGHT as i32
 }
@@ -20574,7 +23367,11 @@ fn should_allow_br2_character_select_polygon_palette_fallback(
     matches!(command, 0x2c..=0x2f | 0x3c..=0x3f)
         && matches!(
             (descriptor, clut),
-            (0x0088, 0x7d40) | (0x0088, 0x7d80) | (0x008a, 0x7d80)
+            (0x0088, 0x7d40)
+                | (0x0088, 0x7d80)
+                | (0x008a, 0x7d80)
+                | (0x000c, 0x7d19)
+                | (0x000c, 0x7d1a)
         )
         && bounds.area() >= 8_000
         && bounds.top <= 180
@@ -20763,6 +23560,14 @@ fn native_disable_br2_stage_strip_skip() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
         std::env::var("BLOODYROAR2_NATIVE_DISABLE_BR2_STAGE_STRIP_SKIP")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn br2_native_trace_recovery_fast_path() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BR2_NATIVE_TRACE_RECOVERY_FAST_PATH")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
 }
@@ -21166,6 +23971,14 @@ fn replay_window_has_catastrophic_regression(
     before: FrameBufferStats,
     candidate: FrameBufferStats,
 ) -> bool {
+    let dense_scene_collapsed = before.pixel_count > 0
+        && before.nonzero_pixels >= 2_048
+        && before.nonzero_pixels.saturating_mul(5) >= before.pixel_count
+        && candidate.nonzero_pixels.saturating_mul(2) < before.nonzero_pixels;
+    if dense_scene_collapsed {
+        return true;
+    }
+
     if !screen_observation_worth_saving(before)
         || !is_detailed_observation(before)
         || before.nonzero_pixels < 2_048
@@ -21182,6 +23995,60 @@ fn replay_window_has_catastrophic_regression(
 
     score_collapsed && (pixels_collapsed || detail_collapsed)
         || pixels_collapsed && detail_collapsed
+}
+
+#[cfg(test)]
+fn recovered_presented_candidate_is_sparse_regression(
+    before: &Gpu,
+    candidate: FrameBufferWindow,
+) -> bool {
+    recovered_presented_candidate_is_sparse_regression_with_reference(
+        before.current_display_window(),
+        before.current_display_output_window(),
+        candidate,
+    )
+}
+
+fn recovered_presented_candidate_is_sparse_regression_with_reference(
+    before_current: FrameBufferWindow,
+    before_output: DisplayOutputWindow,
+    candidate: FrameBufferWindow,
+) -> bool {
+    [before_current, before_output.window]
+        .into_iter()
+        .filter(|window| presented_frame_has_live_scene(window.stats))
+        .max_by_key(|window| screen_observation_score(window.stats))
+        .is_some_and(|before| {
+            recovered_presented_candidate_is_sparse_regression_against(before, candidate)
+        })
+}
+
+fn recovered_presented_candidate_is_sparse_regression_against(
+    before: FrameBufferWindow,
+    candidate: FrameBufferWindow,
+) -> bool {
+    replay_window_has_catastrophic_regression(before.stats, candidate.stats)
+        || recovered_presented_candidate_has_rapid_regression(before.stats, candidate.stats)
+}
+
+fn recovered_presented_candidate_has_rapid_regression(
+    before: FrameBufferStats,
+    candidate: FrameBufferStats,
+) -> bool {
+    if before.pixel_count == 0
+        || before.nonzero_pixels.saturating_mul(100) < before.pixel_count.saturating_mul(65)
+    {
+        return false;
+    }
+
+    let density_collapsed =
+        candidate.nonzero_pixels.saturating_mul(5) < before.nonzero_pixels.saturating_mul(3);
+    let detail_collapsed =
+        candidate.detail_edges.saturating_mul(5) < before.detail_edges.saturating_mul(3);
+    let score_collapsed = screen_observation_score(candidate).saturating_mul(5)
+        < screen_observation_score(before).saturating_mul(3);
+
+    density_collapsed && (detail_collapsed || score_collapsed)
 }
 
 fn minimum_live_draw_overlap_area_for_dimensions(width: usize, height: usize) -> i64 {
@@ -21203,6 +24070,13 @@ fn has_native_full_scene_detail(stats: FrameBufferStats) -> bool {
 fn has_native_gameplay_display_profile(stats: FrameBufferStats) -> bool {
     stats.pixel_count > 0
         && has_native_full_scene_detail(stats)
+        && stats.nonzero_pixels.saturating_mul(100) >= stats.pixel_count.saturating_mul(65)
+        && average_luma(stats) >= 12
+}
+
+fn has_native_recovery_snapshot_profile(stats: FrameBufferStats) -> bool {
+    stats.pixel_count > 0
+        && !is_low_information_observation(stats)
         && stats.nonzero_pixels.saturating_mul(100) >= stats.pixel_count.saturating_mul(65)
         && average_luma(stats) >= 12
 }
@@ -21324,6 +24198,14 @@ fn is_likely_texture_page_candidate(x: usize, y: usize, width: usize, height: us
     let starts_in_texture_column = matches!(x, 512 | 640);
     let is_large_page = width >= DEFAULT_DISPLAY_WIDTH && height >= DEFAULT_DISPLAY_HEIGHT;
     starts_in_texture_column && is_large_page && right <= VRAM_WIDTH && bottom <= PSX_VRAM_HEIGHT
+}
+
+fn display_window_wraps_vram_horizontally(window: FrameBufferWindow, width: usize) -> bool {
+    width > 0
+        && window
+            .x
+            .checked_add(width)
+            .is_none_or(|right| right > VRAM_WIDTH)
 }
 
 #[derive(Clone, Debug)]
@@ -21648,12 +24530,16 @@ fn timer_register_slot(address: u32) -> (usize, TimerRegister) {
 #[derive(Clone, Debug)]
 pub struct Controller {
     pub p1_state: u16,
+    pub p2_state: u16,
     pub last_write: u16,
     pub status: u16,
     pub mode: u16,
     pub control: u16,
     pub baud: u16,
     transfer_index: u8,
+    latched_p1_state: u16,
+    latched_p2_state: u16,
+    latched_p2_selected: bool,
     security_transfer_index: usize,
     security_response: Vec<u8>,
     cat702: [Option<Cat702>; 2],
@@ -21676,12 +24562,22 @@ pub struct ControllerInputActivity {
     pub p1_kick_active_reads: u64,
     pub p1_beast_active_reads: u64,
     pub p1_guard_active_reads: u64,
+    pub p2_input_reads: u64,
+    pub p2_up_active_reads: u64,
+    pub p2_down_active_reads: u64,
+    pub p2_left_active_reads: u64,
+    pub p2_right_active_reads: u64,
+    pub p2_start_active_reads: u64,
+    pub p2_punch_active_reads: u64,
+    pub p2_kick_active_reads: u64,
+    pub p2_beast_active_reads: u64,
+    pub p2_guard_active_reads: u64,
 }
 
 impl ControllerInputActivity {
     fn json(self) -> String {
         format!(
-            "{{\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p1_guard_active_reads\":{}}}",
+            "{{\"p1_input_reads\":{},\"p1_up_active_reads\":{},\"p1_down_active_reads\":{},\"p1_left_active_reads\":{},\"p1_right_active_reads\":{},\"p1_start_active_reads\":{},\"p1_punch_active_reads\":{},\"p1_kick_active_reads\":{},\"p1_beast_active_reads\":{},\"p1_guard_active_reads\":{},\"p2_input_reads\":{},\"p2_up_active_reads\":{},\"p2_down_active_reads\":{},\"p2_left_active_reads\":{},\"p2_right_active_reads\":{},\"p2_start_active_reads\":{},\"p2_punch_active_reads\":{},\"p2_kick_active_reads\":{},\"p2_beast_active_reads\":{},\"p2_guard_active_reads\":{}}}",
             self.p1_input_reads,
             self.p1_up_active_reads,
             self.p1_down_active_reads,
@@ -21691,7 +24587,17 @@ impl ControllerInputActivity {
             self.p1_punch_active_reads,
             self.p1_kick_active_reads,
             self.p1_beast_active_reads,
-            self.p1_guard_active_reads
+            self.p1_guard_active_reads,
+            self.p2_input_reads,
+            self.p2_up_active_reads,
+            self.p2_down_active_reads,
+            self.p2_left_active_reads,
+            self.p2_right_active_reads,
+            self.p2_start_active_reads,
+            self.p2_punch_active_reads,
+            self.p2_kick_active_reads,
+            self.p2_beast_active_reads,
+            self.p2_guard_active_reads
         )
     }
 }
@@ -21700,12 +24606,16 @@ impl Default for Controller {
     fn default() -> Self {
         Self {
             p1_state: 0xffff,
+            p2_state: 0xffff,
             last_write: 0,
             status: 0x0005,
             mode: 0,
             control: 0,
             baud: 0,
             transfer_index: 0,
+            latched_p1_state: 0xffff,
+            latched_p2_state: 0xffff,
+            latched_p2_selected: false,
             security_transfer_index: 0,
             security_response: Vec::new(),
             cat702: [None, None],
@@ -21756,9 +24666,17 @@ impl Controller {
 
     pub fn diagnostic_json(&self) -> String {
         format!(
-            "{{\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"last_write\":{},\"last_write_hex\":\"0x{:04x}\",\"status\":{},\"status_hex\":\"0x{:04x}\",\"mode\":{},\"mode_hex\":\"0x{:04x}\",\"control\":{},\"control_hex\":\"0x{:04x}\",\"baud\":{},\"baud_hex\":\"0x{:04x}\",\"transfer_index\":{},\"security_transfer_index\":{},\"security_response_loaded\":{},\"security_response_len\":{},\"response\":{},\"response_hex\":\"0x{:02x}\",\"irq_requested\":{},\"cat702\":[{}],\"zn_mcu\":{},\"input_activity\":{},\"recent_security_transfers\":[{}]}}",
+            "{{\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"p2_state\":{},\"p2_state_hex\":\"0x{:04x}\",\"selected_pad_port\":{},\"latched_p1_state\":{},\"latched_p1_state_hex\":\"0x{:04x}\",\"latched_p2_state\":{},\"latched_p2_state_hex\":\"0x{:04x}\",\"latched_pad_port\":{},\"last_write\":{},\"last_write_hex\":\"0x{:04x}\",\"status\":{},\"status_hex\":\"0x{:04x}\",\"mode\":{},\"mode_hex\":\"0x{:04x}\",\"control\":{},\"control_hex\":\"0x{:04x}\",\"baud\":{},\"baud_hex\":\"0x{:04x}\",\"transfer_index\":{},\"security_transfer_index\":{},\"security_response_loaded\":{},\"security_response_len\":{},\"response\":{},\"response_hex\":\"0x{:02x}\",\"irq_requested\":{},\"cat702\":[{}],\"zn_mcu\":{},\"input_activity\":{},\"recent_security_transfers\":[{}]}}",
             self.p1_state,
             self.p1_state,
+            self.p2_state,
+            self.p2_state,
+            self.selected_pad_port(),
+            self.latched_p1_state,
+            self.latched_p1_state,
+            self.latched_p2_state,
+            self.latched_p2_state,
+            self.latched_pad_port(),
             self.last_write,
             self.last_write,
             self.status,
@@ -21785,13 +24703,19 @@ impl Controller {
 
     pub fn security_compact_json(&self) -> String {
         format!(
-            "{{\"last_write\":{},\"last_write_hex\":\"0x{:04x}\",\"status\":{},\"status_hex\":\"0x{:04x}\",\"control\":{},\"control_hex\":\"0x{:04x}\",\"transfer_index\":{},\"security_transfer_index\":{},\"security_response_loaded\":{},\"security_response_len\":{},\"response\":{},\"response_hex\":\"0x{:02x}\",\"irq_requested\":{},\"cat702\":[{}],\"zn_mcu\":{},\"input_activity\":{}}}",
+            "{{\"last_write\":{},\"last_write_hex\":\"0x{:04x}\",\"status\":{},\"status_hex\":\"0x{:04x}\",\"control\":{},\"control_hex\":\"0x{:04x}\",\"selected_pad_port\":{},\"latched_pad_port\":{},\"p1_state\":{},\"p1_state_hex\":\"0x{:04x}\",\"p2_state\":{},\"p2_state_hex\":\"0x{:04x}\",\"transfer_index\":{},\"security_transfer_index\":{},\"security_response_loaded\":{},\"security_response_len\":{},\"response\":{},\"response_hex\":\"0x{:02x}\",\"irq_requested\":{},\"cat702\":[{}],\"zn_mcu\":{},\"input_activity\":{}}}",
             self.last_write,
             self.last_write,
             self.status,
             self.status,
             self.control,
             self.control,
+            self.selected_pad_port(),
+            self.latched_pad_port(),
+            self.p1_state,
+            self.p1_state,
+            self.p2_state,
+            self.p2_state,
             self.transfer_index,
             self.security_transfer_index,
             !self.security_response.is_empty(),
@@ -21874,18 +24798,25 @@ impl Controller {
             self.response = self.zn_mcu.transfer_byte();
             self.record_security_transfer("zn_mcu", value, self.response);
         } else if self.security_response.is_empty() || value == 0x01 {
+            if value == 0x01 || self.transfer_index == 0 {
+                self.latch_pad_transfer();
+            }
+            if value == 0x01 {
+                self.transfer_index = 0;
+            }
             let transfer_index = self.transfer_index;
+            let pad_state = self.latched_pad_state();
             self.response = match transfer_index {
                 0 => 0xff,
                 1 if value == 0x42 => 0x41,
                 1 => 0xff,
                 2 => 0x5a,
-                3 => self.p1_state as u8,
-                4 => (self.p1_state >> 8) as u8,
+                3 => pad_state as u8,
+                4 => (pad_state >> 8) as u8,
                 _ => 0xff,
             };
             if transfer_index == 3 {
-                self.record_p1_input_read();
+                self.record_pad_input_read(pad_state, self.latched_p2_selected);
             }
             self.transfer_index = if value == 0x01 {
                 1
@@ -21981,59 +24912,168 @@ impl Controller {
     }
 
     pub fn set_buttons(&mut self, buttons: ActionButtons) {
-        let mut state = 0xffff_u16;
-        clear_if(&mut state, 0x0010, buttons.up);
-        clear_if(&mut state, 0x0040, buttons.down);
-        clear_if(&mut state, 0x0080, buttons.left);
-        clear_if(&mut state, 0x0020, buttons.right);
-        clear_if(&mut state, 0x4000, buttons.punch);
-        clear_if(&mut state, 0x2000, buttons.kick);
-        clear_if(&mut state, 0x1000, buttons.beast);
-        clear_if(&mut state, 0x8000, buttons.guard);
-        clear_if(&mut state, 0x0008, buttons.start);
-        self.p1_state = state;
+        self.p1_state = controller_pad_state_from_buttons(buttons, false);
+        self.p2_state = controller_pad_state_from_buttons(buttons, true);
         self.zn_mcu.set_input(buttons);
     }
 
-    fn record_p1_input_read(&mut self) {
-        self.input_activity.p1_input_reads = self.input_activity.p1_input_reads.saturating_add(1);
-        increment_if_u64(
-            &mut self.input_activity.p1_up_active_reads,
-            self.p1_state & 0x0010 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_down_active_reads,
-            self.p1_state & 0x0040 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_left_active_reads,
-            self.p1_state & 0x0080 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_right_active_reads,
-            self.p1_state & 0x0020 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_start_active_reads,
-            self.p1_state & 0x0008 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_punch_active_reads,
-            self.p1_state & 0x4000 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_kick_active_reads,
-            self.p1_state & 0x2000 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_beast_active_reads,
-            self.p1_state & 0x1000 == 0,
-        );
-        increment_if_u64(
-            &mut self.input_activity.p1_guard_active_reads,
-            self.p1_state & 0x8000 == 0,
-        );
+    fn selected_pad_port(&self) -> u8 {
+        if self.control & SIO_CONTROL_SLOT_2_SELECT != 0 {
+            2
+        } else {
+            1
+        }
     }
+
+    fn latched_pad_port(&self) -> u8 {
+        if self.latched_p2_selected { 2 } else { 1 }
+    }
+
+    fn latch_pad_transfer(&mut self) {
+        self.latched_p1_state = self.p1_state;
+        self.latched_p2_state = self.p2_state;
+        self.latched_p2_selected = self.control & SIO_CONTROL_SLOT_2_SELECT != 0;
+    }
+
+    fn latched_pad_state(&self) -> u16 {
+        if self.latched_p2_selected {
+            self.latched_p2_state
+        } else {
+            self.latched_p1_state
+        }
+    }
+
+    fn record_pad_input_read(&mut self, state: u16, p2_selected: bool) {
+        if p2_selected {
+            self.input_activity.p2_input_reads =
+                self.input_activity.p2_input_reads.saturating_add(1);
+            increment_if_u64(
+                &mut self.input_activity.p2_up_active_reads,
+                state & 0x0010 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_down_active_reads,
+                state & 0x0040 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_left_active_reads,
+                state & 0x0080 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_right_active_reads,
+                state & 0x0020 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_start_active_reads,
+                state & 0x0008 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_punch_active_reads,
+                state & 0x4000 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_kick_active_reads,
+                state & 0x2000 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_beast_active_reads,
+                state & 0x1000 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p2_guard_active_reads,
+                state & 0x8000 == 0,
+            );
+        } else {
+            self.input_activity.p1_input_reads =
+                self.input_activity.p1_input_reads.saturating_add(1);
+            increment_if_u64(
+                &mut self.input_activity.p1_up_active_reads,
+                state & 0x0010 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_down_active_reads,
+                state & 0x0040 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_left_active_reads,
+                state & 0x0080 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_right_active_reads,
+                state & 0x0020 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_start_active_reads,
+                state & 0x0008 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_punch_active_reads,
+                state & 0x4000 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_kick_active_reads,
+                state & 0x2000 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_beast_active_reads,
+                state & 0x1000 == 0,
+            );
+            increment_if_u64(
+                &mut self.input_activity.p1_guard_active_reads,
+                state & 0x8000 == 0,
+            );
+        }
+    }
+}
+
+fn controller_pad_state_from_buttons(buttons: ActionButtons, p2: bool) -> u16 {
+    let mut state = 0xffff_u16;
+    clear_if(
+        &mut state,
+        0x0010,
+        if p2 { buttons.p2_up } else { buttons.up },
+    );
+    clear_if(
+        &mut state,
+        0x0040,
+        if p2 { buttons.p2_down } else { buttons.down },
+    );
+    clear_if(
+        &mut state,
+        0x0080,
+        if p2 { buttons.p2_left } else { buttons.left },
+    );
+    clear_if(
+        &mut state,
+        0x0020,
+        if p2 { buttons.p2_right } else { buttons.right },
+    );
+    clear_if(
+        &mut state,
+        0x4000,
+        if p2 { buttons.p2_punch } else { buttons.punch },
+    );
+    clear_if(
+        &mut state,
+        0x2000,
+        if p2 { buttons.p2_kick } else { buttons.kick },
+    );
+    clear_if(
+        &mut state,
+        0x1000,
+        if p2 { buttons.p2_beast } else { buttons.beast },
+    );
+    clear_if(
+        &mut state,
+        0x8000,
+        if p2 { buttons.p2_guard } else { buttons.guard },
+    );
+    clear_if(
+        &mut state,
+        0x0008,
+        if p2 { buttons.p2_start } else { buttons.start },
+    );
+    state
 }
 
 #[derive(Clone, Debug)]
@@ -22153,12 +25193,8 @@ impl ZnMcu {
         }
 
         self.input = input;
-        if self.selected {
-            self.rebuild_send_buffer();
-            if self.byte_index > self.databytes {
-                self.byte_index = 0;
-                self.bit_index = 0;
-            }
+        if self.selected && self.at_packet_boundary() {
+            self.begin_transfer();
         }
     }
 
@@ -22166,6 +25202,9 @@ impl ZnMcu {
         if !self.selected {
             self.last_response = 0xff;
             return 0xff;
+        }
+        if self.at_packet_boundary() {
+            self.begin_transfer();
         }
         if self.byte_index == 0 && self.bit_index == 0 {
             self.rebuild_send_buffer();
@@ -22229,6 +25268,10 @@ impl ZnMcu {
         }
 
         self.txd
+    }
+
+    fn at_packet_boundary(&self) -> bool {
+        self.bit_index == 0 && (self.byte_index == 0 || self.byte_index > self.databytes)
     }
 
     fn rebuild_send_buffer(&mut self) {
@@ -22457,6 +25500,10 @@ pub struct Mdec {
     dma_input_words: u64,
     dma_output_words: u64,
     input_words: Vec<u32>,
+    decode_input_halfwords: Vec<u16>,
+    decode_input_cursor: usize,
+    decode_complete: bool,
+    discarded_input_halfwords: u64,
     decoded_output_words: Vec<u32>,
     decoded_output_index: usize,
     decoded_output_underflow_reads: u64,
@@ -22476,6 +25523,10 @@ impl Default for Mdec {
             dma_input_words: 0,
             dma_output_words: 0,
             input_words: Vec::new(),
+            decode_input_halfwords: Vec::new(),
+            decode_input_cursor: 0,
+            decode_complete: true,
+            discarded_input_halfwords: 0,
             decoded_output_words: Vec::new(),
             decoded_output_index: 0,
             decoded_output_underflow_reads: 0,
@@ -22501,11 +25552,10 @@ impl Mdec {
             MDEC_COMMAND => self.write_command_or_data(value),
             MDEC_STATUS => {
                 if value & 0x8000_0000 != 0 {
-                    *self = Self::default();
-                } else {
-                    self.control = value & 0x6000_0000;
-                    self.status = mdec_status(self.input_words_remaining);
+                    self.soft_reset();
                 }
+                self.control = value & 0x6000_0000;
+                self.refresh_status();
             }
             _ => {}
         }
@@ -22526,13 +25576,17 @@ impl Mdec {
                 self.finish_input_dma();
             }
         }
-        self.status = mdec_status(self.input_words_remaining);
+        self.refresh_status();
     }
 
     fn start_command(&mut self, value: u32) {
+        self.discard_pending_decode_input();
         self.command = value;
         self.input_words_remaining = mdec_input_words_for_command(value);
         self.input_words.clear();
+        self.decode_input_halfwords.clear();
+        self.decode_input_cursor = 0;
+        self.decode_complete = true;
         self.decoded_output_words.clear();
         self.decoded_output_index = 0;
         self.last_decoded_output_words = 0;
@@ -22543,57 +25597,182 @@ impl Mdec {
 
     pub fn read_dma_output(&mut self) -> u32 {
         self.dma_output_words = self.dma_output_words.saturating_add(1);
-        self.status = mdec_status(self.input_words_remaining);
+        self.ensure_decoded_output();
         if self.decoded_output_index >= self.decoded_output_words.len() {
             self.decoded_output_underflow_reads =
                 self.decoded_output_underflow_reads.saturating_add(1);
+            self.refresh_status();
             return 0;
         }
         let word = self.decoded_output_words[self.decoded_output_index];
         self.decoded_output_index = self.decoded_output_index.saturating_add(1);
+        self.refresh_status();
         word
     }
 
     pub fn read_disabled_dma_output(&mut self) -> u32 {
         self.dma_output_words = self.dma_output_words.saturating_add(1);
-        self.status = mdec_status(self.input_words_remaining);
+        self.ensure_decoded_output();
         if self.decoded_output_index < self.decoded_output_words.len() {
             self.decoded_output_index = self.decoded_output_index.saturating_add(1);
         } else {
             self.decoded_output_underflow_reads =
                 self.decoded_output_underflow_reads.saturating_add(1);
         }
+        self.refresh_status();
         0
     }
 
+    pub fn begin_dma_output_request(&mut self, requested_words: u32) {
+        let target_words = self
+            .decoded_output_index
+            .saturating_add(requested_words as usize);
+        while self.decoded_output_words.len() < target_words && !self.decode_complete {
+            let words_before = self.decoded_output_words.len();
+            self.ensure_decoded_output();
+            if self.decoded_output_words.len() == words_before {
+                break;
+            }
+        }
+        self.refresh_status();
+    }
+
+    pub fn complete_dma_output_request(&mut self) {
+        if !self.output_fifo_pending() && !self.decode_complete {
+            // Probe on a copy of the cursor so trailing FE00 padding can
+            // retire the command without consuming a valid next macroblock.
+            let mut probe_cursor = self.decode_input_cursor;
+            if decode_next_mdec_macroblock(
+                &self.decode_input_halfwords,
+                &mut probe_cursor,
+                &self.quant_luma,
+                &self.quant_chroma,
+                &self.scale_table,
+                self.command,
+            )
+            .is_none()
+            {
+                self.decode_input_cursor = probe_cursor;
+                self.decode_complete = true;
+            }
+        }
+        self.refresh_status();
+    }
+
+    fn soft_reset(&mut self) {
+        // Hardware reset clears the FIFOs and decoder state, not the uploaded
+        // quantization and scale tables. BR2 resets MDEC immediately before
+        // decoding portraits, so dropping the tables corrupts every frame.
+        self.command = 0;
+        self.control = 0;
+        self.input_words_remaining = 0;
+        self.input_words.clear();
+        self.discard_pending_decode_input();
+        self.decode_input_halfwords.clear();
+        self.decode_input_cursor = 0;
+        self.decode_complete = true;
+        self.decoded_output_words.clear();
+        self.decoded_output_index = 0;
+        self.last_decoded_output_words = 0;
+        self.refresh_status();
+    }
+
+    fn refresh_status(&mut self) {
+        let output_pending = self.output_fifo_pending();
+        // Compressed source retained behind an empty output FIFO can either
+        // feed another output DMA or be replaced by the next command. It must
+        // not keep BR2's command-ready poll busy after the bounded strip DMA.
+        let command_busy = self.input_words_remaining != 0 || output_pending;
+        let dma_input_request = self.control & (1 << 30) != 0 && self.input_words_remaining != 0;
+        let dma_output_request = self.control & (1 << 29) != 0 && output_pending;
+        let parameter_words_remaining = self.input_words_remaining.saturating_sub(1) & 0xffff;
+
+        self.status = (u32::from(!output_pending) << 31)
+            | (u32::from(command_busy) << 29)
+            | (u32::from(dma_input_request) << 28)
+            | (u32::from(dma_output_request) << 27)
+            | (((self.command >> 27) & 0x03) << 25)
+            | (((self.command >> 26) & 0x01) << 24)
+            | (((self.command >> 25) & 0x01) << 23)
+            | (4 << 16)
+            | parameter_words_remaining;
+    }
+
+    fn output_fifo_pending(&self) -> bool {
+        self.decoded_output_index < self.decoded_output_words.len()
+    }
+
+    fn ensure_decoded_output(&mut self) {
+        if self.output_fifo_pending() || self.decode_complete {
+            return;
+        }
+
+        let Some(macroblock) = decode_next_mdec_macroblock(
+            &self.decode_input_halfwords,
+            &mut self.decode_input_cursor,
+            &self.quant_luma,
+            &self.quant_chroma,
+            &self.scale_table,
+            self.command,
+        ) else {
+            self.decode_complete = true;
+            self.refresh_status();
+            return;
+        };
+
+        self.decoded_output_words
+            .extend(pack_rgb555_pixels(&macroblock));
+        self.last_decoded_output_words = self.decoded_output_words.len();
+        if self.decode_input_cursor >= self.decode_input_halfwords.len() {
+            self.decode_complete = true;
+        }
+    }
+
+    fn discard_pending_decode_input(&mut self) {
+        if !self.decode_complete {
+            self.discarded_input_halfwords = self
+                .discarded_input_halfwords
+                .saturating_add(self.decode_input_halfwords_remaining() as u64);
+        }
+    }
+
     fn finish_input_dma(&mut self) {
+        self.decode_input_halfwords.clear();
+        self.decode_input_cursor = 0;
+        self.decode_complete = true;
         self.decoded_output_words.clear();
         self.decoded_output_index = 0;
         match self.command >> 29 {
             0x1 => {
-                self.decoded_output_words = decode_mdec_macroblocks(
-                    &self.input_words,
-                    &self.quant_luma,
-                    &self.quant_chroma,
-                    &self.scale_table,
-                    self.command,
-                );
+                if native_mdec_rgb555_output_layout() == "raw" {
+                    self.decode_input_halfwords = mdec_halfwords(&self.input_words);
+                    self.decode_complete = self.decode_input_halfwords.is_empty();
+                } else {
+                    self.decoded_output_words = decode_mdec_macroblocks(
+                        &self.input_words,
+                        &self.quant_luma,
+                        &self.quant_chroma,
+                        &self.scale_table,
+                        self.command,
+                    );
+                }
             }
             0x2 => self.set_quant_tables(),
             0x3 => self.set_scale_table(),
             _ => {}
         }
         self.last_decoded_output_words = self.decoded_output_words.len();
+        self.refresh_status();
     }
 
     fn set_quant_tables(&mut self) {
         let bytes = mdec_bytes(&self.input_words);
         for (index, value) in bytes.iter().take(64).copied().enumerate() {
-            self.quant_luma[index] = value.max(1);
+            self.quant_luma[index] = value;
         }
         if bytes.len() >= 128 {
             for (index, value) in bytes.iter().skip(64).take(64).copied().enumerate() {
-                self.quant_chroma[index] = value.max(1);
+                self.quant_chroma[index] = value;
             }
         } else {
             self.quant_chroma = self.quant_luma;
@@ -22633,6 +25812,35 @@ impl Mdec {
         self.decoded_output_words.len()
     }
 
+    pub fn decode_input_halfwords_remaining(&self) -> usize {
+        self.decode_input_halfwords
+            .len()
+            .saturating_sub(self.decode_input_cursor)
+    }
+
+    pub fn decode_input_cursor(&self) -> usize {
+        self.decode_input_cursor
+    }
+
+    pub fn decode_complete(&self) -> bool {
+        self.decode_complete
+    }
+
+    pub fn discarded_input_halfwords(&self) -> u64 {
+        self.discarded_input_halfwords
+    }
+
+    pub fn decoded_output_checksum(&self) -> u32 {
+        mdec_u32_checksum(&self.decoded_output_words)
+    }
+
+    pub fn consumed_output_checksum(&self) -> u32 {
+        let consumed_output_words = self
+            .decoded_output_index
+            .min(self.decoded_output_words.len());
+        mdec_u32_checksum(&self.decoded_output_words[..consumed_output_words])
+    }
+
     pub fn diagnostic_json(&self) -> String {
         let consumed_output_words = self
             .decoded_output_index
@@ -22645,7 +25853,7 @@ impl Mdec {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"command\":{},\"command_hex\":\"0x{:08x}\",\"control\":{},\"control_hex\":\"0x{:08x}\",\"status\":{},\"status_hex\":\"0x{:08x}\",\"input_words_remaining\":{},\"dma_input_words\":{},\"dma_output_words\":{},\"last_decoded_output_words\":{},\"decoded_output_index\":{},\"decoded_output_underflow_reads\":{},\"quant_luma_checksum\":{},\"quant_chroma_checksum\":{},\"scale_table_checksum\":{},\"scale_table_nonzero\":{},\"decoded_output_checksum\":{},\"consumed_output_words\":{},\"consumed_output_checksum\":{},\"first_output_words_hex\":[{}],\"rgb555_output_layout\":\"{}\"}}",
+            "{{\"command\":{},\"command_hex\":\"0x{:08x}\",\"control\":{},\"control_hex\":\"0x{:08x}\",\"status\":{},\"status_hex\":\"0x{:08x}\",\"input_words_remaining\":{},\"dma_input_words\":{},\"dma_output_words\":{},\"decode_input_halfwords_remaining\":{},\"decode_input_cursor\":{},\"decode_complete\":{},\"discarded_input_halfwords\":{},\"last_decoded_output_words\":{},\"decoded_output_index\":{},\"decoded_output_underflow_reads\":{},\"quant_luma_checksum\":{},\"quant_chroma_checksum\":{},\"scale_table_checksum\":{},\"scale_table_nonzero\":{},\"decoded_output_checksum\":{},\"consumed_output_words\":{},\"consumed_output_checksum\":{},\"first_output_words_hex\":[{}],\"rgb555_output_layout\":\"{}\"}}",
             self.command,
             self.command,
             self.control,
@@ -22655,6 +25863,10 @@ impl Mdec {
             self.input_words_remaining,
             self.dma_input_words,
             self.dma_output_words,
+            self.decode_input_halfwords_remaining(),
+            self.decode_input_cursor,
+            self.decode_complete,
+            self.discarded_input_halfwords,
             self.last_decoded_output_words,
             self.decoded_output_index,
             self.decoded_output_underflow_reads,
@@ -22708,13 +25920,8 @@ fn mdec_input_words_for_command(value: u32) -> u32 {
     }
 }
 
-fn mdec_status(input_words_remaining: u32) -> u32 {
-    let busy = u32::from(input_words_remaining != 0) << 29;
-    0x8004_0000 | busy
-}
-
 fn mdec_ready_status() -> u32 {
-    mdec_status(0)
+    0x8004_0000
 }
 
 const MDEC_ZIGZAG: [usize; 64] = [
@@ -22733,48 +25940,55 @@ fn decode_mdec_macroblocks(
     let halfwords = mdec_halfwords(words);
     let mut cursor = 0usize;
     let mut macroblocks = Vec::new();
-    let output_pixel_mask = mdec_rgb555_output_pixel_mask(command);
 
-    while cursor < halfwords.len() {
-        let Some(cr) = read_mdec_block(&halfwords, &mut cursor, quant_chroma, scale_table) else {
-            break;
-        };
-        let Some(cb) = read_mdec_block(&halfwords, &mut cursor, quant_chroma, scale_table) else {
-            break;
-        };
-        let Some(y0) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
-            break;
-        };
-        let Some(y1) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
-            break;
-        };
-        let Some(y2) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
-            break;
-        };
-        let Some(y3) = read_mdec_block(&halfwords, &mut cursor, quant_luma, scale_table) else {
-            break;
-        };
-
-        let mut pixels = [0_u16; 16 * 16];
-        for row in 0..16 {
-            for col in 0..16 {
-                let y_block = match (row >= 8, col >= 8) {
-                    (false, false) => &y0,
-                    (false, true) => &y1,
-                    (true, false) => &y2,
-                    (true, true) => &y3,
-                };
-                let y = y_block[(row % 8) * 8 + (col % 8)];
-                let chroma_index = (row / 2) * 8 + (col / 2);
-                pixels[row * 16 + col] =
-                    ycbcr_to_rgb555(y, cb[chroma_index], cr[chroma_index]) | output_pixel_mask;
-            }
-        }
-        macroblocks.push(pixels);
+    while let Some(macroblock) = decode_next_mdec_macroblock(
+        &halfwords,
+        &mut cursor,
+        quant_luma,
+        quant_chroma,
+        scale_table,
+        command,
+    ) {
+        macroblocks.push(macroblock);
     }
 
     let pixels = mdec_rgb555_output_pixels(&macroblocks);
     pack_rgb555_pixels(&pixels)
+}
+
+fn decode_next_mdec_macroblock(
+    halfwords: &[u16],
+    cursor: &mut usize,
+    quant_luma: &[u8; 64],
+    quant_chroma: &[u8; 64],
+    scale_table: &[i16; 64],
+    command: u32,
+) -> Option<[u16; 16 * 16]> {
+    let cr = read_mdec_block(halfwords, cursor, quant_chroma, scale_table)?;
+    let cb = read_mdec_block(halfwords, cursor, quant_chroma, scale_table)?;
+    let y0 = read_mdec_block(halfwords, cursor, quant_luma, scale_table)?;
+    let y1 = read_mdec_block(halfwords, cursor, quant_luma, scale_table)?;
+    let y2 = read_mdec_block(halfwords, cursor, quant_luma, scale_table)?;
+    let y3 = read_mdec_block(halfwords, cursor, quant_luma, scale_table)?;
+    let output_pixel_mask = mdec_rgb555_output_pixel_mask(command);
+    let mut pixels = [0_u16; 16 * 16];
+
+    for row in 0..16 {
+        for col in 0..16 {
+            let y_block = match (row >= 8, col >= 8) {
+                (false, false) => &y0,
+                (false, true) => &y1,
+                (true, false) => &y2,
+                (true, true) => &y3,
+            };
+            let y = y_block[(row % 8) * 8 + (col % 8)];
+            let chroma_index = (row / 2) * 8 + (col / 2);
+            pixels[row * 16 + col] =
+                ycbcr_to_rgb555(y, cb[chroma_index], cr[chroma_index]) | output_pixel_mask;
+        }
+    }
+
+    Some(pixels)
 }
 
 fn mdec_rgb555_output_pixels(macroblocks: &[[u16; 16 * 16]]) -> Vec<u16> {
@@ -23189,21 +26403,26 @@ mod tests {
         DISPLAY_SOURCE_PRESENTED_FIELD, DISPLAY_SOURCE_SAFE_FIELD, DMA_GPU_CHCR, DMA_INTERRUPT,
         DisplayAreaTrace, DisplayColorStats, DisplayOutputWindow, DisplayResolve, DrawBounds,
         GP0_BEST_OBSERVATION_DRAW_INTERVAL, GP0_BEST_OBSERVATION_EAGER_COMMANDS, GPU_GP0, GPU_GP1,
-        Gpu, GpuCommandSource, GpuDrawTrace, GpuTransferRegionStats, IO_REGISTER_MAP,
-        IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io, IoAccess, IoDevice, MDEC_COMMAND, MDEC_STATUS,
-        NativeGpuDrawCapturePredicate, PSX_VRAM_HEIGHT, SIO_CONTROL, SIO_DATA,
-        SIO_STATUS_IRQ_REQUEST, SPU_REGION_START, STALE_PRESENTATION_CAPTURE_GRACE,
-        STALE_PRESENTATION_DRAW_GRACE, drawing_area_clip, has_native_full_scene_detail,
-        has_native_playfield_density, image_transfer_dimensions, io_register, io_register_range,
-        is_detailed_observation, is_io_register_address, is_likely_texture_page_candidate,
-        is_sparse_display, minimum_live_draw_overlap_area_for_dimensions,
-        presented_frame_has_live_scene, resolved_display_candidate_has_scene_signal,
+        Gpu, GpuCommandSource, GpuDrawTrace, GpuTransferPayloadStats, GpuTransferRegionStats,
+        GpuTransferTrace, IO_REGISTER_MAP, IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io, IoAccess,
+        IoDevice, MDEC_COMMAND, MDEC_STATUS, NativeGpuDrawCapturePredicate, PSX_VRAM_HEIGHT,
+        SIO_CONTROL, SIO_DATA, SIO_STATUS_IRQ_REQUEST, SPU_REGION_START,
+        STALE_PRESENTATION_CAPTURE_GRACE, STALE_PRESENTATION_DRAW_GRACE,
+        display_window_wraps_vram_horizontally, drawing_area_clip, has_native_full_scene_detail,
+        has_native_gameplay_display_profile, has_native_playfield_density,
+        image_transfer_dimensions, io_register, io_register_range, is_detailed_observation,
+        is_io_register_address, is_likely_texture_page_candidate, is_sparse_display,
+        minimum_live_draw_overlap_area_for_dimensions, presented_frame_has_live_scene,
+        recovered_presented_candidate_has_rapid_regression,
+        recovered_presented_candidate_is_sparse_regression,
+        replay_window_has_catastrophic_regression, resolved_display_candidate_has_scene_signal,
         rgb_framebuffer_stats, screen_observation_score, screen_observation_worth_saving,
         should_preserve_br2_populated_palette_on_blank_copy_with_policy,
         texture_page_origin_for_clut_for_diagnostics, vram_copy_dimensions,
     };
     use crate::native::framebuffer::{
-        ClipRect, FrameBufferStats, FrameBufferWindow, Point, TexturedDrawStats, TexturedPoint,
+        ClipRect, FrameBufferStats, FrameBufferWindow, Point, TextureDrawOptions,
+        TexturedDrawStats, TexturedPoint, VRAM_WIDTH,
     };
 
     fn line_doubled_rgb_frame(field: &[u32], width: usize) -> Vec<u32> {
@@ -23979,6 +27198,42 @@ mod tests {
     }
 
     #[test]
+    fn gpu_display_output_window_cache_skips_repeated_frame_analysis() {
+        let io = Io::default();
+
+        let first = io.gpu.current_display_output_window();
+        let probes_after_miss = current_display_window_stats_probe_count(&io);
+        assert!(probes_after_miss > 0);
+
+        let second = io.gpu.current_display_output_window();
+
+        assert_eq!(second, first);
+        assert_eq!(
+            current_display_window_stats_probe_count(&io),
+            probes_after_miss,
+            "unchanged output selection must not rescan the display window"
+        );
+    }
+
+    #[test]
+    fn gpu_display_output_window_cache_invalidates_after_gp0_vram_change() {
+        let mut io = Io::default();
+        io.gpu.current_display_output_window();
+        let probes_after_first = current_display_window_stats_probe_count(&io);
+
+        io.gpu.write_gp0(0x0200_7fff);
+        io.gpu.write_gp0(0x0000_0000);
+        io.gpu.write_gp0(0x0001_0001);
+        let changed = io.gpu.current_display_output_window();
+
+        assert_ne!(changed.window.stats.nonzero_pixels, 0);
+        assert!(
+            current_display_window_stats_probe_count(&io) > probes_after_first,
+            "VRAM mutations must invalidate cached output selection"
+        );
+    }
+
+    #[test]
     fn gpu_stable_display_frame_cache_reuses_unchanged_vram() {
         let io = Io::default();
 
@@ -23988,6 +27243,25 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(stable_display_frame_cache_counts(&io), (1, 1));
+    }
+
+    #[test]
+    fn gpu_clone_preserves_stable_display_frame_cache() {
+        let io = Io::default();
+        let expected = io.gpu.stable_display_rgb_frame();
+        assert_eq!(stable_display_frame_cache_counts(&io), (0, 1));
+
+        let cloned = io.gpu.clone();
+        let actual = cloned.stable_display_rgb_frame();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            (
+                cloned.stable_display_frame_cache_hits.get(),
+                cloned.stable_display_frame_cache_misses.get(),
+            ),
+            (1, 1)
+        );
     }
 
     #[test]
@@ -24091,7 +27365,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_display_color_stats_cache_invalidates_after_draw_sequence_change() {
+    fn gpu_display_color_stats_cache_reuses_content_after_draw_sequence_change() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
         let window = io.gpu.current_display_window();
@@ -24102,11 +27376,11 @@ mod tests {
         io.gpu
             .display_window_color_stats(window, width, height, true);
 
-        assert_eq!(display_color_stats_cache_counts(&io), (0, 2));
+        assert_eq!(display_color_stats_cache_counts(&io), (1, 1));
     }
 
     #[test]
-    fn gpu_display_color_stats_cache_invalidates_after_presentation_change() {
+    fn gpu_display_color_stats_cache_reuses_content_after_presentation_change() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
         let window = io.gpu.current_display_window();
@@ -24119,7 +27393,64 @@ mod tests {
         io.gpu
             .display_window_color_stats(window, width, height, true);
 
-        assert_eq!(display_color_stats_cache_counts(&io), (0, 2));
+        assert_eq!(display_color_stats_cache_counts(&io), (1, 1));
+    }
+
+    #[test]
+    fn gpu_display_color_stats_cache_invalidates_after_window_content_change() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let first_window = io.gpu.current_display_window();
+        io.gpu
+            .display_window_color_stats(first_window, width, height, true);
+        let (_, misses_before_change) = display_color_stats_cache_counts(&io);
+
+        io.gpu.write_gp0(0x0200_7fff);
+        io.gpu.write_gp0(0x0000_0000);
+        io.gpu.write_gp0(0x0001_0001);
+        let second_window = io.gpu.current_display_window();
+        io.gpu
+            .display_window_color_stats(second_window, width, height, true);
+
+        assert_ne!(second_window.stats.checksum, first_window.stats.checksum);
+        assert_eq!(
+            display_color_stats_cache_counts(&io).1,
+            misses_before_change + 1
+        );
+    }
+
+    #[test]
+    fn gpu_display_analysis_caches_reuse_identical_window_content() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        let window = io.gpu.current_display_window();
+
+        let first_dominant = io
+            .gpu
+            .display_window_dominant_bucket_per_mille(window, width, height, true);
+        let first_glyph = io
+            .gpu
+            .display_window_has_glyph_texture_grid_with_mode(window, width, height, true);
+        let first_ghosting = io
+            .gpu
+            .display_window_has_periodic_horizontal_ghosting(window, width, height, true);
+        io.gpu.draw_sequence = io.gpu.draw_sequence.saturating_add(1);
+        let second_dominant = io
+            .gpu
+            .display_window_dominant_bucket_per_mille(window, width, height, true);
+        let second_glyph = io
+            .gpu
+            .display_window_has_glyph_texture_grid_with_mode(window, width, height, true);
+        let second_ghosting = io
+            .gpu
+            .display_window_has_periodic_horizontal_ghosting(window, width, height, true);
+
+        assert_eq!(second_dominant, first_dominant);
+        assert_eq!(second_glyph, first_glyph);
+        assert_eq!(second_ghosting, first_ghosting);
+        assert_eq!(io.gpu.display_dominant_bucket_cache.borrow().len(), 1);
+        assert_eq!(io.gpu.glyph_texture_grid_cache.borrow().len(), 1);
+        assert_eq!(io.gpu.periodic_horizontal_ghosting_cache.borrow().len(), 1);
     }
 
     #[test]
@@ -24236,7 +27567,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_title_logo_overlay_signal_cache_invalidates_after_draw_sequence_change() {
+    fn gpu_title_logo_overlay_signal_cache_reuses_content_after_draw_sequence_change() {
         let mut io = Io::default();
         let (window, width, height) = title_logo_overlay_signal_test_window(&io);
 
@@ -24246,7 +27577,7 @@ mod tests {
         io.gpu
             .display_window_has_title_logo_overlay_signal(window, width, height, true, true);
 
-        assert_eq!(title_logo_overlay_signal_cache_counts(&io), (0, 2));
+        assert_eq!(title_logo_overlay_signal_cache_counts(&io), (1, 1));
     }
 
     #[test]
@@ -24467,6 +27798,15 @@ mod tests {
         assert!(
             io.gpu
                 .display_window_has_primitive_tearing_artifact(field, width, field_height)
+        );
+        assert!(
+            io.gpu
+                .display_window_has_primitive_tearing_artifact(field, width, field_height)
+        );
+        assert_eq!(
+            io.gpu.primitive_tearing_cache.borrow().len(),
+            1,
+            "identical tearing analysis must reuse the content-keyed result"
         );
         assert!(
             io.gpu
@@ -25461,6 +28801,93 @@ mod tests {
         }
     }
 
+    fn fill_br2_red_cave_recovery_artifact(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        const RED_PALETTE: [u32; 8] = [
+            0x0048_0808,
+            0x0058_1008,
+            0x0068_1010,
+            0x0078_1810,
+            0x0088_1818,
+            0x0098_2018,
+            0x00a8_2018,
+            0x00b8_2820,
+        ];
+        const DARK_RED_PALETTE: [u32; 4] = [0x0018_0000, 0x0020_0800, 0x0028_0808, 0x0030_0800];
+
+        let bottom_band_start = height.saturating_mul(4) / 5;
+        for y in 0..height {
+            for x in 0..width {
+                let palette = if y >= bottom_band_start {
+                    &DARK_RED_PALETTE[..]
+                } else {
+                    &RED_PALETTE[..]
+                };
+                let index = ((x / 8) + (y / 6) + (x.saturating_mul(y) / 257)) % palette.len();
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    1,
+                    1,
+                    palette[index],
+                );
+            }
+        }
+    }
+
+    fn fill_br2_repeating_rock_atlas_artifact(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        fill_br2_character_select_live_field(io, x_offset, y_offset, width, height);
+        let band_height = height / 3;
+        for (start_y, end_y) in [
+            (0, band_height),
+            (height.saturating_sub(band_height), height),
+        ] {
+            let dark_bottom_band = start_y > 0;
+            for y in start_y..end_y {
+                for x in 0..width {
+                    let local_x = x % 64;
+                    let local_y = (y - start_y) % 96;
+                    let rock = (16..=48).contains(&local_x)
+                        && local_y >= local_x.abs_diff(32) * 2
+                        && local_y <= 88;
+                    let color = if rock {
+                        let shade = if dark_bottom_band {
+                            24 + ((local_x * 5 + local_y * 3) % 48) as u32
+                        } else {
+                            48 + ((local_x * 5 + local_y * 3) % 96) as u32
+                        };
+                        (shade << 16) | (shade << 8) | shade
+                    } else {
+                        let red = if dark_bottom_band {
+                            24 + ((local_x * 7 + local_y * 5) % 40) as u32
+                        } else {
+                            48 + ((local_x * 7 + local_y * 5) % 96) as u32
+                        };
+                        (red << 16) | 0x0008_0008
+                    };
+                    io.gpu.framebuffer.fill_rect_unclipped(
+                        x_offset.saturating_add(x) as i32,
+                        y_offset.saturating_add(y) as i32,
+                        1,
+                        1,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+
     fn fill_low_bucket_playfield_scene(
         io: &mut Io,
         x_offset: usize,
@@ -25607,6 +29034,109 @@ mod tests {
     }
 
     #[test]
+    fn controller_latches_p1_sio_packet_across_input_updates() {
+        let mut controller = Controller::default();
+
+        controller.set_buttons(ActionButtons {
+            start: true,
+            left: true,
+            punch: true,
+            ..ActionButtons::default()
+        });
+        controller.write_data(0x01);
+        assert_eq!(controller.response, 0xff);
+        controller.write_data(0x42);
+        assert_eq!(controller.response, 0x41);
+
+        controller.set_buttons(ActionButtons::default());
+        controller.write_data(0);
+        assert_eq!(controller.response, 0x5a);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0x77);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0xbf);
+
+        let activity = controller.input_activity();
+        assert_eq!(activity.p1_input_reads, 1);
+        assert_eq!(activity.p1_start_active_reads, 1);
+        assert_eq!(activity.p1_left_active_reads, 1);
+        assert_eq!(activity.p1_punch_active_reads, 1);
+    }
+
+    #[test]
+    fn controller_routes_sio_slot_2_to_p2_state_and_activity() {
+        let mut controller = Controller::default();
+
+        controller.set_buttons(ActionButtons {
+            p2_start: true,
+            p2_right: true,
+            p2_kick: true,
+            p2_beast: true,
+            p2_guard: true,
+            ..ActionButtons::default()
+        });
+
+        controller.write_control(0x0003);
+        for request in [0x01, 0x42, 0x00, 0x00, 0x00] {
+            controller.write_data(request);
+        }
+        assert_eq!(controller.response, 0xff);
+        assert_eq!(controller.input_activity().p1_input_reads, 1);
+        assert_eq!(controller.input_activity().p2_input_reads, 0);
+
+        controller.write_control(0x2003);
+        controller.write_data(0x01);
+        assert_eq!(controller.response, 0xff);
+        controller.write_data(0x42);
+        assert_eq!(controller.response, 0x41);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0x5a);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0xd7);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0x4f);
+
+        let activity = controller.input_activity();
+        assert_eq!(activity.p1_input_reads, 1);
+        assert_eq!(activity.p2_input_reads, 1);
+        assert_eq!(activity.p2_start_active_reads, 1);
+        assert_eq!(activity.p2_right_active_reads, 1);
+        assert_eq!(activity.p2_kick_active_reads, 1);
+        assert_eq!(activity.p2_beast_active_reads, 1);
+        assert_eq!(activity.p2_guard_active_reads, 1);
+        assert!(
+            controller
+                .diagnostic_json()
+                .contains("\"selected_pad_port\":2")
+        );
+        assert!(
+            controller
+                .diagnostic_json()
+                .contains("\"p2_state_hex\":\"0x4fd7\"")
+        );
+    }
+
+    #[test]
+    fn controller_restarts_zn_mcu_digital_packet_after_beast_input_change() {
+        let mut controller = Controller::default();
+
+        controller.set_security_selects(false, false, false, false, true);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0x1f);
+
+        controller.set_buttons(ActionButtons {
+            beast: true,
+            ..ActionButtons::default()
+        });
+        controller.write_data(0);
+        assert_eq!(controller.response, 0xff);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0x1f);
+        controller.write_data(0);
+        assert_eq!(controller.response, 0xbf);
+    }
+
+    #[test]
     fn controller_combines_cat702_and_zn_mcu_when_both_selected() {
         let mut controller = Controller::default();
 
@@ -25750,7 +29280,7 @@ mod tests {
 
     #[test]
     fn gpu_status_read_keeps_scanline_parity_stable_until_vblank() {
-        let io = Io::default();
+        let mut io = Io::default();
 
         let first = io.read_u32(GPU_GP1);
         let second = io.read_u32(GPU_GP1);
@@ -25762,6 +29292,46 @@ mod tests {
         io.gpu.advance_vblank_field();
         let after_vblank = io.read_u32(GPU_GP1);
         assert_ne!(first & 0x8000_0000, after_vblank & 0x8000_0000);
+    }
+
+    #[test]
+    fn gpu_status_interlaced_field_bit_tracks_vblank_field_flag() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0020);
+
+        let first = io.read_u32(GPU_GP1);
+        assert_eq!((first >> 31) & 1, (first >> 13) & 1);
+
+        io.gpu.advance_vblank_field();
+        let second = io.read_u32(GPU_GP1);
+        assert_eq!((second >> 31) & 1, (second >> 13) & 1);
+        assert_ne!(first & (1 << 13), second & (1 << 13));
+
+        io.gpu.advance_vblank_field();
+        let third = io.read_u32(GPU_GP1);
+        assert_eq!((third >> 31) & 1, (third >> 13) & 1);
+        assert_eq!(first & (1 << 13), third & (1 << 13));
+    }
+
+    #[test]
+    fn gpu_status_noninterlaced_vblank_sets_field_flag() {
+        let mut io = Io::default();
+        io.gpu.status &= !(1 << 13);
+
+        io.gpu.advance_vblank_field();
+
+        assert_ne!(io.gpu.status & (1 << 13), 0);
+    }
+
+    #[test]
+    fn gpu_display_mode_maps_reverse_horizontal_resolution_bit() {
+        let mut io = Io::default();
+
+        io.write_u32(GPU_GP1, 0x0800_0040);
+        assert_ne!(io.gpu.status & (1 << 16), 0);
+
+        io.write_u32(GPU_GP1, 0x0800_0000);
+        assert_eq!(io.gpu.status & (1 << 16), 0);
     }
 
     #[test]
@@ -26255,6 +29825,251 @@ mod tests {
     }
 
     #[test]
+    fn gpu_recovery_scene_snapshot_rejects_stale_presented_frame_as_commit_source() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_recovered_presented_frame();
+        io.gpu.ensure_recovery_scene_snapshot();
+        let stable_pixel = io.gpu.framebuffer.raw_pixel(16, 16);
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x00ff_4000);
+        assert!(
+            !io.gpu
+                .commit_recovery_scene_snapshot_if_current_is_presented(),
+            "a cached presented frame must not verify different raw VRAM"
+        );
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(16, 16),
+            stable_pixel,
+            "the last verified scene must survive a rejected snapshot promotion"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_scene_snapshot_rejects_presented_sparse_texture_field_as_commit_source() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_recovered_presented_frame();
+        io.gpu.ensure_recovery_scene_snapshot();
+        let sample_x = i32::try_from(width - 16).expect("display width fits i32");
+        let sample_y = i32::try_from(height - 16).expect("display height fits i32");
+        let stable_pixel = io.gpu.framebuffer.raw_pixel(sample_x, sample_y);
+        assert_ne!(stable_pixel, 0);
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        fill_multicolor_scene(&mut io, 0, 0, width * 2 / 5, height);
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu.capture_recovered_presented_frame();
+        let current = io.gpu.current_display_window();
+        assert_eq!(
+            io.gpu
+                .presented_frame_window
+                .map(|window| window.stats.checksum),
+            Some(current.stats.checksum),
+            "the fixture must be an exact presented frame"
+        );
+        assert!(
+            !super::has_native_gameplay_display_profile(current.stats),
+            "a sparse texture field must not qualify as a stable match scene"
+        );
+
+        assert!(
+            !io.gpu
+                .commit_recovery_scene_snapshot_if_current_is_stable_presented()
+        );
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(sample_x, sample_y),
+            stable_pixel,
+            "a presented sparse field must not replace the last stable scene"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_rejects_red_cave_replay_artifact_after_dense_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let before = io.gpu.clone();
+
+        fill_br2_red_cave_recovery_artifact(&mut io, 0, 0, width, height);
+        io.gpu.invalidate_recovery_presentation_caches();
+        let output = io.gpu.current_display_output_window();
+        let color_stats = io.gpu.display_window_color_stats(
+            output.window,
+            output.width,
+            output.height,
+            output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+        );
+        assert!(
+            io.gpu.display_window_has_br2_red_cave_recovery_artifact(
+                output.window,
+                output.width,
+                output.height,
+                color_stats,
+                output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            ),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before),
+            "a red-cave recovery artifact must not become the presented frame"
+        );
+        assert!(io.gpu.presented_frame_window.is_none());
+    }
+
+    #[test]
+    fn gpu_recovery_scene_snapshot_rejects_presented_red_cave_artifact_as_commit_source() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_vblank_presented_frame();
+        io.gpu.ensure_recovery_scene_snapshot();
+        let stable_pixel = io.gpu.framebuffer.raw_pixel(16, 16);
+
+        fill_br2_red_cave_recovery_artifact(&mut io, 0, 0, width, height);
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu.capture_vblank_presented_frame();
+        assert!(
+            !io.gpu
+                .commit_recovery_scene_snapshot_if_current_is_stable_presented(),
+            "an exact presented red-cave artifact must not replace the stable recovery scene"
+        );
+
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(16, 16),
+            stable_pixel,
+            "the last verified scene must survive a rejected red-cave snapshot promotion"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_rejects_repeating_rock_atlas_over_character_select() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let before = io.gpu.clone();
+
+        fill_br2_repeating_rock_atlas_artifact(&mut io, 0, 0, width, height);
+        io.gpu.invalidate_recovery_presentation_caches();
+        let output = io.gpu.current_display_output_window();
+        let color_stats = io.gpu.display_window_color_stats(
+            output.window,
+            output.width,
+            output.height,
+            output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+        );
+        assert!(
+            io.gpu.display_window_has_br2_repeating_rock_atlas_artifact(
+                output.window,
+                output.width,
+                output.height,
+                color_stats,
+                output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            ),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before),
+            "a repeating rock atlas must not become the presented character-select frame"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_scene_snapshot_rejects_presented_repeating_rock_atlas() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_vblank_presented_frame();
+        io.gpu.ensure_recovery_scene_snapshot();
+        let stable_pixel = io.gpu.framebuffer.raw_pixel(16, 16);
+
+        fill_br2_repeating_rock_atlas_artifact(&mut io, 0, 0, width, height);
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu.capture_vblank_presented_frame();
+        assert!(
+            !io.gpu
+                .commit_recovery_scene_snapshot_if_current_is_stable_presented(),
+            "a repeating rock atlas must not replace the stable recovery scene"
+        );
+
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(16, 16),
+            stable_pixel,
+            "the last verified scene must survive a rejected rock-atlas snapshot promotion"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_scene_snapshot_accepts_detailed_character_select_caption() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_vblank_presented_frame();
+        io.gpu.ensure_recovery_scene_snapshot();
+
+        fill_br2_character_select_live_field(&mut io, 0, 0, width, height);
+        let caption_y = height.saturating_mul(9) / 10;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            (height.saturating_mul(4) / 5) as i32,
+            width as i32,
+            (height / 5) as i32,
+            0x0008_0808,
+        );
+        for x in (width / 5..width * 4 / 5).step_by(9) {
+            io.gpu.framebuffer.fill_rect_unclipped(
+                x as i32,
+                caption_y as i32,
+                5,
+                (height / 40).max(4) as i32,
+                0x00ef_efef,
+            );
+        }
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu.capture_vblank_presented_frame();
+        let current = io.gpu.current_display_window();
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(current, width, height, true);
+        assert!(has_native_full_scene_detail(current.stats));
+        assert!(color_stats.has_intro_caption_band());
+        assert!(color_stats.has_scene_color_diversity());
+        assert!(
+            io.gpu
+                .commit_recovery_scene_snapshot_if_current_is_stable_presented(),
+            "a detailed character-select UI must be allowed to replace an older recovery scene"
+        );
+        let selected_pixel = io.gpu.framebuffer.raw_pixel(32, 32);
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+        assert_eq!(io.gpu.framebuffer.raw_pixel(32, 32), selected_pixel);
+    }
+
+    #[test]
     fn gpu_high_vertical_recovery_flip_uses_the_field_pair_base() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
@@ -26311,6 +30126,310 @@ mod tests {
     }
 
     #[test]
+    fn gpu_recovery_capture_reuses_identical_presented_rgb_and_stable_frame() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+
+        io.gpu.capture_recovered_presented_frame();
+        let expected = io.gpu.stable_display_rgb_frame();
+        assert_eq!(io.gpu.presentation_captures, 1);
+        assert_eq!(stable_display_frame_cache_counts(&io), (0, 1));
+
+        io.gpu.capture_recovered_presented_frame();
+        let actual = io.gpu.stable_display_rgb_frame();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            io.gpu.presentation_captures, 1,
+            "an identical recovered frame must not allocate and publish a duplicate RGB buffer"
+        );
+        assert_eq!(stable_display_frame_cache_counts(&io), (1, 1));
+    }
+
+    #[test]
+    fn gpu_recovery_capture_refreshes_unchanged_frame_draw_freshness() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_recovered_presented_frame();
+
+        io.gpu.draw_sequence = io
+            .gpu
+            .draw_sequence
+            .saturating_add(STALE_PRESENTATION_DRAW_GRACE);
+        assert!(!io.gpu.presented_frame_is_fresh());
+
+        io.gpu.capture_recovered_presented_frame();
+
+        assert_eq!(io.gpu.presentation_captures, 1);
+        assert_eq!(
+            io.gpu.presented_frame_draw_sequence, io.gpu.draw_sequence,
+            "an accepted identical vblank must refresh draw-age without rebuilding its RGB frame"
+        );
+        assert!(io.gpu.presented_frame_is_fresh());
+    }
+
+    #[test]
+    fn gpu_recovery_capture_invalidates_stable_frame_after_vram_mutation() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+
+        io.gpu.capture_recovered_presented_frame();
+        let first = io.gpu.stable_display_rgb_frame();
+        assert_eq!(stable_display_frame_cache_counts(&io), (0, 1));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, 32, 32, 0x0000_ff00);
+        io.gpu.capture_recovered_presented_frame();
+        let second = io.gpu.stable_display_rgb_frame();
+
+        assert_ne!(second, first);
+        assert_eq!(io.gpu.presentation_captures, 2);
+        assert_eq!(stable_display_frame_cache_counts(&io), (0, 2));
+    }
+
+    #[test]
+    fn gpu_recovery_capture_rejects_sparse_regression_after_dense_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let before = io.gpu.clone();
+        assert!(presented_frame_has_live_scene(
+            before.current_display_window().stats
+        ));
+
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        for x in 0..(width * 13 / 25) {
+            let color = if x % 8 < 4 { 0x00ff_ffff } else { 0x0000_40ff };
+            io.gpu
+                .framebuffer
+                .fill_rect_unclipped(x as i32, 0, 1, height as i32, color);
+        }
+        let sparse = io.gpu.current_display_window();
+        assert!(
+            presented_frame_has_live_scene(sparse.stats),
+            "the regression guard must not trust density alone"
+        );
+        assert!(recovered_presented_candidate_is_sparse_regression(
+            &before, sparse
+        ));
+        assert!(has_native_gameplay_display_profile(
+            before.current_display_window().stats
+        ));
+        before.current_display_window_stats_probes.set(0);
+
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert_eq!(
+            before.current_display_window_stats_probes.get(),
+            1,
+            "a same-size live scene must guard recovery directly without resolving prior output"
+        );
+        assert!(
+            io.gpu.presented_frame_window.is_none(),
+            "a sparse recovered candidate must not become the display source"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_recovery_capture_rejects_texture_atlas_output() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        let before = io.gpu.clone();
+
+        fill_glyph_texture_atlas_page(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        let output = io.gpu.current_display_output_window();
+        assert!(
+            io.gpu.display_window_is_texture_atlas_with_dimensions(
+                output.window,
+                output.width,
+                output.height,
+            ),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before),
+            "a detailed texture page must not become the recovered presentation"
+        );
+        assert!(
+            io.gpu.presented_frame_window.is_none(),
+            "a rejected texture page must not replace the last presented frame"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_rejects_opaque_low_palette_ground_over_fighters() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        let before = io.gpu.clone();
+
+        let lower_start = height / 2;
+        for y in lower_start..height * 7 / 8 {
+            for x in 0..width {
+                let shade = ((x / 16 + y / 12) % 6) as u32;
+                let color = 0x00a0_8060 + shade * 0x0004_0404;
+                io.gpu.framebuffer.set_pixel(x as i32, y as i32, color);
+            }
+        }
+        let candidate = io.gpu.current_display_window();
+        assert!(presented_frame_has_live_scene(candidate.stats));
+        assert!(
+            io.gpu
+                .recovered_presented_candidate_has_lower_playfield_occlusion(
+                    &before, candidate, width, height,
+                )
+        );
+        assert!(
+            !io.gpu
+                .native_replay_preserves_current_display_scene(&before)
+        );
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_allows_rich_lower_playfield_animation() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        let before = io.gpu.clone();
+
+        for y in height / 2..height * 7 / 8 {
+            for x in 0..width {
+                if (x + y).is_multiple_of(11) {
+                    let color = 0x0020_4080
+                        | (((x * 13 + y * 7) as u32 & 0xff) << 16)
+                        | (((x * 3 + y * 17) as u32 & 0xff) << 8);
+                    io.gpu.framebuffer.set_pixel(x as i32, y as i32, color);
+                }
+            }
+        }
+        let candidate = io.gpu.current_display_window();
+        assert!(
+            !io.gpu
+                .recovered_presented_candidate_has_lower_playfield_occlusion(
+                    &before, candidate, width, height,
+                )
+        );
+        assert!(
+            io.gpu
+                .native_replay_preserves_current_display_scene(&before)
+        );
+        assert!(
+            io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+    }
+
+    #[test]
+    fn recovery_rapid_regression_guard_covers_the_gap_above_half_density() {
+        let before = FrameBufferStats {
+            pixel_count: 245_760,
+            nonzero_pixels: 230_000,
+            bright_pixels: 100_000,
+            luma_sum: 245_760 * 96,
+            max_luma: 255,
+            detail_edges: 100_000,
+            checksum: 0x1234_5678,
+        };
+        let candidate = FrameBufferStats {
+            pixel_count: 245_760,
+            nonzero_pixels: 126_500,
+            bright_pixels: 55_000,
+            luma_sum: 245_760 * 52,
+            max_luma: 255,
+            detail_edges: 55_000,
+            checksum: 0x8765_4321,
+        };
+
+        assert!(
+            !replay_window_has_catastrophic_regression(before, candidate),
+            "the general rollback threshold intentionally permits a candidate above half density"
+        );
+        assert!(
+            recovered_presented_candidate_has_rapid_regression(before, candidate),
+            "recovery presentation must reject a roughly 55% one-frame collapse"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_allows_dense_scene_after_dense_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        let before = io.gpu.clone();
+
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu.framebuffer.fill_rect_unclipped(
+            (width / 3) as i32,
+            (height / 3) as i32,
+            (width / 4) as i32,
+            (height / 4) as i32,
+            0x0000_ffff,
+        );
+        io.gpu.current_display_window_stats_probes.set(0);
+
+        assert!(
+            io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert_eq!(
+            io.gpu.current_display_window_stats_probes.get(),
+            0,
+            "a direct live high-vertical recovery frame must skip the full output resolver"
+        );
+        let presented = io.gpu.presented_frame_window.expect("presented frame");
+        assert!(presented_frame_has_live_scene(presented.stats));
+    }
+
+    #[test]
+    fn gpu_recovery_fill_does_not_capture_intermediate_presented_frame() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        assert!(io.gpu.presented_frame_window.is_none());
+
+        io.gpu.write_recovery_gp0_command(
+            &[0x0200_0000, 0, ((height as u32) << 16) | width as u32],
+            0x0039_1000,
+            Some(0x802d_080c),
+        );
+
+        assert_eq!(io.gpu.current_display_window().stats.nonzero_pixels, 0);
+        assert!(
+            io.gpu.presented_frame_window.is_none(),
+            "only the completed recovery transaction may publish a presented frame"
+        );
+    }
+
+    #[test]
     fn gpu_draw_capture_survives_gp1_reset() {
         let mut io = Io::default();
 
@@ -26322,6 +30441,171 @@ mod tests {
 
         assert_eq!(io.gpu.draw_captures().len(), 1);
         assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
+    }
+
+    fn predicate_draw_capture_trace(texture_page: u16) -> GpuDrawTrace {
+        GpuDrawTrace::textured(
+            "textured_quad",
+            texture_page,
+            0x0040,
+            DrawBounds {
+                left: 16,
+                top: 16,
+                right: 31,
+                bottom: 31,
+            },
+            TexturedDrawStats {
+                sampled_pixels: 256,
+                drawn_pixels: 256,
+                written_pixels: 256,
+                clut_nonzero_samples: 256,
+                first_color: 0x001f,
+                last_color: 0x03e0,
+                color_hash: 0x1234_5678,
+                color_changes: 2,
+                ..TexturedDrawStats::default()
+            },
+            &[
+                0x2c80_8080,
+                0x0010_0010,
+                0x0040_0000,
+                0x0010_0020,
+                u32::from(texture_page) << 16,
+                0x0020_0010,
+                0x0000_0000,
+                0x0020_0020,
+                0x0000_0000,
+            ],
+            &[
+                Point { x: 16, y: 16 },
+                Point { x: 16, y: 32 },
+                Point { x: 32, y: 16 },
+                Point { x: 32, y: 32 },
+            ],
+            None,
+        )
+    }
+
+    #[test]
+    fn gpu_draw_capture_predicate_dedupes_identical_generation() {
+        let mut io = Io::default();
+        io.gpu
+            .set_draw_capture_predicates(vec![NativeGpuDrawCapturePredicate {
+                texture_page: Some(0x0000),
+                clut: Some(0x0040),
+                ..NativeGpuDrawCapturePredicate::default()
+            }]);
+        let trace = predicate_draw_capture_trace(0x0000);
+
+        for _ in 0..super::GPU_DRAW_CAPTURE_LIMIT + 4 {
+            io.gpu.push_recent_draw_command(trace.clone());
+        }
+
+        assert_eq!(io.gpu.draw_captures().len(), 1);
+        assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
+    }
+
+    #[test]
+    fn gpu_draw_capture_range_keeps_duplicate_draws_until_existing_limit() {
+        let mut io = Io::default();
+        io.gpu
+            .set_draw_capture_range(1, super::GPU_DRAW_CAPTURE_LIMIT as u64);
+        let trace = predicate_draw_capture_trace(0x0000);
+
+        for _ in 0..super::GPU_DRAW_CAPTURE_LIMIT + 4 {
+            io.gpu.push_recent_draw_command(trace.clone());
+        }
+
+        assert_eq!(io.gpu.draw_captures().len(), super::GPU_DRAW_CAPTURE_LIMIT);
+        assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
+        assert_eq!(
+            io.gpu.draw_captures()[super::GPU_DRAW_CAPTURE_LIMIT - 1].sequence,
+            super::GPU_DRAW_CAPTURE_LIMIT as u64
+        );
+        assert!(io.gpu.draw_capture_keys.iter().all(|key| key.is_none()));
+    }
+
+    #[test]
+    fn gpu_draw_capture_predicate_keeps_unique_texture_generations() {
+        let mut io = Io::default();
+        io.gpu
+            .set_draw_capture_predicates(vec![NativeGpuDrawCapturePredicate {
+                texture_page: Some(0x0000),
+                clut: Some(0x0040),
+                ..NativeGpuDrawCapturePredicate::default()
+            }]);
+        let trace = predicate_draw_capture_trace(0x0000);
+
+        io.gpu
+            .push_recent_transfer_command(GpuTransferTrace::image_upload(
+                0,
+                0,
+                1,
+                1,
+                1,
+                true,
+                GpuTransferPayloadStats {
+                    words: 1,
+                    halfwords: 2,
+                    nonzero_halfwords: 1,
+                    unique_colors: 1,
+                    checksum: 0x1111,
+                },
+                &[0xa000_0000, 0x0000_0000, 0x0001_0001],
+                None,
+            ));
+        io.gpu.push_recent_draw_command(trace.clone());
+        io.gpu.push_recent_draw_command(trace.clone());
+        assert_eq!(io.gpu.draw_captures().len(), 1);
+
+        io.gpu
+            .push_recent_transfer_command(GpuTransferTrace::image_upload(
+                0,
+                0,
+                1,
+                1,
+                1,
+                true,
+                GpuTransferPayloadStats {
+                    words: 1,
+                    halfwords: 2,
+                    nonzero_halfwords: 1,
+                    unique_colors: 1,
+                    checksum: 0x2222,
+                },
+                &[0xa000_0000, 0x0000_0000, 0x0001_0001],
+                None,
+            ));
+        io.gpu.push_recent_draw_command(trace);
+
+        assert_eq!(io.gpu.draw_captures().len(), 2);
+        assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
+        assert_eq!(io.gpu.draw_captures()[1].sequence, 3);
+    }
+
+    #[test]
+    fn gpu_draw_capture_predicate_rolls_unique_draws_to_small_limit() {
+        let mut io = Io::default();
+        io.gpu
+            .set_draw_capture_predicates(vec![NativeGpuDrawCapturePredicate {
+                min_written_pixels: Some(1),
+                ..NativeGpuDrawCapturePredicate::default()
+            }]);
+
+        for index in 0..super::GPU_PREDICATE_DRAW_CAPTURE_LIMIT + 3 {
+            io.gpu
+                .push_recent_draw_command(predicate_draw_capture_trace(index as u16));
+        }
+
+        assert_eq!(
+            io.gpu.draw_captures().len(),
+            super::GPU_PREDICATE_DRAW_CAPTURE_LIMIT
+        );
+        assert_eq!(io.gpu.draw_captures()[0].sequence, 4);
+        assert_eq!(
+            io.gpu.draw_captures()[super::GPU_PREDICATE_DRAW_CAPTURE_LIMIT - 1].sequence,
+            (super::GPU_PREDICATE_DRAW_CAPTURE_LIMIT + 3) as u64
+        );
     }
 
     #[test]
@@ -26514,6 +30798,76 @@ mod tests {
             direct.gpu.recent_draw_commands_json(),
             streamed.gpu.recent_draw_commands_json()
         );
+    }
+
+    #[test]
+    fn recovery_fighter_material_keeps_requested_palette() {
+        let source = GpuCommandSource::recovery_dma_linked_list(0x0003_d1d4, Some(0x802d_080c));
+        let bounds = DrawBounds {
+            left: 192,
+            top: 120,
+            right: 255,
+            bottom: 239,
+        };
+        let mut options = TextureDrawOptions::opaque_raw();
+
+        super::preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            Some(&source),
+            0x001c,
+            0x7994,
+            bounds,
+        );
+
+        assert!(!options.allow_texture_descriptor_alias);
+    }
+
+    #[test]
+    fn recovery_stage_material_keeps_palette_alias_enabled() {
+        let source = GpuCommandSource::recovery_dma_linked_list(0x0003_8ab8, Some(0x802d_080c));
+        let bounds = DrawBounds {
+            left: 80,
+            top: 180,
+            right: 144,
+            bottom: 244,
+        };
+        let mut options = TextureDrawOptions::opaque_raw();
+
+        super::preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            Some(&source),
+            0x001c,
+            0x7994,
+            bounds,
+        );
+
+        assert!(options.allow_texture_descriptor_alias);
+    }
+
+    #[test]
+    fn recovery_fighter_material_rejects_incoherent_geometry() {
+        let source = GpuCommandSource::recovery_dma_linked_list(0x0003_d1d4, Some(0x802d_080c));
+        for bounds in [
+            DrawBounds {
+                left: -300,
+                top: 0,
+                right: 900,
+                bottom: 479,
+            },
+            DrawBounds {
+                left: 192,
+                top: 12,
+                right: 255,
+                bottom: 120,
+            },
+        ] {
+            assert!(!super::is_br2_recovery_fighter_material_draw(
+                Some(&source),
+                0x001c,
+                0x7994,
+                bounds,
+            ));
+        }
     }
 
     #[test]
@@ -27120,6 +31474,18 @@ mod tests {
             !sparse_replay.native_replay_preserves_visible_scene(&before),
             "{}",
             sparse_replay.native_replay_validation_probe_json(Some(&before))
+        );
+        assert!(!sparse_replay.native_replay_preserves_current_display_scene(&before));
+        assert!(sparse_replay.rollback_catastrophic_recovered_scene(&before));
+        assert_eq!(
+            sparse_replay.current_display_window(),
+            before.current_display_window(),
+            "a catastrophic recovered transaction must restore the complete GPU scene"
+        );
+        assert!(
+            !before
+                .clone()
+                .rollback_catastrophic_recovered_scene(&before)
         );
         assert!(before.native_replay_preserves_visible_scene(&before));
     }
@@ -31202,6 +35568,85 @@ mod tests {
     }
 
     #[test]
+    fn gpu_actual_display_rejects_horizontally_wrapped_active_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, display_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 16;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 64,
+            color_changes: 262_144,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.capture_vblank_presented_frame();
+        let baseline_window = io
+            .gpu
+            .presented_frame_window
+            .expect("baseline presented frame");
+        let baseline_frame = io
+            .gpu
+            .presented_frame_rgb
+            .clone()
+            .expect("baseline presented RGB");
+        assert_eq!((baseline_window.x, baseline_window.y), (0, 0));
+
+        let wrapped_x = 939usize;
+        let wrapped_y = 126usize;
+        fill_glyph_texture_atlas_page(
+            &mut io,
+            wrapped_x,
+            wrapped_y,
+            VRAM_WIDTH - wrapped_x,
+            field_height,
+        );
+        io.gpu.push_image_upload_rect(
+            wrapped_x as i32,
+            wrapped_y as i32,
+            (VRAM_WIDTH - wrapped_x) as i32,
+            field_height as i32,
+        );
+        io.write_u32(
+            GPU_GP1,
+            0x0500_0000 | wrapped_x as u32 | ((wrapped_y as u32) << 10),
+        );
+
+        let output = io.gpu.current_display_output_window();
+        let current = io
+            .gpu
+            .current_display_window_with_dimensions(width, field_height);
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert!(display_window_wraps_vram_horizontally(
+            output.window,
+            output.width
+        ));
+        assert!(
+            io.gpu
+                .display_candidate_is_cross_page_texture_atlas(current, width, field_height),
+            "{playability}"
+        );
+        assert_eq!(
+            io.gpu.presented_frame_window,
+            Some(baseline_window),
+            "{playability}"
+        );
+        assert_eq!((actual_width, actual_height), (width, display_height));
+        assert_eq!(actual_frame, baseline_frame);
+        assert!(
+            playability.contains("\"actual_display_source\":\"stable_display_fallback\"")
+                || playability.contains("\"actual_display_source\":\"presented_frame\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
     fn gpu_rejects_heavy_bottom_texture_page_even_with_live_draw_overlap() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0006);
@@ -31815,6 +36260,21 @@ mod tests {
             ),
             "{playability}"
         );
+        let cached_analysis_count = io.gpu.saturated_logo_transition_cache.borrow().len();
+        assert!(
+            io.gpu.display_window_has_saturated_logo_transition(
+                current,
+                width,
+                display_height,
+                true
+            ),
+            "identical saturated transition analysis must remain positive"
+        );
+        assert_eq!(
+            io.gpu.saturated_logo_transition_cache.borrow().len(),
+            cached_analysis_count,
+            "identical saturated transition analysis must reuse the content-keyed result"
+        );
         assert!(
             !io.gpu
                 .should_use_high_vertical_full_output(high_vertical_output),
@@ -32100,6 +36560,103 @@ mod tests {
 
         assert_eq!(cached, &psx);
         assert_ne!(cached, &raw);
+    }
+
+    #[test]
+    fn gpu_best_observation_rgb_cache_reuses_vec_on_recapture() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, 16, 16, 0x00ff_ffff);
+        io.gpu.capture_best_observation();
+        let first = io.gpu.best_observation_window.expect("best observation");
+        let first_score = screen_observation_score(first.stats);
+        let first_rgb = io
+            .gpu
+            .best_observation_rgb
+            .as_ref()
+            .expect("best observation rgb cache");
+        let first_ptr = first_rgb.as_ptr();
+        let first_capacity = first_rgb.capacity();
+        assert_eq!(first_rgb.len(), width * height);
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let candidate = io
+            .gpu
+            .best_observation_capture_candidate(width, height)
+            .expect("next best observation candidate");
+        assert!(
+            screen_observation_score(candidate.stats) > first_score,
+            "{}",
+            io.gpu.native_playability_json()
+        );
+
+        io.gpu.capture_best_observation();
+
+        let best = io.gpu.best_observation_window.expect("best observation");
+        let cached = io
+            .gpu
+            .best_observation_rgb
+            .as_ref()
+            .expect("best observation rgb cache");
+        let expected = io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            best.x,
+            best.y,
+            width,
+            height,
+            io.gpu.display_24bit_enabled(),
+        );
+
+        assert_eq!(cached.as_ptr(), first_ptr);
+        assert_eq!(cached.capacity(), first_capacity);
+        assert_eq!(cached.len(), width * height);
+        assert_eq!(cached, &expected);
+    }
+
+    #[test]
+    fn gpu_presented_frame_rgb_cache_reuses_vec_on_recapture() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_current_presented_frame();
+        let first = io.gpu.presented_frame_window.expect("presented frame");
+        assert!(presented_frame_has_live_scene(first.stats));
+        let first_rgb = io
+            .gpu
+            .presented_frame_rgb
+            .as_ref()
+            .expect("presented frame rgb cache");
+        let first_ptr = first_rgb.as_ptr();
+        let first_capacity = first_rgb.capacity();
+        assert_eq!(first_rgb.len(), width * height);
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, 1, 1, 0x00ff_00ff);
+        io.gpu.capture_current_presented_frame();
+
+        let presented = io.gpu.presented_frame_window.expect("presented frame");
+        let cached = io
+            .gpu
+            .presented_frame_rgb
+            .as_ref()
+            .expect("presented frame rgb cache");
+        let expected = io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            presented.x,
+            presented.y,
+            width,
+            height,
+            io.gpu.display_24bit_enabled(),
+        );
+
+        assert_ne!(presented.stats.checksum, first.stats.checksum);
+        assert_eq!(cached.as_ptr(), first_ptr);
+        assert_eq!(cached.capacity(), first_capacity);
+        assert_eq!(cached.len(), width * height);
+        assert_eq!(cached, &expected);
     }
 
     #[test]
@@ -32393,6 +36950,43 @@ mod tests {
         assert_ne!(top_pixel, bottom_pixel);
         assert!((top_pixel & 0x00ff_0000) > (top_pixel & 0x0000_ff00));
         assert!((bottom_pixel & 0x0000_ff00) > (bottom_pixel & 0x00ff_0000));
+    }
+
+    #[test]
+    fn gpu_fast_gameplay_display_rgb_frame_with_checksum_matches_legacy_frame() {
+        let mut io = Io::default();
+        let (width, height) = io.gpu.display_dimensions();
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0x0012_3456);
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(4, 8, 16, 12, 0x00fe_dcba);
+
+        let (legacy_width, legacy_height, legacy_rgb) = io.gpu.fast_gameplay_display_rgb_frame();
+        let (gpu_width, gpu_height, gpu_rgb, gpu_checksum) =
+            io.gpu.fast_gameplay_display_rgb_frame_with_checksum();
+        let (io_width, io_height, io_rgb, io_checksum) =
+            io.fast_gameplay_display_rgb_frame_with_checksum();
+        let (x, y) = super::display_area_start_xy(io.gpu.display_area_start);
+        let (expected_rgb, expected_checksum) = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window_with_depth_and_checksum(
+                x,
+                y,
+                width,
+                height,
+                io.gpu.display_24bit_enabled(),
+            );
+
+        assert_eq!((gpu_width, gpu_height), (legacy_width, legacy_height));
+        assert_eq!((io_width, io_height), (legacy_width, legacy_height));
+        assert_eq!(gpu_rgb, legacy_rgb);
+        assert_eq!(io_rgb, legacy_rgb);
+        assert_eq!(expected_rgb, legacy_rgb);
+        assert_eq!(gpu_checksum, expected_checksum);
+        assert_eq!(io_checksum, expected_checksum);
     }
 
     #[test]
@@ -32702,6 +37296,93 @@ mod tests {
             compact_playability.contains("\"classification\":\"native_playable_candidate\""),
             "{compact_playability}"
         );
+    }
+
+    #[test]
+    fn gpu_high_vertical_full_beast_effect_allows_caption_and_title_false_positive() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_multicolor_scene(&mut io, 0, 0, width, field_height);
+        fill_br2_character_select_live_field(&mut io, 0, field_height, width, field_height);
+        stamp_title_logo_overlay_marks(&mut io, 0, 0, width, display_height);
+
+        let bottom_start = display_height * 4 / 5;
+        let bottom_height = display_height - bottom_start;
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            bottom_start as i32,
+            width as i32,
+            (bottom_height * 14 / 100) as i32,
+            0,
+        );
+        for y in bottom_start..display_height {
+            for x in 0..width {
+                if (x * 7 + y * 11) % 25 == 0 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, 0x00f0_e8d8);
+                }
+            }
+        }
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io
+                .gpu
+                .current_display_window_with_dimensions(width, display_height),
+        };
+        let color_stats =
+            io.gpu
+                .display_window_color_stats(full.window, width, display_height, true);
+        let playability = io.gpu.native_playability_json();
+
+        assert!(color_stats.has_intro_caption_band(), "{playability}");
+        assert!(
+            io.gpu
+                .display_window_has_title_logo_overlay(full.window, width, display_height, true),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .high_vertical_full_transient_combat_effect_allows_caption_overlay(
+                    true,
+                    full,
+                    full.window,
+                    width,
+                    display_height,
+                    color_stats,
+                ),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.high_vertical_title_logo_overlay_allows_playability(
+                true,
+                full,
+                full.window,
+                width,
+                display_height,
+                color_stats,
+            ),
+            "{playability}"
+        );
+        assert!(io.gpu.native_playable_candidate(), "{playability}");
     }
 
     #[test]
@@ -36801,6 +41482,95 @@ mod tests {
     }
 
     #[test]
+    fn gpu_high_vertical_title_intro_preserves_full_frame_over_safe_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, display_height as i32, 0);
+        for y in 0..field_height {
+            for x in 0..width {
+                let logo_region =
+                    y < field_height * 82 / 100 && (x < width * 88 / 100 || (x + y * 3) % 11 < 4);
+                let spark = (x * 17 + y * 31) % 101 < 7;
+                let color = if logo_region {
+                    let red = 112 + ((x * 5 + y * 7) % 128) as u32;
+                    let green = 8 + ((x * 3 + y * 11) % 72) as u32;
+                    let blue = 12 + ((x * 13 + y * 5) % 96) as u32;
+                    (red << 16) | (green << 8) | blue
+                } else if spark {
+                    0x00f0_f0f0
+                } else {
+                    0
+                };
+                if color != 0 {
+                    io.gpu
+                        .framebuffer
+                        .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
+                }
+            }
+        }
+        for y in field_height + field_height * 35 / 100..field_height + field_height * 35 / 100 + 8
+        {
+            for x in (width * 34 / 100..width * 58 / 100).step_by(7) {
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 4, 2, 0x00f8_f0a0);
+            }
+        }
+        for y in field_height + field_height * 78 / 100..field_height + field_height * 78 / 100 + 14
+        {
+            for x in (width * 22 / 100..width * 82 / 100).step_by(8) {
+                let color = if (x + y) % 3 == 0 {
+                    0x00f0_f0f0
+                } else {
+                    0x00f8_c020
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 5, 2, color);
+            }
+        }
+
+        io.write_u32(GPU_GP1, 0x0500_0000 | ((field_height as u32) << 10));
+        io.write_u32(GPU_GP1, 0x0500_0000);
+
+        let field_pair = io
+            .gpu
+            .interlaced_field_pair_output_window(width, field_height)
+            .expect("recent high-vertical field pair");
+        let playability = io.gpu.native_playability_json();
+        let safe = io
+            .gpu
+            .safe_field_output_from_field_composed_output(field_pair);
+        let output = io.gpu.current_display_output_window();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let expected_frame = io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            0,
+            0,
+            width,
+            display_height,
+            io.gpu.display_24bit_enabled(),
+        );
+
+        assert!(
+            io.gpu
+                .field_composed_output_should_preserve_br2_title_intro_full_frame(field_pair),
+            "{playability}"
+        );
+        assert!(safe.is_none(), "{playability}");
+        assert_eq!(output.source, "gp1_display_area_fields", "{playability}");
+        assert!(output.field_composed, "{playability}");
+        assert_eq!((output.width, output.height), (width, display_height));
+        assert_eq!((actual_width, actual_height), (width, display_height));
+        assert_eq!(actual_frame, expected_frame);
+    }
+
+    #[test]
     fn gpu_actual_display_rejects_thin_caption_text_field_pair() {
         let mut io = Io::default();
         let (width, height) = io.gpu.display_dimensions();
@@ -37121,9 +41891,12 @@ mod tests {
         assert_eq!(cached_height, height * 2);
         assert!(cached_frame.iter().any(|pixel| *pixel != 0));
 
-        io.gpu
-            .framebuffer
-            .fill_rect_unclipped(0, 0, width as i32, (height * 2) as i32, 0);
+        io.write_u32(GPU_GP0, 0x0200_0000);
+        io.write_u32(GPU_GP0, 0);
+        io.write_u32(
+            GPU_GP0,
+            ((height.saturating_mul(2) as u32) << 16) | width as u32,
+        );
 
         let playability = io.gpu.native_playability_json();
         let compact_playability = io.gpu.native_playability_compact_json();
@@ -37138,7 +41911,8 @@ mod tests {
         assert_eq!((stable_width, stable_height), (width, display_height));
         assert_eq!(frame, stable_frame);
         assert_eq!((fast_width, fast_height), (width, height * 2));
-        assert_eq!(fast_frame, cached_frame);
+        assert!(fast_frame.iter().all(|pixel| *pixel == 0));
+        assert_ne!(fast_frame, cached_frame);
         assert!(
             playability.contains("\"actual_display_source\":\"cached_gp1_display_area_fields\""),
             "{playability}"
@@ -39123,6 +43897,7 @@ mod tests {
             None,
             None,
             "",
+            "",
         );
 
         assert!(
@@ -39213,6 +43988,422 @@ mod tests {
         assert!(
             provenance.contains("\"generation_valid\":false"),
             "{provenance}"
+        );
+    }
+
+    #[test]
+    fn retained_textured_polygon_requires_populated_texture_and_palette_transfers() {
+        fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
+            io.write_u32(GPU_GP0, 0xa000_0000);
+            io.write_u32(GPU_GP0, (y << 16) | x);
+            io.write_u32(GPU_GP0, (height << 16) | width);
+            for _ in 0..width.saturating_mul(height).div_ceil(2) {
+                io.write_u32(GPU_GP0, word);
+            }
+        }
+
+        let preview_slices = [
+            [
+                0x2c80_8080,
+                0x00d8_0001,
+                0x7c1d_0000,
+                0x00d8_0060,
+                0x000d_005f,
+                0x0128_0001,
+                0x0000_5000,
+                0x0128_0060,
+                0x0000_505f,
+            ],
+            [
+                0x2c7f_7f7f,
+                0x0128_0001,
+                0x7c1d_5000,
+                0x0128_0060,
+                0x000d_505f,
+                0x0138_0001,
+                0x0000_6000,
+                0x0138_0060,
+                0x0000_605f,
+            ],
+        ];
+        let mut io = Io::default();
+
+        for preview in &preview_slices {
+            assert!(
+                !io.gpu
+                    .retained_textured_polygon_transfer_generation_valid(preview),
+                "VRAM contents without transfer provenance must not revive a retained draw"
+            );
+        }
+
+        upload(&mut io, 832, 256, 24, 97, 0x3210_1234);
+        upload(&mut io, 464, 496, 16, 1, 0x7fff_001f);
+        for preview in &preview_slices {
+            assert!(
+                io.gpu
+                    .retained_textured_polygon_transfer_generation_valid(preview),
+                "populated texture and CLUT uploads must validate both retained preview slices"
+            );
+        }
+
+        let mut partial_texture_io = Io::default();
+        upload(&mut partial_texture_io, 832, 256, 24, 80, 0x3210_1234);
+        upload(&mut partial_texture_io, 464, 496, 16, 1, 0x7fff_001f);
+        assert!(
+            !partial_texture_io
+                .gpu
+                .retained_textured_polygon_transfer_generation_valid(&preview_slices[1]),
+            "the bottom preview slice must not revive without provenance for its UV rows"
+        );
+
+        for index in 0..=super::GPU_RECENT_TRANSFER_LIMIT {
+            upload(
+                &mut io,
+                800 + (index % 8) as u32,
+                400 + (index % 8) as u32,
+                1,
+                1,
+                0x03e0_001f,
+            );
+        }
+        for preview in &preview_slices {
+            assert!(
+                io.gpu
+                    .retained_textured_polygon_transfer_generation_valid(preview),
+                "persistent transfer coverage must survive recent-transfer eviction"
+            );
+        }
+
+        upload(&mut io, 464, 496, 16, 1, 0);
+        for preview in &preview_slices {
+            assert!(
+                !io.gpu
+                    .retained_textured_polygon_transfer_generation_valid(preview),
+                "a newer blank CLUT upload must invalidate retained preview slices"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_br2_select_preview_accepts_only_exact_populated_persisted_clut() {
+        fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
+            io.write_u32(GPU_GP0, 0xa000_0000);
+            io.write_u32(GPU_GP0, (y << 16) | x);
+            io.write_u32(GPU_GP0, (height << 16) | width);
+            for _ in 0..width.saturating_mul(height).div_ceil(2) {
+                io.write_u32(GPU_GP0, word);
+            }
+        }
+
+        let preview = [
+            0x2c80_8080,
+            0x00d8_0001,
+            0x7c1d_0000,
+            0x00d8_0060,
+            0x000d_005f,
+            0x0128_0001,
+            0x0000_5000,
+            0x0128_0060,
+            0x0000_505f,
+        ];
+        let mut io = Io::default();
+        upload(&mut io, 832, 256, 24, 97, 0x3210_1234);
+        for index in 0..16 {
+            io.gpu.framebuffer.set_raw_pixel(
+                464 + index,
+                496,
+                if index % 2 == 0 { 0x001f } else { 0x03e0 },
+            );
+        }
+
+        assert!(
+            !io.gpu
+                .retained_textured_polygon_transfer_generation_valid(&preview),
+            "the generic retained-draw path must continue requiring CLUT provenance"
+        );
+        assert!(
+            io.gpu
+                .retained_br2_character_select_preview_transfer_generation_valid(&preview),
+            "the exact BR2 preview may reuse its populated persisted CLUT"
+        );
+
+        let mut wrong_row_io = Io::default();
+        upload(&mut wrong_row_io, 832, 256, 24, 97, 0x3210_1234);
+        for index in 0..16 {
+            wrong_row_io.gpu.framebuffer.set_raw_pixel(
+                464 + index,
+                495,
+                if index % 2 == 0 { 0x001f } else { 0x03e0 },
+            );
+        }
+        assert!(
+            !wrong_row_io
+                .gpu
+                .retained_br2_character_select_preview_transfer_generation_valid(&preview),
+            "palette data from y=495 must not stand in for the exact y=496 CLUT"
+        );
+
+        let mut wrong_clut_preview = preview;
+        wrong_clut_preview[2] = 0x7bdd_0000;
+        assert!(
+            !wrong_row_io
+                .gpu
+                .retained_br2_character_select_preview_transfer_generation_valid(
+                    &wrong_clut_preview
+                ),
+            "a populated neighboring CLUT descriptor must not enter the BR2 exception"
+        );
+
+        let mut blank_clut_io = Io::default();
+        upload(&mut blank_clut_io, 832, 256, 24, 97, 0x3210_1234);
+        assert!(
+            !blank_clut_io
+                .gpu
+                .retained_br2_character_select_preview_transfer_generation_valid(&preview),
+            "blank exact CLUT contents must not revive the retained preview"
+        );
+    }
+
+    #[test]
+    fn retained_br2_large_select_portrait_requires_exact_low_bank_texture_and_palette_uploads() {
+        fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
+            io.write_u32(GPU_GP0, 0xa000_0000);
+            io.write_u32(GPU_GP0, (y << 16) | x);
+            io.write_u32(GPU_GP0, (height << 16) | width);
+            for _ in 0..width.saturating_mul(height).div_ceil(2) {
+                io.write_u32(GPU_GP0, word);
+            }
+        }
+
+        let portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7d40_0000,
+            0x0071_00e0,
+            0x0088_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+        let mut io = Io::default();
+        assert!(
+            !io.gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait)
+        );
+
+        upload(&mut io, 512, 0, 96, 256, 0x3210_1234);
+        assert!(
+            !io.gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait),
+            "texture provenance alone must not revive the retained portrait"
+        );
+
+        upload(&mut io, 0, 496, 256, 1, 0x03e0_001f);
+        assert!(
+            io.gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait),
+            "the exact low-bank texture and aligned 256-color palette must validate the portrait"
+        );
+
+        let mut high_bank_io = Io::default();
+        upload(&mut high_bank_io, 512, 256, 96, 256, 0x3210_1234);
+        upload(&mut high_bank_io, 0, 496, 256, 1, 0x03e0_001f);
+        assert!(
+            !high_bank_io
+                .gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait),
+            "the unrelated high-bank atlas must not validate the portrait"
+        );
+
+        let mut persisted_clut_io = Io::default();
+        upload(&mut persisted_clut_io, 512, 0, 96, 256, 0x3210_1234);
+        for index in 0..256 {
+            persisted_clut_io.gpu.framebuffer.set_raw_pixel(
+                index,
+                496,
+                if index % 2 == 0 { 0x001f } else { 0x03e0 },
+            );
+        }
+        for index in 0..96 {
+            upload(
+                &mut persisted_clut_io,
+                700 + (index % 32) as u32,
+                700 + (index / 32) as u32,
+                1,
+                1,
+                0x7fff_001f,
+            );
+        }
+        assert!(
+            persisted_clut_io
+                .gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait),
+            "evicted transfer traces must not hide a proven texture with its persisted exact CLUT"
+        );
+
+        let mut unproven_vram_io = Io::default();
+        for y in 0..256 {
+            for x in 512..608 {
+                unproven_vram_io.gpu.framebuffer.set_raw_pixel(
+                    x,
+                    y,
+                    if (x + y) % 2 == 0 { 0x001f } else { 0x03e0 },
+                );
+            }
+        }
+        for x in 0..256 {
+            unproven_vram_io.gpu.framebuffer.set_raw_pixel(
+                x,
+                496,
+                if x % 2 == 0 { 0x001f } else { 0x03e0 },
+            );
+        }
+        assert!(
+            !unproven_vram_io
+                .gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait),
+            "VRAM contents without a texture upload must not revive a stale atlas packet"
+        );
+
+        let mut wrong_uv = portrait;
+        wrong_uv[4] = 0x0088_007f;
+        assert!(
+            !io.gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&wrong_uv),
+            "neighboring 8bpp atlas geometry must not enter the exact portrait exception"
+        );
+
+        let mut retained_io = Io::default();
+        upload(&mut retained_io, 512, 0, 128, 240, 0x3210_1234);
+        upload(&mut retained_io, 0, 496, 256, 1, 0x03e0_001f);
+        assert_eq!(retained_io.gpu.framebuffer.raw_pixel(512, 0), 0x1234);
+        upload(&mut retained_io, 512, 0, 64, 256, 0x03e0_03e0);
+        upload(&mut retained_io, 576, 0, 64, 256, 0x03e0_03e0);
+        upload(&mut retained_io, 0, 496, 16, 16, 0x03e0_03e0);
+        assert_eq!(retained_io.gpu.framebuffer.raw_pixel(512, 0), 0x03e0);
+        assert!(
+            retained_io
+                .gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait),
+            "a qualified retained portrait must survive later stage-atlas uploads"
+        );
+        assert!(
+            retained_io
+                .gpu
+                .restore_retained_br2_character_select_large_portrait_assets()
+        );
+        assert_eq!(
+            retained_io.gpu.framebuffer.raw_pixel(512, 0),
+            0x1234,
+            "stale portrait replay must restore the retained texture, not sample the stage atlas"
+        );
+        assert_eq!(
+            retained_io.gpu.framebuffer.raw_pixel(0, 496),
+            0x001f,
+            "stale portrait replay must restore the retained 256-color CLUT"
+        );
+
+        let mut stage_only_io = Io::default();
+        upload(&mut stage_only_io, 512, 0, 64, 256, 0x03e0_03e0);
+        upload(&mut stage_only_io, 576, 0, 64, 256, 0x03e0_03e0);
+        upload(&mut stage_only_io, 0, 496, 16, 16, 0x03e0_03e0);
+        assert!(
+            !stage_only_io
+                .gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(&portrait),
+            "stage texture coverage must not masquerade as large-portrait provenance"
+        );
+    }
+
+    #[test]
+    fn retained_br2_right_large_select_portrait_requires_completed_cross_page_uploads() {
+        fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
+            io.write_u32(GPU_GP0, 0xa000_0000);
+            io.write_u32(GPU_GP0, (y << 16) | x);
+            io.write_u32(GPU_GP0, (height << 16) | width);
+            for _ in 0..width.saturating_mul(height).div_ceil(2) {
+                io.write_u32(GPU_GP0, word);
+            }
+        }
+
+        let right_slices = [
+            [
+                0x2c64_6464,
+                0x0071_01e0,
+                0x7d80_00c0,
+                0x0071_01a0,
+                0x0088_00ff,
+                0x0170_01e0,
+                0x0000_ffc0,
+                0x0170_01a0,
+                0x0000_ffff,
+            ],
+            [
+                0x2c64_6464,
+                0x0071_01a0,
+                0x7d80_0000,
+                0x0071_0120,
+                0x008a_007f,
+                0x0170_01a0,
+                0x0000_ff00,
+                0x0170_0120,
+                0x0000_ff7f,
+            ],
+        ];
+        let mut io = Io::default();
+        upload(&mut io, 512, 0, 128, 240, 0x3210_1234);
+        upload(&mut io, 0, 496, 256, 1, 0x03e0_001f);
+        upload(&mut io, 640, 0, 128, 240, 0x7654_5678);
+        for slice in &right_slices {
+            assert!(
+                !io.gpu
+                    .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                        slice,
+                    ),
+                "the cross-page portrait must not validate before its completion palette upload"
+            );
+        }
+
+        upload(&mut io, 0, 497, 256, 1, 0x7fff_03e0);
+        for slice in &right_slices {
+            assert!(
+                io.gpu
+                    .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                        slice,
+                    ),
+                "both exact right-side slices must share the retained cross-page asset"
+            );
+        }
+
+        assert_eq!(io.gpu.framebuffer.raw_pixel(608, 0), 0x1234);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(640, 0), 0x5678);
+        upload(&mut io, 576, 0, 64, 256, 0x03e0_03e0);
+        upload(&mut io, 640, 0, 64, 256, 0x03e0_03e0);
+        upload(&mut io, 0, 496, 16, 16, 0x03e0_03e0);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(608, 0), 0x03e0);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(640, 0), 0x03e0);
+        assert!(
+            io.gpu
+                .restore_retained_br2_character_select_right_large_portrait_assets()
+        );
+        assert_eq!(io.gpu.framebuffer.raw_pixel(608, 0), 0x1234);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(640, 0), 0x5678);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(0, 496), 0x001f);
+
+        let mut interrupted_io = Io::default();
+        upload(&mut interrupted_io, 512, 0, 128, 240, 0x3210_1234);
+        upload(&mut interrupted_io, 0, 496, 256, 1, 0x03e0_001f);
+        upload(&mut interrupted_io, 640, 0, 128, 240, 0x7654_5678);
+        upload(&mut interrupted_io, 900, 400, 1, 1, 0x7fff_001f);
+        upload(&mut interrupted_io, 0, 497, 256, 1, 0x7fff_03e0);
+        assert!(
+            !interrupted_io
+                .gpu
+                .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                    &right_slices[0],
+                ),
+            "an unrelated transfer between texture and completion palette must break provenance"
         );
     }
 
@@ -39335,10 +44526,209 @@ mod tests {
         assert_eq!(io.read_u32(MDEC_STATUS), 0x8004_0000);
 
         io.write_u32(MDEC_COMMAND, 0x1234_5678);
-        assert_eq!(io.read_u32(MDEC_STATUS), 0x8004_0000);
+        let status = io.read_u32(MDEC_STATUS);
+        assert_ne!(status & (1 << 31), 0);
+        assert_eq!(status & (1 << 29), 0);
 
         io.write_u32(MDEC_STATUS, 0x8000_0000);
         assert_eq!(io.read_u32(MDEC_STATUS), 0x8004_0000);
+    }
+
+    #[test]
+    fn mdec_soft_reset_preserves_uploaded_decode_tables() {
+        let mut io = Io::default();
+
+        io.write_u32(MDEC_COMMAND, 0x4000_0001);
+        for word in 0..32_u32 {
+            io.write_u32(MDEC_COMMAND, word.wrapping_mul(0x0101_0101));
+        }
+        io.write_u32(MDEC_COMMAND, 0x6000_0000);
+        for pair in 0..32_u32 {
+            let low = pair * 2 + 1;
+            let high = low + 1;
+            io.write_u32(MDEC_COMMAND, low | (high << 16));
+        }
+
+        let quant_luma = io.mdec.quant_luma;
+        let quant_chroma = io.mdec.quant_chroma;
+        let scale_table = io.mdec.scale_table;
+
+        io.write_u32(MDEC_STATUS, 0x8000_0000);
+
+        assert_eq!(io.mdec.quant_luma, quant_luma);
+        assert_eq!(io.mdec.quant_chroma, quant_chroma);
+        assert_eq!(io.mdec.scale_table, scale_table);
+        assert_eq!(io.read_u32(MDEC_STATUS), 0x8004_0000);
+    }
+
+    #[test]
+    fn mdec_status_tracks_output_fifo_and_dma_requests() {
+        let mut io = Io::default();
+
+        io.write_u32(MDEC_STATUS, 0x6000_0000);
+        io.write_u32(MDEC_COMMAND, 0x3a00_0006);
+        for word in [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ] {
+            io.write_u32(MDEC_COMMAND, word);
+        }
+
+        let status = io.read_u32(MDEC_STATUS);
+        assert_ne!(status & (1 << 31), 0);
+        assert_eq!(status & (1 << 29), 0);
+        assert_eq!(status & (1 << 27), 0);
+        assert_eq!((status >> 25) & 0x03, 0x03);
+
+        io.mdec.begin_dma_output_request(128);
+        let status = io.read_u32(MDEC_STATUS);
+        assert_eq!(status & (1 << 31), 0);
+        assert_ne!(status & (1 << 29), 0);
+        assert_ne!(status & (1 << 27), 0);
+
+        for _ in 0..128 {
+            io.mdec.read_dma_output();
+        }
+
+        let status = io.read_u32(MDEC_STATUS);
+        assert_ne!(status & (1 << 31), 0);
+        assert_eq!(status & (1 << 29), 0);
+        assert_eq!(status & (1 << 27), 0);
+    }
+
+    #[test]
+    fn mdec_decode_produces_only_dma_requested_macroblocks() {
+        let mut io = Io::default();
+        let macroblock = [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ];
+
+        io.write_u32(MDEC_COMMAND, 0x3a00_000c);
+        for word in macroblock.into_iter().chain(macroblock) {
+            io.write_u32(MDEC_COMMAND, word);
+        }
+
+        assert_eq!(io.mdec.decoded_output_words(), 0);
+        io.mdec.begin_dma_output_request(128);
+        assert_ne!(io.mdec.read_dma_output(), 0);
+        assert_eq!(io.mdec.decoded_output_words(), 128);
+        for _ in 1..128 {
+            io.mdec.read_dma_output();
+        }
+        io.mdec.complete_dma_output_request();
+        let status = io.read_u32(MDEC_STATUS);
+        assert_ne!(status & (1 << 31), 0);
+        assert_eq!(status & (1 << 29), 0);
+        assert_eq!(status & (1 << 27), 0);
+        assert_eq!(io.mdec.decoded_output_words(), 128);
+
+        io.mdec.begin_dma_output_request(128);
+        assert_eq!(io.read_u32(MDEC_STATUS) & (1 << 31), 0);
+        assert_ne!(io.mdec.read_dma_output(), 0);
+        assert_eq!(io.mdec.decoded_output_words(), 256);
+    }
+
+    #[test]
+    fn mdec_output_request_completion_preserves_valid_remaining_stream() {
+        let mut io = Io::default();
+        let macroblock = [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ];
+
+        io.write_u32(MDEC_COMMAND, 0x3a00_000c);
+        for word in macroblock.into_iter().chain(macroblock) {
+            io.write_u32(MDEC_COMMAND, word);
+        }
+        io.mdec.begin_dma_output_request(128);
+        for _ in 0..128 {
+            io.mdec.read_dma_output();
+        }
+
+        let remaining_before = io.mdec.decode_input_halfwords_remaining();
+        let cursor_before = io.mdec.decode_input_cursor();
+        io.mdec.complete_dma_output_request();
+
+        assert!(remaining_before > 0);
+        assert_eq!(io.mdec.decoded_output_words(), 128);
+        assert_eq!(io.mdec.decode_input_halfwords_remaining(), remaining_before);
+        assert_eq!(io.mdec.decode_input_cursor(), cursor_before);
+        assert!(!io.mdec.decode_complete());
+        assert_eq!(io.mdec.discarded_input_halfwords(), 0);
+        let status = io.read_u32(MDEC_STATUS);
+        assert_ne!(status & (1 << 31), 0);
+        assert_eq!(status & (1 << 29), 0);
+        assert_eq!(status & (1 << 27), 0);
+
+        io.mdec.begin_dma_output_request(128);
+        assert_eq!(io.mdec.decoded_output_words(), 256);
+        assert!(io.mdec.decode_input_halfwords_remaining() < remaining_before);
+        assert!(io.mdec.decode_complete());
+        assert_eq!(io.read_u32(MDEC_STATUS) & (1 << 31), 0);
+    }
+
+    #[test]
+    fn mdec_output_request_completion_consumes_padding_only_tail() {
+        let mut io = Io::default();
+        let macroblock = [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ];
+
+        io.write_u32(MDEC_COMMAND, 0x3a00_0008);
+        for word in macroblock.into_iter().chain([0xfe00_fe00; 2]) {
+            io.write_u32(MDEC_COMMAND, word);
+        }
+        io.mdec.begin_dma_output_request(128);
+        for _ in 0..128 {
+            io.mdec.read_dma_output();
+        }
+        io.mdec.complete_dma_output_request();
+
+        assert!(io.mdec.decode_complete());
+        assert_eq!(io.mdec.decode_input_halfwords_remaining(), 0);
+        assert_eq!(io.mdec.discarded_input_halfwords(), 0);
+        assert_ne!(io.read_u32(MDEC_STATUS) & (1 << 31), 0);
+        assert_eq!(io.read_u32(MDEC_STATUS) & (1 << 29), 0);
+    }
+
+    #[test]
+    fn mdec_diagnostics_report_stream_lifetime() {
+        let mut io = Io::default();
+        io.write_u32(MDEC_COMMAND, 0x3a00_0006);
+        for word in [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ] {
+            io.write_u32(MDEC_COMMAND, word);
+        }
+
+        let diagnostics = io.mdec.diagnostic_json();
+        assert!(diagnostics.contains("\"decode_input_halfwords_remaining\":12"));
+        assert!(diagnostics.contains("\"decode_input_cursor\":0"));
+        assert!(diagnostics.contains("\"decode_complete\":false"));
+        assert!(diagnostics.contains("\"discarded_input_halfwords\":0"));
     }
 
     #[test]
@@ -39348,6 +44738,7 @@ mod tests {
         io.write_u32(MDEC_COMMAND, 0x4000_0001);
         assert_eq!(io.mdec.input_words_remaining(), 32);
         assert_eq!(io.read_u32(MDEC_STATUS) & (1 << 29), 1 << 29);
+        assert_eq!(io.read_u32(MDEC_STATUS) & 0xffff, 31);
 
         io.mdec.write_dma_input(0x1111_2222);
         assert_eq!(io.mdec.input_words_remaining(), 31);
