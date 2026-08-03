@@ -84,12 +84,13 @@ cargo run -- serve 127.0.0.1:8765
 Run the Rust-native Apple Silicon play window with legally supplied local assets:
 
 ```sh
-cargo run -- native-cache-prepare assets/local-romset.zip
-cargo run -- native-play
-cargo run -- native-input-check
-cargo run -- native-health-check
-cargo run -- native-autoplay
-cargo run --release -- native-startup-probe assets/roms 120000 optimized
+cargo run --release -- native-cache-prepare assets/local-romset.zip
+ROM_CACHE="$(cargo run --quiet --release -- native-cache-path)"
+cargo run --release -- native-play "$ROM_CACHE" 600000 1
+cargo run --release -- native-input-check "$ROM_CACHE" 500000
+cargo run --release -- native-health-check "$ROM_CACHE" 500000
+cargo run --release -- native-autoplay "$ROM_CACHE" 600000 1
+cargo run --release -- native-startup-probe "$ROM_CACHE" 600000 optimized
 ```
 
 ZIP inputs are not extracted by hand on every run. Native runtime startup
@@ -197,7 +198,8 @@ Run the complete visible macOS Live QA flow after preparing the reusable ROM
 cache:
 
 ```sh
-scripts/native-live-qa-macos.sh
+ROM_CACHE="$(cargo run --quiet --release -- native-cache-path)"
+scripts/native-e2e-qa-macos.sh --rom-cache "$ROM_CACHE" --mode all
 ```
 
 The script opens the real GUI and CoreAudio output, drives title entry, character
@@ -278,16 +280,17 @@ execution foundation, memory bus, DMA, GPU framebuffer renderer, input mapping,
 Gym-style native backend, and a minifb-powered local play window:
 
 ```sh
-cargo run -- native-inspect assets/roms/<game-romset.zip>
-cargo run -- native-rom-summary assets/roms/<game-romset.zip>
-cargo run -- native-step assets/roms/<game-romset.zip> 16
-cargo run -- native-step assets/roms/<game-romset.zip> 1000000
-cargo run -- native-env-step assets/roms/<game-romset.zip> 5 1 10000
-cargo run -- native-scripted-step assets/roms/<game-romset.zip> 100000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
-cargo run -- native-input-check 120000
-cargo run -- native-health-check 120000
-cargo run -- native-play 120000 fit
-cargo run -- serve-native 127.0.0.1:8765 assets/roms/<game-romset.zip> 500000
+cargo run --release -- native-cache-prepare assets/roms/<game-romset.zip>
+ROM_CACHE="$(cargo run --quiet --release -- native-cache-path)"
+cargo run --release -- native-inspect "$ROM_CACHE"
+cargo run --release -- native-rom-summary "$ROM_CACHE"
+cargo run --release -- native-step "$ROM_CACHE" 1000000
+cargo run --release -- native-env-step "$ROM_CACHE" 5 1 500000
+cargo run --release -- native-scripted-step "$ROM_CACHE" 500000 /tmp/br2-script.png coin:30 noop:30 start:30 coin+start:60 noop:120
+cargo run --release -- native-input-check "$ROM_CACHE" 500000
+cargo run --release -- native-health-check "$ROM_CACHE" 500000
+cargo run --release -- native-play "$ROM_CACHE" 600000 1
+cargo run --release -- serve-native 127.0.0.1:8765 "$ROM_CACHE" 500000
 ```
 
 The native path is intentionally separated from MAME and ZiNc compatibility
@@ -297,7 +300,7 @@ The current native core runs on macOS, opens a local framebuffer window, reads
 the mapped controls, uploads visible texture data to VRAM, tracks presentation
 quality, and exposes CPU/IO/GPU state for iterative validation.
 `native-health-check`, `native-play-snapshot --match-script`, and
-`scripts/native-live-qa-macos.sh` are the release gates for full-scene
+`scripts/native-e2e-qa-macos.sh --mode all` are the release gates for full-scene
 composition, all P1/P2 controls, non-silent PCM, realtime CoreAudio, and
 gameplay performance.
 `native-env-step` and `serve-native` connect the native core to the same
@@ -321,6 +324,9 @@ path.
 
 ```sh
 curl -sS http://127.0.0.1:8765/action_space
+curl -sS http://127.0.0.1:8765/character_action_space
+curl -sS http://127.0.0.1:8765/health
+curl -sS http://127.0.0.1:8765/screenshot
 curl -sS -X POST http://127.0.0.1:8765/reset
 curl -sS -X POST http://127.0.0.1:8765/step \
   -d '{"action":5,"frames":1}'
@@ -328,6 +334,10 @@ curl -sS -X POST http://127.0.0.1:8765/step \
   -d '{"action":5,"frames":1,"screenshot":true}'
 curl -sS -X POST http://127.0.0.1:8765/step \
   -d '{"buttons":{"up":true,"punch":true,"guard":true},"frames":2}'
+curl -sS -X POST http://127.0.0.1:8765/action \
+  -d '{"character":"long","player":2,"action":"forward_punch","facing":"left","screenshot":true}'
+curl -sS -X POST http://127.0.0.1:8765/step_sequence \
+  -d '{"segments":[{"buttons":{"punch":true,"p2_kick":true},"frames":4},{"buttons":{},"frames":3}]}'
 ```
 
 `screenshot` defaults to `false` on both `/reset` and `/step` to keep
@@ -337,6 +347,14 @@ macOS GUI. Each `/step` must provide exactly one of `action` or `buttons`.
 `action` uses the current `Discrete(38)` contract, including P1 and P2 actions;
 `buttons` permits any
 simultaneous boolean control combination. `frames` must be between 1 and 600.
+`POST /action` provides release-safe named controls for all 11 roster
+characters and both players. Its facing-aware forward/back inputs default to
+P1 facing right and P2 facing left. `POST /step_sequence` accepts up to 64
+timed simultaneous-button segments with a maximum total of 600 frames, which
+allows an agent to express exact character command lists without adding a new
+server endpoint for every move. Named attack and Beast actions always include
+an explicit release segment so a held input cannot leave transformation or
+ground effects repeating indefinitely.
 If the core cannot reach the next vblank within its safety budget, the request
 fails instead of returning a partial frame count. The response `info` contains
 the requested buttons, total and per-step guest input activity, playable-state
@@ -346,9 +364,57 @@ Endpoints:
 
 - `GET /`
 - `GET /action_space`
+- `GET /character_action_space`
 - `GET /observation_space`
+- `GET /health`
+- `GET /screenshot`
 - `POST /reset`
 - `POST /step`
+- `POST /action`
+- `POST /step_sequence`
+
+## MCP API
+
+Run the ROM-free deterministic backend for client development:
+
+```sh
+cargo run --release -- mcp
+```
+
+Run the Apple Silicon-native gameplay backend with the reusable ROM cache:
+
+```sh
+ROM_CACHE="$(cargo run --quiet --release -- native-cache-path)"
+cargo run --release -- native-mcp "$ROM_CACHE" 500000
+```
+
+Example stdio MCP server configuration:
+
+```json
+{
+  "mcpServers": {
+    "bloodyroar2": {
+      "command": "/absolute/path/to/target/release/bloodyroar2-gym",
+      "args": [
+        "native-mcp",
+        "/absolute/path/to/legal/rom-cache/roms",
+        "500000"
+      ]
+    }
+  }
+}
+```
+
+The MCP server exposes `action_space`, `character_action_space`,
+`observation_space`, `health`, `reset`, `step`, `step_buttons`,
+`perform_action`, `step_sequence`, and `screenshot`. `step` uses the same
+`Discrete(38)` P1/P2 mapping as HTTP. `step_buttons` accepts simultaneous
+controls for both players, including movement, Punch, Kick, Beast, Guard, coin,
+and start. `perform_action` executes the same release-safe character action
+macros as `POST /action`; `step_sequence` is the exact timed-controller surface
+for character-specific command strings and simultaneous self-play.
+Screenshots are returned as MCP image content while the structured observation
+keeps `screenshot_b64` null to avoid duplicating the image payload.
 
 ## Gymnasium mapping
 
@@ -364,8 +430,15 @@ Observation space:
 - `player_health`: `0.0..1.0`
 - `opponent_health`: `0.0..1.0`
 - `beast_meter`: `0.0..1.0`
+- `opponent_beast_meter`: `0.0..1.0`
 - `round_time`: `0.0..99.0`
 - `terminal`: boolean
+- `native_playable`: current native gameplay/render readiness
+- `rendered_frame_checksum`: deterministic checksum for visual-change checks
+- `render_progressing`: vblank and draw/frame output both progressed
+- `effects_progressing`: an attack/Beast request produced progressing output
+- `audio_progressing`: the native sound renderer produced PCM
+- `emulated_fps`: measured guest vblank throughput since the prior observation
 - `screenshot_b64`: optional PNG frame for vision agents
 
 ## Legal asset workflow

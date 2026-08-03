@@ -1,6 +1,6 @@
 use crate::action::{Action, ActionButtons};
 use crate::backend::BackendError;
-use crate::native::emulator::NativeEmulator;
+use crate::native::emulator::{NativeDisplayFrame, NativeEmulator};
 
 const PLAYABLE_STARTUP_INSTRUCTIONS_PER_FRAME: u64 = 500_000;
 const PLAYABLE_STARTUP_INSTRUCTION_SLICE: u64 = 5_000;
@@ -14,6 +14,19 @@ const PLAYABLE_RENDER_SETTLE_FRAMES: u64 = 120;
 const PLAYABLE_EXTRA_WAIT_FRAMES: u64 = 900;
 const PLAYABLE_EXTRA_WAIT_SAMPLE_FRAMES: u64 = 120;
 const PLAYABLE_PRESENTATION_CAPTURE_INTERVAL: u64 = 6_000;
+const ROSTER_TOP_ROW_COLUMNS: usize = 5;
+const ROSTER_SLOTS: usize = 11;
+const ROSTER_P2_INITIAL_SLOT: usize = 4;
+const ROSTER_NAVIGATION_PULSE_FRAMES: u64 = 1;
+const ROSTER_NAVIGATION_RELEASE_FRAMES: u64 = 24;
+const ROSTER_PREVIEW_SETTLE_FRAMES: u64 = 90;
+const ROSTER_SELECT_CONFIRM_FRAMES: u64 = 36;
+const ROSTER_SELECT_CONFIRM_RELEASE_FRAMES: u64 = 36;
+const ROSTER_P2_JOIN_SETTLE_FRAMES: u64 = 90;
+const ROSTER_GAMEPLAY_WAIT_FRAMES: u64 = 1_800;
+const ROSTER_GAMEPLAY_MIN_SETTLE_FRAMES: u64 = 120;
+const ROSTER_GAMEPLAY_CHECK_STRIDE_FRAMES: u64 = 6;
+const ROSTER_GAMEPLAY_POST_READY_SETTLE_FRAMES: u64 = 180;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativePlayableSegment {
@@ -133,6 +146,262 @@ pub fn prepare_native_playable_emulator(
     )))
 }
 
+pub fn prepare_native_character_select_emulator(
+    emulator: &mut NativeEmulator,
+) -> Result<u64, BackendError> {
+    let script = native_playable_match_entry_script();
+    let first_credit = script
+        .iter()
+        .position(|segment| native_playable_segment_is_credit_attempt(*segment))
+        .unwrap_or(script.len());
+    let boot_segments = &script[..first_credit];
+    let mut frames = 0_u64;
+
+    emulator.set_native_otc_dma_recovery_suppressed(true);
+    emulator.set_vblank_presentation_capture_interval(None);
+    emulator.set_unlinked_primitive_replay_enabled(false);
+    emulator.set_unlinked_primitive_replay_interval(None);
+    run_segments(emulator, boot_segments, &mut frames)?;
+
+    emulator.set_input(ActionButtons::default());
+    for _ in 0..TITLE_READY_EXTRA_WAIT_FRAMES {
+        if native_title_runtime_poll_ready(emulator) {
+            break;
+        }
+        advance_one_script_frame(emulator)?;
+        frames = frames.saturating_add(1);
+        ensure_running(emulator)?;
+    }
+    if !native_title_runtime_poll_ready(emulator) {
+        return Err(BackendError::new(format!(
+            "native character-select startup completed {frames} boot frames without reaching title input polling readiness: {}",
+            emulator.input_activity_json()
+        )));
+    }
+
+    emulator.set_native_otc_dma_recovery_suppressed(false);
+    emulator.set_vblank_presentation_capture_interval(Some(PLAYABLE_PRESENTATION_CAPTURE_INTERVAL));
+    emulator.set_unlinked_primitive_replay_enabled(true);
+    emulator.set_unlinked_primitive_replay_interval(None);
+    run_segments(
+        emulator,
+        &[
+            segment(Action::Coin, 18),
+            segment(Action::Noop, 24),
+            segment(Action::Start, 24),
+            segment(Action::Noop, 240),
+        ],
+        &mut frames,
+    )?;
+    emulator.set_input(ActionButtons::default());
+    emulator.capture_vblank_presented_frame();
+    ensure_running(emulator)?;
+    Ok(frames)
+}
+
+pub fn prepare_native_selected_match_emulator(
+    emulator: &mut NativeEmulator,
+    p1_slot: usize,
+    p2_slot: usize,
+) -> Result<NativePlayableStartup, BackendError> {
+    if p1_slot >= ROSTER_SLOTS || p2_slot >= ROSTER_SLOTS {
+        return Err(BackendError::new(format!(
+            "native roster slots must be between 0 and {}",
+            ROSTER_SLOTS - 1
+        )));
+    }
+
+    let mut frames = 0_u64;
+    let p1_navigation = native_roster_navigation_segments(p1_slot, false);
+    run_segments(emulator, &p1_navigation, &mut frames)?;
+    run_segments(
+        emulator,
+        &[
+            segment(Action::P2Coin, 18),
+            segment(Action::Noop, 24),
+            segment(Action::P2Start, 24),
+            segment(Action::Noop, ROSTER_P2_JOIN_SETTLE_FRAMES),
+        ],
+        &mut frames,
+    )?;
+    let p2_navigation = native_roster_navigation_segments(p2_slot, true);
+    run_segments(emulator, &p2_navigation, &mut frames)?;
+    run_segments(
+        emulator,
+        &[
+            segment(Action::Punch, ROSTER_SELECT_CONFIRM_FRAMES),
+            segment(Action::Noop, ROSTER_SELECT_CONFIRM_RELEASE_FRAMES),
+            segment(Action::P2Punch, ROSTER_SELECT_CONFIRM_FRAMES),
+            segment(Action::Noop, ROSTER_SELECT_CONFIRM_RELEASE_FRAMES),
+        ],
+        &mut frames,
+    )?;
+
+    emulator.set_input(ActionButtons::default());
+    for gameplay_frame in 1..=ROSTER_GAMEPLAY_WAIT_FRAMES {
+        advance_one_script_frame(emulator)?;
+        frames = frames.saturating_add(1);
+        ensure_running(emulator)?;
+        if gameplay_frame >= ROSTER_GAMEPLAY_MIN_SETTLE_FRAMES
+            && gameplay_frame.is_multiple_of(ROSTER_GAMEPLAY_CHECK_STRIDE_FRAMES)
+        {
+            emulator.capture_vblank_presented_frame();
+            if native_two_player_match_ready(emulator) {
+                emulator.set_input(ActionButtons::default());
+                for _ in 0..ROSTER_GAMEPLAY_POST_READY_SETTLE_FRAMES {
+                    advance_one_script_frame(emulator)?;
+                    frames = frames.saturating_add(1);
+                    ensure_running(emulator)?;
+                }
+                emulator.capture_vblank_presented_frame();
+                if native_two_player_match_ready(emulator) {
+                    return Ok(NativePlayableStartup {
+                        frames,
+                        playable: true,
+                    });
+                }
+            }
+        }
+    }
+
+    Err(BackendError::new(format!(
+        "native two-player match startup completed {frames} frames without reaching a rendered fight: readiness={} input={} sync={}",
+        native_two_player_match_readiness_json(emulator),
+        emulator.input_activity_json(),
+        emulator.native_sync_compact_json()
+    )))
+}
+
+fn native_roster_navigation_segments(slot: usize, player_two: bool) -> Vec<NativePlayableSegment> {
+    let (row, column) = native_roster_slot_position(slot);
+    let (initial_row, initial_column) = if player_two {
+        native_roster_slot_position(ROSTER_P2_INITIAL_SLOT)
+    } else {
+        (0, 0)
+    };
+    let up = if player_two { Action::P2Up } else { Action::Up };
+    let down = if player_two {
+        Action::P2Down
+    } else {
+        Action::Down
+    };
+    let left = if player_two {
+        Action::P2Left
+    } else {
+        Action::Left
+    };
+    let right = if player_two {
+        Action::P2Right
+    } else {
+        Action::Right
+    };
+    let mut segments = Vec::new();
+    if row > initial_row {
+        append_navigation_pulses(&mut segments, down, row - initial_row);
+    } else {
+        append_navigation_pulses(&mut segments, up, initial_row - row);
+    }
+    if column > initial_column {
+        append_navigation_pulses(&mut segments, right, column - initial_column);
+    } else {
+        append_navigation_pulses(&mut segments, left, initial_column - column);
+    }
+    segments.push(segment(Action::Noop, ROSTER_PREVIEW_SETTLE_FRAMES));
+    segments
+}
+
+fn native_roster_slot_position(slot: usize) -> (usize, usize) {
+    if slot < ROSTER_TOP_ROW_COLUMNS {
+        (0, slot)
+    } else {
+        (1, slot - ROSTER_TOP_ROW_COLUMNS)
+    }
+}
+
+fn append_navigation_pulses(
+    segments: &mut Vec<NativePlayableSegment>,
+    action: Action,
+    count: usize,
+) {
+    for _ in 0..count {
+        segments.push(segment(action, ROSTER_NAVIGATION_PULSE_FRAMES));
+        segments.push(segment(Action::Noop, ROSTER_NAVIGATION_RELEASE_FRAMES));
+    }
+}
+
+fn native_two_player_match_ready(emulator: &NativeEmulator) -> bool {
+    let activity = emulator.input_activity();
+    let frame = emulator.fast_gameplay_window_frame_with_checksum().0;
+    native_two_player_match_signals_ready(
+        emulator.br2_native_credit_hle_game_start_accepted_seen(),
+        activity.system_p2_start_active_reads > 0,
+        emulator.native_3d_gameplay_signal(),
+        native_two_player_match_frame_ready(&frame),
+    )
+}
+
+fn native_two_player_match_signals_ready(
+    game_start_accepted: bool,
+    p2_start_observed: bool,
+    native_3d_gameplay_signal: bool,
+    frame_ready: bool,
+) -> bool {
+    game_start_accepted && p2_start_observed && native_3d_gameplay_signal && frame_ready
+}
+
+fn native_two_player_match_readiness_json(emulator: &NativeEmulator) -> String {
+    let activity = emulator.input_activity();
+    let (frame, checksum) = emulator.fast_gameplay_window_frame_with_checksum();
+    let p1_health_columns = native_match_health_bar_columns(&frame, 35..230);
+    let p2_health_columns = native_match_health_bar_columns(&frame, 282..477);
+    format!(
+        "{{\"game_start_accepted\":{},\"p2_start_observed\":{},\"native_3d_gameplay_signal\":{},\"gpu_rendered_scene_candidate\":{},\"native_playable_candidate\":{},\"frame_ready\":{},\"frame_width\":{},\"frame_height\":{},\"frame_checksum\":{},\"p1_health_columns\":{},\"p2_health_columns\":{}}}",
+        emulator.br2_native_credit_hle_game_start_accepted_seen(),
+        activity.system_p2_start_active_reads > 0,
+        emulator.native_3d_gameplay_signal(),
+        emulator.gpu_native_rendered_scene_candidate(),
+        emulator.native_playable_candidate(),
+        native_two_player_match_frame_ready(&frame),
+        frame.width,
+        frame.height,
+        checksum,
+        p1_health_columns,
+        p2_health_columns,
+    )
+}
+
+fn native_two_player_match_frame_ready(frame: &NativeDisplayFrame) -> bool {
+    if frame.width < 512
+        || frame.height < 480
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        return false;
+    }
+    native_match_health_bar_columns(frame, 35..230) * 5 >= 195 * 3
+        && native_match_health_bar_columns(frame, 282..477) * 5 >= 195 * 3
+}
+
+fn native_match_health_bar_columns(
+    frame: &NativeDisplayFrame,
+    x_range: std::ops::Range<usize>,
+) -> usize {
+    x_range
+        .filter(|&x| {
+            (38..54)
+                .filter(|&y| native_match_health_bar_pixel(frame.pixels[y * frame.width + x]))
+                .count()
+                >= 6
+        })
+        .count()
+}
+
+fn native_match_health_bar_pixel(pixel: u32) -> bool {
+    let red = (pixel >> 16) & 0xff;
+    let green = (pixel >> 8) & 0xff;
+    let blue = pixel & 0xff;
+    red >= 150 && green >= 120 && blue <= 96 && red.saturating_sub(blue) >= 80
+}
+
 fn native_player_session_ready(emulator: &NativeEmulator) -> bool {
     emulator.br2_native_credit_hle_game_start_accepted_seen()
         && emulator.native_playable_candidate()
@@ -205,7 +474,9 @@ fn advance_one_script_frame(emulator: &mut NativeEmulator) -> Result<(), Backend
     {
         let remaining = PLAYABLE_STARTUP_INSTRUCTIONS_PER_FRAME - executed;
         let slice = remaining.min(PLAYABLE_STARTUP_INSTRUCTION_SLICE);
-        let slice_executed = emulator.step_instructions(slice);
+        // Startup only needs architectural state and vblank progress. Avoid
+        // retaining per-instruction diagnostic state in this hot path.
+        let slice_executed = emulator.step_instructions_until_vblank_untracked(slice);
         executed = executed.saturating_add(slice_executed);
         if slice_executed == 0 {
             break;
@@ -222,8 +493,13 @@ fn advance_one_script_frame(emulator: &mut NativeEmulator) -> Result<(), Backend
 
 #[cfg(test)]
 mod tests {
-    use super::{native_playable_match_entry_script, native_playable_segment_is_credit_attempt};
-    use crate::Action;
+    use super::{
+        ROSTER_NAVIGATION_PULSE_FRAMES, ROSTER_NAVIGATION_RELEASE_FRAMES,
+        ROSTER_PREVIEW_SETTLE_FRAMES, native_playable_match_entry_script,
+        native_playable_segment_is_credit_attempt, native_roster_navigation_segments,
+        native_two_player_match_frame_ready, native_two_player_match_signals_ready,
+    };
+    use crate::{Action, native::NativeDisplayFrame};
 
     #[test]
     fn playable_script_contains_boot_match_and_all_controls() {
@@ -277,5 +553,84 @@ mod tests {
         assert_eq!(script[first_credit + 4].action, Action::Coin);
         assert_eq!(script[first_credit + 5].action, Action::Noop);
         assert_eq!(script[first_credit + 6].action, Action::Start);
+    }
+
+    #[test]
+    fn two_player_match_readiness_requires_both_health_bars() {
+        let mut frame = NativeDisplayFrame {
+            width: 512,
+            height: 480,
+            pixels: vec![0; 512 * 480],
+        };
+        for y in 38..54 {
+            for x in 35..230 {
+                frame.pixels[y * frame.width + x] = 0x00e0_c020;
+            }
+        }
+        assert!(!native_two_player_match_frame_ready(&frame));
+        for y in 38..54 {
+            for x in 282..477 {
+                frame.pixels[y * frame.width + x] = 0x00e0_c020;
+            }
+        }
+        assert!(native_two_player_match_frame_ready(&frame));
+    }
+
+    #[test]
+    fn two_player_match_readiness_uses_rendered_fight_proof_not_gpu_heuristics() {
+        assert!(native_two_player_match_signals_ready(
+            true, true, true, true
+        ));
+        assert!(!native_two_player_match_signals_ready(
+            false, true, true, true
+        ));
+        assert!(!native_two_player_match_signals_ready(
+            true, false, true, true
+        ));
+        assert!(!native_two_player_match_signals_ready(
+            true, true, false, true
+        ));
+        assert!(!native_two_player_match_signals_ready(
+            true, true, true, false
+        ));
+    }
+
+    #[test]
+    fn p2_roster_navigation_starts_on_long() {
+        let actions = |slot| {
+            native_roster_navigation_segments(slot, true)
+                .into_iter()
+                .map(|segment| (segment.action, segment.frames))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            actions(4),
+            vec![(Action::Noop, ROSTER_PREVIEW_SETTLE_FRAMES)]
+        );
+        assert_eq!(
+            actions(0),
+            vec![
+                (Action::P2Left, ROSTER_NAVIGATION_PULSE_FRAMES),
+                (Action::Noop, ROSTER_NAVIGATION_RELEASE_FRAMES),
+                (Action::P2Left, ROSTER_NAVIGATION_PULSE_FRAMES),
+                (Action::Noop, ROSTER_NAVIGATION_RELEASE_FRAMES),
+                (Action::P2Left, ROSTER_NAVIGATION_PULSE_FRAMES),
+                (Action::Noop, ROSTER_NAVIGATION_RELEASE_FRAMES),
+                (Action::P2Left, ROSTER_NAVIGATION_PULSE_FRAMES),
+                (Action::Noop, ROSTER_NAVIGATION_RELEASE_FRAMES),
+                (Action::Noop, ROSTER_PREVIEW_SETTLE_FRAMES),
+            ]
+        );
+        assert_eq!(
+            actions(10),
+            vec![
+                (Action::P2Down, ROSTER_NAVIGATION_PULSE_FRAMES),
+                (Action::Noop, ROSTER_NAVIGATION_RELEASE_FRAMES),
+                (Action::P2Right, ROSTER_NAVIGATION_PULSE_FRAMES),
+                (Action::Noop, ROSTER_NAVIGATION_RELEASE_FRAMES),
+                (Action::Noop, ROSTER_PREVIEW_SETTLE_FRAMES),
+            ]
+        );
     }
 }

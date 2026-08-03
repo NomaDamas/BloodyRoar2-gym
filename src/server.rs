@@ -6,8 +6,13 @@ use std::time::Duration;
 use crate::action::{Action, ActionButtons};
 use crate::backend::{Backend, BackendError, NullBackend};
 use crate::env::{BloodyRoar2Env, MAX_STEP_FRAMES};
+use crate::moves::{
+    ActionSegment, Facing, MAX_ACTION_SEQUENCE_SEGMENTS, Player, named_action_sequence,
+};
 use crate::native::NativeBackend;
-use crate::protocol::{action_space_json, api_index_json, observation_space_json};
+use crate::protocol::{
+    action_space_json, api_index_json, character_action_space_json, observation_space_json,
+};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,17 +101,66 @@ where
         ok(api_index_json())
     } else if first_line.starts_with("GET /action_space ") {
         ok(action_space_json())
+    } else if first_line.starts_with("GET /character_action_space ") {
+        ok(character_action_space_json())
     } else if first_line.starts_with("GET /observation_space ") {
         ok(observation_space_json())
+    } else if first_line.starts_with("GET /health ") {
+        let mut env = env
+            .lock()
+            .map_err(|_| BackendError::new("environment lock poisoned"))?;
+        env.set_observation_screenshot(false);
+        match env.observe() {
+            Ok(observation) => ok(format!(
+                "{{\"status\":\"ok\",\"observation\":{},\"info\":{}}}",
+                observation.json(),
+                observation.info_json
+            )),
+            Err(error) => internal_error(error.to_string()),
+        }
+    } else if first_line.starts_with("GET /diagnostic ") {
+        let env = env
+            .lock()
+            .map_err(|_| BackendError::new("environment lock poisoned"))?;
+        env.diagnostic_json().map_or_else(
+            || not_found("{\"error\":\"backend diagnostics unavailable\"}".to_string()),
+            |diagnostic| ok(format!("{{\"diagnostic\":{diagnostic}}}")),
+        )
+    } else if first_line.starts_with("GET /screenshot ") {
+        let mut env = env
+            .lock()
+            .map_err(|_| BackendError::new("environment lock poisoned"))?;
+        env.set_observation_screenshot(true);
+        match env.observe().or_else(|_| env.reset()) {
+            Ok(observation) => ok(format!(
+                "{{\"observation\":{},\"info\":{}}}",
+                observation.json(),
+                observation.info_json
+            )),
+            Err(error) => internal_error(error.to_string()),
+        }
     } else if first_line.starts_with("POST /reset ") {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-        match parse_observation_options(body) {
-            Ok(include_screenshot) => {
+        match parse_reset_request(body) {
+            Ok((p1_character, p2_character, include_screenshot)) => {
                 let mut env = env
                     .lock()
                     .map_err(|_| BackendError::new("environment lock poisoned"))?;
                 env.set_observation_screenshot(include_screenshot);
-                match env.reset() {
+                let observation = if p1_character.is_some() || p2_character.is_some() {
+                    let (active_p1, active_p2) = env.active_characters().ok_or_else(|| {
+                        BackendError::new(
+                            "current backend does not expose active character selection",
+                        )
+                    })?;
+                    env.reset_match(
+                        p1_character.as_deref().unwrap_or(active_p1),
+                        p2_character.as_deref().unwrap_or(active_p2),
+                    )
+                } else {
+                    env.reset()
+                };
+                match observation {
                     Ok(observation) => ok(format!(
                         "{{\"observation\":{},\"info\":{}}}",
                         observation.json(),
@@ -142,6 +196,42 @@ where
                         Ok(step) => ok(step.json()),
                         Err(error) => internal_error(error.to_string()),
                     }
+                }
+            }
+            Err(message) => bad_request(error_json(&message)),
+        }
+    } else if first_line.starts_with("POST /action ") {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        match parse_named_action_request(body) {
+            Ok((character, player, action, facing, include_screenshot)) => {
+                match named_action_sequence(&character, player, &action, facing) {
+                    Ok(segments) => {
+                        let mut env = env
+                            .lock()
+                            .map_err(|_| BackendError::new("environment lock poisoned"))?;
+                        let step = env
+                            .ensure_character_selected(&character, player)
+                            .and_then(|_| env.step_sequence(&segments, include_screenshot));
+                        match step {
+                            Ok(step) => ok(step.json()),
+                            Err(error) => internal_error(error.to_string()),
+                        }
+                    }
+                    Err(message) => bad_request(error_json(&message)),
+                }
+            }
+            Err(message) => bad_request(error_json(&message)),
+        }
+    } else if first_line.starts_with("POST /step_sequence ") {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        match parse_action_sequence_request(body) {
+            Ok((segments, include_screenshot)) => {
+                let mut env = env
+                    .lock()
+                    .map_err(|_| BackendError::new("environment lock poisoned"))?;
+                match env.step_sequence(&segments, include_screenshot) {
+                    Ok(step) => ok(step.json()),
+                    Err(error) => bad_request(error_json(&error.to_string())),
                 }
             }
             Err(message) => bad_request(error_json(&message)),
@@ -256,7 +346,7 @@ fn parse_step_request(body: &str) -> Result<(StepControl, u32, bool), String> {
     Ok((control, frames as u32, include_screenshot))
 }
 
-fn parse_action_buttons(value: &serde_json::Value) -> Result<ActionButtons, String> {
+pub(crate) fn parse_action_buttons(value: &serde_json::Value) -> Result<ActionButtons, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "buttons must be a JSON object".to_string())?;
@@ -304,16 +394,148 @@ fn parse_action_buttons(value: &serde_json::Value) -> Result<ActionButtons, Stri
     })
 }
 
-fn parse_observation_options(body: &str) -> Result<bool, String> {
+pub(crate) fn parse_action_segments(
+    value: &serde_json::Value,
+) -> Result<Vec<ActionSegment>, String> {
+    let segments = value
+        .as_array()
+        .ok_or_else(|| "segments must be a JSON array".to_string())?;
+    if segments.is_empty() {
+        return Err("segments must contain at least one item".to_string());
+    }
+    if segments.len() > MAX_ACTION_SEQUENCE_SEGMENTS {
+        return Err(format!(
+            "segments must contain at most {MAX_ACTION_SEQUENCE_SEGMENTS} items"
+        ));
+    }
+
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let object = segment
+                .as_object()
+                .ok_or_else(|| format!("segments[{index}] must be a JSON object"))?;
+            if let Some(key) = object
+                .keys()
+                .find(|key| !matches!(key.as_str(), "buttons" | "frames"))
+            {
+                return Err(format!("unknown segments[{index}] field: {key}"));
+            }
+            let buttons = object
+                .get("buttons")
+                .ok_or_else(|| format!("segments[{index}].buttons is required"))
+                .and_then(parse_action_buttons)?;
+            let frames = object
+                .get("frames")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("segments[{index}].frames must be a positive integer"))?;
+            let frames = u32::try_from(frames)
+                .map_err(|_| format!("segments[{index}].frames is outside the supported range"))?;
+            if frames == 0 {
+                return Err(format!("segments[{index}].frames must be positive"));
+            }
+            Ok(ActionSegment::new(buttons, frames))
+        })
+        .collect()
+}
+
+fn parse_named_action_request(
+    body: &str,
+) -> Result<(String, Player, String, Facing, bool), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("invalid JSON body: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "request body must be a JSON object".to_string())?;
+    if let Some(key) = object.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "character" | "player" | "action" | "facing" | "screenshot"
+        )
+    }) {
+        return Err(format!("unknown named action field: {key}"));
+    }
+    let character = object
+        .get("character")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "character must be a string".to_string())?
+        .to_string();
+    let player = object
+        .get("player")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(Player::from_number)
+        .ok_or_else(|| "player must be 1 or 2".to_string())?;
+    let action = object
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "action must be a string".to_string())?
+        .to_string();
+    let facing = object
+        .get("facing")
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(Facing::from_name)
+                .ok_or_else(|| "facing must be left or right".to_string())
+        })
+        .transpose()?
+        .unwrap_or_else(|| player.default_facing());
+    let include_screenshot = parse_screenshot_option(object)?;
+    Ok((character, player, action, facing, include_screenshot))
+}
+
+fn parse_action_sequence_request(body: &str) -> Result<(Vec<ActionSegment>, bool), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("invalid JSON body: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "request body must be a JSON object".to_string())?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "segments" | "screenshot"))
+    {
+        return Err(format!("unknown step sequence field: {key}"));
+    }
+    let segments = object
+        .get("segments")
+        .ok_or_else(|| "segments is required".to_string())
+        .and_then(parse_action_segments)?;
+    let include_screenshot = parse_screenshot_option(object)?;
+    Ok((segments, include_screenshot))
+}
+
+fn parse_reset_request(body: &str) -> Result<(Option<String>, Option<String>, bool), String> {
     if body.trim().is_empty() {
-        return Ok(false);
+        return Ok((None, None, false));
     }
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|error| format!("invalid JSON body: {error}"))?;
     let object = value
         .as_object()
         .ok_or_else(|| "request body must be a JSON object".to_string())?;
-    parse_screenshot_option(object)
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "p1_character" | "p2_character" | "screenshot"))
+    {
+        return Err(format!("unknown reset field: {key}"));
+    }
+    let character = |name: &str| {
+        object
+            .get(name)
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{name} must be a string"))
+            })
+            .transpose()
+    };
+    Ok((
+        character("p1_character")?,
+        character("p2_character")?,
+        parse_screenshot_option(object)?,
+    ))
 }
 
 fn parse_screenshot_option(
@@ -365,16 +587,30 @@ mod tests {
     use crate::action::ActionButtons;
     use crate::backend::{Backend, BackendError, Observation};
     use crate::env::BloodyRoar2Env;
+    use crate::moves::{BLOODY_ROAR_2_ROSTER, canonical_character_name};
 
     use super::{
-        StepControl, find_header_end, internal_error, parse_content_length,
-        parse_observation_options, parse_step_request, route_request,
+        StepControl, find_header_end, internal_error, parse_action_sequence_request,
+        parse_content_length, parse_named_action_request, parse_reset_request, parse_step_request,
+        route_request,
     };
 
-    #[derive(Default)]
     struct ScreenshotBackend {
         frame: u64,
         include_screenshot: bool,
+        p1_character: &'static str,
+        p2_character: &'static str,
+    }
+
+    impl Default for ScreenshotBackend {
+        fn default() -> Self {
+            Self {
+                frame: 0,
+                include_screenshot: false,
+                p1_character: BLOODY_ROAR_2_ROSTER[0],
+                p2_character: BLOODY_ROAR_2_ROSTER[0],
+            }
+        }
     }
 
     impl ScreenshotBackend {
@@ -384,8 +620,15 @@ mod tests {
                 player_health: 1.0,
                 opponent_health: 1.0,
                 beast_meter: 0.0,
+                opponent_beast_meter: 0.0,
                 round_time: 99.0,
                 terminal: false,
+                native_playable: true,
+                rendered_frame_checksum: self.frame as u32,
+                render_progressing: self.frame > 0,
+                effects_progressing: false,
+                audio_progressing: false,
+                emulated_fps: 60.0,
                 screenshot_b64: self.include_screenshot.then(|| "test-png".to_string()),
                 info_json: format!("{{\"frame\":{}}}", self.frame),
             }
@@ -402,12 +645,34 @@ mod tests {
             Ok(self.observation())
         }
 
+        fn reset_match(
+            &mut self,
+            p1_character: &str,
+            p2_character: &str,
+        ) -> Result<Observation, BackendError> {
+            self.p1_character = canonical_character_name(p1_character).ok_or_else(|| {
+                BackendError::new(format!("unknown Bloody Roar 2 character: {p1_character}"))
+            })?;
+            self.p2_character = canonical_character_name(p2_character).ok_or_else(|| {
+                BackendError::new(format!("unknown Bloody Roar 2 character: {p2_character}"))
+            })?;
+            self.reset()
+        }
+
+        fn active_characters(&self) -> Option<(&'static str, &'static str)> {
+            Some((self.p1_character, self.p2_character))
+        }
+
         fn step(
             &mut self,
             _buttons: ActionButtons,
             frames: u32,
         ) -> Result<Observation, BackendError> {
             self.frame = self.frame.saturating_add(frames.max(1) as u64);
+            Ok(self.observation())
+        }
+
+        fn observe(&mut self) -> Result<Observation, BackendError> {
             Ok(self.observation())
         }
     }
@@ -487,13 +752,48 @@ mod tests {
 
     #[test]
     fn reset_observation_options_default_to_lightweight_responses() {
-        assert_eq!(parse_observation_options(""), Ok(false));
-        assert_eq!(parse_observation_options("{}"), Ok(false));
+        assert_eq!(parse_reset_request(""), Ok((None, None, false)));
+        assert_eq!(parse_reset_request("{}"), Ok((None, None, false)));
         assert_eq!(
-            parse_observation_options(r#"{"screenshot":true}"#),
-            Ok(true)
+            parse_reset_request(r#"{"screenshot":true}"#),
+            Ok((None, None, true))
         );
-        assert!(parse_observation_options(r#"{"screenshot":"yes"}"#).is_err());
+        assert_eq!(
+            parse_reset_request(
+                r#"{"p1_character":"long","p2_character":"jenny","screenshot":true}"#
+            ),
+            Ok((Some("long".to_string()), Some("jenny".to_string()), true))
+        );
+        assert!(parse_reset_request(r#"{"screenshot":"yes"}"#).is_err());
+        assert!(parse_reset_request(r#"{"unknown":true}"#).is_err());
+    }
+
+    #[test]
+    fn named_and_sequence_requests_validate_all_players() {
+        let (character, player, action, facing, screenshot) = parse_named_action_request(
+            r#"{"character":"Long","player":2,"action":"forward_punch","facing":"left","screenshot":true}"#,
+        )
+        .expect("named action");
+        assert_eq!(character, "Long");
+        assert_eq!(player, crate::Player::Two);
+        assert_eq!(action, "forward_punch");
+        assert_eq!(facing, crate::Facing::Left);
+        assert!(screenshot);
+
+        let (segments, screenshot) = parse_action_sequence_request(
+            r#"{"segments":[{"buttons":{"punch":true,"p2_kick":true},"frames":2},{"buttons":{},"frames":3}]}"#,
+        )
+        .expect("action sequence");
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].buttons.punch);
+        assert!(segments[0].buttons.p2_kick);
+        assert_eq!(segments[1].frames, 3);
+        assert!(!screenshot);
+        assert!(
+            parse_named_action_request(r#"{"character":"long","player":3,"action":"punch"}"#)
+                .is_err()
+        );
+        assert!(parse_action_sequence_request(r#"{"segments":[]}"#).is_err());
     }
 
     #[test]
@@ -548,6 +848,47 @@ mod tests {
             response_json(&reset_without_image)["observation"]["screenshot_b64"].is_null(),
             "reset without screenshot must clear the prior true setting"
         );
+
+        let health = route_request("GET /health HTTP/1.1\r\n\r\n", &env).expect("health");
+        assert_eq!(response_json(&health)["status"], "ok");
+        assert!(
+            response_json(&health)["observation"]["screenshot_b64"].is_null(),
+            "health must remain lightweight"
+        );
+
+        let screenshot =
+            route_request("GET /screenshot HTTP/1.1\r\n\r\n", &env).expect("screenshot");
+        assert_eq!(
+            response_json(&screenshot)["observation"]["screenshot_b64"],
+            "test-png"
+        );
+
+        let character_action_space =
+            route_request("GET /character_action_space HTTP/1.1\r\n\r\n", &env)
+                .expect("character action space");
+        assert_eq!(response_json(&character_action_space)["roster"][4], "long");
+
+        let named_action = route_request(
+            "POST /action HTTP/1.1\r\n\r\n{\"character\":\"long\",\"player\":2,\"action\":\"transform\",\"screenshot\":true}",
+            &env,
+        )
+        .expect("named action");
+        assert_eq!(
+            response_json(&named_action)["observation"]["screenshot_b64"],
+            "test-png"
+        );
+        assert_eq!(response_json(&named_action)["observation"]["frame"], 24);
+        assert_eq!(
+            response_json(&named_action)["info"]["sequence"]["released"],
+            true
+        );
+
+        let sequence = route_request(
+            "POST /step_sequence HTTP/1.1\r\n\r\n{\"segments\":[{\"buttons\":{\"punch\":true,\"p2_kick\":true},\"frames\":2},{\"buttons\":{},\"frames\":3}]}",
+            &env,
+        )
+        .expect("step sequence");
+        assert_eq!(response_json(&sequence)["observation"]["frame"], 29);
     }
 
     #[test]

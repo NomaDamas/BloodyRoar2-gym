@@ -14,7 +14,7 @@ DRY_RUN=0
 SMOKE_IPF=${BR2_E2E_QA_SMOKE_IPF:-500000}
 LIVE_IPF=${BR2_E2E_QA_LIVE_IPF:-600000}
 LIVE_MAX_FRAMES=${BR2_LIVE_QA_MAX_FRAMES:-4200}
-GUI_CAPTURE_INTERVAL=${BR2_NATIVE_GUI_CAPTURE_INTERVAL:-15}
+GUI_CAPTURE_INTERVAL=${BR2_NATIVE_GUI_CAPTURE_INTERVAL:-60}
 SMOKE_WALL_TIMEOUT_SECS=${BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS:-600}
 WINDOW_SCALE=${BR2_E2E_QA_WINDOW_SCALE:-1}
 SMOKE_SELECT_CONFIRM_WAIT_FRAMES=${BR2_E2E_QA_SMOKE_SELECT_CONFIRM_WAIT_FRAMES:-420}
@@ -39,7 +39,8 @@ Options:
   --smoke-ipf <n>             native-match-tail-timeline instructions per frame. Default: 500000.
   --live-ipf <n>              native-play instructions per frame. Default: 600000.
   --live-max-frames <n>       Bounded GUI frames. Default: BR2_LIVE_QA_MAX_FRAMES or 4200.
-  --capture-interval <n>      GUI capture interval in frames. Default: 15.
+  --capture-interval <n>      Gameplay GUI capture interval in frames. Default: 60.
+                              Non-gameplay transitions are sampled at most every 15 frames.
   --window-scale <scale>      native-play scale argument. Default: 1.
   --no-build                  Use target/release/bloodyroar2-gym as-is.
   --dry-run                   Print commands only; do not build, run, or write artifacts.
@@ -289,7 +290,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
             "BR2_NATIVE_GUI_CAPTURE_DIR=$LIVE_CAPTURE_DIR" \
             "BR2_NATIVE_GUI_CAPTURE_INTERVAL=$GUI_CAPTURE_INTERVAL" \
             "BR2_NATIVE_GUI_DEEP_CAPTURE=${BR2_NATIVE_GUI_DEEP_CAPTURE:-1}" \
-            "BR2_NATIVE_TRACE_GUI_INPUT=${BR2_NATIVE_TRACE_GUI_INPUT:-1}" \
+            "BR2_NATIVE_TRACE_GUI_INPUT=${BR2_NATIVE_TRACE_GUI_INPUT:-0}" \
             "BR2_NATIVE_GUI_TEST_EXCLUSIVE_INPUT=${BR2_NATIVE_GUI_TEST_EXCLUSIVE_INPUT:-1}" \
             "BR2_NATIVE_GUI_WALL_TIMEOUT_SECS=${BR2_NATIVE_GUI_WALL_TIMEOUT_SECS:-300}" \
             "$BIN" native-play "$ROM_CACHE" "$LIVE_IPF" "$WINDOW_SCALE" "$LIVE_MAX_FRAMES" \
@@ -332,7 +333,7 @@ if [ "$BUILD_STATUS" -eq 0 ] && { [ "$MODE" = "live" ] || [ "$MODE" = "all" ]; }
         "BR2_NATIVE_GUI_CAPTURE_DIR=$LIVE_CAPTURE_DIR" \
         "BR2_NATIVE_GUI_CAPTURE_INTERVAL=$GUI_CAPTURE_INTERVAL" \
         "BR2_NATIVE_GUI_DEEP_CAPTURE=${BR2_NATIVE_GUI_DEEP_CAPTURE:-1}" \
-        "BR2_NATIVE_TRACE_GUI_INPUT=${BR2_NATIVE_TRACE_GUI_INPUT:-1}" \
+        "BR2_NATIVE_TRACE_GUI_INPUT=${BR2_NATIVE_TRACE_GUI_INPUT:-0}" \
         "BR2_NATIVE_GUI_TEST_EXCLUSIVE_INPUT=${BR2_NATIVE_GUI_TEST_EXCLUSIVE_INPUT:-1}" \
         "BR2_NATIVE_GUI_WALL_TIMEOUT_SECS=${BR2_NATIVE_GUI_WALL_TIMEOUT_SECS:-300}" \
         "$BIN" native-play "$ROM_CACHE" "$LIVE_IPF" "$WINDOW_SCALE" "$LIVE_MAX_FRAMES" \

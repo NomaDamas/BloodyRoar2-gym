@@ -1283,12 +1283,13 @@ impl NativeEmulator {
     pub fn diagnostic_json(&self) -> String {
         let playable = self.native_playable_candidate();
         format!(
-            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"audio\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
+            "{{\"cpu\":{},\"gte\":{},\"io\":{},\"zn_board\":{},\"audio\":{},\"gpu_recovery_raster_cache\":{},\"native_sync\":{},\"write_watch\":[{}],\"native_playability\":{},\"platform\":{},\"rom_compatibility\":{},\"rom_bytes\":{},\"banked_rom_bytes\":{},\"ram_bytes\":{},\"scratchpad_bytes\":{},\"executed_steps\":{},\"last_step\":{},\"last_outcome\":\"{:?}\",\"gpu_playable_candidate\":{},\"gte_gameplay_signal\":{},\"playable\":{},\"development_stage\":\"native_runtime_validation\"}}",
             self.cpu.json(),
             self.cpu.gte_json(),
             self.bus.io_compact_json(),
             self.bus.zn_board_json(),
             self.bus.audio_stats_json(),
+            self.bus.recovery_raster_cache_stats_json(),
             self.bus.native_sync_json(),
             self.bus.write_watch_json(),
             self.native_playability_json(),

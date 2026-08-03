@@ -978,6 +978,24 @@ const BR2_RUNTIME_INVALID_CALLBACK_WORD_LOAD_RELOCATED_SIGNATURE: [(u32, u32); 5
     (0x8035_4a30, 0x0200_2821),
     (0x8035_4a34, 0x8ca2_0008),
 ];
+const BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_PC: u32 = 0x8035_8544;
+const BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_CALLER_RETURN: u32 = 0x8035_84dc;
+const BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_SIGNATURE: [(u32, u32); 14] = [
+    (0x8035_84fc, 0x27bd_ffd8),
+    (0x8035_8504, 0x0080_8021),
+    (0x8035_851c, 0x8e02_0044),
+    (0x8035_8524, 0x1840_0065),
+    (0x8035_8534, 0x0240_8821),
+    (0x8035_8538, 0x8e02_0034),
+    (0x8035_8540, 0x0222_1021),
+    (0x8035_8544, 0x8c42_0000),
+    (0x8035_854c, 0x1040_0017),
+    (0x8035_8554, 0x8442_0004),
+    (0x8035_855c, 0x1054_0005),
+    (0x8035_8564, 0x1053_003b),
+    (0x8035_856c, 0x080d_616b),
+    (0x8035_8580, 0x8c44_0000),
+];
 const BR2_RUNTIME_INVALID_CALLBACK_DISPATCH_SIGNATURE: [(u32, u32); 11] = [
     (0x8035_4a24, 0x0c0d_42f5),
     (0x8035_4a28, 0x0000_0000),
@@ -1096,6 +1114,35 @@ const BR2_RUNTIME_UNALIGNED_VERTEX_WORD_LOAD_PC: u32 = 0x8034_47d0;
 const BR2_RUNTIME_UNALIGNED_VERTEX_WORD_LOAD_END_PC: u32 = 0x8034_47d4;
 const BR2_RUNTIME_UNALIGNED_VERTEX_SECOND_WORD_LOAD_PC: u32 = 0x8034_47f8;
 const BR2_RUNTIME_UNALIGNED_VERTEX_SECOND_WORD_LOAD_END_PC: u32 = 0x8034_482c;
+const BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_LOAD_PC: u32 = 0x8035_1ab4;
+const BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_EPILOGUE_PC: u32 = 0x8035_1bf0;
+const BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_RETURN: u32 = 0x8035_5244;
+const BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_HLE_CYCLES: u64 = 64;
+const BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_SIGNATURE: [(u32, u32); 16] = [
+    (0x8035_1a80, 0x8cd3_0024),
+    (0x8035_1a84, 0x8e94_0008),
+    (0x8035_1a88, 0x84d5_0030),
+    (0x8035_1a9c, 0x8e48_0000),
+    (0x8035_1aa0, 0x8e4a_0004),
+    (0x8035_1aac, 0x0008_40c0),
+    (0x8035_1ab0, 0x0111_4020),
+    (0x8035_1ab4, 0xc900_0000),
+    (0x8035_1ab8, 0xc901_0004),
+    (0x8035_1ac4, 0xc922_0000),
+    (0x8035_1ac8, 0xc923_0004),
+    (0x8035_1ae4, 0xc944_0000),
+    (0x8035_1ae8, 0xc945_0004),
+    (0x8035_1af0, 0x1ea0_0005),
+    (0x8035_1bf0, 0x3c08_1f80),
+    (0x8035_1c18, 0x03e0_0008),
+];
+const BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_SIGNATURE: [(u32, u32); 5] = [
+    (0x8035_5238, 0x8f84_004c),
+    (0x8035_523c, 0x0c0d_4690),
+    (0x8035_5240, 0x0000_0000),
+    (0x8035_5244, 0x080d_549d),
+    (0x8035_5248, 0x0000_0000),
+];
 const BR2_RUNTIME_UNALIGNED_GTE_LOAD_PC: u32 = 0x8033_c884;
 const BR2_RUNTIME_UNALIGNED_GTE_LOAD_END_PC: u32 = 0x8033_c88c;
 const BR2_RUNTIME_UNALIGNED_RENDER_SOURCE_WORD_LOAD_PC: u32 = 0x8033_c85c;
@@ -2964,6 +3011,7 @@ fn br2_native_hle_disabled(feature: &str) -> bool {
             "runtime_control_callback_cycle" => 1 << 40,
             "bitstream_decode" => 1 << 41,
             "byte_copy" => 1 << 42,
+            "runtime_invalid_beast_geometry" => 1 << 43,
             _ => 0,
         }
     }
@@ -7612,6 +7660,15 @@ impl Cpu {
             0x32 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
                 if address & 0x03 != 0 {
+                    if self.try_hle_br2_runtime_invalid_beast_gte_source(
+                        current_pc,
+                        delay_slot_branch_pc,
+                        instruction,
+                        address,
+                        bus,
+                    ) {
+                        return StepOutcome::Continue;
+                    }
                     if self.try_hle_br2_runtime_unaligned_gte_load(
                         current_pc,
                         delay_slot_branch_pc,
@@ -8030,17 +8087,30 @@ impl Cpu {
             );
         let scene_callback_caller = br2_runtime_scene_callback_context_valid(return_address, bus);
         let object_callback_caller = br2_runtime_object_callback_context_valid(return_address, bus);
+        let beast_callback_load = current_pc == BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_PC
+            && return_address == BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_CALLER_RETURN
+            && instruction == BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_SIGNATURE[7].1
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_SIGNATURE,
+            )
+            && br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_INVALID_CALLBACK_HALFWORD_LOAD_CALLER_SIGNATURE,
+            );
+        let standard_load = instruction == BR2_RUNTIME_INVALID_CALLBACK_WORD_LOAD_SIGNATURE[2].1
+            && br2_runtime_invalid_callback_word_load_signature_matches(current_pc, bus);
         if self.br2_runtime_recovery_hle_disabled("runtime_invalid_callback_word_load")
             || !br2_game_runtime_pc(current_pc)
             || delay_slot_branch_pc.is_some()
-            || instruction != BR2_RUNTIME_INVALID_CALLBACK_WORD_LOAD_SIGNATURE[2].1
             || address & 0x03 == 0
-            || !(recursive_caller
+            || !(standard_load || beast_callback_load)
+            || !(beast_callback_load
+                || recursive_caller
                 || recursive_loop_caller
                 || relocated_caller
                 || scene_callback_caller
                 || object_callback_caller)
-            || !br2_runtime_invalid_callback_word_load_signature_matches(current_pc, bus)
         {
             return false;
         }
@@ -8057,6 +8127,49 @@ impl Cpu {
             return false;
         };
         self.schedule_load(rt(instruction), value);
+        true
+    }
+
+    fn try_hle_br2_runtime_invalid_beast_gte_source(
+        &mut self,
+        current_pc: u32,
+        delay_slot_branch_pc: Option<u32>,
+        instruction: u32,
+        address: u32,
+        bus: &Bus,
+    ) -> bool {
+        let physical = psx_physical_address(address);
+        if self.br2_runtime_recovery_hle_disabled("runtime_invalid_beast_geometry")
+            || current_pc != BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_LOAD_PC
+            || delay_slot_branch_pc.is_some()
+            || instruction != BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_SIGNATURE[7].1
+            || self.regs[17] != address
+            || self.regs[31] != BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_RETURN
+            || physical >= 0x0001_0000
+            || !br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_SIGNATURE,
+            )
+            || !br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_SIGNATURE,
+            )
+        {
+            return false;
+        }
+
+        // The function saves its caller context in scratchpad and restores it
+        // from this epilogue. Skipping the corrupt primitive here avoids using
+        // low-RAM sentinels as vertex arrays without weakening normal LWC2.
+        self.pc = BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_EPILOGUE_PC;
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self
+            .cycles
+            .saturating_add(BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_HLE_CYCLES);
+        self.pending_load = None;
+        self.load_commit_register = None;
+        self.load_commit_value = None;
+        self.load_commit_cancelled = false;
         true
     }
 
@@ -13773,6 +13886,26 @@ mod tests {
             bus,
             BR2_RUNTIME_INVALID_CALLBACK_WORD_LOAD_PC,
         );
+    }
+
+    fn install_br2_runtime_invalid_beast_callback_word_load(bus: &mut Bus) {
+        for (address, instruction) in super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_SIGNATURE
+            .iter()
+            .chain(BR2_RUNTIME_INVALID_CALLBACK_HALFWORD_LOAD_CALLER_SIGNATURE.iter())
+            .copied()
+        {
+            bus.write_u32(address, instruction);
+        }
+    }
+
+    fn install_br2_runtime_invalid_beast_gte_source(bus: &mut Bus) {
+        for (address, instruction) in super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_SIGNATURE
+            .iter()
+            .chain(super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_SIGNATURE.iter())
+            .copied()
+        {
+            bus.write_u32(address, instruction);
+        }
     }
 
     fn install_br2_runtime_invalid_scene_callback(bus: &mut Bus) {
@@ -23069,6 +23202,57 @@ mod tests {
     }
 
     #[test]
+    fn hle_br2_runtime_invalid_beast_callback_word_load_nulls_gap_pointer() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_invalid_beast_callback_word_load(&mut bus);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = 0x807f_7f7f;
+        cpu.regs[31] = super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_CALLER_RETURN;
+
+        let load = cpu.step_report(&mut bus);
+        assert_eq!(load.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.regs[2], 0x807f_7f7f);
+
+        let delay = cpu.step_report(&mut bus);
+        assert_eq!(delay.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(
+            cpu.pc,
+            super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_PC + 8
+        );
+    }
+
+    #[test]
+    fn invalid_beast_callback_word_load_with_bad_caller_signature_still_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_invalid_beast_callback_word_load(&mut bus);
+        bus.write_u32(
+            super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_CALLER_RETURN - 8,
+            0,
+        );
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = 0x807f_7f7f;
+        cpu.regs[31] = super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_CALLER_RETURN;
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0x807f_7f7f);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(
+            cpu.cp0[CP0_EPC],
+            super::BR2_RUNTIME_INVALID_BEAST_CALLBACK_WORD_LOAD_PC
+        );
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+    }
+
+    #[test]
     fn hle_br2_runtime_invalid_callback_word_load_matches_relocated_low_sentinel_copy() {
         let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
         let copied_pc = 0x8035_49fc;
@@ -24720,6 +24904,60 @@ mod tests {
         let delay = cpu.step_report(&mut bus);
         assert_eq!(delay.outcome, StepOutcome::Continue);
         assert_eq!(cpu.cop2_data[0], 0xfeed_beef);
+    }
+
+    #[test]
+    fn hle_br2_runtime_invalid_beast_gte_source_skips_corrupt_primitive() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_invalid_beast_gte_source(&mut bus);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[8] = 0x8000_0001;
+        cpu.regs[17] = 0x8000_0001;
+        cpu.regs[31] = super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_RETURN;
+        cpu.cop2_data[0] = 0xfeed_beef;
+
+        let load = cpu.step_report(&mut bus);
+        assert_eq!(load.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cop2_data[0], 0xfeed_beef);
+        assert_eq!(
+            cpu.pc,
+            super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_EPILOGUE_PC
+        );
+        assert_eq!(
+            cpu.next_pc,
+            super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_EPILOGUE_PC + 4
+        );
+    }
+
+    #[test]
+    fn invalid_beast_gte_source_with_bad_caller_signature_still_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_invalid_beast_gte_source(&mut bus);
+        bus.write_u32(
+            super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_RETURN - 8,
+            0,
+        );
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[8] = 0x8000_0001;
+        cpu.regs[17] = 0x8000_0001;
+        cpu.regs[31] = super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_CALLER_RETURN;
+
+        assert_eq!(cpu.step_report(&mut bus).outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0x8000_0001);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(
+            cpu.cp0[CP0_EPC],
+            super::BR2_RUNTIME_INVALID_BEAST_GTE_SOURCE_LOAD_PC
+        );
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
     }
 
     #[test]

@@ -216,7 +216,12 @@ struct RecoveryPaletteDescriptorDiagnostics {
     provenance_hits: u64,
     misses: u64,
     texture_signature: u64,
+    last_input_source: &'static str,
+    last_output_source: &'static str,
+    last_source_x: i32,
+    last_source_y: i32,
     last_stats: PaletteRegionStats,
+    last_source_stats: PaletteRegionStats,
     last_color_hash: u64,
     last_first_colors: [u16; 4],
     last_trustworthy: bool,
@@ -491,6 +496,7 @@ impl NativeFrameBuffer {
         raster = recovery_raster_mix(raster, u64::from(options.texture_flip_y));
         raster = recovery_raster_mix(raster, u64::from(options.allow_palette_fallback));
         raster = recovery_raster_mix(raster, u64::from(options.allow_texture_descriptor_alias));
+        raster = recovery_raster_mix(raster, u64::from(options.allow_texture_origin_alias));
         raster = recovery_raster_mix(raster, u64::from(texture_window.gp0_value()));
         if let Some(clip) = self.clip {
             for value in [clip.left, clip.top, clip.right, clip.bottom] {
@@ -532,7 +538,12 @@ impl NativeFrameBuffer {
         let mut fingerprint = 0x243f_6a88_85a3_08d3;
         fingerprint = self.mix_vram_dependency_bounds(
             fingerprint,
-            texture_sample_raw_bounds_for_clut(texture_page, clut, sample_range),
+            texture_sample_raw_bounds(
+                texture_page,
+                clut,
+                sample_range,
+                sampling_policy.allow_texture_origin_alias,
+            ),
         );
 
         if let Some(palette_bounds) = texture_palette_raw_bounds(texture_page, clut) {
@@ -1701,12 +1712,8 @@ impl NativeFrameBuffer {
             return stats[0];
         }
         let sampling_policy = TextureSamplingPolicy::from_draw_options(options);
-        let source_snapshot = self.textured_draw_requires_snapshot(
-            dest_bounds,
-            texture_page,
-            clut,
-            sampling_policy.allow_texture_descriptor_alias,
-        );
+        let source_snapshot =
+            self.textured_draw_requires_snapshot(dest_bounds, texture_page, clut, sampling_policy);
         let source_raw = source_snapshot.as_deref();
         let sampler = PreparedTextureSampler::new(
             source_raw.unwrap_or(&self.raw_pixels),
@@ -2115,7 +2122,7 @@ impl NativeFrameBuffer {
         sampling_policy: TextureSamplingPolicy,
     ) -> TextureSample {
         let (texture_page, clut) = sampling_policy.resolve_descriptor(texture_page, clut);
-        let (page_x, page_y) = texture_page_origin_for_sample(texture_page, clut, u, v);
+        let (page_x, page_y) = sampling_policy.texture_origin(texture_page, clut);
         self.sample_texture_sample_from_origin(
             raw_pixels,
             texture_page,
@@ -2195,14 +2202,14 @@ impl NativeFrameBuffer {
         dest_bounds: (i32, i32, i32, i32),
         texture_page: u16,
         clut: u16,
-        allow_texture_descriptor_alias: bool,
+        sampling_policy: TextureSamplingPolicy,
     ) -> Option<Vec<u16>> {
-        let (texture_page, clut) = if allow_texture_descriptor_alias {
-            br2_texture_descriptor_alias(texture_page, clut)
-        } else {
-            (texture_page, clut)
-        };
-        let texture_bounds = texture_page_raw_bounds_for_clut(texture_page, clut);
+        let (texture_page, clut) = sampling_policy.resolve_descriptor(texture_page, clut);
+        let texture_bounds = texture_page_raw_bounds(
+            texture_page,
+            clut,
+            sampling_policy.allow_texture_origin_alias,
+        );
         let palette_bounds = texture_palette_raw_bounds(texture_page, clut);
         if bounds_overlap(dest_bounds, texture_bounds)
             || palette_bounds.is_some_and(|bounds| bounds_overlap(dest_bounds, bounds))
@@ -4232,24 +4239,31 @@ struct TextureSample {
 struct TextureSamplingPolicy {
     allow_palette_fallback: bool,
     allow_texture_descriptor_alias: bool,
+    allow_texture_origin_alias: bool,
 }
 
 impl TextureSamplingPolicy {
-    const fn new(allow_palette_fallback: bool, allow_texture_descriptor_alias: bool) -> Self {
+    const fn new(
+        allow_palette_fallback: bool,
+        allow_texture_descriptor_alias: bool,
+        allow_texture_origin_alias: bool,
+    ) -> Self {
         Self {
             allow_palette_fallback,
             allow_texture_descriptor_alias,
+            allow_texture_origin_alias,
         }
     }
 
     const fn diagnostics_default() -> Self {
-        Self::new(true, true)
+        Self::new(true, true, true)
     }
 
     const fn from_draw_options(options: TextureDrawOptions) -> Self {
         Self::new(
             options.allow_palette_fallback,
             options.allow_texture_descriptor_alias,
+            options.allow_texture_origin_alias,
         )
     }
 
@@ -4258,6 +4272,14 @@ impl TextureSamplingPolicy {
             br2_texture_descriptor_alias(texture_page, clut)
         } else {
             (texture_page, clut)
+        }
+    }
+
+    fn texture_origin(self, texture_page: u16, clut: u16) -> (i32, i32) {
+        if self.allow_texture_origin_alias {
+            texture_page_origin_for_clut(texture_page, clut)
+        } else {
+            texture_page_origin(texture_page)
         }
     }
 }
@@ -4345,7 +4367,7 @@ impl PreparedTextureDrawResources {
             dest_bounds,
             texture_page,
             clut,
-            sampling_policy.allow_texture_descriptor_alias,
+            sampling_policy,
         );
         let sampler = PreparedTextureSampler::new(
             source_snapshot
@@ -4401,7 +4423,7 @@ impl PreparedTextureSampler {
     ) -> Self {
         let (texture_page, clut) = sampling_policy.resolve_descriptor(texture_page, clut);
         let mode = texture_page_color_mode(texture_page);
-        let (origin_x, origin_y) = texture_page_origin_for_clut(texture_page, clut);
+        let (origin_x, origin_y) = sampling_policy.texture_origin(texture_page, clut);
         let raw_width = texture_page_raw_width(texture_page) as i32;
         let origin_index = (origin_x >= 0
             && origin_y >= 0
@@ -4534,11 +4556,29 @@ fn prepared_indexed_palette_samples_with_history(
 
     let exact_key = recovery_palette_history_exact_key(raw_pixels, texture_page, clut);
     let provenance_key = recovery_palette_history_provenance_key(texture_page, clut);
+    let source =
+        recovery_palette_resolved_source(raw_pixels, texture_page, clut, allow_palette_fallback);
     let stats = palette_colors_stats(samples[..16].iter().map(|sample| sample.color));
     let trustworthy = recovery_palette_history_stats_are_trustworthy(texture_page, clut, stats);
     let provenance_allowed =
         recovery_palette_history_can_use_provenance_fallback(texture_page, clut, stats);
     let mut history = history.lock().expect("recovery palette history lock");
+    if let Some(colors) = history.entries.get(&exact_key).cloned() {
+        history.record_diagnostic(
+            texture_page,
+            clut,
+            exact_key.texture_signature.unwrap_or_default(),
+            source,
+            stats,
+            &colors.colors,
+            trustworthy,
+            provenance_allowed,
+            "exact_hit",
+        );
+        drop(history);
+        apply_recovery_palette_history_entry(&mut samples, &colors, entries, texture_page, clut);
+        return samples;
+    }
     if trustworthy {
         let colors = samples
             .iter()
@@ -4552,6 +4592,7 @@ fn prepared_indexed_palette_samples_with_history(
             texture_page,
             clut,
             exact_key.texture_signature.unwrap_or_default(),
+            source,
             stats,
             &colors,
             trustworthy,
@@ -4561,15 +4602,12 @@ fn prepared_indexed_palette_samples_with_history(
         return samples;
     }
 
-    let exact_colors = history.entries.get(&exact_key).cloned();
-    let provenance_colors = exact_colors.is_none().then(|| {
+    let provenance_colors = {
         provenance_allowed
             .then(|| history.entries.get(&provenance_key).cloned())
             .flatten()
-    });
-    let (colors, outcome) = if let Some(colors) = exact_colors {
-        (colors, "exact_hit")
-    } else if let Some(colors) = provenance_colors.flatten() {
+    };
+    let (colors, outcome) = if let Some(colors) = provenance_colors {
         (colors, "provenance_hit")
     } else {
         let diagnostic_colors = samples
@@ -4581,6 +4619,7 @@ fn prepared_indexed_palette_samples_with_history(
             texture_page,
             clut,
             exact_key.texture_signature.unwrap_or_default(),
+            source,
             stats,
             &diagnostic_colors,
             trustworthy,
@@ -4593,6 +4632,7 @@ fn prepared_indexed_palette_samples_with_history(
         texture_page,
         clut,
         exact_key.texture_signature.unwrap_or_default(),
+        source,
         stats,
         &colors.colors,
         trustworthy,
@@ -4627,6 +4667,7 @@ impl RecoveryPaletteHistory {
         texture_page: u16,
         clut: u16,
         texture_signature: u64,
+        source: RecoveryPaletteResolvedSource,
         stats: PaletteRegionStats,
         colors: &[u16],
         trustworthy: bool,
@@ -4669,7 +4710,16 @@ impl RecoveryPaletteHistory {
             _ => {}
         }
         entry.texture_signature = texture_signature;
+        entry.last_input_source = source.kind;
+        entry.last_output_source = match outcome {
+            "exact_hit" => "history_exact",
+            "provenance_hit" => "history_provenance",
+            _ => source.kind,
+        };
+        entry.last_source_x = source.x;
+        entry.last_source_y = source.y;
         entry.last_stats = stats;
+        entry.last_source_stats = source.stats;
         entry.last_color_hash = recovery_palette_color_hash(colors);
         entry.last_first_colors =
             std::array::from_fn(|index| colors.get(index).copied().unwrap_or_default());
@@ -4690,7 +4740,7 @@ impl RecoveryPaletteHistory {
             .into_iter()
             .map(|(texture_page, clut, diagnostics)| {
                 format!(
-                    "{{\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"trustworthy_inserts\":{},\"exact_hits\":{},\"provenance_hits\":{},\"misses\":{},\"last_outcome\":\"{}\",\"last_trustworthy\":{},\"last_provenance_allowed\":{},\"texture_signature\":{},\"texture_signature_hex\":\"0x{:016x}\",\"last_stats\":{},\"last_color_hash\":{},\"last_color_hash_hex\":\"0x{:016x}\",\"last_first_colors_hex\":[\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\"]}}",
+                    "{{\"texture_page\":{},\"texture_page_hex\":\"0x{:04x}\",\"clut\":{},\"clut_hex\":\"0x{:04x}\",\"trustworthy_inserts\":{},\"exact_hits\":{},\"provenance_hits\":{},\"misses\":{},\"last_outcome\":\"{}\",\"last_input_source\":\"{}\",\"last_output_source\":\"{}\",\"last_source_x\":{},\"last_source_y\":{},\"last_trustworthy\":{},\"last_provenance_allowed\":{},\"texture_signature\":{},\"texture_signature_hex\":\"0x{:016x}\",\"last_stats\":{},\"last_source_stats\":{},\"last_color_hash\":{},\"last_color_hash_hex\":\"0x{:016x}\",\"last_first_colors_hex\":[\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\",\"0x{:04x}\"]}}",
                     texture_page,
                     texture_page,
                     clut,
@@ -4700,11 +4750,16 @@ impl RecoveryPaletteHistory {
                     diagnostics.provenance_hits,
                     diagnostics.misses,
                     diagnostics.last_outcome,
+                    diagnostics.last_input_source,
+                    diagnostics.last_output_source,
+                    diagnostics.last_source_x,
+                    diagnostics.last_source_y,
                     diagnostics.last_trustworthy,
                     diagnostics.last_provenance_allowed,
                     diagnostics.texture_signature,
                     diagnostics.texture_signature,
                     diagnostics.last_stats.json(),
+                    diagnostics.last_source_stats.json(),
                     diagnostics.last_color_hash,
                     diagnostics.last_color_hash,
                     diagnostics.last_first_colors[0],
@@ -5039,6 +5094,7 @@ pub struct TextureDrawOptions {
     pub texture_flip_y: bool,
     pub allow_palette_fallback: bool,
     pub allow_texture_descriptor_alias: bool,
+    pub allow_texture_origin_alias: bool,
 }
 
 impl TextureDrawOptions {
@@ -5054,6 +5110,7 @@ impl TextureDrawOptions {
             texture_flip_y: false,
             allow_palette_fallback: true,
             allow_texture_descriptor_alias: true,
+            allow_texture_origin_alias: true,
         }
     }
 
@@ -5901,6 +5958,84 @@ struct LinearPaletteCandidate {
     unique_entries: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RecoveryPaletteResolvedSource {
+    kind: &'static str,
+    x: i32,
+    y: i32,
+    stats: PaletteRegionStats,
+}
+
+fn recovery_palette_resolved_source(
+    raw_pixels: &[u16],
+    texture_page: u16,
+    clut: u16,
+    allow_palette_fallback: bool,
+) -> RecoveryPaletteResolvedSource {
+    let requested_x = i32::from(clut & 0x003f) * 16;
+    let requested_y = i32::from(clut_y(clut));
+    let requested_stats = palette_row_stats(raw_pixels, clut, 16);
+    if let Some(candidate) = fallback_br2_4bpp_palette_candidate(raw_pixels, texture_page, clut)
+        && should_use_br2_4bpp_palette_sample(
+            texture_page,
+            clut,
+            allow_palette_fallback,
+            requested_stats,
+        )
+    {
+        return RecoveryPaletteResolvedSource {
+            kind: "br2_fallback",
+            x: candidate.x,
+            y: candidate.y,
+            stats: palette_region_stats(raw_pixels, candidate.x, candidate.y, 16)
+                .unwrap_or_default(),
+        };
+    }
+    if allow_palette_fallback
+        && br2_gameplay_body_missing_palette_descriptor(texture_page, clut)
+        && requested_stats.nonzero_entries == 0
+        && should_use_br2_4bpp_palette_sample(
+            texture_page,
+            clut,
+            allow_palette_fallback,
+            requested_stats,
+        )
+    {
+        return RecoveryPaletteResolvedSource {
+            kind: "synthetic_body",
+            x: requested_x,
+            y: requested_y,
+            stats: requested_stats,
+        };
+    }
+    if let Some(candidate) = fallback_zn_4bpp_palette_candidate(raw_pixels, texture_page, clut)
+        && should_use_zn_4bpp_palette_sample(
+            texture_page,
+            clut,
+            allow_palette_fallback,
+            requested_stats.nonzero_entries,
+            requested_stats.unique_entries,
+            candidate.nonzero_entries,
+            candidate.unique_entries,
+        )
+    {
+        return RecoveryPaletteResolvedSource {
+            kind: "zn_fallback",
+            x: candidate.x,
+            y: candidate.y,
+            stats: palette_region_stats(raw_pixels, candidate.x, candidate.y, 16)
+                .unwrap_or_default(),
+        };
+    }
+
+    RecoveryPaletteResolvedSource {
+        kind: "requested",
+        x: requested_x,
+        y: requested_y,
+        stats: requested_stats,
+    }
+}
+
 fn palette_region_stats(
     raw_pixels: &[u16],
     x: i32,
@@ -6316,7 +6451,7 @@ fn br2_gameplay_body_missing_palette_descriptor(texture_page: u16, clut: u16) ->
     let descriptor = texture_page_without_dither(texture_page);
     matches!(descriptor, 0x000c | 0x000d)
         && ((clut & 0x3f) as i32) * 16 == 64
-        && (480..=486).contains(&clut_y(clut))
+        && (480..=490).contains(&clut_y(clut))
 }
 
 fn texture_page_without_dither(texture_page: u16) -> u16 {
@@ -6388,7 +6523,11 @@ fn should_use_br2_4bpp_palette_sample(
 }
 
 fn br2_retained_character_select_texture_descriptor(texture_page: u16, clut: u16) -> bool {
-    texture_page_without_dither(texture_page) == 0x000d && matches!(clut, 0x7c1d | 0x7e1d)
+    let clut_x = i32::from(clut & 0x003f) * 16;
+    let clut_y = clut_y(clut);
+    texture_page_without_dither(texture_page) == 0x000d
+        && clut_x == 464
+        && (496..512).contains(&clut_y)
 }
 
 fn rgb555_luma(color: u16) -> u8 {
@@ -7138,22 +7277,40 @@ fn fallback_palette_min_nonzero_entries(entries: usize) -> usize {
     }
 }
 
-fn texture_page_raw_bounds_for_clut(texture_page: u16, clut: u16) -> (i32, i32, i32, i32) {
-    let (page_x, page_y) = texture_page_origin_for_clut(texture_page, clut);
+fn texture_page_raw_bounds(
+    texture_page: u16,
+    clut: u16,
+    allow_texture_origin_alias: bool,
+) -> (i32, i32, i32, i32) {
+    let (page_x, page_y) = if allow_texture_origin_alias {
+        texture_page_origin_for_clut(texture_page, clut)
+    } else {
+        texture_page_origin(texture_page)
+    };
     let raw_width = texture_page_raw_width(texture_page) as i32;
     (page_x, page_y, page_x + raw_width - 1, page_y + 256 - 1)
 }
 
-fn texture_sample_raw_bounds_for_clut(
+#[cfg(test)]
+fn texture_page_raw_bounds_for_clut(texture_page: u16, clut: u16) -> (i32, i32, i32, i32) {
+    texture_page_raw_bounds(texture_page, clut, true)
+}
+
+fn texture_sample_raw_bounds(
     texture_page: u16,
     clut: u16,
     range: TextureSampleRange,
+    allow_texture_origin_alias: bool,
 ) -> (i32, i32, i32, i32) {
     if range == TextureSampleRange::FULL {
-        return texture_page_raw_bounds_for_clut(texture_page, clut);
+        return texture_page_raw_bounds(texture_page, clut, allow_texture_origin_alias);
     }
 
-    let (page_x, page_y) = texture_page_origin_for_clut(texture_page, clut);
+    let (page_x, page_y) = if allow_texture_origin_alias {
+        texture_page_origin_for_clut(texture_page, clut)
+    } else {
+        texture_page_origin(texture_page)
+    };
     let u_divisor = match texture_page_color_mode(texture_page) {
         0 => 4,
         1 => 2,
@@ -7164,6 +7321,15 @@ fn texture_sample_raw_bounds_for_clut(
     let top = page_y + i32::from(range.min_v);
     let bottom = page_y + i32::from(range.max_v);
     (left, top, right, bottom)
+}
+
+#[cfg(test)]
+fn texture_sample_raw_bounds_for_clut(
+    texture_page: u16,
+    clut: u16,
+    range: TextureSampleRange,
+) -> (i32, i32, i32, i32) {
+    texture_sample_raw_bounds(texture_page, clut, range, true)
 }
 
 fn texture_page_raw_width(texture_page: u16) -> usize {
@@ -7277,6 +7443,7 @@ fn texture_page_origin_for_clut(texture_page: u16, clut: u16) -> (i32, i32) {
     (page_x, page_y)
 }
 
+#[cfg(test)]
 fn texture_page_origin_for_sample(texture_page: u16, clut: u16, _u: u8, _v: u8) -> (i32, i32) {
     texture_page_origin_for_clut(texture_page, clut)
 }
@@ -7289,7 +7456,7 @@ fn br2_gameplay_4bpp_texture_origin(
     let descriptor = texture_page_without_dither(texture_page);
     let clut_x = ((clut & 0x3f) as i32) * 16;
     let clut_y = clut_y(clut);
-    if descriptor == 0x000d && matches!(clut, 0x7c1d | 0x7e1d) {
+    if br2_retained_character_select_texture_descriptor(texture_page, clut) {
         // The character-select portraits are uploaded to the paired high VRAM
         // bank, while recovered packets retain the low-bank descriptor.
         return Some((page_x, PSX_VRAM_HEIGHT as i32 / 2));
@@ -7305,7 +7472,7 @@ fn br2_gameplay_4bpp_texture_origin(
         // its transparent texels are in the paired high VRAM bank.
         return Some((page_x, PSX_VRAM_HEIGHT as i32 / 2));
     }
-    if matches!(descriptor, 0x000c | 0x000d) && clut_x == 64 && (480..=486).contains(&clut_y) {
+    if matches!(descriptor, 0x000c | 0x000d) && clut_x == 64 && (480..=490).contains(&clut_y) {
         // Gameplay body packets retain the low-bank page bits, while the
         // character atlas is uploaded to the paired y=256 bank. HUD packets
         // use page 0x000e and different CLUT columns, so keep those on y=0.
@@ -7917,7 +8084,7 @@ mod tests {
         }
 
         for (texture_page, clut) in [(0x0000, 0x0041), (0x0080, 0x0082), (0x0100, 0)] {
-            let sampling_policy = TextureSamplingPolicy::new(true, true);
+            let sampling_policy = TextureSamplingPolicy::new(true, true, true);
             let sampler = PreparedTextureSampler::new(
                 &framebuffer.raw_pixels,
                 texture_page,
@@ -8498,7 +8665,7 @@ mod tests {
         framebuffer.set_raw_pixel(live_clut_x + 1, live_clut_y, 0x001f);
 
         for (allow_alias, expected_color) in [(true, 0x001f), (false, 0x03e0)] {
-            let sampling_policy = TextureSamplingPolicy::new(false, allow_alias);
+            let sampling_policy = TextureSamplingPolicy::new(false, allow_alias, true);
             let sampler = PreparedTextureSampler::new(
                 &framebuffer.raw_pixels,
                 stale_texture_page,
@@ -9895,7 +10062,7 @@ mod tests {
             clut,
             160,
             224,
-            TextureSamplingPolicy::new(false, true),
+            TextureSamplingPolicy::new(false, true, true),
         );
         assert_eq!(sample.color, 0x03e0);
         assert!(sample.texture_nonzero);
@@ -9924,6 +10091,69 @@ mod tests {
                 texture_page_origin_for_clut(texture_page, clut),
                 (expected_x, 0),
                 "gameplay fighter TPage 0x{texture_page:04x} CLUT 0x{clut:04x} must not sample the y=256 UI atlas"
+            );
+        }
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_can_bypass_br2_long_beast_y256_alias() {
+        for texture_page in [0x000c, 0x020c, 0x000d, 0x020d] {
+            for clut in [0x79c4, 0x7a04, 0x7a84] {
+                let mut framebuffer = NativeFrameBuffer::default();
+                let page_x = ((texture_page & 0x0f) as i32) * 64;
+                let clut_x = ((clut & 0x3f) as i32) * 16;
+                let clut_y = ((clut >> 6) & 0x03ff) as i32;
+
+                assert_eq!(
+                    texture_page_origin_for_clut(texture_page, clut),
+                    (page_x, PSX_VRAM_HEIGHT as i32 / 2),
+                    "the general BR2 alias must remain available outside the recovery draw policy"
+                );
+
+                framebuffer.set_raw_pixel(page_x, 0, 0x0001);
+                framebuffer.set_raw_pixel(page_x, PSX_VRAM_HEIGHT as i32 / 2, 0x0002);
+                framebuffer.set_raw_pixel(clut_x + 1, clut_y, 0x001f);
+                framebuffer.set_raw_pixel(clut_x + 2, clut_y, 0x03e0);
+
+                let aliased = framebuffer.sample_texture_sample_from(
+                    &framebuffer.raw_pixels,
+                    texture_page,
+                    clut,
+                    0,
+                    0,
+                    TextureSamplingPolicy::new(false, false, true),
+                );
+                assert_eq!(aliased.color, 0x03e0);
+
+                let hardware_origin = framebuffer.sample_texture_sample_from(
+                    &framebuffer.raw_pixels,
+                    texture_page,
+                    clut,
+                    0,
+                    0,
+                    TextureSamplingPolicy::new(false, false, false),
+                );
+                assert_eq!(
+                    hardware_origin.color, 0x001f,
+                    "TPage 0x{texture_page:04x} CLUT 0x{clut:04x} did not bypass the y=256 alias"
+                );
+                assert!(hardware_origin.texture_nonzero);
+            }
+        }
+    }
+
+    #[test]
+    fn framebuffer_texture_sampling_limits_br2_body_y256_alias_to_fighter_descriptors() {
+        for (texture_page, clut, expected) in [
+            (0x000b, 0x7a04, (704, 0)),
+            (0x000c, 0x7ac4, (768, 0)),
+            (0x000d, 0x7ac5, (832, 0)),
+            (0x000e, 0x7a04, (896, 0)),
+        ] {
+            assert_eq!(
+                texture_page_origin_for_clut(texture_page, clut),
+                expected,
+                "non-fighter TPage 0x{texture_page:04x} CLUT 0x{clut:04x} must keep its hardware origin"
             );
         }
     }
@@ -10229,7 +10459,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(false, true),
+            TextureSamplingPolicy::new(false, true, true),
         );
         assert_eq!(sample.color, 0);
         assert!(sample.zero_texel);
@@ -10279,7 +10509,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
 
         assert_eq!(sample.color, 0x03e0);
@@ -10317,7 +10547,7 @@ mod tests {
                 clut,
                 0,
                 0,
-                TextureSamplingPolicy::new(true, true),
+                TextureSamplingPolicy::new(true, true, true),
             );
 
             assert_eq!(sample.color, 0x4210);
@@ -10374,7 +10604,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
 
         assert_eq!(sample.color, 0x4210);
@@ -10474,7 +10704,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
 
         assert_eq!(sample.color, 0x001f);
@@ -10531,7 +10761,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert_eq!(sample.color, uploaded_material[1]);
         assert!(sample.palette_fallback);
@@ -10618,7 +10848,7 @@ mod tests {
                 stale_clut,
                 0,
                 0,
-                TextureSamplingPolicy::new(false, true),
+                TextureSamplingPolicy::new(false, true, true),
             );
 
             assert_eq!(
@@ -10647,7 +10877,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
 
         assert_eq!(sample.color, 0x03e0);
@@ -12079,7 +12309,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert!(sample.palette_fallback);
         assert_eq!(sample.color, 0x0421);
@@ -12129,7 +12359,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert_eq!(sample.color, 0x001e);
         assert!(sample.palette_fallback);
@@ -12229,7 +12459,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert_eq!(sample.color, 0x3021);
         assert!(sample.palette_fallback);
@@ -12382,6 +12612,70 @@ mod tests {
         );
         assert_eq!(recovered[2].color, material[2]);
         assert!(recovered[2].palette_fallback);
+    }
+
+    #[test]
+    fn br2_recovery_palette_history_keeps_first_rich_palette_for_texture_generation() {
+        let mut framebuffer = NativeFrameBuffer::default();
+        let texture_page = 0x020c;
+        let clut = 0x7904;
+        let requested_x = ((clut & 0x3f) as i32) * 16;
+        let requested_y = ((clut >> 6) & 0x03ff) as i32;
+        let material = [
+            0x0000, 0x1861, 0x1c82, 0x20a3, 0x24c4, 0x28e5, 0x2d06, 0x3127, 0x3548, 0x3969, 0x3d8a,
+            0x41ab, 0x45cc, 0x49ed, 0x4e0e, 0x522f,
+        ];
+        let overwritten = [
+            0x0000, 0x5247, 0x5a69, 0x62ab, 0x6aed, 0x732f, 0x7b71, 0x7fb3, 0x7ff5, 0x7bd7, 0x7395,
+            0x6b53, 0x6311, 0x5acf, 0x528d, 0x4a4b,
+        ];
+        let (page_x, page_y) = texture_page_origin_for_clut(texture_page, clut);
+        framebuffer.set_raw_pixel(page_x, page_y, 0x1234);
+        for (index, color) in material.into_iter().enumerate() {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+        }
+
+        let initial = prepared_indexed_palette_samples_with_history(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            16,
+            true,
+            Some(&framebuffer.recovery_palette_history),
+        );
+        assert_eq!(initial[5].color, material[5]);
+
+        for (index, color) in overwritten.into_iter().enumerate() {
+            framebuffer.set_raw_pixel(requested_x + index as i32, requested_y, color);
+        }
+        let recovered = prepared_indexed_palette_samples_with_history(
+            &framebuffer.raw_pixels,
+            texture_page,
+            clut,
+            16,
+            true,
+            Some(&framebuffer.recovery_palette_history),
+        );
+
+        assert_eq!(
+            recovered[5].color, material[5],
+            "an effect upload must not replace the material palette for the same fighter texture"
+        );
+        assert!(recovered[5].palette_fallback);
+        let diagnostics = framebuffer.recovery_palette_history_stats_json();
+        assert!(diagnostics.contains("\"exact_hits\":1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("\"last_output_source\":\"history_exact\""),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"last_source_x\":64"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("\"last_source_y\":484"),
+            "{diagnostics}"
+        );
     }
 
     #[test]
@@ -13145,13 +13439,33 @@ mod tests {
             "the selected fighter portrait uses the adjacent observed CLUT row"
         );
         assert_eq!(
+            texture_page_origin_for_clut(texture_page, 0x7c9d),
+            (page_x, alias_y),
+            "right navigation must keep the portrait in the high VRAM bank"
+        );
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page, 0x7e9d),
+            (page_x, alias_y),
+            "lower-row navigation must keep the portrait in the high VRAM bank"
+        );
+        assert_eq!(
             texture_page_origin_for_clut(texture_page & !0x0200, clut),
             (page_x, alias_y)
         );
         assert_eq!(
             texture_page_origin_for_clut(texture_page, 0x7d1d),
+            (page_x, alias_y),
+            "all rows in the uploaded 16-palette select bank share the portrait atlas"
+        );
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page, 0x7bdd),
             (page_x, 0),
-            "unobserved neighboring CLUT rows must keep the standard origin"
+            "the row before the select palette bank must keep the standard origin"
+        );
+        assert_eq!(
+            texture_page_origin_for_clut(texture_page, 0x801d),
+            (page_x, 0),
+            "the row after the select palette bank must keep the standard origin"
         );
         assert_eq!(
             texture_page_origin_for_clut(0x020c, 0x7d18),
@@ -13170,7 +13484,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert_eq!(sample.color, 0x03e0);
         assert!(sample.texture_nonzero);
@@ -13216,7 +13530,7 @@ mod tests {
                 clut,
                 0,
                 0,
-                TextureSamplingPolicy::new(true, true),
+                TextureSamplingPolicy::new(true, true, true),
             );
             assert_eq!(sample.color, 0x03e0);
             assert!(sample.texture_nonzero);
@@ -13246,7 +13560,7 @@ mod tests {
                 clut,
                 0,
                 0,
-                TextureSamplingPolicy::new(true, true),
+                TextureSamplingPolicy::new(true, true, true),
             );
             assert_eq!(sample.color, expected);
             assert!(sample.texture_nonzero);
@@ -13259,7 +13573,7 @@ mod tests {
             0x7d18,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert_eq!(
             background.color, 0,
@@ -13606,7 +13920,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert_eq!(sample.color, 0x03e0);
         assert!(sample.texture_nonzero);
@@ -13645,7 +13959,7 @@ mod tests {
             clut,
             0,
             0,
-            TextureSamplingPolicy::new(true, true),
+            TextureSamplingPolicy::new(true, true, true),
         );
         assert_eq!(sample.color, 0x03e0);
         assert!(sample.texture_nonzero);

@@ -116,7 +116,9 @@ const BR2_RETAINED_PORTRAIT_TEXTURE_MIN_COVERAGE_PER_MILLE: usize = 900;
 const BR2_RETAINED_PORTRAIT_CLUT_X: i32 = 464;
 const BR2_RETAINED_PORTRAIT_CLUT_Y: i32 = 496;
 const BR2_RETAINED_PORTRAIT_CLUT_WIDTH: usize = 16;
-const BR2_RETAINED_PORTRAIT_CLUT_HEIGHT: usize = 1;
+// Character select keeps sixteen 4bpp palettes in one 16x16 upload. The
+// selected fighter changes the CLUT row while retaining the same x selector.
+const BR2_RETAINED_PORTRAIT_CLUT_HEIGHT: usize = 16;
 const BR2_RETAINED_PORTRAIT_CLUT_WORDS: usize =
     (BR2_RETAINED_PORTRAIT_CLUT_WIDTH * BR2_RETAINED_PORTRAIT_CLUT_HEIGHT).div_ceil(64);
 const BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X: i32 = 512;
@@ -263,6 +265,7 @@ struct PendingBr2LargePortraitAssets {
 struct RetainedBr2LargePortraitAssets {
     texture: FrameBufferRegionSnapshot,
     clut: FrameBufferRegionSnapshot,
+    generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -9280,14 +9283,14 @@ impl Gpu {
         if display_x.saturating_add(display_width) > VRAM_WIDTH {
             return false;
         }
-        let before_current = before.map(Gpu::current_display_window);
-        let trusted_prior_live_scene =
+        let before_current = before.map(|before| {
             before
-                .zip(before_current)
-                .is_some_and(|(before, before_current)| {
-                    before.display_dimensions() == (display_width, display_height)
-                        && has_native_gameplay_display_profile(before_current.stats)
-                });
+                .recovery_prior_scene_reference(display_width, display_height)
+                .unwrap_or_else(|| before.current_display_window())
+        });
+        let trusted_prior_live_scene = before_current.is_some_and(|before_current| {
+            has_native_recovery_fast_scene_profile(before_current.stats)
+        });
 
         // Recovery happens after a guest draw batch has already updated both
         // interlaced fields. Resolve that pair once instead of first running the
@@ -9311,7 +9314,7 @@ impl Gpu {
             };
             let direct_full_window_rejection = if !trusted_prior_live_scene {
                 Some("untrusted_prior_scene")
-            } else if !has_native_gameplay_display_profile(current.stats) {
+            } else if !has_native_recovery_fast_scene_profile(current.stats) {
                 Some("gameplay_profile")
             } else if !self.display_candidate_has_live_draw_overlap_with_dimensions(
                 current,
@@ -9501,6 +9504,19 @@ impl Gpu {
         *self.display_output_window_cache.borrow_mut() = None;
         *self.visibility_cache.borrow_mut() = None;
         true
+    }
+
+    fn recovery_prior_scene_reference(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<FrameBufferWindow> {
+        self.presented_frame_window.filter(|presented| {
+            self.presented_frame_width == width
+                && (self.presented_frame_height == height
+                    || self.presented_frame_height.saturating_mul(2) == height)
+                && has_native_recovery_fast_scene_profile(presented.stats)
+        })
     }
 
     fn recovery_window_has_blocking_artifact(
@@ -12512,6 +12528,13 @@ impl Gpu {
             clut,
             bounds,
         );
+        preserve_br2_recovery_fighter_texture_origin(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
         if should_allow_br2_gameplay_polygon_palette_fallback(words[0], texture_page, clut, bounds)
         {
             options.allow_palette_fallback = true;
@@ -12563,6 +12586,13 @@ impl Gpu {
         let c = self.textured_point(c, c_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point]);
         preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
+        preserve_br2_recovery_fighter_texture_origin(
             &mut options,
             source,
             texture_page,
@@ -12621,6 +12651,13 @@ impl Gpu {
         let d = self.textured_point(d, d_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
         preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
+        preserve_br2_recovery_fighter_texture_origin(
             &mut options,
             source,
             texture_page,
@@ -12709,6 +12746,13 @@ impl Gpu {
         let d = self.textured_point(d, d_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
         preserve_br2_recovery_fighter_material_palette(
+            &mut options,
+            source,
+            texture_page,
+            clut,
+            bounds,
+        );
+        preserve_br2_recovery_fighter_texture_origin(
             &mut options,
             source,
             texture_page,
@@ -13181,8 +13225,11 @@ impl Gpu {
         let Some(pending) = self.pending_br2_large_portrait_assets.take() else {
             return;
         };
-        if self.transfer_sequence != pending.transfer_sequence.saturating_add(1)
-            || self.presentation_captures != pending.vblank
+        if !self.br2_portrait_completion_sequence_valid(
+            pending.transfer_sequence,
+            pending.vblank,
+            transfer_is_br2_right_large_portrait_texture_asset,
+        ) || self.presentation_captures != pending.vblank
         {
             return;
         }
@@ -13217,6 +13264,7 @@ impl Gpu {
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
             ),
+            generation: pending.transfer_sequence,
         });
     }
 
@@ -13224,8 +13272,11 @@ impl Gpu {
         let Some(pending) = self.pending_br2_right_large_portrait_assets.take() else {
             return;
         };
-        if self.transfer_sequence != pending.transfer_sequence.saturating_add(1)
-            || self.presentation_captures != pending.vblank
+        if !self.br2_portrait_completion_sequence_valid(
+            pending.transfer_sequence,
+            pending.vblank,
+            transfer_is_br2_large_portrait_clut_asset,
+        ) || self.presentation_captures != pending.vblank
         {
             return;
         }
@@ -13269,6 +13320,37 @@ impl Gpu {
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
             ),
         });
+    }
+
+    fn br2_portrait_completion_sequence_valid(
+        &self,
+        pending_sequence: u64,
+        pending_vblank: u64,
+        allowed_intermediate: fn(i32, i32, i32, i32) -> bool,
+    ) -> bool {
+        let sequence_delta = self.transfer_sequence.saturating_sub(pending_sequence);
+        if sequence_delta == 1 {
+            return true;
+        }
+        if sequence_delta != 2 {
+            return false;
+        }
+
+        let intermediate_sequence = pending_sequence.saturating_add(1);
+        self.recent_transfer_commands
+            .iter()
+            .rev()
+            .find(|transfer| transfer.sequence == intermediate_sequence)
+            .is_some_and(|transfer| {
+                transfer.valid
+                    && transfer.vblank == pending_vblank
+                    && allowed_intermediate(
+                        transfer.dest_x,
+                        transfer.dest_y,
+                        transfer.width,
+                        transfer.height,
+                    )
+            })
     }
 
     fn push_image_upload_rect(&mut self, x: i32, y: i32, width: i32, height: i32) {
@@ -13527,9 +13609,14 @@ impl Gpu {
         &self,
         words: &[u32],
     ) -> bool {
-        if words.len() != 9
-            || texture_page(words[4]) & !0x0200 != 0x000d
-            || clut(words[2]) != 0x7c1d
+        if words.len() != 9 || texture_page(words[4]) & !0x0200 != 0x000d {
+            return false;
+        }
+        let (clut_x, clut_y) = clut_origin_for_diagnostics(clut(words[2]));
+        if clut_x != BR2_RETAINED_PORTRAIT_CLUT_X
+            || !(BR2_RETAINED_PORTRAIT_CLUT_Y
+                ..BR2_RETAINED_PORTRAIT_CLUT_Y + BR2_RETAINED_PORTRAIT_CLUT_HEIGHT as i32)
+                .contains(&clut_y)
         {
             return false;
         }
@@ -13625,6 +13712,12 @@ impl Gpu {
         self.framebuffer.restore_region_snapshot(&assets.clut);
         self.invalidate_recovery_presentation_caches();
         true
+    }
+
+    pub(crate) fn retained_br2_character_select_large_portrait_asset_generation(&self) -> u64 {
+        self.retained_br2_large_portrait_assets
+            .as_ref()
+            .map_or(0, |assets| assets.generation)
     }
 
     pub(crate) fn retained_br2_character_select_right_large_portrait_transfer_generation_valid(
@@ -16915,8 +17008,54 @@ impl Gpu {
         width: usize,
         height: usize,
     ) -> bool {
+        let accepted_prior_field = before.presented_frame_window == Some(before_current)
+            && before.presented_frame_width == width
+            && before.presented_frame_height.saturating_mul(2) == height
+            && before_current.x == candidate.x
+            && before_current.y >= candidate.y
+            && before_current
+                .y
+                .saturating_add(before.presented_frame_height)
+                <= candidate.y.saturating_add(height);
+        if accepted_prior_field {
+            let candidate_field = FrameBufferWindow {
+                x: before_current.x,
+                y: before_current.y,
+                stats: self.framebuffer.psx_display_stats_with_depth(
+                    before_current.x,
+                    before_current.y,
+                    width,
+                    before.presented_frame_height,
+                    self.display_24bit_enabled(),
+                ),
+            };
+            if recovered_presented_candidate_is_sparse_regression_against(
+                before_current,
+                candidate_field,
+            ) {
+                return true;
+            }
+            let Some(candidate_bands) = self.lower_playfield_occlusion_candidate(
+                candidate_field,
+                width,
+                before.presented_frame_height,
+            ) else {
+                return false;
+            };
+            return before
+                .lower_playfield_occlusion_reference_window(
+                    before_current,
+                    width,
+                    before.presented_frame_height,
+                )
+                .as_ref()
+                .is_some_and(|reference| {
+                    lower_playfield_occlusion_detected(&candidate_bands, reference)
+                });
+        }
+
         let current_is_direct_reference = before.display_dimensions() == (width, height)
-            && has_native_gameplay_display_profile(before_current.stats);
+            && has_native_recovery_fast_scene_profile(before_current.stats);
         if current_is_direct_reference {
             if recovered_presented_candidate_is_sparse_regression_against(before_current, candidate)
             {
@@ -16981,7 +17120,7 @@ impl Gpu {
         if width < DEFAULT_DISPLAY_WIDTH
             || height < DEFAULT_DISPLAY_HEIGHT
             || !presented_frame_has_live_scene(candidate.stats)
-            || !has_native_gameplay_display_profile(candidate.stats)
+            || !has_native_recovery_fast_scene_profile(candidate.stats)
             || !self.has_native_play_3d_draw_signal()
         {
             return None;
@@ -17024,7 +17163,7 @@ impl Gpu {
             *before_width == width
                 && *before_height == height
                 && presented_frame_has_live_scene(window.stats)
-                && has_native_gameplay_display_profile(window.stats)
+                && has_native_recovery_fast_scene_profile(window.stats)
         })
         .max_by_key(|(window, _, _)| screen_observation_score(window.stats))
         .map(|(window, _, _)| window)?;
@@ -17041,7 +17180,7 @@ impl Gpu {
         if width < DEFAULT_DISPLAY_WIDTH
             || height < DEFAULT_DISPLAY_HEIGHT
             || !presented_frame_has_live_scene(before_window.stats)
-            || !has_native_gameplay_display_profile(before_window.stats)
+            || !has_native_recovery_fast_scene_profile(before_window.stats)
             || !self.has_native_play_3d_draw_signal()
         {
             return None;
@@ -20234,18 +20373,25 @@ impl Gpu {
             return rgb_frame_has_periodic_horizontal_ghosting(rgb, width, height);
         }
 
+        const SAMPLE_STEP: usize = 4;
         let mut horizontal_changes = 0usize;
-        for y in (0..height).step_by(2) {
+        let mut horizontal_samples = 0usize;
+        for y in (0..height).step_by(SAMPLE_STEP) {
             let mut previous = None;
-            for x in (0..width).step_by(2) {
+            for x in (0..width).step_by(SAMPLE_STEP) {
                 let color = self.display_window_pixel(window, x, y, psx_wrap);
-                if previous.is_some_and(|previous| previous != color) {
-                    horizontal_changes = horizontal_changes.saturating_add(1);
+                if let Some(previous) = previous {
+                    horizontal_samples = horizontal_samples.saturating_add(1);
+                    if previous != color {
+                        horizontal_changes = horizontal_changes.saturating_add(1);
+                    }
                 }
                 previous = Some(color);
             }
         }
-        if horizontal_changes.saturating_mul(100) < width.saturating_mul(height) / 2 {
+        if horizontal_samples == 0
+            || horizontal_changes.saturating_mul(100) < horizontal_samples.saturating_mul(2)
+        {
             return false;
         }
 
@@ -20255,8 +20401,8 @@ impl Gpu {
             .any(|period| {
                 let mut matches = 0usize;
                 let mut samples = 0usize;
-                for y in (0..height).step_by(2) {
-                    for x in (0..width - period).step_by(2) {
+                for y in (0..height).step_by(SAMPLE_STEP) {
+                    for x in (0..width - period).step_by(SAMPLE_STEP) {
                         samples = samples.saturating_add(1);
                         let left = self.display_window_pixel(window, x, y, psx_wrap);
                         let right = self.display_window_pixel(window, x + period, y, psx_wrap);
@@ -21436,19 +21582,26 @@ fn rgb_frame_has_periodic_horizontal_ghosting(pixels: &[u32], width: usize, heig
         return false;
     }
 
+    const SAMPLE_STEP: usize = 4;
     let mut horizontal_changes = 0usize;
-    for y in (0..height).step_by(2) {
+    let mut horizontal_samples = 0usize;
+    for y in (0..height).step_by(SAMPLE_STEP) {
         let row = y.saturating_mul(width);
         let mut previous = None;
-        for x in (0..width).step_by(2) {
+        for x in (0..width).step_by(SAMPLE_STEP) {
             let color = pixels[row + x] & 0x00ff_ffff;
-            if previous.is_some_and(|previous| previous != color) {
-                horizontal_changes = horizontal_changes.saturating_add(1);
+            if let Some(previous) = previous {
+                horizontal_samples = horizontal_samples.saturating_add(1);
+                if previous != color {
+                    horizontal_changes = horizontal_changes.saturating_add(1);
+                }
             }
             previous = Some(color);
         }
     }
-    if horizontal_changes.saturating_mul(100) < width.saturating_mul(height) / 2 {
+    if horizontal_samples == 0
+        || horizontal_changes.saturating_mul(100) < horizontal_samples.saturating_mul(2)
+    {
         return false;
     }
 
@@ -21458,9 +21611,9 @@ fn rgb_frame_has_periodic_horizontal_ghosting(pixels: &[u32], width: usize, heig
         .any(|period| {
             let mut matches = 0usize;
             let mut samples = 0usize;
-            for y in (0..height).step_by(2) {
+            for y in (0..height).step_by(SAMPLE_STEP) {
                 let row = y.saturating_mul(width);
-                for x in (0..width - period).step_by(2) {
+                for x in (0..width - period).step_by(SAMPLE_STEP) {
                     samples = samples.saturating_add(1);
                     let left = pixels[row + x] & 0x00ff_ffff;
                     let right = pixels[row + x + period] & 0x00ff_ffff;
@@ -23176,6 +23329,50 @@ fn is_br2_recovery_fighter_material_draw(
         && bounds.bottom <= 431
 }
 
+fn preserve_br2_recovery_fighter_texture_origin(
+    options: &mut TextureDrawOptions,
+    source: Option<&GpuCommandSource>,
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) {
+    if is_br2_recovery_long_beast_fighter_draw(source, texture_page, clut, bounds) {
+        options.allow_texture_origin_alias = false;
+    }
+}
+
+fn is_br2_recovery_long_beast_fighter_draw(
+    source: Option<&GpuCommandSource>,
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    let clut_x = usize::from(clut & 0x003f).saturating_mul(16);
+    let clut_y = usize::from(clut >> 6);
+    if source.kind != "recovery_dma_linked_list"
+        || !matches!(texture_page & !0x0200, 0x000c | 0x000d)
+        || clut_x != 64
+        || !(482..=490).contains(&clut_y)
+    {
+        return false;
+    }
+
+    let width = bounds.right.saturating_sub(bounds.left).saturating_add(1);
+    let height = bounds.bottom.saturating_sub(bounds.top).saturating_add(1);
+    width > 1
+        && height > 1
+        && width <= 96
+        && height <= 128
+        && bounds.left >= 256
+        && bounds.left <= 639
+        && bounds.right >= 0
+        && bounds.top >= 32
+        && bounds.bottom <= 431
+}
+
 fn fill_rect_dimensions_valid(width: i32, height: i32) -> bool {
     width > 0 && height > 0 && width <= VRAM_WIDTH as i32 && height <= VRAM_HEIGHT as i32
 }
@@ -23343,6 +23540,7 @@ fn texture_draw_options(command_word: u32, texture_page: u16) -> TextureDrawOpti
         texture_flip_y: allow_sprite_flip && texture_page & 0x2000 != 0,
         allow_palette_fallback,
         allow_texture_descriptor_alias: true,
+        allow_texture_origin_alias: true,
     }
 }
 
@@ -23744,7 +23942,7 @@ fn optional_texture_options_json(value: Option<TextureDrawOptions>) -> String {
         || "null".to_string(),
         |value| {
             format!(
-                "{{\"primitive_color\":{},\"primitive_color_hex\":\"0x{:06x}\",\"raw_texture\":{},\"semi_transparent\":{},\"semi_transparency_mode\":{},\"set_mask_bit\":{},\"check_mask_bit\":{},\"texture_flip_x\":{},\"texture_flip_y\":{},\"allow_palette_fallback\":{},\"allow_texture_descriptor_alias\":{}}}",
+                "{{\"primitive_color\":{},\"primitive_color_hex\":\"0x{:06x}\",\"raw_texture\":{},\"semi_transparent\":{},\"semi_transparency_mode\":{},\"set_mask_bit\":{},\"check_mask_bit\":{},\"texture_flip_x\":{},\"texture_flip_y\":{},\"allow_palette_fallback\":{},\"allow_texture_descriptor_alias\":{},\"allow_texture_origin_alias\":{}}}",
                 value.primitive_color,
                 value.primitive_color,
                 value.raw_texture,
@@ -23755,7 +23953,8 @@ fn optional_texture_options_json(value: Option<TextureDrawOptions>) -> String {
                 value.texture_flip_x,
                 value.texture_flip_y,
                 value.allow_palette_fallback,
-                value.allow_texture_descriptor_alias
+                value.allow_texture_descriptor_alias,
+                value.allow_texture_origin_alias
             )
         },
     )
@@ -24071,6 +24270,13 @@ fn has_native_gameplay_display_profile(stats: FrameBufferStats) -> bool {
     stats.pixel_count > 0
         && has_native_full_scene_detail(stats)
         && stats.nonzero_pixels.saturating_mul(100) >= stats.pixel_count.saturating_mul(65)
+        && average_luma(stats) >= 12
+}
+
+fn has_native_recovery_fast_scene_profile(stats: FrameBufferStats) -> bool {
+    stats.pixel_count > 0
+        && has_native_full_scene_detail(stats)
+        && stats.nonzero_pixels.saturating_mul(100) >= stats.pixel_count.saturating_mul(55)
         && average_luma(stats) >= 12
 }
 
@@ -27877,6 +28083,30 @@ mod tests {
         }
     }
 
+    fn fill_recovery_fast_scene(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+    ) {
+        for y in 0..height {
+            for x in 0..width {
+                if x % 5 >= 3 {
+                    continue;
+                }
+                let red = 24 + ((x * 13 + y * 5) % 224) as u32;
+                let green = 16 + ((x * 7 + y * 17) % 224) as u32;
+                let blue = 32 + ((x * 19 + y * 11) % 208) as u32;
+                io.gpu.framebuffer.set_pixel(
+                    x_offset.saturating_add(x) as i32,
+                    y_offset.saturating_add(y) as i32,
+                    (red << 16) | (green << 8) | blue,
+                );
+            }
+        }
+    }
+
     fn fill_sparse_multicolor_scene(
         io: &mut Io,
         x_offset: usize,
@@ -30409,6 +30639,136 @@ mod tests {
     }
 
     #[test]
+    fn gpu_recovery_capture_fast_path_allows_detailed_scene_below_gameplay_density() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_recovery_fast_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+
+        let initial = io.gpu.current_display_window();
+        assert!(has_native_full_scene_detail(initial.stats));
+        assert!(super::has_native_recovery_fast_scene_profile(initial.stats));
+        assert!(
+            !has_native_gameplay_display_profile(initial.stats),
+            "the fixture must cover the 55-64% density range rejected by the general gameplay profile"
+        );
+        io.gpu.capture_recovered_presented_frame();
+        let before = io.gpu.clone();
+
+        io.gpu.invalidate_recovery_presentation_caches();
+        for y in height / 3..height / 2 {
+            for x in width / 3..width / 2 {
+                if x % 5 < 3 {
+                    io.gpu
+                        .framebuffer
+                        .set_pixel(x as i32, y as i32, 0x0000_ffff);
+                }
+            }
+        }
+        before.current_display_window_stats_probes.set(0);
+        io.gpu.current_display_window_stats_probes.set(0);
+
+        assert!(
+            io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert_eq!(
+            before.current_display_window_stats_probes.get(),
+            0,
+            "the accepted presented frame must be reused without resolving the prior raw field"
+        );
+        assert_eq!(
+            io.gpu.current_display_window_stats_probes.get(),
+            0,
+            "a detailed 55-64% recovery scene must stay on the direct full-frame path"
+        );
+        let presented = io.gpu.presented_frame_window.expect("presented frame");
+        assert!(super::has_native_recovery_fast_scene_profile(
+            presented.stats
+        ));
+        assert!(!has_native_gameplay_display_profile(presented.stats));
+    }
+
+    #[test]
+    fn gpu_recovery_capture_reuses_last_accepted_scene_as_prior_reference() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.capture_recovered_presented_frame();
+        let mut before = io.gpu.clone();
+        before.display_area_start = (height as u32) << 10;
+        before.current_display_window_stats_probes.set(0);
+
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu.framebuffer.fill_rect_unclipped(
+            (width / 3) as i32,
+            (height / 3) as i32,
+            (width / 4) as i32,
+            (height / 4) as i32,
+            0x0000_ffff,
+        );
+
+        assert!(
+            io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert_eq!(
+            before.current_display_window_stats_probes.get(),
+            0,
+            "the last accepted recovery scene must avoid rescanning an incomplete raw prior field"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_reuses_accepted_field_for_full_frame_guard() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        let field_height = height / 2;
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        let mut before = io.gpu.clone();
+        let prior_field = FrameBufferWindow {
+            x: 0,
+            y: 0,
+            stats: before.framebuffer.psx_display_stats_with_depth(
+                0,
+                0,
+                width,
+                field_height,
+                false,
+            ),
+        };
+        before.presented_frame_window = Some(prior_field);
+        before.presented_frame_width = width;
+        before.presented_frame_height = field_height;
+        before.display_area_start = (field_height as u32) << 10;
+        before.current_display_window_stats_probes.set(0);
+
+        io.gpu.invalidate_recovery_presentation_caches();
+        io.gpu.framebuffer.fill_rect_unclipped(
+            (width / 3) as i32,
+            (height / 3) as i32,
+            (width / 4) as i32,
+            (height / 4) as i32,
+            0x0000_ffff,
+        );
+
+        assert!(
+            io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert_eq!(
+            before.current_display_window_stats_probes.get(),
+            0,
+            "an accepted prior field must guard a composed frame without resolving the raw prior output"
+        );
+    }
+
+    #[test]
     fn gpu_recovery_fill_does_not_capture_intermediate_presented_frame() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
@@ -30820,6 +31180,85 @@ mod tests {
         );
 
         assert!(!options.allow_texture_descriptor_alias);
+    }
+
+    #[test]
+    fn recovery_long_beast_fighter_uses_hardware_texture_origin() {
+        let source = GpuCommandSource::recovery_dma_linked_list(0x000d_787c, Some(0x802d_080c));
+        for (texture_page, clut) in [
+            (0x000c, 0x7884),
+            (0x020d, 0x7904),
+            (0x000c, 0x7944),
+            (0x020d, 0x7984),
+            (0x000c, 0x79c4),
+            (0x020d, 0x7a04),
+            (0x000c, 0x7a84),
+        ] {
+            let bounds = DrawBounds {
+                left: 368,
+                top: 237,
+                right: 407,
+                bottom: 288,
+            };
+            let mut options = TextureDrawOptions::opaque_raw();
+
+            super::preserve_br2_recovery_fighter_texture_origin(
+                &mut options,
+                Some(&source),
+                texture_page,
+                clut,
+                bounds,
+            );
+
+            assert!(
+                !options.allow_texture_origin_alias,
+                "Long Beast TPage 0x{texture_page:04x} CLUT 0x{clut:04x} must use y=0"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_long_beast_texture_origin_policy_rejects_unrelated_draws() {
+        let recovery = GpuCommandSource::recovery_dma_linked_list(0x000d_787c, Some(0x802d_080c));
+        let guest = GpuCommandSource::dma_linked_list(0x000d_787c, Some(0x802d_080c));
+        let fighter_bounds = DrawBounds {
+            left: 368,
+            top: 237,
+            right: 407,
+            bottom: 288,
+        };
+        let oversized_bounds = DrawBounds {
+            left: 0,
+            top: 32,
+            right: 639,
+            bottom: 431,
+        };
+        let left_fighter_bounds = DrawBounds {
+            left: 128,
+            top: 237,
+            right: 167,
+            bottom: 288,
+        };
+
+        for (source, texture_page, clut, bounds) in [
+            (Some(&guest), 0x000c, 0x7a84, fighter_bounds),
+            (Some(&recovery), 0x000b, 0x7a04, fighter_bounds),
+            (Some(&recovery), 0x000c, 0x7844, fighter_bounds),
+            (Some(&recovery), 0x000d, 0x7ac4, fighter_bounds),
+            (Some(&recovery), 0x000c, 0x7a04, left_fighter_bounds),
+            (Some(&recovery), 0x000d, 0x79c4, oversized_bounds),
+            (None, 0x000d, 0x79c4, fighter_bounds),
+        ] {
+            let mut options = TextureDrawOptions::opaque_raw();
+            super::preserve_br2_recovery_fighter_texture_origin(
+                &mut options,
+                source,
+                texture_page,
+                clut,
+                bounds,
+            );
+            assert!(options.allow_texture_origin_alias);
+        }
     }
 
     #[test]
@@ -44127,6 +44566,22 @@ mod tests {
             "the exact BR2 preview may reuse its populated persisted CLUT"
         );
 
+        let mut palette_bank_io = Io::default();
+        upload(&mut palette_bank_io, 832, 256, 24, 97, 0x3210_1234);
+        upload(&mut palette_bank_io, 464, 496, 16, 16, 0x7fff_001f);
+        for clut in [0x7c1d_u16, 0x7c9d, 0x7e1d, 0x7e9d] {
+            let mut fighter_preview = preview;
+            fighter_preview[2] = (u32::from(clut) << 16) | (fighter_preview[2] & 0x0000_ffff);
+            assert!(
+                palette_bank_io
+                    .gpu
+                    .retained_br2_character_select_preview_transfer_generation_valid(
+                        &fighter_preview
+                    ),
+                "observed character-select CLUT 0x{clut:04x} must use the retained palette bank"
+            );
+        }
+
         let mut wrong_row_io = Io::default();
         upload(&mut wrong_row_io, 832, 256, 24, 97, 0x3210_1234);
         for index in 0..16 {
@@ -44404,6 +44859,90 @@ mod tests {
                     &right_slices[0],
                 ),
             "an unrelated transfer between texture and completion palette must break provenance"
+        );
+    }
+
+    #[test]
+    fn retained_br2_large_select_portraits_accept_interleaved_game_upload_order_only() {
+        fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
+            io.write_u32(GPU_GP0, 0xa000_0000);
+            io.write_u32(GPU_GP0, (y << 16) | x);
+            io.write_u32(GPU_GP0, (height << 16) | width);
+            for _ in 0..width.saturating_mul(height).div_ceil(2) {
+                io.write_u32(GPU_GP0, word);
+            }
+        }
+
+        let left_portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7d40_0000,
+            0x0071_00e0,
+            0x0088_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+        let right_portrait = [
+            0x2c64_6464,
+            0x0071_01e0,
+            0x7d80_00c0,
+            0x0071_01a0,
+            0x0088_00ff,
+            0x0170_01e0,
+            0x0000_ffc0,
+            0x0170_01a0,
+            0x0000_ffff,
+        ];
+
+        let mut interleaved_io = Io::default();
+        upload(&mut interleaved_io, 512, 0, 128, 240, 0x3210_1234);
+        upload(&mut interleaved_io, 640, 0, 128, 240, 0x7654_5678);
+        upload(&mut interleaved_io, 0, 496, 256, 1, 0x03e0_001f);
+        upload(&mut interleaved_io, 0, 497, 256, 1, 0x7fff_03e0);
+
+        assert!(
+            interleaved_io
+                .gpu
+                .retained_br2_large_portrait_assets
+                .is_some(),
+            "the observed interleave must retain the left portrait asset"
+        );
+        assert!(
+            interleaved_io
+                .gpu
+                .retained_br2_right_large_portrait_assets
+                .is_some(),
+            "the observed interleave must retain the right portrait asset"
+        );
+        assert!(
+            interleaved_io
+                .gpu
+                .retained_br2_character_select_large_portrait_transfer_generation_valid(
+                    &left_portrait,
+                ),
+            "the left portrait must accept the observed right-texture interleave"
+        );
+        assert!(
+            interleaved_io
+                .gpu
+                .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                    &right_portrait,
+                ),
+            "the right portrait must accept the observed left-CLUT interleave"
+        );
+
+        let mut unrelated_io = Io::default();
+        upload(&mut unrelated_io, 512, 0, 128, 240, 0x3210_1234);
+        upload(&mut unrelated_io, 900, 400, 1, 1, 0x7fff_001f);
+        upload(&mut unrelated_io, 0, 496, 256, 1, 0x03e0_001f);
+        assert!(
+            unrelated_io
+                .gpu
+                .retained_br2_large_portrait_assets
+                .is_none(),
+            "an unrelated interleave must not qualify retained left portrait assets"
         );
     }
 
