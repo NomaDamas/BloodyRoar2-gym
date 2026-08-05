@@ -7,12 +7,12 @@ use std::sync::OnceLock;
 use crate::action::ActionButtons;
 use crate::native::framebuffer::{
     ClipRect, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH, FrameBufferBounds,
-    FrameBufferRegionSnapshot, FrameBufferStats, FrameBufferWindow, NativeFrameBuffer,
-    PSX_VRAM_HEIGHT, PixelWriteOptions, Point, TextureCandidateImage, TextureCoordinate,
-    TextureDrawOptions, TextureWindow, TexturedDrawStats, TexturedPoint, VRAM_HEIGHT, VRAM_WIDTH,
-    bytes_base64, clut_origin_for_diagnostics, png_from_rgb888_pixels,
-    texture_page_color_mode_for_diagnostics, texture_page_origin_for_clut_for_diagnostics,
-    texture_page_origin_for_diagnostics,
+    FrameBufferRegionSnapshot, FrameBufferSnapshotContentStats, FrameBufferSnapshotMatchStats,
+    FrameBufferStats, FrameBufferWindow, NativeFrameBuffer, PSX_VRAM_HEIGHT, PixelWriteOptions,
+    Point, TextureCandidateImage, TextureCoordinate, TextureDrawOptions, TextureWindow,
+    TexturedDrawStats, TexturedPoint, VRAM_HEIGHT, VRAM_WIDTH, bytes_base64,
+    clut_origin_for_diagnostics, png_from_rgb888_pixels, texture_page_color_mode_for_diagnostics,
+    texture_page_origin_for_clut_for_diagnostics, texture_page_origin_for_diagnostics,
 };
 
 pub const IO_REGION_START: u32 = 0x1f80_1000;
@@ -97,15 +97,10 @@ const SIO_SECURITY_TRANSFER_TRACE_LIMIT: usize = 64;
 const GP0_RECENT_COMMAND_LIMIT: usize = 16;
 const GP0_RECENT_COMMAND_WORD_LIMIT: usize = 12;
 const GP1_RECENT_COMMAND_LIMIT: usize = 16;
+const GPU_RESET_STATUS: u32 = 0x1480_2000;
 // Retain a full BR2 boot-to-match transfer window so missing fighter CLUT
 // uploads can be diagnosed without losing the earlier palette commands.
 const GPU_RECENT_TRANSFER_LIMIT: usize = 512;
-// Captured live fighter material packets occupy this compact low-RAM pool.
-// Stage recovery packets using the same 0x001c/0x7994 descriptor live outside
-// it, so command provenance can disambiguate the palette without weakening
-// the stage relocation globally.
-const BR2_RECOVERY_FIGHTER_MATERIAL_START: u32 = 0x0003_d000;
-const BR2_RECOVERY_FIGHTER_MATERIAL_END: u32 = 0x0003_e400;
 const BR2_RETAINED_PORTRAIT_TEXTURE_X: i32 = 832;
 const BR2_RETAINED_PORTRAIT_TEXTURE_Y: i32 = 256;
 const BR2_RETAINED_PORTRAIT_TEXTURE_WIDTH: usize = 24;
@@ -142,6 +137,8 @@ const BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH: usize = 256;
 const BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT: usize = 1;
 const BR2_RETAINED_LARGE_PORTRAIT_CLUT_WORDS: usize =
     (BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH * BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT).div_ceil(64);
+const BR2_RETAINED_LARGE_PORTRAIT_HISTORY_LIMIT: usize = 16;
+const BR2_SELECT_ATLAS_DIAGNOSTIC_HISTORY_LIMIT: usize = 8;
 const GPU_RECENT_DRAW_LIMIT: usize = 128;
 const GPU_TOP_DRAW_LIMIT: usize = 12;
 // A BR2 gameplay frame submits both fighters plus the stage and HUD in one
@@ -178,6 +175,10 @@ const DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_COLOR_CHANGES: u64 = 262_144;
 const DISPLAY_RESOLVE_MIN_PIXEL_HEAVY_PRESENTATION_CAPTURES: u64 = 120;
 const DISPLAY_RESOLVE_MIN_ACTIVE_FIELD_RENDER_READY_COLOR_CHANGES: u64 = 131_072;
 const DISPLAY_RESOLVE_MIN_ACTIVE_FIELD_RENDER_READY_PRESENTATION_CAPTURES: u64 = 32;
+const BR2_CHARACTER_SELECT_SNAPSHOT_MIN_FULL_NONZERO_PERCENT: u64 = 55;
+const BR2_CHARACTER_SELECT_SNAPSHOT_MIN_TOP_NONZERO_PERCENT: u64 = 35;
+const BR2_CHARACTER_SELECT_SNAPSHOT_MIN_BOTTOM_NONZERO_PERCENT: u64 = 50;
+const BR2_CHARACTER_SELECT_SNAPSHOT_MIN_OCCUPIED_ROW_SPAN_PERCENT: usize = 95;
 const DISPLAY_SCENE_MAX_CHANNEL_DOMINANCE: u64 = 2;
 const DISPLAY_SCENE_MIN_COLOR_BUCKETS: u16 = 24;
 const NATIVE_REPLAY_STAGED_MIN_DISPLAY_WIDTH: usize = 256;
@@ -192,6 +193,32 @@ const DISPLAY_SOURCE_HIGH_VERTICAL_DEINTERLACED: &str =
     "gp1_display_area_high_vertical_deinterlaced";
 const VRAM_X_MASK: u32 = 0x03ff;
 const VRAM_Y_MASK: u32 = 0x03ff;
+
+fn native_draw_sequence_trace_range() -> Option<(u64, u64)> {
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let raw = std::env::var("BR2_NATIVE_TRACE_DRAW_SEQUENCE_RANGE").ok()?;
+        let (start, end) = raw.split_once(':')?;
+        let start = start.trim().parse::<u64>().ok()?;
+        let end = end.trim().parse::<u64>().ok()?;
+        (start <= end).then_some((start, end))
+    })
+}
+
+fn native_freeze_predicate_draw_captures() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BR2_NATIVE_FREEZE_DRAW_CAPTURES").is_some())
+}
+
+fn native_expanded_draw_capture_assets() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BR2_NATIVE_EXPANDED_DRAW_CAPTURE_ASSETS").is_some())
+}
+
+fn native_trace_br2_large_portrait_assets() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BR2_NATIVE_TRACE_LARGE_PORTRAIT_ASSETS").is_some())
+}
 
 #[derive(Clone, Debug, Default)]
 struct GpuDrawTraceBuffer {
@@ -257,6 +284,7 @@ struct RetainedTransferCoverage {
 #[derive(Clone, Debug)]
 struct PendingBr2LargePortraitAssets {
     texture: FrameBufferRegionSnapshot,
+    fingerprint: Br2LargePortraitAssetFingerprint,
     transfer_sequence: u64,
     vblank: u64,
 }
@@ -265,7 +293,30 @@ struct PendingBr2LargePortraitAssets {
 struct RetainedBr2LargePortraitAssets {
     texture: FrameBufferRegionSnapshot,
     clut: FrameBufferRegionSnapshot,
+    fingerprint: Br2LargePortraitAssetFingerprint,
     generation: u64,
+    vblank: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Br2LargePortraitAssetClass {
+    CandidateSelectPanel,
+    InvalidContent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Br2LargePortraitAssetFingerprint {
+    upload_checksum: Option<u32>,
+    texture_checksum: u32,
+    nonzero_pixels: usize,
+    unique_colors: usize,
+    class: Br2LargePortraitAssetClass,
+}
+
+impl Br2LargePortraitAssetFingerprint {
+    fn is_candidate_select_panel(self) -> bool {
+        self.class == Br2LargePortraitAssetClass::CandidateSelectPanel
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +330,30 @@ struct PendingBr2RightLargePortraitAssets {
 struct RetainedBr2RightLargePortraitAssets {
     texture: FrameBufferRegionSnapshot,
     clut: FrameBufferRegionSnapshot,
+    generation: u64,
+    vblank: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingBr2SelectAtlasDiagnosticAssets {
+    texture: FrameBufferRegionSnapshot,
+    texture_page: u16,
+    clut: u16,
+    clut_y: i32,
+    upload_checksum: Option<u32>,
+    transfer_sequence: u64,
+    vblank: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Br2SelectAtlasDiagnosticAssets {
+    texture: FrameBufferRegionSnapshot,
+    clut_snapshot: FrameBufferRegionSnapshot,
+    texture_page: u16,
+    clut: u16,
+    upload_checksum: Option<u32>,
+    generation: u64,
+    vblank: u64,
 }
 
 impl Default for RetainedTransferCoverage {
@@ -1791,8 +1866,12 @@ pub struct Gpu {
     retained_transfer_coverage: RetainedTransferCoverage,
     pending_br2_large_portrait_assets: Option<PendingBr2LargePortraitAssets>,
     retained_br2_large_portrait_assets: Option<RetainedBr2LargePortraitAssets>,
+    retained_br2_large_portrait_asset_history: VecDeque<RetainedBr2LargePortraitAssets>,
     pending_br2_right_large_portrait_assets: Option<PendingBr2RightLargePortraitAssets>,
     retained_br2_right_large_portrait_assets: Option<RetainedBr2RightLargePortraitAssets>,
+    retained_br2_right_large_portrait_asset_history: VecDeque<RetainedBr2RightLargePortraitAssets>,
+    pending_br2_select_atlas_diagnostic_assets: Option<PendingBr2SelectAtlasDiagnosticAssets>,
+    br2_select_atlas_diagnostic_asset_history: VecDeque<Br2SelectAtlasDiagnosticAssets>,
     transfer_sequence: u64,
     image_upload_rects: Vec<DrawBounds>,
     recent_draw_commands: GpuDrawTraceBuffer,
@@ -1820,6 +1899,10 @@ pub struct Gpu {
     recovered_field_local_clip: Option<ClipRect>,
     recovery_overlay_translation: Option<(i32, i32)>,
     recovery_scene_snapshot: Option<FrameBufferRegionSnapshot>,
+    recovery_scene_snapshot_stable: bool,
+    br2_character_select_scene_snapshot: Option<FrameBufferRegionSnapshot>,
+    br2_character_select_scene_snapshot_active: bool,
+    last_recovery_presentation_reason: &'static str,
     presented_frame_png: Option<Vec<u8>>,
     presented_frame_rgb: Option<Vec<u32>>,
     presented_frame_window: Option<FrameBufferWindow>,
@@ -1880,7 +1963,7 @@ impl Default for Gpu {
     fn default() -> Self {
         Self {
             gp0_read: 0,
-            status: 0x1480_2000,
+            status: GPU_RESET_STATUS,
             commands_seen: 0,
             display_area_start: 0,
             horizontal_range: 0,
@@ -1915,8 +1998,12 @@ impl Default for Gpu {
             retained_transfer_coverage: RetainedTransferCoverage::default(),
             pending_br2_large_portrait_assets: None,
             retained_br2_large_portrait_assets: None,
+            retained_br2_large_portrait_asset_history: VecDeque::new(),
             pending_br2_right_large_portrait_assets: None,
             retained_br2_right_large_portrait_assets: None,
+            retained_br2_right_large_portrait_asset_history: VecDeque::new(),
+            pending_br2_select_atlas_diagnostic_assets: None,
+            br2_select_atlas_diagnostic_asset_history: VecDeque::new(),
             transfer_sequence: 0,
             image_upload_rects: Vec::new(),
             recent_draw_commands: GpuDrawTraceBuffer::new(),
@@ -1944,6 +2031,10 @@ impl Default for Gpu {
             recovered_field_local_clip: None,
             recovery_overlay_translation: None,
             recovery_scene_snapshot: None,
+            recovery_scene_snapshot_stable: false,
+            br2_character_select_scene_snapshot: None,
+            br2_character_select_scene_snapshot_active: false,
+            last_recovery_presentation_reason: "never",
             presented_frame_png: None,
             presented_frame_rgb: None,
             presented_frame_window: None,
@@ -2072,6 +2163,19 @@ impl Gpu {
     pub(crate) fn commit_recovery_scene_snapshot(&mut self) {
         let (x, y) = display_area_start_xy(self.display_area_start);
         let (width, height) = self.display_dimensions();
+        let current = FrameBufferWindow {
+            x,
+            y,
+            stats: self.framebuffer.psx_display_stats_with_depth(
+                x,
+                y,
+                width,
+                height,
+                self.display_24bit_enabled(),
+            ),
+        };
+        self.recovery_scene_snapshot_stable = has_native_recovery_snapshot_profile(current.stats)
+            && !self.recovery_window_has_blocking_artifact(current, width, height, true);
         self.recovery_scene_snapshot = Some(self.framebuffer.snapshot_psx_display_region(
             x,
             y,
@@ -2131,6 +2235,17 @@ impl Gpu {
         self.commit_recovery_scene_snapshot_if_presented_window(current, width, height)
     }
 
+    pub(crate) fn repair_unstable_recovery_scene_snapshot_from_presented_frame(&mut self) -> bool {
+        if self.recovery_scene_snapshot_stable {
+            return false;
+        }
+        self.commit_recovery_scene_snapshot_if_current_is_stable_presented()
+    }
+
+    pub(crate) fn last_recovery_presentation_reason(&self) -> &'static str {
+        self.last_recovery_presentation_reason
+    }
+
     pub(crate) fn restore_recovery_scene_snapshot(&mut self) -> bool {
         let Some(snapshot) = self.recovery_scene_snapshot.as_ref() else {
             return false;
@@ -2138,6 +2253,313 @@ impl Gpu {
         self.framebuffer.restore_region_snapshot(snapshot);
         self.invalidate_recovery_presentation_caches();
         true
+    }
+
+    fn br2_character_select_snapshot_content(
+        snapshot: &FrameBufferRegionSnapshot,
+    ) -> (
+        FrameBufferSnapshotContentStats,
+        FrameBufferSnapshotContentStats,
+        FrameBufferSnapshotContentStats,
+    ) {
+        let (width, height) = snapshot.dimensions();
+        let field_height = height / 2;
+        (
+            snapshot.content_stats((0, 0, width, height)),
+            snapshot.content_stats((0, 0, width, field_height)),
+            snapshot.content_stats((0, field_height, width, height)),
+        )
+    }
+
+    fn br2_character_select_snapshot_has_complete_coverage(
+        snapshot: &FrameBufferRegionSnapshot,
+    ) -> bool {
+        let (_, height) = snapshot.dimensions();
+        let (full, top, bottom) = Self::br2_character_select_snapshot_content(snapshot);
+        full.pixel_count > 0
+            && top.pixel_count > 0
+            && bottom.pixel_count > 0
+            && full.nonzero_pixels.saturating_mul(100)
+                >= full
+                    .pixel_count
+                    .saturating_mul(BR2_CHARACTER_SELECT_SNAPSHOT_MIN_FULL_NONZERO_PERCENT)
+            && top.nonzero_pixels.saturating_mul(100)
+                >= top
+                    .pixel_count
+                    .saturating_mul(BR2_CHARACTER_SELECT_SNAPSHOT_MIN_TOP_NONZERO_PERCENT)
+            && bottom.nonzero_pixels.saturating_mul(100)
+                >= bottom
+                    .pixel_count
+                    .saturating_mul(BR2_CHARACTER_SELECT_SNAPSHOT_MIN_BOTTOM_NONZERO_PERCENT)
+            && full.occupied_row_span.saturating_mul(100)
+                >= height
+                    .saturating_mul(BR2_CHARACTER_SELECT_SNAPSHOT_MIN_OCCUPIED_ROW_SPAN_PERCENT)
+    }
+
+    fn try_commit_br2_character_select_scene_snapshot(
+        &mut self,
+        require_complete_coverage: bool,
+    ) -> bool {
+        let (x, y) = display_area_start_xy(self.display_area_start);
+        let (width, height) = self.display_dimensions();
+        let candidate = self.framebuffer.snapshot_psx_display_region(
+            x,
+            y,
+            width.min(VRAM_WIDTH),
+            height.min(PSX_VRAM_HEIGHT),
+        );
+        let candidate_is_complete =
+            Self::br2_character_select_snapshot_has_complete_coverage(&candidate);
+        if require_complete_coverage && !candidate_is_complete {
+            if self
+                .br2_character_select_scene_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    !Self::br2_character_select_snapshot_has_complete_coverage(snapshot)
+                })
+            {
+                self.br2_character_select_scene_snapshot = None;
+                self.br2_character_select_scene_snapshot_active = false;
+            }
+            return false;
+        }
+
+        if self
+            .br2_character_select_scene_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| {
+                Self::br2_character_select_snapshot_has_complete_coverage(snapshot)
+                    && !candidate_is_complete
+            })
+        {
+            return false;
+        }
+
+        self.br2_character_select_scene_snapshot = Some(candidate);
+        self.br2_character_select_scene_snapshot_active = true;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_br2_character_select_scene_snapshot(&mut self) {
+        let _ = self.try_commit_br2_character_select_scene_snapshot(false);
+    }
+
+    pub(crate) fn refresh_br2_character_select_scene_snapshot(
+        &mut self,
+        known_select_context: bool,
+    ) -> bool {
+        if native_disable_br2_character_select_scene_snapshot() {
+            return false;
+        }
+        let (x, y) = display_area_start_xy(self.display_area_start);
+        let (width, height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+            || x.saturating_add(width) > VRAM_WIDTH
+            || y.saturating_add(height) > PSX_VRAM_HEIGHT
+        {
+            return false;
+        }
+
+        let output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+        if self.field_composed_output_should_preserve_br2_character_select_full_frame(output)
+            && self.try_commit_br2_character_select_scene_snapshot(true)
+        {
+            return true;
+        }
+        if known_select_context
+            && self.field_composed_output_matches_known_br2_character_select_context(output)
+            && self.try_commit_br2_character_select_scene_snapshot(true)
+        {
+            return true;
+        }
+        if self.br2_character_select_scene_snapshot.is_none()
+            || (!known_select_context && !self.br2_character_select_scene_snapshot_active)
+        {
+            return false;
+        }
+
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(output)
+        else {
+            return false;
+        };
+        let top_is_viable_select_field = screen_observation_worth_saving(top.stats)
+            && is_detailed_observation(top.stats)
+            && !self.display_window_has_glyph_texture_grid(top, width, field_height)
+            && !self.display_window_has_glyph_texture_grid_with_psx_depth(top, width, field_height);
+        let bottom_color = self.display_window_color_stats(bottom, width, field_height, true);
+        let bottom_is_corrupt =
+            self.field_half_texture_artifact_blocks_playability(
+                bottom,
+                width,
+                field_height,
+                bottom_color,
+            ) || self.display_window_has_high_vertical_warning_text_overlay(
+                bottom,
+                width,
+                field_height,
+                true,
+            ) || self.display_window_has_title_logo_overlay_artifact(
+                bottom,
+                width,
+                field_height,
+                true,
+            ) || self.display_window_has_glyph_texture_grid(bottom, width, field_height)
+                || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                    bottom,
+                    width,
+                    field_height,
+                );
+        if !top_is_viable_select_field || !bottom_is_corrupt {
+            return false;
+        }
+
+        let archived_bottom_has_content = self
+            .br2_character_select_scene_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| {
+                let stats = self.framebuffer.psx_display_snapshot_match_stats(
+                    snapshot,
+                    x,
+                    y,
+                    width,
+                    height,
+                    (0, field_height, width, height),
+                    4,
+                );
+                stats.reference_nonzero_samples >= 2_048
+            });
+        if !archived_bottom_has_content {
+            return false;
+        }
+
+        let current_bottom =
+            self.framebuffer
+                .snapshot_psx_display_region(x, y + field_height, width, field_height);
+        let restored = {
+            let snapshot = self
+                .br2_character_select_scene_snapshot
+                .as_ref()
+                .expect("character-select snapshot was checked");
+            self.framebuffer
+                .restore_region_snapshot_region(snapshot, (0, field_height, width, height))
+        };
+        if !restored {
+            return false;
+        }
+        const LEFT_PORTRAIT_X: (usize, usize) = (33, 225);
+        const RIGHT_PORTRAIT_X: (usize, usize) = (288, 481);
+        const ROSTER_GRID_TOP: usize = 322;
+        let live_portrait_height = ROSTER_GRID_TOP
+            .saturating_sub(field_height)
+            .min(field_height);
+        for (left, right) in [LEFT_PORTRAIT_X, RIGHT_PORTRAIT_X] {
+            self.framebuffer.restore_region_snapshot_region(
+                &current_bottom,
+                (left.min(width), 0, right.min(width), live_portrait_height),
+            );
+        }
+        self.invalidate_recovery_presentation_caches();
+
+        let repaired = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: self.current_display_window_with_dimensions(width, height),
+        };
+        if self.field_composed_output_should_preserve_br2_character_select_full_frame(repaired) {
+            return self.try_commit_br2_character_select_scene_snapshot(true);
+        }
+
+        self.framebuffer.restore_region_snapshot(&current_bottom);
+        self.invalidate_recovery_presentation_caches();
+        false
+    }
+
+    pub(crate) fn restore_br2_character_select_scene_snapshot(&mut self) -> bool {
+        if native_disable_br2_character_select_scene_snapshot() {
+            return false;
+        }
+        if !self.br2_character_select_scene_snapshot_active {
+            return false;
+        }
+        let Some(snapshot) = self.br2_character_select_scene_snapshot.as_ref() else {
+            return false;
+        };
+        self.framebuffer.restore_region_snapshot(snapshot);
+        self.invalidate_recovery_presentation_caches();
+        true
+    }
+
+    fn restore_active_br2_character_select_scene_snapshot_after_display_collapse(
+        &mut self,
+    ) -> bool {
+        if !self.br2_character_select_scene_snapshot_active {
+            return false;
+        }
+        let (x, y) = display_area_start_xy(self.display_area_start);
+        let (width, height) = self.display_dimensions();
+        if width == 0
+            || height == 0
+            || x.saturating_add(width) > VRAM_WIDTH
+            || y.saturating_add(height) > PSX_VRAM_HEIGHT
+        {
+            return false;
+        }
+        let current = self.framebuffer.psx_display_stats_with_depth(
+            x,
+            y,
+            width,
+            height,
+            self.display_24bit_enabled(),
+        );
+        if screen_observation_worth_saving(current) && !is_sparse_display(current) {
+            return false;
+        }
+        self.restore_br2_character_select_scene_snapshot()
+    }
+
+    pub(crate) fn clear_br2_character_select_scene_snapshot(&mut self) {
+        self.br2_character_select_scene_snapshot_active = false;
+        // The general snapshot may still contain the select backdrop. Force
+        // recovery to replace it from the first verified gameplay frame.
+        self.recovery_scene_snapshot_stable = false;
+    }
+
+    pub(crate) fn clear_br2_character_select_pixels_after_gameplay_transition(&mut self) -> usize {
+        self.br2_character_select_scene_snapshot_active = false;
+        self.recovery_scene_snapshot_stable = false;
+        let Some(snapshot) = self.br2_character_select_scene_snapshot.as_ref() else {
+            return 0;
+        };
+        let (x, y) = display_area_start_xy(self.display_area_start);
+        let (width, height) = self.display_dimensions();
+        let width = width.min(VRAM_WIDTH);
+        let height = height.min(PSX_VRAM_HEIGHT);
+        let cleared = self.framebuffer.clear_psx_display_snapshot_matches(
+            snapshot,
+            x,
+            y,
+            width,
+            height,
+            (0, 0, width, height.div_ceil(4)),
+        );
+        if cleared > 0 {
+            self.invalidate_recovery_presentation_caches();
+        }
+        cleared
     }
 
     pub fn read_status(&self) -> u32 {
@@ -2205,6 +2627,25 @@ impl Gpu {
         command_address: u32,
         pc: Option<u32>,
     ) {
+        self.write_recovery_gp0_command_with_filter(words, command_address, pc, false);
+    }
+
+    pub(crate) fn write_recovery_alpha_bilinear_gp0_command(
+        &mut self,
+        words: &[u32],
+        command_address: u32,
+        pc: Option<u32>,
+    ) {
+        self.write_recovery_gp0_command_with_filter(words, command_address, pc, true);
+    }
+
+    fn write_recovery_gp0_command_with_filter(
+        &mut self,
+        words: &[u32],
+        command_address: u32,
+        pc: Option<u32>,
+        alpha_bilinear: bool,
+    ) {
         if words.is_empty() {
             return;
         }
@@ -2212,9 +2653,10 @@ impl Gpu {
             for (index, word) in words.iter().copied().enumerate() {
                 self.write_gp0_with_source(
                     word,
-                    GpuCommandSource::recovery_dma_linked_list(
+                    GpuCommandSource::recovery_dma_linked_list_with_filter(
                         command_address.saturating_add(index as u32 * 4),
                         pc,
+                        alpha_bilinear,
                     ),
                 );
             }
@@ -2222,17 +2664,20 @@ impl Gpu {
         }
 
         self.commands_seen = self.commands_seen.saturating_add(words.len() as u64);
-        let source = [Some(GpuCommandSource::recovery_dma_linked_list(
-            command_address,
-            pc,
-        ))];
-        let fingerprint = self.recovery_raster_command_fingerprint(words);
+        let source = [Some(
+            GpuCommandSource::recovery_dma_linked_list_with_filter(
+                command_address,
+                pc,
+                alpha_bilinear,
+            ),
+        )];
+        let fingerprint = self.recovery_raster_command_fingerprint(words, alpha_bilinear);
         self.framebuffer.begin_recovery_raster_command(fingerprint);
         self.execute_gp0_command(words, &source);
         self.framebuffer.end_recovery_raster_command();
     }
 
-    fn recovery_raster_command_fingerprint(&self, words: &[u32]) -> u64 {
+    fn recovery_raster_command_fingerprint(&self, words: &[u32], alpha_bilinear: bool) -> u64 {
         let mut fingerprint = 0x6a09_e667_f3bc_c909u64;
         for value in [
             u64::from(self.drawing_area_top_left),
@@ -2243,6 +2688,7 @@ impl Gpu {
             u64::from(self.set_mask_bit),
             u64::from(self.check_mask_bit),
             u64::from(self.display_area_start),
+            u64::from(alpha_bilinear),
         ] {
             Self::visibility_mix_u64(&mut fingerprint, value);
         }
@@ -2316,6 +2762,44 @@ impl Gpu {
         self.write_gp1_from(value, None);
     }
 
+    pub(crate) fn image_upload_command_count(&self) -> u64 {
+        self.image_upload_commands
+    }
+
+    pub(crate) fn transfer_sequence(&self) -> u64 {
+        self.transfer_sequence
+    }
+
+    fn reset_control_state(&mut self) {
+        // GP1(00h) resets command/control state while retaining PS1 VRAM.
+        // Diagnostics and recovery provenance must survive too, otherwise BR2
+        // loses the character-select uploads submitted immediately beforehand.
+        self.gp0_read = 0;
+        self.status = GPU_RESET_STATUS;
+        self.display_area_start = 0;
+        self.horizontal_range = 0;
+        self.vertical_range = 0;
+        self.status_reads.set(0);
+        self.field_parity.set(false);
+        self.gp0_fifo.clear();
+        self.gp0_fifo_sources.clear();
+        self.drawing_area_top_left = 0;
+        self.drawing_area_bottom_right = 0;
+        self.drawing_offset = 0;
+        self.texture_page = 0;
+        self.texture_window = TextureWindow::default();
+        self.set_mask_bit = false;
+        self.check_mask_bit = false;
+        self.gp0_capture_batch_depth = 0;
+        self.gp0_capture_batch_field_probe_pending = false;
+        self.gp0_capture_batch_best_probe_pending = false;
+        self.recovered_draw_page_tracking = false;
+        self.recovered_field_local_clip = None;
+        self.recovery_overlay_translation = None;
+        self.framebuffer.set_clip(None);
+        self.invalidate_recovery_presentation_caches();
+    }
+
     fn write_gp1_from(&mut self, value: u32, source: Option<GpuCommandSource>) {
         let command = value >> 24;
         let recovery_display_flip = source
@@ -2323,17 +2807,7 @@ impl Gpu {
             .is_some_and(GpuCommandSource::is_recovery_display_flip);
         self.push_recent_gp1_command(value, source.as_ref());
         match command {
-            0x00 => {
-                let draw_capture_range = self.draw_capture_range;
-                let draw_capture_predicates = std::mem::take(&mut self.draw_capture_predicates);
-                let draw_captures = std::mem::take(&mut self.draw_captures);
-                let draw_capture_keys = std::mem::take(&mut self.draw_capture_keys);
-                *self = Self::default();
-                self.draw_capture_range = draw_capture_range;
-                self.draw_capture_predicates = draw_capture_predicates;
-                self.draw_captures = draw_captures;
-                self.draw_capture_keys = draw_capture_keys;
-            }
+            0x00 => self.reset_control_state(),
             0x01 => {
                 self.gp0_read = 0;
                 self.gp0_fifo.clear();
@@ -3369,11 +3843,14 @@ impl Gpu {
                     .high_vertical_active_field_replaces_static_counterpart(output, output_color));
         let playable_safe_field = output.source == DISPLAY_SOURCE_SAFE_FIELD
             && self.safe_field_output_recovers_playable_scene(output, output_color);
+        let gui_full_frame_safe_field =
+            self.high_vertical_safe_field_should_preserve_gui_full_frame(output);
         let drawing_area_field = self.output_matches_high_vertical_drawing_area_field(output);
         let selected_field_output = output.source == DISPLAY_SOURCE_ACTIVE_FIELD
             && self.should_use_active_field_output(output, resolved);
         if !active_live_field
             && !playable_safe_field
+            && !gui_full_frame_safe_field
             && !drawing_area_field
             && !selected_field_output
         {
@@ -3395,6 +3872,7 @@ impl Gpu {
             || (output.window.y == current.y
                 && !active_live_field
                 && !playable_safe_field
+                && !gui_full_frame_safe_field
                 && !drawing_area_field
                 && !selected_field_output)
             || current.y.saturating_add(height) > PSX_VRAM_HEIGHT
@@ -3412,7 +3890,9 @@ impl Gpu {
             height,
             window: current,
         };
-        if self.field_composed_output_has_gui_recoverable_live_scene(full) {
+        if gui_full_frame_safe_field
+            || self.field_composed_output_has_gui_recoverable_live_scene(full)
+        {
             return Some(full);
         }
 
@@ -3429,6 +3909,74 @@ impl Gpu {
         // line-double the visible field instead of exposing a cropped 240-line
         // buffer or a half-blank framebuffer to the user.
         Some(full)
+    }
+
+    fn high_vertical_safe_field_should_preserve_gui_full_frame(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        if output.source != DISPLAY_SOURCE_SAFE_FIELD
+            || output.field_composed
+            || output.cached
+            || output.width == 0
+            || output.height == 0
+            || !screen_observation_worth_saving(output.window.stats)
+        {
+            return false;
+        }
+
+        let (width, height) = self.display_dimensions();
+        if !self.high_vertical_interlace_enabled()
+            || width != output.width
+            || height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !height.is_multiple_of(2)
+            || output.height.saturating_mul(2) != height
+        {
+            return false;
+        }
+
+        let current = self.current_display_window();
+        if output.window.x != current.x
+            || current.y.saturating_add(height) > PSX_VRAM_HEIGHT
+            || !screen_observation_worth_saving(current.stats)
+            || current.stats.nonzero_pixels < output.window.stats.nonzero_pixels
+        {
+            return false;
+        }
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height,
+            window: current,
+        };
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(full)
+        else {
+            return false;
+        };
+        let output_matches_current_field = output.window.y == current.y
+            || output.window.y == current.y.saturating_add(field_height);
+        let both_halves_visible = screen_observation_worth_saving(top.stats)
+            && screen_observation_worth_saving(bottom.stats);
+        let top_glyph = self.display_window_has_glyph_texture_grid(top, width, field_height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(top, width, field_height);
+        let bottom_glyph = self.display_window_has_glyph_texture_grid(bottom, width, field_height)
+            || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                bottom,
+                width,
+                field_height,
+            );
+
+        self.display_output_matches_recent_field_pair(full)
+            && output_matches_current_field
+            && (both_halves_visible || self.field_composed_output_is_intro_video_caption(full))
+            && !top_glyph
+            && !bottom_glyph
+            && !self.display_window_is_texture_atlas_with_dimensions(current, width, height)
+            && !self.display_window_has_primitive_tearing_artifact(current, width, height)
+            && !self.display_window_has_primitive_workspace_artifact(current, width, height)
     }
 
     fn current_raw_display_output_window(&self) -> DisplayOutputWindow {
@@ -3857,6 +4405,117 @@ impl Gpu {
                     full_has_more_information,
                 )
             });
+        let snapshot_present = self.br2_character_select_scene_snapshot.is_some();
+        let snapshot_active = self.br2_character_select_scene_snapshot_active;
+        let (snapshot_full_match, snapshot_bottom_match) =
+            if let (Some(snapshot), Some((_, _, field_height))) =
+                (self.br2_character_select_scene_snapshot.as_ref(), halves)
+            {
+                (
+                    self.framebuffer.psx_display_snapshot_match_stats(
+                        snapshot,
+                        output.window.x,
+                        output.window.y,
+                        output.width,
+                        output.height,
+                        (0, 0, output.width, output.height),
+                        4,
+                    ),
+                    self.framebuffer.psx_display_snapshot_match_stats(
+                        snapshot,
+                        output.window.x,
+                        output.window.y,
+                        output.width,
+                        output.height,
+                        (0, field_height, output.width, output.height),
+                        2,
+                    ),
+                )
+            } else {
+                (
+                    FrameBufferSnapshotMatchStats::default(),
+                    FrameBufferSnapshotMatchStats::default(),
+                )
+            };
+        let preserve_character_select_full_frame =
+            self.field_composed_output_should_preserve_br2_character_select_full_frame(output);
+        let (
+            character_select_top_ui_recovery,
+            character_select_live_pair_fallback,
+            character_select_full_contains_both_fields,
+            character_select_bottom_color_diversity,
+            character_select_intro_video_caption,
+            character_select_bottom_warning_overlay,
+            character_select_bottom_title_logo_artifact,
+            character_select_bottom_glyph,
+            character_select_workspace_artifact,
+        ) = halves
+            .map(|(top, bottom, field_height)| {
+                let top_output = DisplayOutputWindow {
+                    source: DISPLAY_SOURCE_SAFE_FIELD,
+                    field_composed: false,
+                    cached: false,
+                    width,
+                    height: field_height,
+                    window: top,
+                };
+                let top_color = self.display_window_color_stats(top, width, field_height, true);
+                let full_score = screen_observation_score(output.window.stats);
+                let top_score = screen_observation_score(top.stats);
+                let bottom_score = screen_observation_score(bottom.stats);
+                let best_half_score = top_score.max(bottom_score);
+                let weaker_half_score = top_score.min(bottom_score);
+                let bottom_color =
+                    self.display_window_color_stats(bottom, width, field_height, true);
+                (
+                    self.high_vertical_safe_field_is_br2_select_ui_recovery(top_output, top_color),
+                    self.field_composed_output_has_br2_character_select_live_pair_signal(
+                        output,
+                        top,
+                        bottom,
+                        field_height,
+                        top_color,
+                        bottom_color,
+                    ),
+                    full_score > best_half_score.saturating_add(weaker_half_score / 2)
+                        || output.window.stats.detail_edges
+                            > top
+                                .stats
+                                .detail_edges
+                                .max(bottom.stats.detail_edges)
+                                .saturating_add(
+                                    top.stats.detail_edges.min(bottom.stats.detail_edges) / 2,
+                                ),
+                    bottom_color.has_scene_color_diversity(),
+                    self.field_composed_output_is_intro_video_caption(output),
+                    self.display_window_has_high_vertical_warning_text_overlay(
+                        bottom,
+                        width,
+                        field_height,
+                        true,
+                    ),
+                    self.display_window_has_title_logo_overlay_artifact(
+                        bottom,
+                        width,
+                        field_height,
+                        true,
+                    ),
+                    self.display_window_has_glyph_texture_grid(bottom, width, field_height)
+                        || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                            bottom,
+                            width,
+                            field_height,
+                        ),
+                    self.display_window_has_primitive_workspace_artifact(
+                        output.window,
+                        width,
+                        height,
+                    ),
+                )
+            })
+            .unwrap_or((
+                false, false, false, false, false, false, false, false, false,
+            ));
         let live_draw_overlap = self.display_candidate_has_live_draw_overlap(output.window);
         let scene_upload_overlap = self.display_candidate_has_scene_upload_overlap(output.window);
         let allowed = self.should_use_high_vertical_full_output(output);
@@ -3891,7 +4550,7 @@ impl Gpu {
         };
 
         format!(
-            "{{\"candidate_present\":true,\"allowed\":{},\"reason\":\"{}\",\"width\":{},\"height\":{},\"window\":{},\"worth_saving\":{},\"saturated_logo_transition\":{},\"origin_matches\":{},\"color\":{},\"color_diversity\":{},\"low_bucket_scene_range_signal\":{},\"low_bucket_playfield_brightness\":{},\"strong_native_3d_textured_playfield\":{},\"has_color_signal\":{},\"halves_present\":{},\"field_height\":{},\"top\":{},\"bottom\":{},\"full_score\":{},\"top_score\":{},\"bottom_score\":{},\"both_halves_visible\":{},\"full_has_more_information\":{},\"field_intro_caption\":{},\"full_frame_scene\":{},\"trusted_live_full_scene\":{},\"single_field_scene\":{},\"stale_live_field_split\":{},\"top_glyph\":{},\"bottom_glyph\":{},\"blocking_field_texture_artifact\":{},\"recoverable_field_texture_artifact\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{}}}",
+            "{{\"candidate_present\":true,\"allowed\":{},\"reason\":\"{}\",\"width\":{},\"height\":{},\"window\":{},\"worth_saving\":{},\"saturated_logo_transition\":{},\"origin_matches\":{},\"color\":{},\"color_diversity\":{},\"low_bucket_scene_range_signal\":{},\"low_bucket_playfield_brightness\":{},\"strong_native_3d_textured_playfield\":{},\"has_color_signal\":{},\"halves_present\":{},\"field_height\":{},\"top\":{},\"bottom\":{},\"full_score\":{},\"top_score\":{},\"bottom_score\":{},\"both_halves_visible\":{},\"full_has_more_information\":{},\"field_intro_caption\":{},\"full_frame_scene\":{},\"trusted_live_full_scene\":{},\"single_field_scene\":{},\"stale_live_field_split\":{},\"top_glyph\":{},\"bottom_glyph\":{},\"blocking_field_texture_artifact\":{},\"recoverable_field_texture_artifact\":{},\"character_select_snapshot_present\":{},\"character_select_snapshot_active\":{},\"character_select_snapshot_full_match\":{},\"character_select_snapshot_bottom_match\":{},\"preserve_character_select_full_frame\":{},\"character_select_top_ui_recovery\":{},\"character_select_live_pair_fallback\":{},\"character_select_full_contains_both_fields\":{},\"character_select_bottom_color_diversity\":{},\"character_select_intro_video_caption\":{},\"character_select_bottom_warning_overlay\":{},\"character_select_bottom_title_logo_artifact\":{},\"character_select_bottom_glyph\":{},\"character_select_workspace_artifact\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{}}}",
             allowed,
             reason,
             width,
@@ -3924,6 +4583,20 @@ impl Gpu {
             bottom_glyph,
             blocking_field_texture_artifact,
             recoverable_field_texture_artifact,
+            snapshot_present,
+            snapshot_active,
+            br2_snapshot_match_stats_json(snapshot_full_match),
+            br2_snapshot_match_stats_json(snapshot_bottom_match),
+            preserve_character_select_full_frame,
+            character_select_top_ui_recovery,
+            character_select_live_pair_fallback,
+            character_select_full_contains_both_fields,
+            character_select_bottom_color_diversity,
+            character_select_intro_video_caption,
+            character_select_bottom_warning_overlay,
+            character_select_bottom_title_logo_artifact,
+            character_select_bottom_glyph,
+            character_select_workspace_artifact,
             live_draw_overlap,
             scene_upload_overlap
         )
@@ -5248,6 +5921,9 @@ impl Gpu {
         if output.window.x != display_x || output.window.y != display_y {
             return false;
         }
+        if self.field_composed_output_should_preserve_br2_character_select_full_frame(output) {
+            return true;
+        }
 
         let color_stats =
             self.display_window_color_stats(output.window, output.width, output.height, true);
@@ -5489,10 +6165,23 @@ impl Gpu {
         height: usize,
         color_stats: DisplayColorStats,
     ) -> bool {
+        let raw_color_stats = self.display_window_color_stats(window, width, height, false);
+        let psx_color_stats = self.display_window_color_stats(window, width, height, true);
         screen_observation_worth_saving(window.stats)
             && is_detailed_observation(window.stats)
             && color_stats.has_scene_color_diversity()
             && color_stats.bucket_count >= 40
+            // A field that already passed the strict blocking detector must not
+            // be rescued solely by color diversity when it is still shaped
+            // like a caption/font page or another texture-atlas fragment.
+            && !self.field_half_is_probable_texture_atlas_artifact(window, width, height)
+            && !self.field_half_is_caption_or_font_texture_page_artifact(
+                window,
+                width,
+                height,
+                raw_color_stats,
+                psx_color_stats,
+            )
             && !self.high_vertical_static_field_is_stale_warning_or_title(window, width, height)
             && !self
                 .display_window_has_high_vertical_static_title_screen(window, width, height, true)
@@ -6375,9 +7064,12 @@ impl Gpu {
     fn should_use_field_composed_output(&self, output: DisplayOutputWindow) -> bool {
         let preserve_title_intro =
             self.field_composed_output_should_preserve_br2_title_intro_full_frame(output);
+        let preserve_character_select =
+            self.field_composed_output_should_preserve_br2_character_select_full_frame(output);
         output.field_composed
             && has_native_full_scene_detail(output.window.stats)
             && (preserve_title_intro
+                || preserve_character_select
                 || (!self.field_composed_output_is_intro_video_caption(output)
                     && !self.field_composed_output_has_texture_atlas_half(output)))
             && (output.cached
@@ -6387,6 +7079,276 @@ impl Gpu {
                     output.width,
                     output.height,
                 ))
+    }
+
+    fn field_composed_output_has_br2_character_select_live_pair_signal(
+        &self,
+        output: DisplayOutputWindow,
+        top: FrameBufferWindow,
+        bottom: FrameBufferWindow,
+        field_height: usize,
+        top_color: DisplayColorStats,
+        bottom_color: DisplayColorStats,
+    ) -> bool {
+        br2_character_select_live_pair_profile_matches(
+            output.window.stats,
+            top.stats,
+            bottom.stats,
+            top_color,
+            bottom_color,
+        ) && !self.field_composed_output_is_intro_video_caption(output)
+            && !self.display_window_has_high_vertical_warning_text_overlay(
+                bottom,
+                output.width,
+                field_height,
+                true,
+            )
+            && !self.display_window_has_glyph_texture_grid(bottom, output.width, field_height)
+            && !self.display_window_has_glyph_texture_grid_with_psx_depth(
+                bottom,
+                output.width,
+                field_height,
+            )
+            && !self.display_window_has_primitive_workspace_artifact(
+                output.window,
+                output.width,
+                output.height,
+            )
+            && self.display_candidate_has_live_draw_overlap(output.window)
+            && !self.display_candidate_has_scene_upload_overlap(output.window)
+            && self.has_strong_native_3d_textured_playfield_activity()
+            && self.has_visible_presentation()
+    }
+
+    fn field_composed_output_matches_known_br2_character_select_context(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if !output.field_composed
+            || output.cached
+            || !self.high_vertical_interlace_enabled()
+            || output.width != display_width
+            || output.height != display_height
+            || output.width < DEFAULT_DISPLAY_WIDTH
+            || output.height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !output.height.is_multiple_of(2)
+            || output.window.x != display_x
+            || output.window.y != display_y
+            || output.window.y.saturating_add(output.height) > PSX_VRAM_HEIGHT
+            || output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+            || !screen_observation_worth_saving(output.window.stats)
+            || !is_detailed_observation(output.window.stats)
+            || self.display_window_has_saturated_logo_transition(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            )
+        {
+            return false;
+        }
+
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(output)
+        else {
+            return false;
+        };
+        if field_height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(top.stats)
+            || !screen_observation_worth_saving(bottom.stats)
+            || !is_detailed_observation(top.stats)
+            || !is_detailed_observation(bottom.stats)
+        {
+            return false;
+        }
+
+        let top_color = self.display_window_color_stats(top, output.width, field_height, true);
+        let bottom_color =
+            self.display_window_color_stats(bottom, output.width, field_height, true);
+        br2_sparse_one_player_character_select_profile_matches(
+            output.window.stats,
+            top.stats,
+            bottom.stats,
+            top_color,
+            bottom_color,
+        ) && !self.field_composed_output_is_intro_video_caption(output)
+            && !self.display_window_has_high_vertical_warning_text_overlay(
+                bottom,
+                output.width,
+                field_height,
+                true,
+            )
+            && !self.display_window_has_glyph_texture_grid(bottom, output.width, field_height)
+            && !self.display_window_has_glyph_texture_grid_with_psx_depth(
+                bottom,
+                output.width,
+                field_height,
+            )
+            && !self.display_window_has_primitive_workspace_artifact(
+                output.window,
+                output.width,
+                output.height,
+            )
+            && self.display_candidate_has_live_draw_overlap(output.window)
+            && !self.display_candidate_has_scene_upload_overlap(output.window)
+            && self.has_strong_native_3d_textured_playfield_activity()
+            && self.has_visible_presentation()
+    }
+
+    fn field_composed_output_should_preserve_br2_character_select_full_frame(
+        &self,
+        output: DisplayOutputWindow,
+    ) -> bool {
+        let (display_width, display_height) = self.display_dimensions();
+        let (display_x, display_y) = display_area_start_xy(self.display_area_start);
+        if !output.field_composed
+            || output.cached
+            || !self.high_vertical_interlace_enabled()
+            || output.width != display_width
+            || output.height != display_height
+            || output.width < DEFAULT_DISPLAY_WIDTH
+            || output.height < DEFAULT_DISPLAY_HEIGHT * 2
+            || !output.height.is_multiple_of(2)
+            || output.window.x != display_x
+            || output.window.y != display_y
+            || output.window.y.saturating_add(output.height) > PSX_VRAM_HEIGHT
+            || !matches!(
+                output.source,
+                DISPLAY_SOURCE_HIGH_VERTICAL_FULL
+                    | "gp1_display_area_fields"
+                    | "gp1_display_area_high_vertical_fields"
+            )
+            || !screen_observation_worth_saving(output.window.stats)
+            || !is_detailed_observation(output.window.stats)
+            || self.display_window_has_saturated_logo_transition(
+                output.window,
+                output.width,
+                output.height,
+                true,
+            )
+        {
+            return false;
+        }
+
+        let Some((top, bottom, field_height)) = self.field_composed_output_half_windows(output)
+        else {
+            return false;
+        };
+        if field_height < DEFAULT_DISPLAY_HEIGHT
+            || !screen_observation_worth_saving(top.stats)
+            || !screen_observation_worth_saving(bottom.stats)
+            || !is_detailed_observation(top.stats)
+            || !is_detailed_observation(bottom.stats)
+        {
+            return false;
+        }
+
+        let snapshot_matches = self
+            .br2_character_select_scene_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| {
+                let full_match = self.framebuffer.psx_display_snapshot_match_stats(
+                    snapshot,
+                    output.window.x,
+                    output.window.y,
+                    output.width,
+                    output.height,
+                    (0, 0, output.width, output.height),
+                    4,
+                );
+                let bottom_match = self.framebuffer.psx_display_snapshot_match_stats(
+                    snapshot,
+                    output.window.x,
+                    output.window.y,
+                    output.width,
+                    output.height,
+                    (0, field_height, output.width, output.height),
+                    2,
+                );
+                full_match.reference_nonzero_samples >= 2_048
+                    && full_match.exact_nonzero_matches >= 1_536
+                    && full_match.exact_nonzero_match_per_mille() >= 600
+                    && bottom_match.reference_nonzero_samples >= 2_048
+                    && bottom_match.exact_nonzero_matches >= 1_536
+                    && bottom_match.exact_nonzero_match_per_mille() >= 550
+            });
+        if snapshot_matches {
+            return true;
+        }
+
+        let top_output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_SAFE_FIELD,
+            field_composed: false,
+            cached: false,
+            width: output.width,
+            height: field_height,
+            window: top,
+        };
+        let top_color = self.display_window_color_stats(top, output.width, field_height, true);
+        let bottom_color =
+            self.display_window_color_stats(bottom, output.width, field_height, true);
+        let top_ui_recovery =
+            self.high_vertical_safe_field_is_br2_select_ui_recovery(top_output, top_color);
+        let live_pair_fallback = self
+            .field_composed_output_has_br2_character_select_live_pair_signal(
+                output,
+                top,
+                bottom,
+                field_height,
+                top_color,
+                bottom_color,
+            );
+        if !top_ui_recovery && !live_pair_fallback {
+            return false;
+        }
+
+        let full_score = screen_observation_score(output.window.stats);
+        let top_score = screen_observation_score(top.stats);
+        let bottom_score = screen_observation_score(bottom.stats);
+        let best_half_score = top_score.max(bottom_score);
+        let weaker_half_score = top_score.min(bottom_score);
+        let full_contains_both_fields = full_score
+            > best_half_score.saturating_add(weaker_half_score / 2)
+            || output.window.stats.detail_edges
+                > top
+                    .stats
+                    .detail_edges
+                    .max(bottom.stats.detail_edges)
+                    .saturating_add(top.stats.detail_edges.min(bottom.stats.detail_edges) / 2);
+        let bottom_has_explicit_corrupt_overlay =
+            self.display_window_has_high_vertical_warning_text_overlay(
+                bottom,
+                output.width,
+                field_height,
+                true,
+            ) || (!live_pair_fallback
+                && self.display_window_has_title_logo_overlay_artifact(
+                    bottom,
+                    output.width,
+                    field_height,
+                    true,
+                ))
+                || self.display_window_has_glyph_texture_grid(bottom, output.width, field_height)
+                || self.display_window_has_glyph_texture_grid_with_psx_depth(
+                    bottom,
+                    output.width,
+                    field_height,
+                );
+
+        full_contains_both_fields
+            && has_native_full_scene_detail(output.window.stats)
+            && has_native_gameplay_display_profile(output.window.stats)
+            && bottom_color.has_scene_color_diversity()
+            && !self.field_composed_output_is_intro_video_caption(output)
+            && !bottom_has_explicit_corrupt_overlay
+            && !self.display_window_has_primitive_workspace_artifact(
+                output.window,
+                output.width,
+                output.height,
+            )
+            && self.display_candidate_has_live_draw_overlap(output.window)
+            && !self.display_candidate_has_scene_upload_overlap(output.window)
     }
 
     fn field_composed_output_should_preserve_br2_title_intro_full_frame(
@@ -6500,12 +7462,15 @@ impl Gpu {
     }
 
     fn should_use_gui_field_composed_output(&self, output: DisplayOutputWindow) -> bool {
+        let preserve_character_select =
+            self.field_composed_output_should_preserve_br2_character_select_full_frame(output);
         output.field_composed
             && !output.cached
             && output.width > 0
             && output.height >= DEFAULT_DISPLAY_HEIGHT * 2
             && screen_observation_worth_saving(output.window.stats)
-            && !self.field_composed_output_has_texture_atlas_half(output)
+            && (preserve_character_select
+                || !self.field_composed_output_has_texture_atlas_half(output))
             && (self.display_output_matches_recent_field_pair(output)
                 || !self.display_window_is_texture_atlas_with_dimensions(
                     output.window,
@@ -6522,6 +7487,9 @@ impl Gpu {
             return None;
         }
         if self.field_composed_output_should_preserve_br2_title_intro_full_frame(output) {
+            return None;
+        }
+        if self.field_composed_output_should_preserve_br2_character_select_full_frame(output) {
             return None;
         }
         let (top, bottom, field_height) = self.field_composed_output_half_windows(output)?;
@@ -7070,7 +8038,8 @@ impl Gpu {
         };
 
         (self.should_use_high_vertical_full_output(output)
-            || self.field_composed_output_should_preserve_br2_title_intro_full_frame(output))
+            || self.field_composed_output_should_preserve_br2_title_intro_full_frame(output)
+            || self.field_composed_output_should_preserve_br2_character_select_full_frame(output))
         .then_some(output)
     }
 
@@ -9262,6 +10231,9 @@ impl Gpu {
     }
 
     pub fn capture_vblank_presented_frame(&mut self) {
+        if !self.refresh_br2_character_select_scene_snapshot(false) {
+            self.restore_active_br2_character_select_scene_snapshot_after_display_collapse();
+        }
         self.capture_current_presented_frame();
     }
 
@@ -9277,11 +10249,17 @@ impl Gpu {
         self.capture_recovered_presented_frame_with_guard(Some(before))
     }
 
+    fn reject_recovered_presented_frame(&mut self, reason: &'static str) -> bool {
+        self.last_recovery_presentation_reason = reason;
+        false
+    }
+
     fn capture_recovered_presented_frame_with_guard(&mut self, before: Option<&Gpu>) -> bool {
+        self.last_recovery_presentation_reason = "evaluating";
         let (display_width, display_height) = self.display_dimensions();
         let (display_x, display_y) = display_area_start_xy(self.display_area_start);
         if display_x.saturating_add(display_width) > VRAM_WIDTH {
-            return false;
+            return self.reject_recovered_presented_frame("display_out_of_bounds");
         }
         let before_current = before.map(|before| {
             before
@@ -9324,6 +10302,12 @@ impl Gpu {
                 Some("live_draw_overlap")
             } else if self.display_candidate_has_scene_upload_overlap(current) {
                 Some("scene_upload_overlap")
+            } else if self.display_window_has_br2_retained_character_select_scene_mixture(
+                current,
+                display_width,
+                display_height,
+            ) {
+                Some("character_select_scene_mixture")
             } else if self.recovery_window_has_blocking_artifact(
                 current,
                 display_width,
@@ -9360,32 +10344,47 @@ impl Gpu {
                 (display_width, display_height, current)
             } else {
                 let output = self.current_display_output_window();
-                if output.cached
-                    || !screen_observation_worth_saving(output.window.stats)
-                    || self.display_window_is_texture_atlas_with_dimensions(
-                        output.window,
-                        output.width,
-                        output.height,
-                    )
-                    || self.recovery_window_has_blocking_artifact(
-                        output.window,
-                        output.width,
-                        output.height,
-                        output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
-                    )
-                    || before
-                        .zip(before_current)
-                        .is_some_and(|(before, before_current)| {
-                            self.recovered_presented_candidate_fails_prior_scene_guard(
-                                before,
-                                before_current,
-                                output.window,
-                                output.width,
-                                output.height,
-                            )
-                        })
+                let fallback_rejection = if output.cached {
+                    Some("fallback_cached")
+                } else if !screen_observation_worth_saving(output.window.stats) {
+                    Some("fallback_not_worth_saving")
+                } else if self.display_window_is_texture_atlas_with_dimensions(
+                    output.window,
+                    output.width,
+                    output.height,
+                ) {
+                    Some("fallback_texture_atlas")
+                } else if self.display_window_has_br2_retained_character_select_scene_mixture(
+                    output.window,
+                    output.width,
+                    output.height,
+                ) {
+                    Some("fallback_character_select_scene_mixture")
+                } else if self.recovery_window_has_blocking_artifact(
+                    output.window,
+                    output.width,
+                    output.height,
+                    output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+                ) {
+                    Some("fallback_blocking_artifact")
+                } else if before
+                    .zip(before_current)
+                    .is_some_and(|(before, before_current)| {
+                        self.recovered_presented_candidate_fails_prior_scene_guard(
+                            before,
+                            before_current,
+                            output.window,
+                            output.width,
+                            output.height,
+                        )
+                    })
                 {
-                    return false;
+                    Some("fallback_prior_scene_guard")
+                } else {
+                    None
+                };
+                if let Some(reason) = fallback_rejection {
+                    return self.reject_recovered_presented_frame(reason);
                 }
                 (output.width, output.height, output.window)
             }
@@ -9401,6 +10400,13 @@ impl Gpu {
                     self.display_24bit_enabled(),
                 ),
             };
+            if self.display_window_has_br2_retained_character_select_scene_mixture(
+                current,
+                display_width,
+                display_height,
+            ) {
+                return self.reject_recovered_presented_frame("character_select_scene_mixture");
+            }
             let current_is_safe = screen_observation_worth_saving(current.stats)
                 && !self.display_window_is_texture_atlas_with_dimensions(
                     current,
@@ -9428,32 +10434,47 @@ impl Gpu {
                 (display_width, display_height, current)
             } else {
                 let output = self.current_display_output_window();
-                if output.cached
-                    || !screen_observation_worth_saving(output.window.stats)
-                    || self.display_window_is_texture_atlas_with_dimensions(
-                        output.window,
-                        output.width,
-                        output.height,
-                    )
-                    || self.recovery_window_has_blocking_artifact(
-                        output.window,
-                        output.width,
-                        output.height,
-                        output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
-                    )
-                    || before
-                        .zip(before_current)
-                        .is_some_and(|(before, before_current)| {
-                            self.recovered_presented_candidate_fails_prior_scene_guard(
-                                before,
-                                before_current,
-                                output.window,
-                                output.width,
-                                output.height,
-                            )
-                        })
+                let fallback_rejection = if output.cached {
+                    Some("fallback_cached")
+                } else if !screen_observation_worth_saving(output.window.stats) {
+                    Some("fallback_not_worth_saving")
+                } else if self.display_window_is_texture_atlas_with_dimensions(
+                    output.window,
+                    output.width,
+                    output.height,
+                ) {
+                    Some("fallback_texture_atlas")
+                } else if self.display_window_has_br2_retained_character_select_scene_mixture(
+                    output.window,
+                    output.width,
+                    output.height,
+                ) {
+                    Some("fallback_character_select_scene_mixture")
+                } else if self.recovery_window_has_blocking_artifact(
+                    output.window,
+                    output.width,
+                    output.height,
+                    output.source != DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+                ) {
+                    Some("fallback_blocking_artifact")
+                } else if before
+                    .zip(before_current)
+                    .is_some_and(|(before, before_current)| {
+                        self.recovered_presented_candidate_fails_prior_scene_guard(
+                            before,
+                            before_current,
+                            output.window,
+                            output.width,
+                            output.height,
+                        )
+                    })
                 {
-                    return false;
+                    Some("fallback_prior_scene_guard")
+                } else {
+                    None
+                };
+                if let Some(reason) = fallback_rejection {
+                    return self.reject_recovered_presented_frame(reason);
                 }
                 (output.width, output.height, output.window)
             }
@@ -9468,6 +10489,7 @@ impl Gpu {
         });
         if unchanged {
             self.presented_frame_draw_sequence = self.draw_sequence;
+            self.last_recovery_presentation_reason = "accepted_unchanged";
             return true;
         }
 
@@ -9503,6 +10525,7 @@ impl Gpu {
         *self.display_resolve_cache.borrow_mut() = None;
         *self.display_output_window_cache.borrow_mut() = None;
         *self.visibility_cache.borrow_mut() = None;
+        self.last_recovery_presentation_reason = "accepted";
         true
     }
 
@@ -9574,11 +10597,21 @@ impl Gpu {
             psx_wrap,
             color_stats,
         );
+        let character_select_scene_mixture = self
+            .display_window_has_br2_retained_character_select_scene_mixture(window, width, height);
+        let stable_combat_transition_artifact = self
+            .display_window_has_br2_stable_combat_transition_artifact(
+                window,
+                width,
+                height,
+                psx_wrap,
+                color_stats,
+            );
 
         #[cfg(test)]
         if std::env::var_os("BR2_NATIVE_TRACE_RECOVERY_SNAPSHOT").is_some() {
             eprintln!(
-                "BR2 recovery snapshot guard: stable_profile={} structurally_detailed={} detailed_scene={} low_palette={} red_warning={} low_color_select={} red_cave={} repeating_rock_atlas={} periodic={} saturated_logo={} atlas_caption={} title_logo={} caption={} stats={} color={}",
+                "BR2 recovery snapshot guard: stable_profile={} structurally_detailed={} detailed_scene={} low_palette={} red_warning={} low_color_select={} red_cave={} repeating_rock_atlas={} periodic={} saturated_logo={} atlas_caption={} character_select_scene_mixture={} stable_combat_transition_artifact={} title_logo={} caption={} stats={} color={}",
                 has_native_recovery_snapshot_profile(window.stats),
                 structurally_detailed,
                 detailed_scene,
@@ -9590,6 +10623,8 @@ impl Gpu {
                 periodic_ghosting_blocks,
                 saturated_logo,
                 atlas_caption,
+                character_select_scene_mixture,
+                stable_combat_transition_artifact,
                 title_logo_blocks,
                 caption_blocks,
                 window.stats.json(),
@@ -9605,11 +10640,13 @@ impl Gpu {
             || periodic_ghosting_blocks
             || saturated_logo
             || atlas_caption
+            || character_select_scene_mixture
+            || stable_combat_transition_artifact
             || title_logo_blocks
             || caption_blocks;
         if blocked && br2_native_trace_recovery_fast_path() {
             eprintln!(
-                "BR2 recovery blocker: low_palette={} red_warning={} low_color_select={} red_cave={} repeating_rock_atlas={} periodic={} saturated_logo={} atlas_caption={} title_logo={} caption={} checksum={:#010x}",
+                "BR2 recovery blocker: low_palette={} red_warning={} low_color_select={} red_cave={} repeating_rock_atlas={} periodic={} saturated_logo={} atlas_caption={} character_select_scene_mixture={} stable_combat_transition_artifact={} title_logo={} caption={} checksum={:#010x}",
                 low_palette,
                 red_warning,
                 low_color_select,
@@ -9618,12 +10655,252 @@ impl Gpu {
                 periodic_ghosting_blocks,
                 saturated_logo,
                 atlas_caption,
+                character_select_scene_mixture,
+                stable_combat_transition_artifact,
                 title_logo_blocks,
                 caption_blocks,
                 window.stats.checksum,
             );
         }
         blocked
+    }
+
+    fn display_window_has_br2_stable_combat_transition_artifact(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+        psx_wrap: bool,
+        color_stats: DisplayColorStats,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !has_native_full_scene_detail(window.stats)
+            || !has_native_gameplay_display_profile(window.stats)
+            || color_stats.has_intro_caption_band()
+            || color_stats.has_caption_text_band()
+        {
+            return false;
+        }
+
+        let hud_signal = |pixel: u32| {
+            let red = (pixel >> 16) & 0xff;
+            let green = (pixel >> 8) & 0xff;
+            let blue = pixel & 0xff;
+            let max_channel = red.max(green).max(blue);
+            let min_channel = red.min(green).min(blue);
+            let luma =
+                (red.saturating_mul(30) + green.saturating_mul(59) + blue.saturating_mul(11)) / 100;
+            let bright_bar = luma >= 140 && max_channel.saturating_sub(min_channel) <= 120;
+            let warm_bar =
+                red >= 170 && green >= 110 && blue <= 96 && red >= blue.saturating_add(48);
+            bright_bar || warm_bar
+        };
+        let top_hud_has_excessive_lines = |left_percent: usize, right_percent: usize| {
+            let left = width.saturating_mul(left_percent) / 100;
+            let right = width.saturating_mul(right_percent) / 100;
+            let bottom = height.saturating_mul(14) / 100;
+            let roi_width = right.saturating_sub(left);
+            let mut rows_with_long_run = 0usize;
+            let mut line_bands = 0usize;
+            let mut longest_horizontal_run = 0usize;
+            let mut previous_row_qualified = false;
+
+            for y in 0..bottom {
+                let mut row_longest_run = 0usize;
+                let mut current_run = 0usize;
+                for x in left..right {
+                    let pixel = self.display_window_pixel(window, x, y, psx_wrap);
+                    if hud_signal(pixel) {
+                        current_run = current_run.saturating_add(1);
+                        row_longest_run = row_longest_run.max(current_run);
+                    } else {
+                        current_run = 0;
+                    }
+                }
+                let row_qualified = roi_width > 0
+                    && row_longest_run.saturating_mul(100) >= roi_width.saturating_mul(55);
+                if row_qualified {
+                    rows_with_long_run = rows_with_long_run.saturating_add(1);
+                    if !previous_row_qualified {
+                        line_bands = line_bands.saturating_add(1);
+                    }
+                }
+                previous_row_qualified = row_qualified;
+                longest_horizontal_run = longest_horizontal_run.max(row_longest_run);
+            }
+
+            roi_width > 0
+                && rows_with_long_run >= 18
+                && line_bands >= 8
+                && longest_horizontal_run.saturating_mul(100) >= roi_width.saturating_mul(55)
+        };
+        if !top_hud_has_excessive_lines(7, 45) || !top_hud_has_excessive_lines(55, 93) {
+            return false;
+        }
+
+        let left = width.saturating_mul(30) / 100;
+        let right = width.saturating_mul(70) / 100;
+        let top = height.saturating_mul(34) / 100;
+        let bottom = height.saturating_mul(58) / 100;
+        let mut yellow_pixels = 0usize;
+        let mut blue_shadow_pixels = 0usize;
+        let mut rows = 0usize;
+        let mut first_row = None;
+        let mut last_row = None;
+        let mut min_column = None;
+        let mut max_column = None;
+
+        for y in top..bottom {
+            let mut row_has_text = false;
+            for x in left..right {
+                let pixel = self.display_window_pixel(window, x, y, psx_wrap);
+                let red = (pixel >> 16) & 0xff;
+                let green = (pixel >> 8) & 0xff;
+                let blue = pixel & 0xff;
+                let yellow =
+                    red >= 160 && green >= 100 && blue <= 120 && red >= blue.saturating_add(48);
+                let blue_shadow =
+                    blue >= 112 && red <= 96 && green <= 128 && blue >= red.saturating_add(32);
+                if yellow {
+                    yellow_pixels = yellow_pixels.saturating_add(1);
+                }
+                if blue_shadow {
+                    blue_shadow_pixels = blue_shadow_pixels.saturating_add(1);
+                }
+                if yellow || blue_shadow {
+                    row_has_text = true;
+                    min_column = Some(min_column.map_or(x, |current: usize| current.min(x)));
+                    max_column = Some(max_column.map_or(x, |current: usize| current.max(x)));
+                }
+            }
+            if row_has_text {
+                rows = rows.saturating_add(1);
+                first_row.get_or_insert(y);
+                last_row = Some(y);
+            }
+        }
+
+        let row_span = first_row.zip(last_row).map_or(0, |(first, last)| {
+            last.saturating_sub(first).saturating_add(1)
+        });
+        let column_span = min_column.zip(max_column).map_or(0, |(first, last)| {
+            last.saturating_sub(first).saturating_add(1)
+        });
+        yellow_pixels >= 1_000
+            && blue_shadow_pixels >= 250
+            && rows >= 30
+            && row_span >= 40
+            && column_span >= 96
+    }
+
+    fn display_window_has_br2_retained_character_select_scene_mixture(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if self.br2_character_select_scene_snapshot_active {
+            return false;
+        }
+        self.display_window_matches_br2_character_select_scene_snapshot(window, width, height)
+    }
+
+    fn display_window_matches_br2_character_select_scene_snapshot(
+        &self,
+        window: FrameBufferWindow,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width < DEFAULT_DISPLAY_WIDTH
+            || height < DEFAULT_DISPLAY_HEIGHT
+            || !has_native_recovery_fast_scene_profile(window.stats)
+            || !self.has_native_play_3d_draw_signal()
+        {
+            return false;
+        }
+        let Some(snapshot) = self.br2_character_select_scene_snapshot.as_ref() else {
+            return false;
+        };
+
+        const SAMPLE_STEP: usize = 4;
+        let top = height / 5;
+        let bottom = height.saturating_mul(9) / 10;
+        let midpoint = width / 2;
+        let full = self.framebuffer.psx_display_snapshot_match_stats(
+            snapshot,
+            window.x,
+            window.y,
+            width,
+            height,
+            (0, top, width, bottom),
+            SAMPLE_STEP,
+        );
+        let left = self.framebuffer.psx_display_snapshot_match_stats(
+            snapshot,
+            window.x,
+            window.y,
+            width,
+            height,
+            (0, top, midpoint, bottom),
+            SAMPLE_STEP,
+        );
+        let right = self.framebuffer.psx_display_snapshot_match_stats(
+            snapshot,
+            window.x,
+            window.y,
+            width,
+            height,
+            (midpoint, top, width, bottom),
+            SAMPLE_STEP,
+        );
+        let full_match = full.exact_nonzero_match_per_mille();
+        let strongest_side_match = left
+            .exact_nonzero_match_per_mille()
+            .max(right.exact_nonzero_match_per_mille());
+        let lower_scene_mixture = full.reference_nonzero_samples >= 2_048
+            && full.exact_nonzero_matches >= 768
+            && full_match >= 220
+            && strongest_side_match >= 260;
+        let top_center = self.framebuffer.psx_display_snapshot_match_stats(
+            snapshot,
+            window.x,
+            window.y,
+            width,
+            height,
+            (width / 3, 0, width.saturating_mul(2) / 3, top),
+            2,
+        );
+        let top_center_match = top_center.exact_nonzero_match_per_mille();
+        let retained_select_banner = top_center.reference_nonzero_samples >= 1_024
+            && top_center.exact_nonzero_matches >= 512
+            && top_center_match >= 450;
+        let mixture = lower_scene_mixture || retained_select_banner;
+
+        if br2_native_trace_recovery_fast_path()
+            && (mixture || full_match >= 100 || top_center_match >= 100)
+        {
+            eprintln!(
+                "BR2 character-select scene mixture probe: mixture={} lower_scene_mixture={} retained_select_banner={} full={} left={} right={} top_center={}",
+                mixture,
+                lower_scene_mixture,
+                retained_select_banner,
+                br2_snapshot_match_stats_json(full),
+                br2_snapshot_match_stats_json(left),
+                br2_snapshot_match_stats_json(right),
+                br2_snapshot_match_stats_json(top_center),
+            );
+        }
+        mixture
+    }
+
+    pub(crate) fn current_display_retains_br2_character_select_scene(&self) -> bool {
+        let (width, height) = self.display_dimensions();
+        self.display_window_matches_br2_character_select_scene_snapshot(
+            self.current_display_window(),
+            width,
+            height,
+        )
     }
 
     pub fn begin_recovered_draw_page_tracking(&mut self) {
@@ -9782,6 +11059,20 @@ impl Gpu {
     }
 
     #[cfg(test)]
+    pub(crate) fn draw_words_for_test(&self, address: u32) -> Option<Vec<u32>> {
+        self.recent_draw_commands
+            .iter()
+            .rev()
+            .find(|trace| {
+                trace
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.address == Some(address))
+            })
+            .map(|trace| trace.words.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn last_recovery_draw_address_for_test(&self) -> Option<u32> {
         self.recent_draw_commands.iter().rev().find_map(|trace| {
             trace
@@ -9790,6 +11081,22 @@ impl Gpu {
                 .filter(|source| source.kind == "recovery_dma_linked_list")
                 .and_then(|source| source.address)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_draw_sequences_for_test(&self, address: u32) -> Vec<u64> {
+        self.recent_draw_commands
+            .iter()
+            .filter_map(|trace| {
+                trace
+                    .source
+                    .as_ref()
+                    .filter(|source| {
+                        source.kind == "recovery_dma_linked_list" && source.address == Some(address)
+                    })
+                    .map(|_| trace.sequence)
+            })
+            .collect()
     }
 
     fn display_resolve(&self) -> DisplayResolve {
@@ -11813,6 +13120,103 @@ impl Gpu {
         self.framebuffer.png(0, 0, VRAM_WIDTH, VRAM_HEIGHT)
     }
 
+    pub fn decoded_texture_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
+        self.framebuffer.decoded_texture_png(texture_page, clut)
+    }
+
+    pub fn raw_texture_page_png(&self, texture_page: u16) -> Vec<u8> {
+        self.framebuffer.raw_texture_page_png(texture_page)
+    }
+
+    pub fn texture_palette_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
+        self.framebuffer.texture_palette_png(texture_page, clut)
+    }
+
+    pub fn texture_diagnostics_json(&self, texture_page: u16, clut: u16) -> String {
+        self.framebuffer
+            .texture_diagnostics_json(texture_page, clut)
+    }
+
+    pub fn retained_br2_character_select_portrait_diagnostic_images(
+        &self,
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut images = Vec::new();
+        for assets in &self.br2_select_atlas_diagnostic_asset_history {
+            let mut framebuffer = self.framebuffer.clone();
+            framebuffer.restore_region_snapshot(&assets.texture);
+            framebuffer.restore_region_snapshot(&assets.clut_snapshot);
+            images.push((
+                format!(
+                    "select-atlas-gen-{:06}-vblank-{:06}-page-{:04x}-clut-{:04x}-checksum-{}.decoded.png",
+                    assets.generation,
+                    assets.vblank,
+                    assets.texture_page,
+                    assets.clut,
+                    assets
+                        .upload_checksum
+                        .map_or_else(|| "unknown".to_owned(), |checksum| format!("{checksum:08x}")),
+                ),
+                framebuffer.decoded_texture_region_png(
+                    assets.texture_page,
+                    assets.clut,
+                    0,
+                    0,
+                    256,
+                    240,
+                ),
+            ));
+        }
+        for assets in &self.retained_br2_large_portrait_asset_history {
+            let mut framebuffer = self.framebuffer.clone();
+            framebuffer.restore_region_snapshot(&assets.texture);
+            framebuffer.restore_region_snapshot(&assets.clut);
+            images.push((
+                format!(
+                    "retained-left-gen-{:06}-vblank-{:06}.decoded.png",
+                    assets.generation, assets.vblank
+                ),
+                framebuffer.decoded_texture_region_png(0x0088, 0x7d40, 0, 0, 192, 256),
+            ));
+        }
+        for assets in &self.retained_br2_right_large_portrait_asset_history {
+            let mut framebuffer = self.framebuffer.clone();
+            framebuffer.restore_region_snapshot(&assets.texture);
+            framebuffer.restore_region_snapshot(&assets.clut);
+            images.push((
+                format!(
+                    "retained-right-gen-{:06}-vblank-{:06}-page-0088.decoded.png",
+                    assets.generation, assets.vblank
+                ),
+                framebuffer.decoded_texture_region_png(0x0088, 0x7d80, 192, 0, 64, 256),
+            ));
+            images.push((
+                format!(
+                    "retained-right-gen-{:06}-vblank-{:06}-page-008a.decoded.png",
+                    assets.generation, assets.vblank
+                ),
+                framebuffer.decoded_texture_region_png(0x008a, 0x7d80, 0, 0, 128, 256),
+            ));
+        }
+        images
+    }
+
+    pub fn retained_br2_character_select_portrait_diagnostics_json(&self) -> String {
+        format!(
+            "{{\"left_available\":{},\"left_generation\":{},\"left_history\":{},\"right_available\":{},\"right_generation\":{},\"right_history\":{},\"select_atlas_history\":{},\"transfer_sequence\":{},\"presentation_vblank\":{}}}",
+            self.retained_br2_large_portrait_assets.is_some(),
+            self.retained_br2_character_select_large_portrait_asset_generation(),
+            self.retained_br2_large_portrait_asset_history.len(),
+            self.retained_br2_right_large_portrait_assets.is_some(),
+            self.retained_br2_right_large_portrait_assets
+                .as_ref()
+                .map_or(0, |assets| assets.generation),
+            self.retained_br2_right_large_portrait_asset_history.len(),
+            self.br2_select_atlas_diagnostic_asset_history.len(),
+            self.transfer_sequence,
+            self.presentation_captures,
+        )
+    }
+
     pub fn set_draw_capture_range(&mut self, start: u64, end: u64) {
         self.draw_capture_range = Some((start.min(end), start.max(end)));
         self.draw_captures.clear();
@@ -11919,13 +13323,21 @@ impl Gpu {
                     self.capture_presented_frame_before_clear(x, y, width, height);
                 }
                 self.fill_rect_commands += 1;
+                let options = if source_ref.is_some_and(GpuCommandSource::is_replay_frame_clear) {
+                    // Recovery clears are emulator-internal transactions, not
+                    // guest draws. Ignore a stale GP0(E6) mask state so masked
+                    // character-select pixels cannot survive under gameplay.
+                    PixelWriteOptions::default()
+                } else {
+                    self.pixel_write_options()
+                };
                 self.framebuffer.fill_rect_unclipped_with_options(
                     x,
                     y,
                     width,
                     height,
                     color(words[0]),
-                    self.pixel_write_options(),
+                    options,
                 );
                 self.push_recent_draw_command(GpuDrawTrace::flat(
                     "fill_rect_unclipped",
@@ -12521,13 +13933,6 @@ impl Gpu {
         let b = self.textured_point(b, b_uv);
         let c = self.textured_point(c, c_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point]);
-        preserve_br2_recovery_fighter_material_palette(
-            &mut options,
-            source,
-            texture_page,
-            clut,
-            bounds,
-        );
         preserve_br2_recovery_fighter_texture_origin(
             &mut options,
             source,
@@ -12585,13 +13990,6 @@ impl Gpu {
         let b = self.textured_point(b, b_uv);
         let c = self.textured_point(c, c_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point]);
-        preserve_br2_recovery_fighter_material_palette(
-            &mut options,
-            source,
-            texture_page,
-            clut,
-            bounds,
-        );
         preserve_br2_recovery_fighter_texture_origin(
             &mut options,
             source,
@@ -12650,13 +14048,6 @@ impl Gpu {
         let c = self.textured_point(c, c_uv);
         let d = self.textured_point(d, d_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
-        preserve_br2_recovery_fighter_material_palette(
-            &mut options,
-            source,
-            texture_page,
-            clut,
-            bounds,
-        );
         preserve_br2_recovery_fighter_texture_origin(
             &mut options,
             source,
@@ -12687,6 +14078,11 @@ impl Gpu {
             clut,
             bounds,
             &[a, b, c, d],
+        ) || should_skip_br2_stale_character_select_recovery_overlay(
+            source,
+            texture_page,
+            clut,
+            bounds,
         ) {
             (TexturedDrawStats::default(), TexturedDrawStats::default())
         } else if native_use_alternate_quad_split() {
@@ -12745,13 +14141,6 @@ impl Gpu {
         let c = self.textured_point(c, c_uv);
         let d = self.textured_point(d, d_uv);
         let bounds = points_bounds(&[a.point, b.point, c.point, d.point]);
-        preserve_br2_recovery_fighter_material_palette(
-            &mut options,
-            source,
-            texture_page,
-            clut,
-            bounds,
-        );
         preserve_br2_recovery_fighter_texture_origin(
             &mut options,
             source,
@@ -12779,8 +14168,25 @@ impl Gpu {
                 clut,
                 bounds,
                 &[a, b, c, d],
+            )
+            || should_skip_br2_stale_character_select_recovery_overlay(
+                source,
+                texture_page,
+                clut,
+                bounds,
             ) {
             (TexturedDrawStats::default(), TexturedDrawStats::default())
+        } else if source.is_some_and(GpuCommandSource::uses_alpha_bilinear_texture_filter) {
+            (
+                self.framebuffer.draw_alpha_bilinear_textured_quad(
+                    [a, b, c, d],
+                    texture_page,
+                    clut,
+                    options,
+                    self.texture_window,
+                ),
+                TexturedDrawStats::default(),
+            )
         } else if native_use_alternate_quad_split() {
             self.framebuffer.draw_textured_quad_triangles_shared(
                 [a, b, d],
@@ -13186,7 +14592,42 @@ impl Gpu {
         }
     }
 
+    fn br2_large_portrait_fingerprint_for_current_transfer(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Br2LargePortraitAssetFingerprint {
+        let upload_checksum = self
+            .recent_transfer_commands
+            .last()
+            .filter(|transfer| {
+                transfer.sequence == self.transfer_sequence
+                    && transfer.valid
+                    && transfer.dest_x == x
+                    && transfer.dest_y == y
+                    && transfer.width == width
+                    && transfer.height == height
+            })
+            .and_then(|transfer| {
+                transfer
+                    .payload
+                    .map(|payload| payload.checksum)
+                    .or_else(|| transfer.dest_after.map(|stats| stats.checksum))
+            });
+        let texture_stats = gpu_transfer_region_stats(
+            &self.framebuffer,
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_X,
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_Y,
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH as i32,
+            BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT as i32,
+        );
+        br2_large_portrait_asset_fingerprint(upload_checksum, texture_stats)
+    }
+
     fn track_br2_large_portrait_transfer(&mut self, x: i32, y: i32, width: i32, height: i32) {
+        self.track_br2_select_atlas_diagnostic_transfer(x, y, width, height);
         if transfer_is_br2_large_portrait_texture_asset(x, y, width, height) {
             self.pending_br2_large_portrait_assets = Some(PendingBr2LargePortraitAssets {
                 texture: self.framebuffer.snapshot_psx_display_region(
@@ -13195,6 +14636,8 @@ impl Gpu {
                     BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_WIDTH,
                     BR2_RETAINED_LARGE_PORTRAIT_TEXTURE_HEIGHT,
                 ),
+                fingerprint: self
+                    .br2_large_portrait_fingerprint_for_current_transfer(x, y, width, height),
                 transfer_sequence: self.transfer_sequence,
                 vblank: self.presentation_captures,
             });
@@ -13221,18 +14664,92 @@ impl Gpu {
         }
     }
 
+    fn track_br2_select_atlas_diagnostic_transfer(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) {
+        if let Some((texture_page, clut, clut_y)) =
+            br2_select_atlas_diagnostic_texture_descriptor(x, y, width, height)
+        {
+            let upload_checksum = self
+                .recent_transfer_commands
+                .last()
+                .filter(|transfer| transfer.sequence == self.transfer_sequence && transfer.valid)
+                .and_then(|transfer| {
+                    transfer
+                        .payload
+                        .map(|payload| payload.checksum)
+                        .or_else(|| transfer.dest_after.map(|stats| stats.checksum))
+                });
+            self.pending_br2_select_atlas_diagnostic_assets =
+                Some(PendingBr2SelectAtlasDiagnosticAssets {
+                    texture: self.framebuffer.snapshot_psx_display_region(
+                        x as usize,
+                        y as usize,
+                        width as usize,
+                        height as usize,
+                    ),
+                    texture_page,
+                    clut,
+                    clut_y,
+                    upload_checksum,
+                    transfer_sequence: self.transfer_sequence,
+                    vblank: self.presentation_captures,
+                });
+            return;
+        }
+
+        let completion_matches = self
+            .pending_br2_select_atlas_diagnostic_assets
+            .as_ref()
+            .is_some_and(|pending| x == 0 && y == pending.clut_y && width == 256 && height == 1);
+        if !completion_matches {
+            return;
+        }
+        let Some(pending) = self.pending_br2_select_atlas_diagnostic_assets.take() else {
+            return;
+        };
+        if self.transfer_sequence != pending.transfer_sequence.saturating_add(1)
+            || self.presentation_captures != pending.vblank
+        {
+            return;
+        }
+        let assets = Br2SelectAtlasDiagnosticAssets {
+            texture: pending.texture,
+            clut_snapshot: self.framebuffer.snapshot_psx_display_region(
+                0,
+                pending.clut_y as usize,
+                256,
+                1,
+            ),
+            texture_page: pending.texture_page,
+            clut: pending.clut,
+            upload_checksum: pending.upload_checksum,
+            generation: pending.transfer_sequence,
+            vblank: pending.vblank,
+        };
+        self.br2_select_atlas_diagnostic_asset_history
+            .push_back(assets);
+        while self.br2_select_atlas_diagnostic_asset_history.len()
+            > BR2_SELECT_ATLAS_DIAGNOSTIC_HISTORY_LIMIT
+        {
+            self.br2_select_atlas_diagnostic_asset_history.pop_front();
+        }
+    }
+
     fn finalize_pending_br2_large_portrait_assets(&mut self) {
         let Some(pending) = self.pending_br2_large_portrait_assets.take() else {
             return;
         };
-        if !self.br2_portrait_completion_sequence_valid(
+        let sequence_valid = self.br2_portrait_completion_sequence_valid(
             pending.transfer_sequence,
             pending.vblank,
             transfer_is_br2_right_large_portrait_texture_asset,
-        ) || self.presentation_captures != pending.vblank
-        {
-            return;
-        }
+        );
+        let same_vblank = self.presentation_captures == pending.vblank;
 
         let texture_bounds = rect_bounds(
             Point {
@@ -13250,13 +14767,42 @@ impl Gpu {
             BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH as i32,
             BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT as i32,
         );
-        if !transfer_region_has_image_data(&self.framebuffer, texture_bounds)
-            || !transfer_region_has_palette_data(&self.framebuffer, clut_bounds)
+        let texture_has_image_data =
+            transfer_region_has_image_data(&self.framebuffer, texture_bounds);
+        let palette_has_data = transfer_region_has_palette_data(&self.framebuffer, clut_bounds);
+        let fingerprint_valid = pending.fingerprint.is_candidate_select_panel();
+        if native_trace_br2_large_portrait_assets() {
+            eprintln!(
+                "br2-large-portrait-finalize pending_sequence={} current_sequence={} pending_vblank={} current_vblank={} sequence_valid={} same_vblank={} texture_has_image_data={} palette_has_data={} fingerprint_valid={} upload_checksum={} texture_checksum=0x{:08x} nonzero_pixels={} unique_colors={} class={:?}",
+                pending.transfer_sequence,
+                self.transfer_sequence,
+                pending.vblank,
+                self.presentation_captures,
+                sequence_valid,
+                same_vblank,
+                texture_has_image_data,
+                palette_has_data,
+                fingerprint_valid,
+                pending
+                    .fingerprint
+                    .upload_checksum
+                    .map_or_else(|| "null".to_owned(), |checksum| format!("0x{checksum:08x}")),
+                pending.fingerprint.texture_checksum,
+                pending.fingerprint.nonzero_pixels,
+                pending.fingerprint.unique_colors,
+                pending.fingerprint.class,
+            );
+        }
+        if !sequence_valid
+            || !same_vblank
+            || !texture_has_image_data
+            || !palette_has_data
+            || !fingerprint_valid
         {
             return;
         }
 
-        self.retained_br2_large_portrait_assets = Some(RetainedBr2LargePortraitAssets {
+        let assets = RetainedBr2LargePortraitAssets {
             texture: pending.texture,
             clut: self.framebuffer.snapshot_psx_display_region(
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_X as usize,
@@ -13264,8 +14810,18 @@ impl Gpu {
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
             ),
+            fingerprint: pending.fingerprint,
             generation: pending.transfer_sequence,
-        });
+            vblank: pending.vblank,
+        };
+        self.retained_br2_large_portrait_asset_history
+            .push_back(assets.clone());
+        while self.retained_br2_large_portrait_asset_history.len()
+            > BR2_RETAINED_LARGE_PORTRAIT_HISTORY_LIMIT
+        {
+            self.retained_br2_large_portrait_asset_history.pop_front();
+        }
+        self.retained_br2_large_portrait_assets = Some(assets);
     }
 
     fn finalize_pending_br2_right_large_portrait_assets(&mut self) {
@@ -13311,7 +14867,7 @@ impl Gpu {
             return;
         }
 
-        self.retained_br2_right_large_portrait_assets = Some(RetainedBr2RightLargePortraitAssets {
+        let assets = RetainedBr2RightLargePortraitAssets {
             texture: pending.texture,
             clut: self.framebuffer.snapshot_psx_display_region(
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_X as usize,
@@ -13319,7 +14875,18 @@ impl Gpu {
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_WIDTH,
                 BR2_RETAINED_LARGE_PORTRAIT_CLUT_HEIGHT,
             ),
-        });
+            generation: pending.transfer_sequence,
+            vblank: pending.vblank,
+        };
+        self.retained_br2_right_large_portrait_asset_history
+            .push_back(assets.clone());
+        while self.retained_br2_right_large_portrait_asset_history.len()
+            > BR2_RETAINED_LARGE_PORTRAIT_HISTORY_LIMIT
+        {
+            self.retained_br2_right_large_portrait_asset_history
+                .pop_front();
+        }
+        self.retained_br2_right_large_portrait_assets = Some(assets);
     }
 
     fn br2_portrait_completion_sequence_valid(
@@ -13380,6 +14947,11 @@ impl Gpu {
         trace.drawing_area_top_left = self.drawing_area_top_left;
         trace.drawing_area_bottom_right = self.drawing_area_bottom_right;
         trace.drawing_offset = self.drawing_offset;
+        if native_draw_sequence_trace_range()
+            .is_some_and(|(start, end)| (start..=end).contains(&trace.sequence))
+        {
+            eprintln!("BR2 draw trace: {}", trace.compact_json());
+        }
         if trace.score() > 0
             && self
                 .largest_draw_command
@@ -13435,6 +15007,9 @@ impl Gpu {
         }
 
         if self.predicate_draw_capture_count() >= GPU_PREDICATE_DRAW_CAPTURE_LIMIT {
+            if native_freeze_predicate_draw_captures() {
+                return;
+            }
             self.evict_oldest_predicate_draw_capture();
         }
         if self.draw_captures.len() >= GPU_DRAW_CAPTURE_LIMIT {
@@ -13475,49 +15050,70 @@ impl Gpu {
             trace
                 .bounds
                 .capture_window(display_width, display_height, 16);
-        let texture_png = trace
-            .texture_page
-            .zip(trace.clut)
-            .map(|(texture_page, clut)| self.framebuffer.decoded_texture_png(texture_page, clut));
-        let raw_texture_png = trace
-            .texture_page
-            .map(|texture_page| self.framebuffer.raw_texture_page_png(texture_page));
-        let palette_png = trace
-            .texture_page
-            .zip(trace.clut)
-            .map(|(texture_page, clut)| self.framebuffer.texture_palette_png(texture_page, clut));
-        let resolved_palette_png =
+        let expanded_assets = native_expanded_draw_capture_assets();
+        let texture_png = expanded_assets.then(|| {
+            trace
+                .texture_page
+                .zip(trace.clut)
+                .map(|(texture_page, clut)| {
+                    self.framebuffer.decoded_texture_png(texture_page, clut)
+                })
+        });
+        let raw_texture_png = expanded_assets.then(|| {
+            trace
+                .texture_page
+                .map(|texture_page| self.framebuffer.raw_texture_page_png(texture_page))
+        });
+        let palette_png = expanded_assets.then(|| {
+            trace
+                .texture_page
+                .zip(trace.clut)
+                .map(|(texture_page, clut)| {
+                    self.framebuffer.texture_palette_png(texture_page, clut)
+                })
+        });
+        let resolved_palette_png = expanded_assets.then(|| {
             trace
                 .texture_page
                 .zip(trace.clut)
                 .map(|(texture_page, clut)| {
                     self.framebuffer
                         .resolved_texture_palette_png(texture_page, clut)
-                });
-        let texture_diagnostics_json =
+                })
+        });
+        let texture_diagnostics_json = expanded_assets.then(|| {
             trace
                 .texture_page
                 .zip(trace.clut)
                 .map(|(texture_page, clut)| {
                     self.framebuffer
                         .texture_diagnostics_json(texture_page, clut)
-                });
-        let texture_candidate_images = trace
-            .texture_page
-            .zip(trace.clut)
-            .map(|(texture_page, clut)| {
-                self.framebuffer
-                    .texture_candidate_images(texture_page, clut)
-            })
-            .unwrap_or_default();
-        let palette_candidate_images = trace
-            .texture_page
-            .zip(trace.clut)
-            .map(|(texture_page, clut)| {
-                self.framebuffer
-                    .palette_candidate_images(texture_page, clut)
-            })
-            .unwrap_or_default();
+                })
+        });
+        let texture_candidate_images = if expanded_assets {
+            trace
+                .texture_page
+                .zip(trace.clut)
+                .map(|(texture_page, clut)| {
+                    self.framebuffer
+                        .texture_candidate_images(texture_page, clut)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let palette_candidate_images = if expanded_assets {
+            trace
+                .texture_page
+                .zip(trace.clut)
+                .map(|(texture_page, clut)| {
+                    self.framebuffer
+                        .palette_candidate_images(texture_page, clut)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let transfer_provenance_json = self.draw_transfer_provenance_json(trace);
         self.draw_capture_keys.push(key);
         self.draw_captures.push(NativeGpuDrawCapture {
@@ -13544,11 +15140,11 @@ impl Gpu {
             bounds_png: self
                 .framebuffer
                 .png(bounds_x, bounds_y, bounds_width, bounds_height),
-            texture_png,
-            raw_texture_png,
-            palette_png,
-            resolved_palette_png,
-            texture_diagnostics_json,
+            texture_png: texture_png.flatten(),
+            raw_texture_png: raw_texture_png.flatten(),
+            palette_png: palette_png.flatten(),
+            resolved_palette_png: resolved_palette_png.flatten(),
+            texture_diagnostics_json: texture_diagnostics_json.flatten(),
             texture_candidate_images,
             palette_candidate_images,
         });
@@ -13564,19 +15160,29 @@ impl Gpu {
         });
         let texture_generation = texture_raw_bounds_for_trace(trace).and_then(|bounds| {
             self.latest_transfer_dest_overlap(bounds, trace.command_order)
-                .map(|transfer| transfer.sequence)
+                .map(GpuTransferCaptureKey::from)
         });
         let clut_generation = clut_bounds_for_trace(trace).and_then(|bounds| {
             self.latest_transfer_dest_overlap(bounds, trace.command_order)
-                .map(|transfer| transfer.sequence)
+                .map(GpuTransferCaptureKey::from)
         });
         let clut_candidate_generation = clut_candidate_bounds_for_trace(trace)
             .into_iter()
             .filter_map(|candidate| {
                 self.latest_transfer_dest_overlap(candidate.bounds, trace.command_order)
-                    .map(|transfer| transfer.sequence)
+                    .map(GpuTransferCaptureKey::from)
             })
             .max();
+        let source = trace.source.as_ref().map(|source| {
+            let mut source = source.clone();
+            if source.kind == "recovery_dma_linked_list" {
+                // Recovery runs from whichever guest PC happened to trigger the
+                // replay. The packet address and draw contents identify the
+                // capture; a changing trigger PC must not regenerate PNGs.
+                source.pc = None;
+            }
+            source
+        });
 
         GpuDrawCaptureKey {
             kind: trace.kind,
@@ -13590,7 +15196,7 @@ impl Gpu {
             uvs: trace.uvs.clone(),
             texture_window: trace.texture_window,
             texture_options: trace.texture_options,
-            source: trace.source.clone(),
+            source,
             texture_generation,
             clut_generation,
             clut_candidate_generation,
@@ -13624,6 +15230,60 @@ impl Gpu {
         self.retained_textured_polygon_transfer_generation_valid_with_policy(words, true)
     }
 
+    pub(crate) fn br2_character_select_roster_portrait_transfer_generation_valid(
+        &self,
+        words: &[u32],
+    ) -> bool {
+        if words.len() != 9
+            || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f)
+            || texture_page(words[4]) & !0x0200 != 0x009d
+        {
+            return false;
+        }
+        let (clut_x, clut_y) = clut_origin_for_diagnostics(clut(words[2]));
+        if clut_x != 0 || !(480..=490).contains(&clut_y) {
+            return false;
+        }
+
+        // Roster palettes persist across the select scene, while the texture
+        // upload provenance must still cover the exact packet UV bounds.
+        self.retained_textured_polygon_transfer_generation_valid_with_policy(words, true)
+    }
+
+    pub(crate) fn br2_character_select_human_portrait_transfer_generation_valid(
+        &self,
+        words: &[u32],
+    ) -> bool {
+        if words.len() != 9
+            || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f)
+            || texture_page(words[4]) & !0x0200 != 0x009d
+        {
+            return false;
+        }
+        let (clut_x, clut_y) = clut_origin_for_diagnostics(clut(words[2]));
+        if clut_x != 0 || !(480..=490).contains(&clut_y) {
+            return false;
+        }
+        let texture_uvs = [words[2], words[4], words[6], words[8]]
+            .map(texture_coordinate)
+            .map(|uv| (uv.u, uv.v));
+        let min_u = texture_uvs.iter().map(|(u, _)| *u).min();
+        let max_u = texture_uvs.iter().map(|(u, _)| *u).max();
+        let min_v = texture_uvs.iter().map(|(_, v)| *v).min();
+        let max_v = texture_uvs.iter().map(|(_, v)| *v).max();
+        if min_u
+            .zip(max_u)
+            .is_none_or(|(min_u, max_u)| max_u.saturating_sub(min_u) < 160)
+            || min_v
+                .zip(max_v)
+                .is_none_or(|(min_v, max_v)| max_v.saturating_sub(min_v) < 224)
+        {
+            return false;
+        }
+
+        self.retained_textured_polygon_transfer_generation_valid_with_policy(words, true)
+    }
+
     pub(crate) fn retained_br2_character_select_large_portrait_transfer_generation_valid(
         &self,
         words: &[u32],
@@ -13642,8 +15302,8 @@ impl Gpu {
         if texture_uvs != [(0, 0), (191, 0), (0, 255), (191, 255)] {
             return false;
         }
-        if self.retained_br2_large_portrait_assets.is_some() {
-            return true;
+        if let Some(assets) = self.retained_br2_large_portrait_assets.as_ref() {
+            return assets.fingerprint.is_candidate_select_panel();
         }
 
         let textured_points = [
@@ -13823,6 +15483,54 @@ impl Gpu {
     pub(crate) fn retained_portrait_texture_generation(&self) -> u64 {
         self.retained_transfer_coverage
             .portrait_texture_generation()
+    }
+
+    pub(crate) fn textured_polygon_texture_transfer_age_vblanks(
+        &self,
+        words: &[u32],
+    ) -> Option<u64> {
+        if words.len() != 9 || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f) {
+            return None;
+        }
+
+        let texture_page = texture_page(words[4]);
+        let clut = clut(words[2]);
+        let textured_points = [
+            (words[1], words[2]),
+            (words[3], words[4]),
+            (words[5], words[6]),
+            (words[7], words[8]),
+        ]
+        .map(|(position, uv)| {
+            let texture_uv = texture_coordinate(uv);
+            TexturedPoint {
+                point: point(position),
+                u: texture_uv.u,
+                v: texture_uv.v,
+            }
+        });
+        let points = textured_points.map(|point| point.point);
+        let trace = GpuDrawTrace::textured_with_options(
+            "textured_quad",
+            texture_page,
+            clut,
+            points_bounds(&points),
+            TexturedDrawStats::default(),
+            words,
+            &textured_points,
+            self.texture_window,
+            self.texture_draw_options(words[0], texture_page),
+            None,
+        );
+        let texture_bounds = texture_raw_bounds_for_trace(&trace)?;
+        let draw_command_order = self.commands_seen.saturating_add(words.len() as u64);
+        self.latest_transfer_dest_overlap(texture_bounds, draw_command_order)
+            .map(|transfer| self.presentation_captures.saturating_sub(transfer.vblank))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_presentation_vblanks_for_test(&mut self, count: u64) {
+        self.presentation_captures = self.presentation_captures.saturating_add(count);
     }
 
     pub(crate) fn retained_portrait_texture_coverage_per_mille(&self) -> usize {
@@ -15269,6 +16977,17 @@ impl Gpu {
             candidate,
             display_width,
             display_height,
+        ) {
+            return;
+        }
+        let color_stats =
+            self.display_window_color_stats(candidate, display_width, display_height, true);
+        if self.display_window_has_br2_repeating_rock_atlas_artifact(
+            candidate,
+            display_width,
+            display_height,
+            color_stats,
+            true,
         ) {
             return;
         }
@@ -20959,6 +22678,7 @@ pub struct GpuCommandSource {
     kind: &'static str,
     address: Option<u32>,
     pc: Option<u32>,
+    alpha_bilinear: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20992,6 +22712,7 @@ impl GpuCommandSource {
             kind: "cpu_io",
             address: Some(address),
             pc,
+            alpha_bilinear: false,
         }
     }
 
@@ -21000,14 +22721,24 @@ impl GpuCommandSource {
             kind: "dma_linked_list",
             address: Some(address),
             pc,
+            alpha_bilinear: false,
         }
     }
 
     pub fn recovery_dma_linked_list(address: u32, pc: Option<u32>) -> Self {
+        Self::recovery_dma_linked_list_with_filter(address, pc, false)
+    }
+
+    fn recovery_dma_linked_list_with_filter(
+        address: u32,
+        pc: Option<u32>,
+        alpha_bilinear: bool,
+    ) -> Self {
         Self {
             kind: "recovery_dma_linked_list",
             address: Some(address),
             pc,
+            alpha_bilinear,
         }
     }
 
@@ -21016,6 +22747,7 @@ impl GpuCommandSource {
             kind: "dma_block",
             address: Some(address),
             pc,
+            alpha_bilinear: false,
         }
     }
 
@@ -21024,6 +22756,7 @@ impl GpuCommandSource {
             kind: "replay_frame_clear",
             address: None,
             pc,
+            alpha_bilinear: false,
         }
     }
 
@@ -21032,6 +22765,7 @@ impl GpuCommandSource {
             kind: "recovery_display_flip",
             address: None,
             pc,
+            alpha_bilinear: false,
         }
     }
 
@@ -21043,18 +22777,31 @@ impl GpuCommandSource {
         self.kind == "recovery_display_flip"
     }
 
+    fn is_replay_frame_clear(&self) -> bool {
+        self.kind == "replay_frame_clear"
+    }
+
     fn is_dma_linked_list(&self) -> bool {
         matches!(self.kind, "dma_linked_list" | "recovery_dma_linked_list")
     }
 
+    fn uses_alpha_bilinear_texture_filter(&self) -> bool {
+        self.alpha_bilinear
+    }
+
     fn json(&self) -> String {
         format!(
-            "{{\"kind\":\"{}\",\"address\":{},\"address_hex\":{},\"pc\":{},\"pc_hex\":{}}}",
+            "{{\"kind\":\"{}\",\"address\":{},\"address_hex\":{},\"pc\":{},\"pc_hex\":{},\"texture_filter\":\"{}\"}}",
             self.kind,
             optional_u32_json(self.address),
             optional_u32_hex_json(self.address),
             optional_u32_json(self.pc),
-            optional_u32_hex_json(self.pc)
+            optional_u32_hex_json(self.pc),
+            if self.alpha_bilinear {
+                "alpha_bilinear"
+            } else {
+                "nearest"
+            },
         )
     }
 }
@@ -21121,9 +22868,40 @@ struct GpuDrawCaptureKey {
     texture_window: Option<TextureWindow>,
     texture_options: Option<TextureDrawOptions>,
     source: Option<GpuCommandSource>,
-    texture_generation: Option<u64>,
-    clut_generation: Option<u64>,
-    clut_candidate_generation: Option<u64>,
+    texture_generation: Option<GpuTransferCaptureKey>,
+    clut_generation: Option<GpuTransferCaptureKey>,
+    clut_candidate_generation: Option<GpuTransferCaptureKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GpuTransferCaptureKey {
+    kind: &'static str,
+    source_x: Option<i32>,
+    source_y: Option<i32>,
+    dest_x: i32,
+    dest_y: i32,
+    width: i32,
+    height: i32,
+    data_words: usize,
+    payload_checksum: Option<u32>,
+    dest_checksum: Option<u32>,
+}
+
+impl From<&GpuTransferTrace> for GpuTransferCaptureKey {
+    fn from(transfer: &GpuTransferTrace) -> Self {
+        Self {
+            kind: transfer.kind,
+            source_x: transfer.source_x,
+            source_y: transfer.source_y,
+            dest_x: transfer.dest_x,
+            dest_y: transfer.dest_y,
+            width: transfer.width,
+            height: transfer.height,
+            data_words: transfer.data_words,
+            payload_checksum: transfer.payload.map(|payload| payload.checksum),
+            dest_checksum: transfer.dest_after.map(|stats| stats.checksum),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -22489,6 +24267,24 @@ fn gpu_transfer_region_stats(
     stats
 }
 
+fn br2_large_portrait_asset_fingerprint(
+    upload_checksum: Option<u32>,
+    texture_stats: GpuTransferRegionStats,
+) -> Br2LargePortraitAssetFingerprint {
+    let class = if texture_stats.nonzero_pixels > 0 && texture_stats.unique_colors >= 2 {
+        Br2LargePortraitAssetClass::CandidateSelectPanel
+    } else {
+        Br2LargePortraitAssetClass::InvalidContent
+    };
+    Br2LargePortraitAssetFingerprint {
+        upload_checksum,
+        texture_checksum: texture_stats.checksum,
+        nonzero_pixels: texture_stats.nonzero_pixels,
+        unique_colors: texture_stats.unique_colors,
+        class,
+    }
+}
+
 fn transfer_region_has_image_data(framebuffer: &NativeFrameBuffer, bounds: DrawBounds) -> bool {
     let stats = gpu_transfer_region_stats(
         framebuffer,
@@ -22994,6 +24790,24 @@ fn transfer_is_br2_right_large_portrait_completion_asset(
     x == 0 && y == 497 && width == 256 && height == 1
 }
 
+fn br2_select_atlas_diagnostic_texture_descriptor(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<(u16, u16, i32)> {
+    if width != 128 || height != 240 {
+        return None;
+    }
+    match (x, y) {
+        (512, 0) => Some((0x0088, 0x7d40, 496)),
+        (640, 0) => Some((0x008a, 0x7d80, 497)),
+        (576, 256) => Some((0x0099, 0x7c80, 498)),
+        (704, 256) => Some((0x009b, 0x7cc0, 499)),
+        _ => None,
+    }
+}
+
 fn transfer_rect_json(x: i32, y: i32, width: i32, height: i32) -> String {
     let bounds = rect_bounds(Point { x, y }, width, height);
     format!(
@@ -23284,51 +25098,6 @@ fn first_command_source(sources: &[Option<GpuCommandSource>]) -> Option<GpuComma
     sources.first().and_then(Clone::clone)
 }
 
-fn preserve_br2_recovery_fighter_material_palette(
-    options: &mut TextureDrawOptions,
-    source: Option<&GpuCommandSource>,
-    texture_page: u16,
-    clut: u16,
-    bounds: DrawBounds,
-) {
-    if is_br2_recovery_fighter_material_draw(source, texture_page, clut, bounds) {
-        options.allow_texture_descriptor_alias = false;
-    }
-}
-
-fn is_br2_recovery_fighter_material_draw(
-    source: Option<&GpuCommandSource>,
-    texture_page: u16,
-    clut: u16,
-    bounds: DrawBounds,
-) -> bool {
-    let Some(source) = source else {
-        return false;
-    };
-    let Some(address) = source.address.map(|address| address & 0x00ff_fffc) else {
-        return false;
-    };
-    if source.kind != "recovery_dma_linked_list"
-        || !(BR2_RECOVERY_FIGHTER_MATERIAL_START..BR2_RECOVERY_FIGHTER_MATERIAL_END)
-            .contains(&address)
-        || texture_page & !0x0600 != 0x001c
-        || clut != 0x7994
-    {
-        return false;
-    }
-
-    let width = bounds.right.saturating_sub(bounds.left).saturating_add(1);
-    let height = bounds.bottom.saturating_sub(bounds.top).saturating_add(1);
-    width > 1
-        && height > 1
-        && width <= 192
-        && height <= 224
-        && bounds.left <= 639
-        && bounds.right >= 0
-        && bounds.top >= 32
-        && bounds.bottom <= 431
-}
-
 fn preserve_br2_recovery_fighter_texture_origin(
     options: &mut TextureDrawOptions,
     source: Option<&GpuCommandSource>,
@@ -23353,7 +25122,10 @@ fn is_br2_recovery_long_beast_fighter_draw(
     let clut_x = usize::from(clut & 0x003f).saturating_mul(16);
     let clut_y = usize::from(clut >> 6);
     if source.kind != "recovery_dma_linked_list"
-        || !matches!(texture_page & !0x0200, 0x000c | 0x000d)
+        || !matches!(
+            br2_texture_material_descriptor(texture_page),
+            0x000c | 0x000d
+        )
         || clut_x != 64
         || !(482..=490).contains(&clut_y)
     {
@@ -23366,9 +25138,10 @@ fn is_br2_recovery_long_beast_fighter_draw(
         && height > 1
         && width <= 96
         && height <= 128
-        && bounds.left >= 256
+        && bounds.left >= -128
         && bounds.left <= 639
         && bounds.right >= 0
+        && bounds.right <= 639
         && bounds.top >= 32
         && bounds.bottom <= 431
 }
@@ -23588,7 +25361,7 @@ fn should_allow_br2_gameplay_polygon_palette_fallback(
     let command = (command_word >> 24) as u8;
     let low_bank_descriptor =
         br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut);
-    let descriptor = texture_page & !0x0200;
+    let descriptor = br2_texture_material_descriptor(texture_page);
     let clut_x = (clut & 0x3f) as usize * 16;
     let clut_y = clut_row(clut);
     // BR2 character bodies are submitted as many small polygons. Their requested
@@ -23618,7 +25391,7 @@ fn should_allow_br2_gameplay_polygon_palette_fallback(
 }
 
 fn br2_low_bank_gameplay_character_texture_descriptor(texture_page: u16, clut: u16) -> bool {
-    let texture_page = texture_page & !0x0200;
+    let texture_page = br2_texture_material_descriptor(texture_page);
     ((texture_page >> 7) & 0x03) == 0
         && (0x0008..=0x000e).contains(&texture_page)
         && (480..512).contains(&clut_row(clut))
@@ -23626,7 +25399,13 @@ fn br2_low_bank_gameplay_character_texture_descriptor(texture_page: u16, clut: u
 }
 
 fn br2_reused_texture_page_0039(texture_page: u16) -> bool {
-    texture_page & !0x0200 == 0x0039
+    br2_texture_material_descriptor(texture_page) == 0x0019
+}
+
+fn br2_texture_material_descriptor(texture_page: u16) -> u16 {
+    // TPage bits 5-6 select the PSX semi-transparency blend mode. They affect
+    // compositing, not which texture/material atlas the polygon addresses.
+    texture_page & !0x0260
 }
 
 fn should_allow_zn_low_bank_screen_rect_palette_fallback(
@@ -23754,10 +25533,51 @@ fn should_skip_br2_stale_character_select_stage_atlas_strip(
     uses_captured_u_band && uses_captured_v_band
 }
 
+fn should_skip_br2_stale_character_select_recovery_overlay(
+    source: Option<&GpuCommandSource>,
+    texture_page: u16,
+    clut: u16,
+    bounds: DrawBounds,
+) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    if source.kind != "recovery_dma_linked_list" {
+        return false;
+    }
+    let Some(address) = source.address else {
+        return false;
+    };
+    let normalized_page = texture_page & !0x0200;
+    matches!(
+        (address, normalized_page, clut),
+        (
+            0x0039_1214 | 0x0039_1264 | 0x0039_0624 | 0x0039_0674,
+            0x001a,
+            0x7e9e
+        ) | (
+            0x0039_1174 | 0x0039_119c | 0x0039_11c4 | 0x0039_11ec,
+            0x0018,
+            0x781c
+        )
+    ) && bounds.left >= 0
+        && bounds.right <= 512
+        && bounds.top >= -20
+        && bounds.bottom <= 532
+}
+
 fn native_disable_br2_stage_strip_skip() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
         std::env::var("BLOODYROAR2_NATIVE_DISABLE_BR2_STAGE_STRIP_SKIP")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn native_disable_br2_character_select_scene_snapshot() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BR2_NATIVE_DISABLE_CHARACTER_SELECT_SCENE_SNAPSHOT")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
 }
@@ -24027,8 +25847,113 @@ fn framebuffer_window_json(window: FrameBufferWindow) -> String {
     )
 }
 
+fn br2_snapshot_match_stats_json(stats: FrameBufferSnapshotMatchStats) -> String {
+    format!(
+        "{{\"samples\":{},\"reference_nonzero_samples\":{},\"exact_nonzero_matches\":{},\"exact_nonzero_match_per_mille\":{}}}",
+        stats.samples,
+        stats.reference_nonzero_samples,
+        stats.exact_nonzero_matches,
+        stats.exact_nonzero_match_per_mille(),
+    )
+}
+
 fn average_luma(stats: FrameBufferStats) -> u64 {
     stats.luma_sum.checked_div(stats.pixel_count).unwrap_or(0)
+}
+
+fn br2_character_select_live_pair_profile_matches(
+    full: FrameBufferStats,
+    top: FrameBufferStats,
+    bottom: FrameBufferStats,
+    top_color: DisplayColorStats,
+    bottom_color: DisplayColorStats,
+) -> bool {
+    let full_score = screen_observation_score(full);
+    let top_score = screen_observation_score(top);
+    let bottom_score = screen_observation_score(bottom);
+    let best_half_score = top_score.max(bottom_score);
+    let weaker_half_score = top_score.min(bottom_score);
+    let full_contains_both_fields = full_score
+        > best_half_score.saturating_add(weaker_half_score / 2)
+        || full.detail_edges
+            > top
+                .detail_edges
+                .max(bottom.detail_edges)
+                .saturating_add(top.detail_edges.min(bottom.detail_edges) / 2);
+    let top_pixels = top.pixel_count.max(1);
+    let bottom_pixels = bottom.pixel_count.max(1);
+    let top_has_dark_portrait_panel = top_color.has_scene_color_diversity()
+        && top.nonzero_pixels.saturating_mul(100) >= top_pixels.saturating_mul(55)
+        && top.nonzero_pixels.saturating_mul(100) <= top_pixels.saturating_mul(90)
+        && top.bright_pixels.saturating_mul(100) >= top_pixels.saturating_mul(8)
+        && top.bright_pixels.saturating_mul(100) <= top_pixels.saturating_mul(30)
+        && average_luma(top) <= 48
+        && top_color.bottom_band_samples > 0
+        && top_color.bottom_dark_samples.saturating_mul(100)
+            >= top_color.bottom_band_samples.saturating_mul(70)
+        && top_color.bottom_caption_samples.saturating_mul(100)
+            <= top_color.bottom_band_samples.saturating_mul(12);
+    let bottom_has_dense_roster = bottom_color.has_scene_color_diversity()
+        && bottom.nonzero_pixels.saturating_mul(100) >= bottom_pixels.saturating_mul(45)
+        && bottom.nonzero_pixels.saturating_mul(100) <= bottom_pixels.saturating_mul(85)
+        && average_luma(bottom) <= 64
+        && bottom_score > top_score.saturating_add(top_score / 3)
+        && bottom.detail_edges > top.detail_edges.saturating_add(top.detail_edges / 2)
+        && bottom.bright_pixels > top.bright_pixels.saturating_add(top.bright_pixels / 4);
+
+    full_contains_both_fields
+        && top_has_dark_portrait_panel
+        && bottom_has_dense_roster
+        && has_native_full_scene_detail(full)
+        && has_native_gameplay_display_profile(full)
+}
+
+fn br2_sparse_one_player_character_select_profile_matches(
+    full: FrameBufferStats,
+    top: FrameBufferStats,
+    bottom: FrameBufferStats,
+    top_color: DisplayColorStats,
+    bottom_color: DisplayColorStats,
+) -> bool {
+    let full_score = screen_observation_score(full);
+    let top_score = screen_observation_score(top);
+    let bottom_score = screen_observation_score(bottom);
+    let best_half_score = top_score.max(bottom_score);
+    let weaker_half_score = top_score.min(bottom_score);
+    let full_contains_both_fields = full_score
+        > best_half_score.saturating_add(weaker_half_score / 2)
+        || full.detail_edges
+            > top
+                .detail_edges
+                .max(bottom.detail_edges)
+                .saturating_add(top.detail_edges.min(bottom.detail_edges) / 2);
+    let top_pixels = top.pixel_count.max(1);
+    let bottom_pixels = bottom.pixel_count.max(1);
+    let sparse_p1_panel = top_color.has_scene_color_diversity()
+        && top.nonzero_pixels.saturating_mul(100) >= top_pixels.saturating_mul(35)
+        && top.nonzero_pixels.saturating_mul(100) <= top_pixels.saturating_mul(50)
+        && top.bright_pixels.saturating_mul(100) >= top_pixels.saturating_mul(16)
+        && top.bright_pixels.saturating_mul(100) <= top_pixels.saturating_mul(30)
+        && average_luma(top) <= 48
+        && top_color.bottom_band_samples > 0
+        && top_color.bottom_dark_samples.saturating_mul(100)
+            >= top_color.bottom_band_samples.saturating_mul(70)
+        && top_color.bottom_caption_samples.saturating_mul(100)
+            <= top_color.bottom_band_samples.saturating_mul(12);
+    let dense_roster_field = bottom_color.has_scene_color_diversity()
+        && bottom.nonzero_pixels.saturating_mul(100) >= bottom_pixels.saturating_mul(38)
+        && bottom.nonzero_pixels.saturating_mul(100) <= bottom_pixels.saturating_mul(55)
+        && average_luma(bottom) <= 48
+        && bottom_score > top_score.saturating_add(top_score / 3)
+        && bottom.detail_edges > top.detail_edges.saturating_add(top.detail_edges / 2)
+        && bottom.bright_pixels > top.bright_pixels;
+
+    full_contains_both_fields
+        && sparse_p1_panel
+        && dense_roster_field
+        && has_native_full_scene_detail(full)
+        && full.nonzero_pixels.saturating_mul(100) >= full.pixel_count.saturating_mul(38)
+        && full.nonzero_pixels.saturating_mul(100) <= full.pixel_count.saturating_mul(50)
 }
 
 fn rgb_luma(rgb: u32) -> u8 {
@@ -25710,6 +27635,7 @@ pub struct Mdec {
     decode_input_cursor: usize,
     decode_complete: bool,
     discarded_input_halfwords: u64,
+    rejected_command_writes: u64,
     decoded_output_words: Vec<u32>,
     decoded_output_index: usize,
     decoded_output_underflow_reads: u64,
@@ -25717,6 +27643,10 @@ pub struct Mdec {
     quant_luma: [u8; 64],
     quant_chroma: [u8; 64],
     scale_table: [i16; 64],
+    quant_table_uploads: u64,
+    scale_table_uploads: u64,
+    last_quant_input_checksum: u32,
+    last_scale_input_checksum: u32,
 }
 
 impl Default for Mdec {
@@ -25733,6 +27663,7 @@ impl Default for Mdec {
             decode_input_cursor: 0,
             decode_complete: true,
             discarded_input_halfwords: 0,
+            rejected_command_writes: 0,
             decoded_output_words: Vec::new(),
             decoded_output_index: 0,
             decoded_output_underflow_reads: 0,
@@ -25740,6 +27671,10 @@ impl Default for Mdec {
             quant_luma: [8; 64],
             quant_chroma: [8; 64],
             scale_table: [0; 64],
+            quant_table_uploads: 0,
+            scale_table_uploads: 0,
+            last_quant_input_checksum: 0,
+            last_scale_input_checksum: 0,
         }
     }
 }
@@ -25774,7 +27709,11 @@ impl Mdec {
 
     fn write_command_or_data(&mut self, value: u32) {
         if self.input_words_remaining == 0 {
-            self.start_command(value);
+            if self.command_busy() {
+                self.rejected_command_writes = self.rejected_command_writes.saturating_add(1);
+            } else {
+                self.start_command(value);
+            }
         } else {
             self.input_words.push(value);
             self.input_words_remaining = self.input_words_remaining.saturating_sub(1);
@@ -25835,7 +27774,7 @@ impl Mdec {
             .saturating_add(requested_words as usize);
         while self.decoded_output_words.len() < target_words && !self.decode_complete {
             let words_before = self.decoded_output_words.len();
-            self.ensure_decoded_output();
+            self.append_next_decoded_macroblock();
             if self.decoded_output_words.len() == words_before {
                 break;
             }
@@ -25847,6 +27786,8 @@ impl Mdec {
         if !self.output_fifo_pending() && !self.decode_complete {
             // Probe on a copy of the cursor so trailing FE00 padding can
             // retire the command without consuming a valid next macroblock.
+            // BR2 treats each output DMA as a bounded slice and waits for an
+            // empty FIFO before starting the next compressed input command.
             let mut probe_cursor = self.decode_input_cursor;
             if decode_next_mdec_macroblock(
                 &self.decode_input_halfwords,
@@ -25885,9 +27826,9 @@ impl Mdec {
 
     fn refresh_status(&mut self) {
         let output_pending = self.output_fifo_pending();
-        // Compressed source retained behind an empty output FIFO can either
-        // feed another output DMA or be replaced by the next command. It must
-        // not keep BR2's command-ready poll busy after the bounded strip DMA.
+        // BR2 submits one bounded 16x240 output DMA per compressed command.
+        // Remaining compressed words are not visible in the output FIFO and
+        // must not keep the guest's command-ready poll busy.
         let command_busy = self.input_words_remaining != 0 || output_pending;
         let dma_input_request = self.control & (1 << 30) != 0 && self.input_words_remaining != 0;
         let dma_output_request = self.control & (1 << 29) != 0 && output_pending;
@@ -25908,11 +27849,21 @@ impl Mdec {
         self.decoded_output_index < self.decoded_output_words.len()
     }
 
+    fn command_busy(&self) -> bool {
+        self.input_words_remaining != 0 || self.output_fifo_pending()
+    }
+
     fn ensure_decoded_output(&mut self) {
         if self.output_fifo_pending() || self.decode_complete {
             return;
         }
+        self.append_next_decoded_macroblock();
+    }
 
+    fn append_next_decoded_macroblock(&mut self) {
+        if self.decode_complete {
+            return;
+        }
         let Some(macroblock) = decode_next_mdec_macroblock(
             &self.decode_input_halfwords,
             &mut self.decode_input_cursor,
@@ -25950,18 +27901,8 @@ impl Mdec {
         self.decoded_output_index = 0;
         match self.command >> 29 {
             0x1 => {
-                if native_mdec_rgb555_output_layout() == "raw" {
-                    self.decode_input_halfwords = mdec_halfwords(&self.input_words);
-                    self.decode_complete = self.decode_input_halfwords.is_empty();
-                } else {
-                    self.decoded_output_words = decode_mdec_macroblocks(
-                        &self.input_words,
-                        &self.quant_luma,
-                        &self.quant_chroma,
-                        &self.scale_table,
-                        self.command,
-                    );
-                }
+                self.decode_input_halfwords = mdec_halfwords(&self.input_words);
+                self.decode_complete = self.decode_input_halfwords.is_empty();
             }
             0x2 => self.set_quant_tables(),
             0x3 => self.set_scale_table(),
@@ -25973,6 +27914,8 @@ impl Mdec {
 
     fn set_quant_tables(&mut self) {
         let bytes = mdec_bytes(&self.input_words);
+        self.quant_table_uploads = self.quant_table_uploads.saturating_add(1);
+        self.last_quant_input_checksum = mdec_u8_checksum(&bytes);
         for (index, value) in bytes.iter().take(64).copied().enumerate() {
             self.quant_luma[index] = value;
         }
@@ -25987,6 +27930,8 @@ impl Mdec {
 
     fn set_scale_table(&mut self) {
         let values = mdec_halfwords(&self.input_words);
+        self.scale_table_uploads = self.scale_table_uploads.saturating_add(1);
+        self.last_scale_input_checksum = mdec_u16_checksum(&values);
         for y in 0..8 {
             for x in 0..8 {
                 self.scale_table[y * 8 + x] = values.get(x * 8 + y).copied().unwrap_or(0) as i16;
@@ -26036,6 +27981,10 @@ impl Mdec {
         self.discarded_input_halfwords
     }
 
+    pub fn rejected_command_writes(&self) -> u64 {
+        self.rejected_command_writes
+    }
+
     pub fn decoded_output_checksum(&self) -> u32 {
         mdec_u32_checksum(&self.decoded_output_words)
     }
@@ -26058,8 +28007,29 @@ impl Mdec {
             .map(|word| format!("\"0x{word:08x}\""))
             .collect::<Vec<_>>()
             .join(",");
+        let first_input_halfwords = self
+            .decode_input_halfwords
+            .iter()
+            .take(32)
+            .map(|word| format!("\"0x{word:04x}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let quant_luma_head = self
+            .quant_luma
+            .iter()
+            .take(16)
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let scale_table_head = self
+            .scale_table
+            .iter()
+            .take(16)
+            .map(i16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{{\"command\":{},\"command_hex\":\"0x{:08x}\",\"control\":{},\"control_hex\":\"0x{:08x}\",\"status\":{},\"status_hex\":\"0x{:08x}\",\"input_words_remaining\":{},\"dma_input_words\":{},\"dma_output_words\":{},\"decode_input_halfwords_remaining\":{},\"decode_input_cursor\":{},\"decode_complete\":{},\"discarded_input_halfwords\":{},\"last_decoded_output_words\":{},\"decoded_output_index\":{},\"decoded_output_underflow_reads\":{},\"quant_luma_checksum\":{},\"quant_chroma_checksum\":{},\"scale_table_checksum\":{},\"scale_table_nonzero\":{},\"decoded_output_checksum\":{},\"consumed_output_words\":{},\"consumed_output_checksum\":{},\"first_output_words_hex\":[{}],\"rgb555_output_layout\":\"{}\"}}",
+            "{{\"command\":{},\"command_hex\":\"0x{:08x}\",\"control\":{},\"control_hex\":\"0x{:08x}\",\"status\":{},\"status_hex\":\"0x{:08x}\",\"input_words_remaining\":{},\"dma_input_words\":{},\"dma_output_words\":{},\"decode_input_halfwords_remaining\":{},\"decode_input_cursor\":{},\"decode_complete\":{},\"discarded_input_halfwords\":{},\"rejected_command_writes\":{},\"last_decoded_output_words\":{},\"decoded_output_index\":{},\"decoded_output_underflow_reads\":{},\"quant_table_uploads\":{},\"scale_table_uploads\":{},\"last_quant_input_checksum\":{},\"last_scale_input_checksum\":{},\"quant_luma_checksum\":{},\"quant_chroma_checksum\":{},\"scale_table_checksum\":{},\"scale_table_nonzero\":{},\"quant_luma_head\":[{}],\"scale_table_head\":[{}],\"decoded_output_checksum\":{},\"consumed_output_words\":{},\"consumed_output_checksum\":{},\"first_input_halfwords_hex\":[{}],\"first_output_words_hex\":[{}],\"rgb555_output_layout\":\"{}\"}}",
             self.command,
             self.command,
             self.control,
@@ -26073,16 +28043,24 @@ impl Mdec {
             self.decode_input_cursor,
             self.decode_complete,
             self.discarded_input_halfwords,
+            self.rejected_command_writes,
             self.last_decoded_output_words,
             self.decoded_output_index,
             self.decoded_output_underflow_reads,
+            self.quant_table_uploads,
+            self.scale_table_uploads,
+            self.last_quant_input_checksum,
+            self.last_scale_input_checksum,
             mdec_u8_checksum(&self.quant_luma),
             mdec_u8_checksum(&self.quant_chroma),
             mdec_i16_checksum(&self.scale_table),
             self.scale_table.iter().filter(|value| **value != 0).count(),
+            quant_luma_head,
+            scale_table_head,
             mdec_u32_checksum(&self.decoded_output_words),
             consumed_output_words,
             mdec_u32_checksum(&self.decoded_output_words[..consumed_output_words]),
+            first_input_halfwords,
             first_output_words,
             native_mdec_rgb555_output_layout()
         )
@@ -26096,6 +28074,14 @@ fn mdec_u8_checksum(values: &[u8]) -> u32 {
 }
 
 fn mdec_i16_checksum(values: &[i16]) -> u32 {
+    values.iter().fold(0x811c_9dc5_u32, |hash, value| {
+        value.to_le_bytes().into_iter().fold(hash, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        })
+    })
+}
+
+fn mdec_u16_checksum(values: &[u16]) -> u32 {
     values.iter().fold(0x811c_9dc5_u32, |hash, value| {
         value.to_le_bytes().into_iter().fold(hash, |hash, byte| {
             (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
@@ -26135,7 +28121,25 @@ const MDEC_ZIGZAG: [usize; 64] = [
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
+#[cfg(test)]
+const MDEC_MACROBLOCK_WIDTH: usize = 16;
+#[cfg(test)]
+const MDEC_MACROBLOCK_HEIGHT: usize = 16;
+#[cfg(test)]
+const MDEC_MACROBLOCK_PIXELS: usize = MDEC_MACROBLOCK_WIDTH * MDEC_MACROBLOCK_HEIGHT;
+#[cfg(test)]
+const MDEC_RGB555_PIXELS_PER_WORD: usize = 2;
+#[cfg(test)]
+const MDEC_16X240_RGB555_WIDTH: usize = 16;
+#[cfg(test)]
+const MDEC_16X240_RGB555_HEIGHT: usize = 240;
+#[cfg(test)]
+const MDEC_16X240_RGB555_MACROBLOCKS: usize = MDEC_16X240_RGB555_HEIGHT / MDEC_MACROBLOCK_HEIGHT;
+#[cfg(test)]
+const MDEC_16X240_RGB555_DMA_WORDS: u32 =
+    (MDEC_16X240_RGB555_WIDTH * MDEC_16X240_RGB555_HEIGHT / MDEC_RGB555_PIXELS_PER_WORD) as u32;
 
+#[cfg(test)]
 fn decode_mdec_macroblocks(
     words: &[u32],
     quant_luma: &[u8; 64],
@@ -26197,6 +28201,7 @@ fn decode_next_mdec_macroblock(
     Some(pixels)
 }
 
+#[cfg(test)]
 fn mdec_rgb555_output_pixels(macroblocks: &[[u16; 16 * 16]]) -> Vec<u16> {
     match native_mdec_rgb555_output_layout() {
         "strip-row" => flatten_mdec_rgb555_macroblocks_as_240p_strips(macroblocks)
@@ -26218,6 +28223,7 @@ fn native_mdec_rgb555_output_layout() -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn flatten_mdec_rgb555_macroblocks_raw(macroblocks: &[[u16; 16 * 16]]) -> Vec<u16> {
     macroblocks
         .iter()
@@ -26234,6 +28240,7 @@ fn flatten_mdec_rgb555_macroblocks(macroblocks: &[[u16; 16 * 16]]) -> Vec<u16> {
     flatten_mdec_rgb555_macroblocks_raw(macroblocks)
 }
 
+#[cfg(test)]
 fn flatten_mdec_rgb555_macroblocks_as_240p_strips(
     macroblocks: &[[u16; 16 * 16]],
 ) -> Option<Vec<u16>> {
@@ -26299,6 +28306,7 @@ fn flatten_mdec_rgb555_macroblocks_as_240p_strips(
     Some(pixels)
 }
 
+#[cfg(test)]
 fn flatten_mdec_rgb555_macroblocks_as_240p_column_strips(
     macroblocks: &[[u16; 16 * 16]],
 ) -> Option<Vec<u16>> {
@@ -26398,10 +28406,10 @@ fn read_mdec_block(
             break;
         }
         let value = sign_extend_10(word & 0x03ff) as i32;
+        let natural_index = MDEC_ZIGZAG[zigzag_index];
         if qscale == 0 {
-            coefficients[zigzag_index] = saturate_mdec_coefficient(value.saturating_mul(2));
+            coefficients[natural_index] = saturate_mdec_coefficient(value.saturating_mul(2));
         } else {
-            let natural_index = MDEC_ZIGZAG[zigzag_index];
             let quant_index = if native_mdec_quant_table_uses_natural_order() {
                 natural_index
             } else {
@@ -26611,9 +28619,13 @@ mod tests {
         GP0_BEST_OBSERVATION_DRAW_INTERVAL, GP0_BEST_OBSERVATION_EAGER_COMMANDS, GPU_GP0, GPU_GP1,
         Gpu, GpuCommandSource, GpuDrawTrace, GpuTransferPayloadStats, GpuTransferRegionStats,
         GpuTransferTrace, IO_REGISTER_MAP, IRQ_CONTROLLER, IRQ_MASK, IRQ_STATUS, Io, IoAccess,
-        IoDevice, MDEC_COMMAND, MDEC_STATUS, NativeGpuDrawCapturePredicate, PSX_VRAM_HEIGHT,
-        SIO_CONTROL, SIO_DATA, SIO_STATUS_IRQ_REQUEST, SPU_REGION_START,
-        STALE_PRESENTATION_CAPTURE_GRACE, STALE_PRESENTATION_DRAW_GRACE,
+        IoDevice, MDEC_16X240_RGB555_DMA_WORDS, MDEC_16X240_RGB555_HEIGHT,
+        MDEC_16X240_RGB555_MACROBLOCKS, MDEC_16X240_RGB555_WIDTH, MDEC_COMMAND,
+        MDEC_MACROBLOCK_PIXELS, MDEC_RGB555_PIXELS_PER_WORD, MDEC_STATUS, MDEC_ZIGZAG,
+        NativeGpuDrawCapturePredicate, PSX_VRAM_HEIGHT, SIO_CONTROL, SIO_DATA,
+        SIO_STATUS_IRQ_REQUEST, SPU_REGION_START, STALE_PRESENTATION_CAPTURE_GRACE,
+        STALE_PRESENTATION_DRAW_GRACE, br2_character_select_live_pair_profile_matches,
+        br2_sparse_one_player_character_select_profile_matches,
         display_window_wraps_vram_horizontally, drawing_area_clip, has_native_full_scene_detail,
         has_native_gameplay_display_profile, has_native_playfield_density,
         image_transfer_dimensions, io_register, io_register_range, is_detailed_observation,
@@ -26929,6 +28941,32 @@ mod tests {
             ),
             "captured small fighter polygons must recover their sparse gameplay CLUT"
         );
+        for (base_page, semi_transparent_page, clut) in [
+            (0x0208, 0x0228, 0x7900),
+            (0x0209, 0x0229, 0x78c0),
+            (0x020a, 0x022a, 0x78c0),
+        ] {
+            let bounds = super::DrawBounds {
+                left: 192,
+                top: 187,
+                right: 202,
+                bottom: 200,
+            };
+            assert_eq!(
+                super::br2_texture_material_descriptor(base_page),
+                super::br2_texture_material_descriptor(semi_transparent_page),
+                "semi-transparency mode must not change fighter material identity"
+            );
+            assert!(
+                super::should_allow_br2_gameplay_polygon_palette_fallback(
+                    0x2c71_91c7,
+                    semi_transparent_page,
+                    clut,
+                    bounds,
+                ),
+                "TPage 0x{semi_transparent_page:04x} must recover the same fighter palette as 0x{base_page:04x}"
+            );
+        }
         for clut in [0x7803, 0x7903] {
             assert!(
                 super::should_allow_br2_gameplay_polygon_palette_fallback(
@@ -28079,6 +30117,45 @@ mod tests {
                     1,
                     (red << 16) | (green << 8) | blue,
                 );
+            }
+        }
+    }
+
+    fn stamp_br2_stable_combat_transition_artifact(
+        io: &mut Io,
+        x_offset: usize,
+        y_offset: usize,
+        width: usize,
+        height: usize,
+        line_bands: usize,
+    ) {
+        for band in 0..line_bands {
+            let y = y_offset + 4 + band * 7;
+            for (left_percent, right_percent) in [(7, 45), (55, 93)] {
+                io.gpu.framebuffer.fill_rect_unclipped(
+                    (x_offset + width * left_percent / 100) as i32,
+                    y as i32,
+                    (width * (right_percent - left_percent) / 100) as i32,
+                    3,
+                    0x00f0_e8d8,
+                );
+            }
+        }
+
+        let text_left = x_offset + width * 37 / 100;
+        let text_right = x_offset + width * 63 / 100;
+        let text_top = y_offset + height * 38 / 100;
+        let text_bottom = y_offset + height * 48 / 100;
+        for y in text_top..text_bottom {
+            for x in text_left..text_right {
+                let color = if (x + y).is_multiple_of(4) {
+                    0x0020_40d8
+                } else {
+                    0x00f0_b820
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
             }
         }
     }
@@ -30055,6 +32132,322 @@ mod tests {
     }
 
     #[test]
+    fn gpu_character_select_snapshot_isolated_from_general_recovery_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0001);
+        io.write_u32(GPU_GP1, 0x0503_c000);
+
+        io.gpu.framebuffer.set_raw_pixel(10, 250, 0x001f);
+        io.gpu.commit_recovery_scene_snapshot();
+
+        io.gpu.framebuffer.set_raw_pixel(10, 250, 0x03e0);
+        io.gpu.commit_br2_character_select_scene_snapshot();
+
+        io.gpu.framebuffer.set_raw_pixel(10, 250, 0x7c00);
+        assert!(io.gpu.restore_br2_character_select_scene_snapshot());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(10, 250),
+            0x03e0,
+            "an incomplete transition must restore the last complete select scene"
+        );
+
+        io.gpu.clear_br2_character_select_scene_snapshot();
+        assert!(
+            io.gpu.br2_character_select_scene_snapshot.is_some(),
+            "select pixels must remain available as a post-transition contamination guard"
+        );
+        assert!(!io.gpu.br2_character_select_scene_snapshot_active);
+        assert!(
+            !io.gpu.recovery_scene_snapshot_stable,
+            "leaving select must force the general recovery scene to be revalidated"
+        );
+        io.gpu.framebuffer.set_raw_pixel(10, 250, 0x7c00);
+        assert!(!io.gpu.restore_br2_character_select_scene_snapshot());
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(10, 250),
+            0x001f,
+            "clearing select context must retain the independent general recovery scene"
+        );
+    }
+
+    #[test]
+    fn gpu_vblank_capture_restores_active_character_select_snapshot_after_display_collapse() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        let field_height = height / 2;
+        assert_eq!((width, height), (512, 480));
+
+        fill_br2_sparse_character_select_hud_field(&mut io, 0, 0, width, field_height);
+        fill_br2_character_select_live_field(&mut io, 0, field_height, width, field_height);
+        io.gpu.commit_br2_character_select_scene_snapshot();
+        let expected = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, height);
+        assert!(
+            expected[field_height * width..]
+                .iter()
+                .any(|pixel| *pixel != 0),
+            "the retained fixture must include the lower character roster"
+        );
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        io.gpu.invalidate_recovery_presentation_caches();
+        assert_eq!(
+            io.gpu
+                .current_display_window_with_dimensions(width, height)
+                .stats
+                .nonzero_pixels,
+            0,
+            "the live display must collapse before vblank restoration"
+        );
+
+        io.gpu.capture_vblank_presented_frame();
+
+        let restored = io
+            .gpu
+            .framebuffer
+            .psx_display_rgb_window(0, 0, width, height);
+        let (actual_width, actual_height, actual) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui) = io.gpu.display_rgb_frame();
+        assert_eq!(restored, expected);
+        assert_eq!((actual_width, actual_height), (width, height));
+        assert_eq!((gui_width, gui_height), (width, height));
+        assert_eq!(actual, expected);
+        assert_eq!(gui, expected);
+        assert!(
+            gui[field_height * width..].iter().any(|pixel| *pixel != 0),
+            "vblank presentation must retain the lower character roster"
+        );
+    }
+
+    #[test]
+    fn gpu_gameplay_transition_clears_only_exact_archived_select_pixels_in_top_band() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0001);
+        io.write_u32(GPU_GP1, 0x0503_c000);
+        let (display_x, display_y) = io.gpu.display_origin();
+        let (_, height) = io.gpu.display_dimensions();
+
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(display_x + 10, display_y + 10, 0x001f);
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(display_x + 11, display_y + 10, 0x03e0);
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(display_x + 10, display_y + height as i32 / 2, 0x7c00);
+        io.gpu.commit_br2_character_select_scene_snapshot();
+
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(display_x + 11, display_y + 10, 0x7fff);
+        let cleared = io
+            .gpu
+            .clear_br2_character_select_pixels_after_gameplay_transition();
+
+        assert_eq!(cleared, 1);
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(display_x + 10, display_y + 10),
+            0,
+            "stale character-select pixels must be removed from the combat HUD band"
+        );
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(display_x + 11, display_y + 10),
+            0x7fff,
+            "new combat HUD pixels must survive the selective cleanup"
+        );
+        assert_eq!(
+            io.gpu
+                .framebuffer
+                .raw_pixel(display_x + 10, display_y + height as i32 / 2),
+            0x7c00,
+            "the gameplay field below the top band must remain untouched"
+        );
+        assert!(!io.gpu.br2_character_select_scene_snapshot_active);
+        assert!(!io.gpu.recovery_scene_snapshot_stable);
+    }
+
+    #[test]
+    fn gpu_recovery_rejects_archived_character_select_scene_under_live_fighters() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_br2_character_select_live_field(&mut io, 0, 0, width, height);
+        io.gpu.commit_br2_character_select_scene_snapshot();
+        let select_snapshot = io
+            .gpu
+            .br2_character_select_scene_snapshot
+            .clone()
+            .expect("character-select snapshot");
+        let top = height / 5;
+        fill_multicolor_scene(&mut io, 0, top, width, height - top);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.invalidate_recovery_presentation_caches();
+        assert!(
+            io.gpu.current_display_retains_br2_character_select_scene(),
+            "transition logic must detect a live fight drawn under an active select snapshot"
+        );
+        io.gpu.framebuffer.restore_region_snapshot(&select_snapshot);
+        io.gpu.clear_br2_character_select_scene_snapshot();
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.capture_recovered_presented_frame();
+        io.gpu.commit_recovery_scene_snapshot();
+        let before = io.gpu.clone();
+
+        io.gpu.framebuffer.restore_region_snapshot(&select_snapshot);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            (width / 14) as i32,
+            (height / 12) as i32,
+            (width * 5 / 12) as i32,
+            (height / 28).max(4) as i32,
+            0x00f8_e020,
+        );
+        io.gpu.framebuffer.fill_rect_unclipped(
+            (width * 7 / 12) as i32,
+            (height / 12) as i32,
+            (width * 5 / 14) as i32,
+            (height / 28).max(4) as i32,
+            0x00f8_e020,
+        );
+        io.gpu.framebuffer.fill_rect_unclipped(
+            (width * 2 / 5) as i32,
+            (height * 2 / 5) as i32,
+            (width / 5) as i32,
+            (height * 2 / 5) as i32,
+            0x0020_a0f0,
+        );
+        io.gpu.invalidate_recovery_presentation_caches();
+        let contaminated = io.gpu.current_display_window();
+        assert!(
+            io.gpu
+                .display_window_has_br2_retained_character_select_scene_mixture(
+                    contaminated,
+                    width,
+                    height,
+                ),
+            "the fixture must retain a large exact select backdrop under live fight draws"
+        );
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert!(
+            matches!(
+                io.gpu.last_recovery_presentation_reason(),
+                "character_select_scene_mixture" | "fallback_character_select_scene_mixture"
+            ),
+            "unexpected recovery rejection: {}",
+            io.gpu.last_recovery_presentation_reason(),
+        );
+
+        io.gpu = before.clone();
+        io.gpu.framebuffer.fill_rect_unclipped(
+            (width * 2 / 5) as i32,
+            (height * 2 / 5) as i32,
+            (width / 6) as i32,
+            (height / 4) as i32,
+            0x0000_ffff,
+        );
+        io.gpu.invalidate_recovery_presentation_caches();
+        assert!(
+            io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before),
+            "normal gameplay animation must remain publishable after select is archived"
+        );
+        assert_eq!(io.gpu.last_recovery_presentation_reason(), "accepted");
+    }
+
+    #[test]
+    fn gpu_recovery_rejects_archived_character_select_banner_over_gameplay() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+
+        fill_br2_character_select_live_field(&mut io, 0, 0, width, height);
+        io.gpu.commit_br2_character_select_scene_snapshot();
+        let select_snapshot = io
+            .gpu
+            .br2_character_select_scene_snapshot
+            .clone()
+            .expect("character-select snapshot");
+        io.gpu.clear_br2_character_select_scene_snapshot();
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.capture_recovered_presented_frame();
+        io.gpu.commit_recovery_scene_snapshot();
+        let before = io.gpu.clone();
+
+        io.gpu.framebuffer.restore_region_snapshot(&select_snapshot);
+        let top = height / 5;
+        fill_multicolor_scene(&mut io, 0, top, width, height - top);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, height);
+        io.gpu.invalidate_recovery_presentation_caches();
+        let contaminated = io.gpu.current_display_window();
+
+        assert!(
+            io.gpu
+                .display_window_has_br2_retained_character_select_scene_mixture(
+                    contaminated,
+                    width,
+                    height,
+                ),
+            "an exact archived select banner must not survive above live gameplay"
+        );
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert!(
+            matches!(
+                io.gpu.last_recovery_presentation_reason(),
+                "character_select_scene_mixture" | "fallback_character_select_scene_mixture"
+            ),
+            "unexpected recovery rejection: {}",
+            io.gpu.last_recovery_presentation_reason(),
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_scene_snapshot_repairs_initial_blank_from_stable_presented_scene() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+
+        io.gpu.ensure_recovery_scene_snapshot();
+        assert!(!io.gpu.recovery_scene_snapshot_stable);
+
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_vblank_presented_frame();
+        let stable_pixel = io.gpu.framebuffer.raw_pixel(16, 16);
+        assert_ne!(stable_pixel, 0);
+        assert!(
+            io.gpu
+                .repair_unstable_recovery_scene_snapshot_from_presented_frame()
+        );
+        assert!(io.gpu.recovery_scene_snapshot_stable);
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(16, 16),
+            stable_pixel,
+            "an initial blank recovery snapshot must not overwrite a later verified match scene"
+        );
+    }
+
+    #[test]
     fn gpu_recovery_scene_snapshot_rejects_stale_presented_frame_as_commit_source() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
@@ -30121,6 +32514,90 @@ mod tests {
             io.gpu.framebuffer.raw_pixel(sample_x, sample_y),
             stable_pixel,
             "a presented sparse field must not replace the last stable scene"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_guard_rejects_stacked_hud_with_center_transition_residue() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        stamp_br2_stable_combat_transition_artifact(&mut io, 0, 0, width, height, 9);
+        let current = io.gpu.current_display_window();
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(current, width, height, true);
+
+        assert!(
+            super::has_native_gameplay_display_profile(current.stats),
+            "{}",
+            current.stats.json()
+        );
+        assert!(
+            io.gpu
+                .display_window_has_br2_stable_combat_transition_artifact(
+                    current,
+                    width,
+                    height,
+                    true,
+                    color_stats,
+                ),
+            "stacked left/right HUD generations with ROUND/GET READY residue must be blocked"
+        );
+        assert!(
+            io.gpu
+                .recovery_window_has_blocking_artifact(current, width, height, true)
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_guard_keeps_normal_single_hud_band_with_round_text() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        stamp_br2_stable_combat_transition_artifact(&mut io, 0, 0, width, height, 1);
+        let current = io.gpu.current_display_window();
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(current, width, height, true);
+
+        assert!(
+            !io.gpu
+                .display_window_has_br2_stable_combat_transition_artifact(
+                    current,
+                    width,
+                    height,
+                    true,
+                    color_stats,
+                ),
+            "a single current HUD band and legitimate ROUND text must remain publishable"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_guard_keeps_six_line_outlined_hud_with_round_text() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        stamp_br2_stable_combat_transition_artifact(&mut io, 0, 0, width, height, 6);
+        let current = io.gpu.current_display_window();
+        let color_stats = io
+            .gpu
+            .display_window_color_stats(current, width, height, true);
+
+        assert!(
+            !io.gpu
+                .display_window_has_br2_stable_combat_transition_artifact(
+                    current,
+                    width,
+                    height,
+                    true,
+                    color_stats,
+                ),
+            "one outlined HUD can form six long line bands and must remain publishable"
         );
     }
 
@@ -30219,6 +32696,32 @@ mod tests {
             !io.gpu
                 .capture_recovered_presented_frame_after_recovery(&before),
             "a repeating rock atlas must not become the presented character-select frame"
+        );
+    }
+
+    #[test]
+    fn gpu_vblank_capture_preserves_last_presented_scene_over_repeating_rock_atlas() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        io.gpu.capture_vblank_presented_frame();
+        let stable = io
+            .gpu
+            .presented_frame_window
+            .expect("stable presented frame");
+
+        fill_br2_repeating_rock_atlas_artifact(&mut io, 0, 0, width, height);
+        io.gpu.capture_vblank_presented_frame();
+
+        assert_eq!(
+            io.gpu
+                .presented_frame_window
+                .expect("preserved presented frame")
+                .stats
+                .checksum,
+            stable.stats.checksum,
+            "ordinary vblank capture must not cache the repeating rock atlas"
         );
     }
 
@@ -30803,6 +33306,37 @@ mod tests {
         assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
     }
 
+    #[test]
+    fn gpu_gp1_reset_preserves_vram_and_transfer_provenance() {
+        let mut io = Io::default();
+
+        io.gpu.presentation_captures = 2_054;
+        io.write_u32(GPU_GP0, 0xa000_0000);
+        io.write_u32(GPU_GP0, 0x0000_02c0);
+        io.write_u32(GPU_GP0, 0x0001_0002);
+        io.write_u32(GPU_GP0, 0x03e0_001f);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(704, 0), 0x001f);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(705, 0), 0x03e0);
+        assert_eq!(io.gpu.image_upload_commands, 1);
+        assert_eq!(io.gpu.recent_transfer_commands.len(), 1);
+
+        io.write_u32(GPU_GP1, 0x0000_0000);
+
+        assert_eq!(io.gpu.framebuffer.raw_pixel(704, 0), 0x001f);
+        assert_eq!(io.gpu.framebuffer.raw_pixel(705, 0), 0x03e0);
+        assert_eq!(io.gpu.image_upload_commands, 1);
+        assert_eq!(io.gpu.recent_transfer_commands.len(), 1);
+        assert_eq!(io.gpu.transfer_sequence, 1);
+        assert_eq!(io.gpu.presentation_captures, 2_054);
+        assert_eq!(io.gpu.commands_seen, 5);
+        assert_eq!(io.gpu.recent_gp1_commands.len(), 1);
+        assert!(
+            io.gpu
+                .recent_transfer_commands_json()
+                .contains("\"vblank\":2054")
+        );
+    }
+
     fn predicate_draw_capture_trace(texture_page: u16) -> GpuDrawTrace {
         GpuDrawTrace::textured(
             "textured_quad",
@@ -30860,6 +33394,70 @@ mod tests {
         for _ in 0..super::GPU_DRAW_CAPTURE_LIMIT + 4 {
             io.gpu.push_recent_draw_command(trace.clone());
         }
+
+        assert_eq!(io.gpu.draw_captures().len(), 1);
+        assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
+    }
+
+    #[test]
+    fn gpu_draw_capture_predicate_dedupes_recovery_trigger_pc_changes() {
+        let mut io = Io::default();
+        io.gpu
+            .set_draw_capture_predicates(vec![NativeGpuDrawCapturePredicate {
+                texture_page: Some(0x0000),
+                clut: Some(0x0040),
+                ..NativeGpuDrawCapturePredicate::default()
+            }]);
+        let mut trace = predicate_draw_capture_trace(0x0000);
+        trace.source = Some(GpuCommandSource::recovery_dma_linked_list(
+            0x0039_0cdc,
+            Some(0x8001_0000),
+        ));
+        io.gpu.push_recent_draw_command(trace.clone());
+        trace.source = Some(GpuCommandSource::recovery_dma_linked_list(
+            0x0039_0cdc,
+            Some(0x8002_0000),
+        ));
+        io.gpu.push_recent_draw_command(trace);
+
+        assert_eq!(io.gpu.draw_captures().len(), 1);
+        assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
+    }
+
+    #[test]
+    fn gpu_draw_capture_predicate_dedupes_identical_reuploads() {
+        let mut io = Io::default();
+        io.gpu
+            .set_draw_capture_predicates(vec![NativeGpuDrawCapturePredicate {
+                texture_page: Some(0x0000),
+                clut: Some(0x0040),
+                ..NativeGpuDrawCapturePredicate::default()
+            }]);
+        let trace = predicate_draw_capture_trace(0x0000);
+        let transfer = || {
+            GpuTransferTrace::image_upload(
+                0,
+                0,
+                1,
+                1,
+                1,
+                true,
+                GpuTransferPayloadStats {
+                    words: 1,
+                    halfwords: 2,
+                    nonzero_halfwords: 1,
+                    unique_colors: 1,
+                    checksum: 0x1111,
+                },
+                &[0xa000_0000, 0x0000_0000, 0x0001_0001],
+                None,
+            )
+        };
+
+        io.gpu.push_recent_transfer_command(transfer());
+        io.gpu.push_recent_draw_command(trace.clone());
+        io.gpu.push_recent_transfer_command(transfer());
+        io.gpu.push_recent_draw_command(trace);
 
         assert_eq!(io.gpu.draw_captures().len(), 1);
         assert_eq!(io.gpu.draw_captures()[0].sequence, 1);
@@ -31161,43 +33759,65 @@ mod tests {
     }
 
     #[test]
-    fn recovery_fighter_material_keeps_requested_palette() {
-        let source = GpuCommandSource::recovery_dma_linked_list(0x0003_d1d4, Some(0x802d_080c));
-        let bounds = DrawBounds {
-            left: 192,
-            top: 120,
-            right: 255,
-            bottom: 239,
-        };
-        let mut options = TextureDrawOptions::opaque_raw();
+    fn recovery_alpha_bilinear_gp0_command_filters_only_the_marked_quad() {
+        let texture_page = 0x009d_u32;
+        let clut = 0x7800_u32;
+        let (page_x, page_y) =
+            texture_page_origin_for_clut_for_diagnostics(texture_page as u16, clut as u16);
+        let mut io = Io::default();
+        io.write_u32(GPU_GP0, 0xe300_0000);
+        io.write_u32(GPU_GP0, 0xe407_ffff);
+        for (index, color) in [(1, 0x001f), (2, 0x03e0), (3, 0x7c00), (4, 0x7fff)] {
+            io.gpu.framebuffer.set_raw_pixel(index, 480, color);
+        }
+        io.gpu.framebuffer.set_raw_pixel(page_x, page_y, 0x0201);
+        io.gpu.framebuffer.set_raw_pixel(page_x, page_y + 1, 0x0403);
 
-        super::preserve_br2_recovery_fighter_material_palette(
-            &mut options,
-            Some(&source),
-            0x001c,
-            0x7994,
-            bounds,
+        let command = [
+            0x2d7f_7f7f,
+            0x0064_0064,
+            clut << 16,
+            0x0064_0066,
+            (texture_page << 16) | 0x0001,
+            0x0066_0064,
+            0x0000_0100,
+            0x0066_0066,
+            0x0000_0101,
+        ];
+        io.gpu
+            .write_recovery_alpha_bilinear_gp0_command(&command, 0x0039_9000, Some(0x802d_080c));
+
+        let trace = io.gpu.recent_draw_commands.last().expect("filtered draw");
+        assert_eq!(trace.kind, "textured_quad");
+        assert!(
+            trace
+                .source
+                .as_ref()
+                .is_some_and(GpuCommandSource::uses_alpha_bilinear_texture_filter)
         );
+        assert_eq!(io.gpu.framebuffer.raw_pixel(101, 101), 0x5294);
 
-        assert!(!options.allow_texture_descriptor_alias);
+        let ordinary = GpuCommandSource::recovery_dma_linked_list(0x0039_9000, None);
+        assert!(!ordinary.uses_alpha_bilinear_texture_filter());
     }
 
     #[test]
     fn recovery_long_beast_fighter_uses_hardware_texture_origin() {
         let source = GpuCommandSource::recovery_dma_linked_list(0x000d_787c, Some(0x802d_080c));
-        for (texture_page, clut) in [
-            (0x000c, 0x7884),
-            (0x020d, 0x7904),
-            (0x000c, 0x7944),
-            (0x020d, 0x7984),
-            (0x000c, 0x79c4),
-            (0x020d, 0x7a04),
-            (0x000c, 0x7a84),
+        for (texture_page, clut, left) in [
+            (0x000c, 0x7884, 368),
+            (0x020d, 0x7904, 368),
+            (0x000c, 0x7944, 368),
+            (0x020d, 0x7984, 368),
+            (0x000c, 0x79c4, 368),
+            (0x020d, 0x7a04, 368),
+            (0x000c, 0x7a84, 368),
+            (0x000c, 0x7a04, 128),
         ] {
             let bounds = DrawBounds {
-                left: 368,
+                left,
                 top: 237,
-                right: 407,
+                right: left + 39,
                 bottom: 288,
             };
             let mut options = TextureDrawOptions::opaque_raw();
@@ -31212,7 +33832,7 @@ mod tests {
 
             assert!(
                 !options.allow_texture_origin_alias,
-                "Long Beast TPage 0x{texture_page:04x} CLUT 0x{clut:04x} must use y=0"
+                "recovered Beast TPage 0x{texture_page:04x} CLUT 0x{clut:04x} at x={left} must use y=0"
             );
         }
     }
@@ -31233,10 +33853,10 @@ mod tests {
             right: 639,
             bottom: 431,
         };
-        let left_fighter_bounds = DrawBounds {
-            left: 128,
+        let offscreen_bounds = DrawBounds {
+            left: -192,
             top: 237,
-            right: 167,
+            right: -153,
             bottom: 288,
         };
 
@@ -31245,7 +33865,7 @@ mod tests {
             (Some(&recovery), 0x000b, 0x7a04, fighter_bounds),
             (Some(&recovery), 0x000c, 0x7844, fighter_bounds),
             (Some(&recovery), 0x000d, 0x7ac4, fighter_bounds),
-            (Some(&recovery), 0x000c, 0x7a04, left_fighter_bounds),
+            (Some(&recovery), 0x000c, 0x7a04, offscreen_bounds),
             (Some(&recovery), 0x000d, 0x79c4, oversized_bounds),
             (None, 0x000d, 0x79c4, fighter_bounds),
         ] {
@@ -31258,54 +33878,6 @@ mod tests {
                 bounds,
             );
             assert!(options.allow_texture_origin_alias);
-        }
-    }
-
-    #[test]
-    fn recovery_stage_material_keeps_palette_alias_enabled() {
-        let source = GpuCommandSource::recovery_dma_linked_list(0x0003_8ab8, Some(0x802d_080c));
-        let bounds = DrawBounds {
-            left: 80,
-            top: 180,
-            right: 144,
-            bottom: 244,
-        };
-        let mut options = TextureDrawOptions::opaque_raw();
-
-        super::preserve_br2_recovery_fighter_material_palette(
-            &mut options,
-            Some(&source),
-            0x001c,
-            0x7994,
-            bounds,
-        );
-
-        assert!(options.allow_texture_descriptor_alias);
-    }
-
-    #[test]
-    fn recovery_fighter_material_rejects_incoherent_geometry() {
-        let source = GpuCommandSource::recovery_dma_linked_list(0x0003_d1d4, Some(0x802d_080c));
-        for bounds in [
-            DrawBounds {
-                left: -300,
-                top: 0,
-                right: 900,
-                bottom: 479,
-            },
-            DrawBounds {
-                left: 192,
-                top: 12,
-                right: 255,
-                bottom: 120,
-            },
-        ] {
-            assert!(!super::is_br2_recovery_fighter_material_draw(
-                Some(&source),
-                0x001c,
-                0x7994,
-                bounds,
-            ));
         }
     }
 
@@ -37900,6 +40472,127 @@ mod tests {
     }
 
     #[test]
+    fn gpu_high_vertical_colorful_atlas_top_uses_live_bottom_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        for y in 0..field_height {
+            for x in 0..width {
+                let selector = (x * 11 + y * 17) % 5;
+                let low_red = ((x * 5 + y * 7) % 96) as u32;
+                let low_green = ((x * 7 + y * 19) % 96) as u32;
+                let low_blue = ((x * 23 + y * 3) % 128) as u32;
+                let high_red = 144 + ((x * 17 + y * 13) % 112) as u32;
+                let high_green = 144 + ((x * 13 + y * 5) % 112) as u32;
+                let high_blue = 144 + ((x * 3 + y * 23) % 112) as u32;
+                let color = match selector {
+                    0 => 0x0008_0808,
+                    1 => (high_red << 16) | (low_green << 8) | low_blue,
+                    2 => (high_red << 16) | (low_green << 8) | high_blue,
+                    3 => (low_red << 16) | (high_green << 8) | high_blue,
+                    _ => (high_red << 16) | (low_green << 8) | low_blue,
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
+            }
+        }
+        fill_multicolor_scene(&mut io, 0, field_height, width, field_height);
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 128,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io
+                .gpu
+                .current_display_window_with_dimensions(width, display_height),
+        };
+        let (top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let top_color = io
+            .gpu
+            .display_window_color_stats(top, width, field_height, true);
+        let bottom_color = io
+            .gpu
+            .display_window_color_stats(bottom, width, field_height, true);
+        let bottom_output = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_ACTIVE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: bottom,
+        };
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(top, width, field_height);
+        let gate = io.gpu.high_vertical_full_output_gate_json();
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let bottom_frame =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+
+        assert!(top_color.has_scene_color_diversity(), "{diagnostics}");
+        assert!(top_color.bucket_count >= 40, "{diagnostics}");
+        assert!(
+            io.gpu
+                .field_half_is_probable_texture_atlas_artifact(top, width, field_height),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu.field_half_texture_artifact_blocks_playability(
+                top,
+                width,
+                field_height,
+                top_color,
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            !io.gpu
+                .high_vertical_blocking_field_is_recoverable_live_scene(
+                    top,
+                    width,
+                    field_height,
+                    top_color,
+                ),
+            "{diagnostics}"
+        );
+        assert!(
+            io.gpu
+                .high_vertical_active_field_live_scene(bottom_output, bottom_color),
+            "{playability}"
+        );
+        assert!(!io.gpu.should_use_high_vertical_full_output(full), "{gate}");
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert_eq!((actual_width, actual_height), (width, field_height));
+        assert_eq!(actual_frame, bottom_frame);
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!(gui_frame, line_doubled_rgb_frame(&bottom_frame, width));
+    }
+
+    #[test]
     fn gpu_high_vertical_full_rejects_blocking_texture_artifact_half() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
@@ -38186,6 +40879,528 @@ mod tests {
         assert_eq!(actual_frame, top_frame);
         assert!(
             playability.contains("\"actual_display_source\":\"gp1_display_area_active_field\""),
+            "{playability}"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_character_select_live_pair_fallback_preserves_full_roster() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        for y in 0..field_height {
+            for x in 0..width {
+                let hash = (x * 17 + y * 31 + (x * y) / 97) % 100;
+                let color = if hash < 25 {
+                    0
+                } else {
+                    let band = (x / 32 + y / 24) % 8;
+                    [
+                        0x0008_0404,
+                        0x000c_0404,
+                        0x0010_0804,
+                        0x0014_0808,
+                        0x0018_0c08,
+                        0x001c_0c0c,
+                        0x0020_100c,
+                        0x0024_1010,
+                    ][band]
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
+            }
+        }
+        for y in field_height * 28 / 100..field_height * 73 / 100 {
+            for x in width * 6 / 100..width * 44 / 100 {
+                let hash = (x * 13 + y * 19 + (x * y) / 37) % 100;
+                let color = if hash < 6 {
+                    0
+                } else {
+                    let red = [48_u32, 80, 112, 144, 176, 208, 240][(x / 7 + y / 11) % 7];
+                    let green = [24_u32, 64, 104, 144][(x / 13 + y / 5) % 4];
+                    let blue = [16_u32, 56, 96, 136][(x / 5 + y / 17) % 4];
+                    (red << 16) | (green << 8) | blue
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
+            }
+        }
+        for y in field_height..display_height {
+            for x in 0..width {
+                let local_y = y - field_height;
+                let hash = (x * 29 + local_y * 43 + (x * local_y) / 23) % 100;
+                let color = if hash < 38 {
+                    0
+                } else if hash < 80 {
+                    let red = 12 + ((x * 19 + local_y * 7) % 92) as u32;
+                    let green = 8 + ((x * 5 + local_y * 17) % 72) as u32;
+                    let blue = 10 + ((x * 23 + local_y * 3) % 80) as u32;
+                    (red << 16) | (green << 8) | blue
+                } else {
+                    let red = 96 + ((x * 23 + local_y * 11) % 152) as u32;
+                    let green = 64 + ((x * 7 + local_y * 31) % 144) as u32;
+                    let blue = 72 + ((x * 37 + local_y * 5) % 152) as u32;
+                    (red << 16) | (green << 8) | blue
+                };
+                io.gpu
+                    .framebuffer
+                    .fill_rect_unclipped(x as i32, y as i32, 1, 1, color);
+            }
+        }
+        stamp_title_logo_overlay_marks(&mut io, 0, field_height, width, field_height);
+
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.image_upload_commands = 35;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 32;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS * 8;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 512,
+            color_changes: 524_288,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures = 180;
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io
+                .gpu
+                .current_display_window_with_dimensions(width, display_height),
+        };
+        let (top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let top_color = io
+            .gpu
+            .display_window_color_stats(top, width, field_height, true);
+        let bottom_color = io
+            .gpu
+            .display_window_color_stats(bottom, width, field_height, true);
+        let top_safe = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_SAFE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: top,
+        };
+        let gate = io.gpu.high_vertical_full_output_gate_json();
+        let output = io.gpu.current_display_output_window();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let full_frame = io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            0,
+            0,
+            width,
+            display_height,
+            io.gpu.display_24bit_enabled(),
+        );
+
+        assert!(
+            !io.gpu
+                .high_vertical_safe_field_is_br2_select_ui_recovery(top_safe, top_color),
+            "{gate}"
+        );
+        assert!(
+            io.gpu.display_window_has_title_logo_overlay_artifact(
+                bottom,
+                width,
+                field_height,
+                true
+            ),
+            "{gate}"
+        );
+        assert!(
+            io.gpu
+                .field_composed_output_has_br2_character_select_live_pair_signal(
+                    full,
+                    top,
+                    bottom,
+                    field_height,
+                    top_color,
+                    bottom_color,
+                ),
+            "{gate}"
+        );
+        assert!(
+            io.gpu
+                .field_composed_output_should_preserve_br2_character_select_full_frame(full),
+            "{gate}"
+        );
+        assert!(io.gpu.should_use_high_vertical_full_output(full), "{gate}");
+        assert_eq!(output.source, DISPLAY_SOURCE_HIGH_VERTICAL_FULL, "{gate}");
+        assert_eq!((actual_width, actual_height), (width, display_height));
+        assert_eq!(actual_frame, full_frame);
+    }
+
+    #[test]
+    fn gpu_high_vertical_character_select_snapshot_preserves_full_roster_field_pair() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_br2_sparse_character_select_hud_field(&mut io, 0, 0, width, field_height);
+        fill_br2_character_select_live_field(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.image_upload_commands = 27;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS + 10;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 512,
+            color_changes: DISPLAY_RESOLVE_MIN_ACTIVE_FIELD_RENDER_READY_COLOR_CHANGES * 2,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures =
+            DISPLAY_RESOLVE_MIN_ACTIVE_FIELD_RENDER_READY_PRESENTATION_CAPTURES + 96;
+        io.gpu.commit_br2_character_select_scene_snapshot();
+        io.gpu.clear_br2_character_select_scene_snapshot();
+        assert!(
+            !io.gpu.br2_character_select_scene_snapshot_active,
+            "the complete retained frame must survive a false gameplay-transition latch"
+        );
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io
+                .gpu
+                .current_display_window_with_dimensions(width, display_height),
+        };
+        let (top, bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let top_color = io
+            .gpu
+            .display_window_color_stats(top, width, field_height, true);
+        let top_safe = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_SAFE_FIELD,
+            field_composed: false,
+            cached: false,
+            width,
+            height: field_height,
+            window: top,
+        };
+        let full_frame = io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            0,
+            0,
+            width,
+            display_height,
+            io.gpu.display_24bit_enabled(),
+        );
+        let safe = io.gpu.safe_field_output_from_field_composed_output(full);
+        let output = io.gpu.current_display_output_window();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(
+            io.gpu
+                .high_vertical_safe_field_is_br2_select_ui_recovery(top_safe, top_color),
+            "{playability}"
+        );
+        assert!(
+            screen_observation_worth_saving(bottom.stats) && is_detailed_observation(bottom.stats),
+            "{playability}"
+        );
+        assert!(
+            io.gpu
+                .field_composed_output_should_preserve_br2_character_select_full_frame(full),
+            "{playability}"
+        );
+        assert!(
+            io.gpu.should_use_high_vertical_full_output(full),
+            "{playability}"
+        );
+        assert!(
+            safe.is_none(),
+            "a complete retained roster must not be replaced by a doubled top field: {playability}"
+        );
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            "{playability}"
+        );
+        assert!(output.field_composed, "{playability}");
+        assert_eq!((output.width, output.height), (width, display_height));
+        assert_eq!((actual_width, actual_height), (width, display_height));
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!(actual_frame, full_frame);
+        assert_eq!(gui_frame, full_frame);
+        assert!(
+            actual_frame[field_height * width..]
+                .iter()
+                .any(|pixel| *pixel != 0),
+            "the lower character roster field must remain visible"
+        );
+    }
+
+    #[test]
+    fn br2_sparse_one_player_select_profile_matches_real_capture_only_in_known_context() {
+        let full = FrameBufferStats {
+            pixel_count: 245_760,
+            nonzero_pixels: 96_937,
+            bright_pixels: 59_907,
+            luma_sum: 245_760 * 29,
+            max_luma: 247,
+            detail_edges: 59_987,
+            checksum: 3_408_288_713,
+        };
+        let top = FrameBufferStats {
+            pixel_count: 122_880,
+            nonzero_pixels: 49_286,
+            bright_pixels: 29_602,
+            luma_sum: 122_880 * 31,
+            max_luma: 222,
+            detail_edges: 21_078,
+            checksum: 870_802_103,
+        };
+        let bottom = FrameBufferStats {
+            pixel_count: 122_880,
+            nonzero_pixels: 47_651,
+            bright_pixels: 30_305,
+            luma_sum: 122_880 * 27,
+            max_luma: 247,
+            detail_edges: 38_854,
+            checksum: 1_036_912_739,
+        };
+        let top_color = DisplayColorStats {
+            samples: 5_120,
+            bottom_band_samples: 1_024,
+            bottom_caption_samples: 15,
+            bottom_dark_samples: 732,
+            red_sum: 197_678,
+            green_sum: 146_466,
+            blue_sum: 122_210,
+            red_min: 0,
+            red_max: 247,
+            green_min: 0,
+            green_max: 231,
+            blue_min: 0,
+            blue_max: 222,
+            bucket_count: 74,
+            ..DisplayColorStats::default()
+        };
+        let bottom_color = DisplayColorStats {
+            samples: 5_120,
+            bottom_band_samples: 1_024,
+            bottom_caption_samples: 23,
+            bottom_dark_samples: 909,
+            red_sum: 188_815,
+            green_sum: 103_814,
+            blue_sum: 94_480,
+            red_min: 0,
+            red_max: 255,
+            green_min: 0,
+            green_max: 255,
+            blue_min: 0,
+            blue_max: 247,
+            bucket_count: 130,
+            ..DisplayColorStats::default()
+        };
+
+        assert!(br2_sparse_one_player_character_select_profile_matches(
+            full,
+            top,
+            bottom,
+            top_color,
+            bottom_color
+        ));
+        assert!(
+            !br2_character_select_live_pair_profile_matches(
+                full,
+                top,
+                bottom,
+                top_color,
+                bottom_color
+            ),
+            "the sparse profile must remain unavailable to the generic output resolver"
+        );
+    }
+
+    #[test]
+    fn gpu_character_select_snapshot_rejects_sparse_full_frame_and_keeps_dense_archive() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        let field_height = height / 2;
+        assert_eq!((width, height), (512, 480));
+
+        fill_br2_character_select_live_field(&mut io, 0, 0, width, height);
+        assert!(io.gpu.try_commit_br2_character_select_scene_snapshot(true));
+        let archived = io
+            .gpu
+            .br2_character_select_scene_snapshot
+            .as_ref()
+            .expect("dense character-select snapshot")
+            .content_stats((0, 0, width, height));
+        assert!(
+            archived.nonzero_pixels.saturating_mul(100) >= archived.pixel_count.saturating_mul(80),
+            "{archived:?}"
+        );
+
+        io.gpu
+            .framebuffer
+            .fill_rect_unclipped(0, 0, width as i32, height as i32, 0);
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            0,
+            (width * 41 / 100) as i32,
+            field_height as i32,
+            0x001f,
+        );
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            field_height as i32,
+            (width * 39 / 100) as i32,
+            field_height as i32,
+            0x03e0,
+        );
+
+        assert!(
+            !io.gpu.try_commit_br2_character_select_scene_snapshot(true),
+            "the real sparse regression profile must never become the retained full frame"
+        );
+        let retained = io
+            .gpu
+            .br2_character_select_scene_snapshot
+            .as_ref()
+            .expect("dense snapshot must survive")
+            .content_stats((0, 0, width, height));
+        assert_eq!(retained, archived);
+        assert!(io.gpu.restore_br2_character_select_scene_snapshot());
+        assert_ne!(
+            io.gpu
+                .framebuffer
+                .raw_pixel(width as i32 - 1, height as i32 - 1)
+                & 0x7fff,
+            0,
+            "restoration must use the dense archive rather than the sparse candidate"
+        );
+    }
+
+    #[test]
+    fn gpu_character_select_snapshot_drops_initial_sparse_candidate() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        let field_height = height / 2;
+
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            0,
+            (width * 41 / 100) as i32,
+            field_height as i32,
+            0x001f,
+        );
+        io.gpu.framebuffer.fill_rect_unclipped(
+            0,
+            field_height as i32,
+            (width * 39 / 100) as i32,
+            field_height as i32,
+            0x03e0,
+        );
+
+        assert!(!io.gpu.try_commit_br2_character_select_scene_snapshot(true));
+        assert!(io.gpu.br2_character_select_scene_snapshot.is_none());
+        assert!(!io.gpu.br2_character_select_scene_snapshot_active);
+    }
+
+    #[test]
+    fn gpu_character_select_refresh_repairs_only_corrupt_bottom_field() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        assert_eq!((width, display_height), (512, 480));
+
+        fill_br2_sparse_character_select_hud_field(&mut io, 0, 0, width, field_height);
+        for y in 0..field_height {
+            for x in 0..width {
+                if io.gpu.framebuffer.raw_pixel(x as i32, y as i32) & 0x7fff == 0
+                    && (x * 17 + y * 31) % 100 < 45
+                {
+                    io.gpu.framebuffer.set_raw_pixel(x as i32, y as i32, 0x0842);
+                }
+            }
+        }
+        fill_br2_character_select_live_field(&mut io, 0, field_height, width, field_height);
+        mark_gpu_as_having_live_textured_playfield(&mut io, width, display_height);
+        io.gpu.image_upload_commands = 27;
+        io.gpu.textured_triangle_commands = DISPLAY_RESOLVE_MIN_TEXTURED_TRIANGLE_COMMANDS * 4;
+        io.gpu.textured_rect_commands = DISPLAY_RESOLVE_MIN_TEXTURED_RECT_COMMANDS + 10;
+        io.gpu.textured_draw_stats = TexturedDrawStats {
+            written_pixels: DISPLAY_RESOLVE_MIN_TEXTURED_WRITTEN_PIXELS * 512,
+            color_changes: DISPLAY_RESOLVE_MIN_ACTIVE_FIELD_RENDER_READY_COLOR_CHANGES * 2,
+            ..TexturedDrawStats::default()
+        };
+        io.gpu.presentation_captures =
+            DISPLAY_RESOLVE_MIN_ACTIVE_FIELD_RENDER_READY_PRESENTATION_CAPTURES + 96;
+
+        io.gpu.commit_br2_character_select_scene_snapshot();
+        assert!(io.gpu.br2_character_select_scene_snapshot_active);
+        let archived_bottom =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+
+        fill_warning_text_overlay_over_playfield(&mut io, 0, field_height, width, field_height);
+        stamp_title_logo_overlay_marks(&mut io, 0, field_height, width, field_height);
+        let live_top_pixel = 0x001f;
+        let live_lower_portrait_pixel = 0x03e0;
+        io.gpu.framebuffer.set_raw_pixel(40, 120, live_top_pixel);
+        io.gpu
+            .framebuffer
+            .set_raw_pixel(40, field_height as i32 + 20, live_lower_portrait_pixel);
+        io.gpu.invalidate_recovery_presentation_caches();
+
+        assert!(
+            io.gpu.refresh_br2_character_select_scene_snapshot(true),
+            "{}",
+            io.gpu.native_playability_json()
+        );
+        let repaired_bottom =
+            io.gpu
+                .framebuffer
+                .psx_display_rgb_window(0, field_height, width, field_height);
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(40, 120),
+            live_top_pixel,
+            "the current character portrait field must remain live"
+        );
+        assert_eq!(
+            io.gpu.framebuffer.raw_pixel(40, field_height as i32 + 20),
+            live_lower_portrait_pixel,
+            "the current lower portrait field must survive roster recovery"
+        );
+        assert_eq!(
+            &repaired_bottom[(322 - field_height) * width..],
+            &archived_bottom[(322 - field_height) * width..],
+            "the roster grid must be restored from the verified snapshot"
+        );
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            "{playability}"
+        );
+        assert_eq!((output.width, output.height), (width, display_height));
+        assert!(
+            io.gpu
+                .field_composed_output_should_preserve_br2_character_select_full_frame(output),
             "{playability}"
         );
     }
@@ -42766,9 +45981,21 @@ mod tests {
             None,
         ));
 
+        let output = io.gpu.current_display_output_window();
         let playability = io.gpu.native_playability_json();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
 
-        assert_eq!(io.gpu.display_rgb_frame().1, display_height);
+        assert_eq!(
+            (gui_width, gui_height),
+            (width, display_height),
+            "{playability}; output={output:?}"
+        );
+        assert_eq!(gui_frame.len(), width * display_height);
+        assert!(
+            gui_frame[..width * height].iter().any(|pixel| *pixel != 0)
+                && gui_frame[width * height..].iter().any(|pixel| *pixel != 0),
+            "GUI output must retain both high-vertical fields: {playability}; output={output:?}"
+        );
         assert!(!io.gpu.native_playable_candidate(), "{playability}");
         assert!(
             playability.contains("\"display_height\":480"),
@@ -43294,6 +46521,80 @@ mod tests {
             io.gpu.offset_point(Point { x: 64, y: 440 }),
             Point { x: 64, y: 440 },
             "coordinates already inside the target field must not receive the field offset twice"
+        );
+    }
+
+    #[test]
+    fn gpu_gp0_scaled_roster_quad_uses_standard_ps1_rasterization() {
+        let mut io = Io::default();
+        let texture_page = 0x009d_u32;
+        let clut = 0x7800_u32;
+        let (page_x, page_y) =
+            texture_page_origin_for_clut_for_diagnostics(texture_page as u16, clut as u16);
+        assert_eq!((page_x, page_y), (832, 256));
+
+        io.write_u32(GPU_GP0, 0xe300_0000);
+        io.write_u32(GPU_GP0, 0xe407_ffff);
+        io.gpu.framebuffer.set_raw_pixel(1, 480, 0x001f);
+        io.gpu.framebuffer.set_raw_pixel(2, 480, 0x03e0);
+        for v in 0..64 {
+            for packed_u in 0..29 {
+                let low = if packed_u % 2 == 0 { 1_u16 } else { 2_u16 };
+                let high = if packed_u % 2 == 0 { 2_u16 } else { 1_u16 };
+                io.gpu
+                    .framebuffer
+                    .set_raw_pixel(page_x + packed_u, page_y + v, low | (high << 8));
+            }
+        }
+
+        let portrait = [
+            0x2d7f_7f7f,
+            0x0071_0021,
+            clut << 16,
+            0x0071_00e0,
+            (texture_page << 16) | 0x0038,
+            0x0170_0021,
+            0x0000_3f00,
+            0x0170_00e0,
+            0x0000_3f38,
+        ];
+        for word in portrait {
+            io.write_u32(GPU_GP0, word);
+        }
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        let portrait_draw = io.gpu.recent_draw_commands.last().expect("portrait draw");
+        assert_eq!(portrait_draw.kind, "textured_quad");
+        assert!(
+            portrait_draw.stats.sampled_pixels > 48_000,
+            "{}",
+            portrait_draw.json()
+        );
+        assert!(portrait_draw.stats.written_pixels > 40_000);
+        assert_ne!(io.gpu.framebuffer.raw_pixel(128, 200) & 0x7fff, 0);
+
+        let roster = [
+            0x2d7f_7f7f,
+            0x0141_0064,
+            clut << 16,
+            0x0141_009c,
+            (texture_page << 16) | 0x0038,
+            0x0180_0064,
+            0x0000_3f00,
+            0x0180_009c,
+            0x0000_3f38,
+        ];
+        for word in roster {
+            io.write_u32(GPU_GP0, word);
+        }
+
+        assert_eq!(io.gpu.gp0_pending_words(), 0);
+        let roster_draw = io.gpu.recent_draw_commands.last().expect("roster draw");
+        assert_eq!(roster_draw.kind, "textured_quad");
+        assert!(
+            roster_draw.stats.written_pixels > 0,
+            "{}",
+            roster_draw.json()
         );
     }
 
@@ -44772,6 +48073,155 @@ mod tests {
     }
 
     #[test]
+    fn br2_large_human_select_portrait_requires_high_resolution_source_provenance() {
+        fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
+            io.write_u32(GPU_GP0, 0xa000_0000);
+            io.write_u32(GPU_GP0, (y << 16) | x);
+            io.write_u32(GPU_GP0, (height << 16) | width);
+            for _ in 0..width.saturating_mul(height).div_ceil(2) {
+                io.write_u32(GPU_GP0, word);
+            }
+        }
+
+        let portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7800_0000,
+            0x0071_00e0,
+            0x009d_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+        let mut io = Io::default();
+        assert!(
+            !io.gpu
+                .br2_character_select_human_portrait_transfer_generation_valid(&portrait)
+        );
+
+        upload(&mut io, 832, 256, 96, 256, 0x3210_1234);
+        upload(&mut io, 0, 480, 256, 1, 0x7fff_03e0);
+        assert!(
+            io.gpu
+                .br2_character_select_human_portrait_transfer_generation_valid(&portrait)
+        );
+
+        let mut small_geometry = portrait;
+        small_geometry[1] = 0x0141_0064;
+        small_geometry[3] = 0x0141_009c;
+        small_geometry[5] = 0x0180_0064;
+        small_geometry[7] = 0x0180_009c;
+        assert!(
+            io.gpu
+                .br2_character_select_human_portrait_transfer_generation_valid(&small_geometry),
+            "GPU provenance validation is destination-geometry independent"
+        );
+
+        let mut roster_source = portrait;
+        roster_source[4] = 0x009d_0038;
+        roster_source[6] = 0x0000_3f00;
+        roster_source[8] = 0x0000_3f38;
+        assert!(
+            !io.gpu
+                .br2_character_select_human_portrait_transfer_generation_valid(&roster_source),
+            "a 56x63 roster source must never validate as a large human portrait"
+        );
+
+        let mut stale_descriptor = portrait;
+        stale_descriptor[2] = 0x7e9f_0000;
+        stale_descriptor[4] = 0x001c_0038;
+        assert!(
+            !io.gpu
+                .br2_character_select_human_portrait_transfer_generation_valid(&stale_descriptor)
+        );
+    }
+
+    #[test]
+    fn retained_br2_large_select_panel_accepts_observed_game_atlas_checksums() {
+        fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
+            io.write_u32(GPU_GP0, 0xa000_0000);
+            io.write_u32(GPU_GP0, (y << 16) | x);
+            io.write_u32(GPU_GP0, (height << 16) | width);
+            for _ in 0..width.saturating_mul(height).div_ceil(2) {
+                io.write_u32(GPU_GP0, word);
+            }
+        }
+
+        fn seed_large_portrait_texture_with_upload_checksum(io: &mut Io, checksum: u32) {
+            for y in 0..256 {
+                for x in 512..608 {
+                    let color = if (x + y) % 3 == 0 {
+                        0x1234
+                    } else if (x + y) % 3 == 1 {
+                        0x03e0
+                    } else {
+                        0x001f
+                    };
+                    io.gpu.framebuffer.set_raw_pixel(x, y, color);
+                }
+            }
+            io.gpu
+                .push_recent_transfer_command(GpuTransferTrace::image_upload(
+                    512,
+                    0,
+                    128,
+                    240,
+                    (128usize * 240usize).div_ceil(2),
+                    true,
+                    GpuTransferPayloadStats {
+                        words: (128usize * 240usize).div_ceil(2),
+                        halfwords: 128usize * 240usize,
+                        nonzero_halfwords: 128usize * 240usize,
+                        unique_colors: 3,
+                        checksum,
+                    },
+                    &[0xa000_0000, 0x0000_0200, 0x00f0_0080],
+                    None,
+                ));
+            io.gpu.track_br2_large_portrait_transfer(512, 0, 128, 240);
+        }
+
+        let portrait = [
+            0x2c80_8080,
+            0x0071_0021,
+            0x7d40_0000,
+            0x0071_00e0,
+            0x0088_00bf,
+            0x0170_0021,
+            0x0000_ff00,
+            0x0170_00e0,
+            0x0000_ffbf,
+        ];
+
+        for checksum in [0x6962_c4eb, 0x80dc_9f23, 0x66b4_bcd1, 0x90d8_cb48] {
+            let mut io = Io::default();
+            seed_large_portrait_texture_with_upload_checksum(&mut io, checksum);
+            upload(&mut io, 0, 496, 256, 1, 0x03e0_001f);
+
+            assert!(
+                io.gpu.retained_br2_large_portrait_assets.is_some(),
+                "observed select-panel atlas checksum {checksum:#010x} must be retained"
+            );
+            assert!(
+                io.gpu
+                    .retained_br2_character_select_large_portrait_transfer_generation_valid(
+                        &portrait,
+                    ),
+                "observed select-panel atlas checksum {checksum:#010x} must validate through exact transfer provenance"
+            );
+        }
+
+        let mut accepted_io = Io::default();
+        seed_large_portrait_texture_with_upload_checksum(&mut accepted_io, 0x1234_5678);
+        upload(&mut accepted_io, 0, 496, 256, 1, 0x03e0_001f);
+        assert!(
+            accepted_io.gpu.retained_br2_large_portrait_assets.is_some(),
+            "other populated exact select-panel uploads must still retain"
+        );
+    }
+
+    #[test]
     fn retained_br2_right_large_select_portrait_requires_completed_cross_page_uploads() {
         fn upload(io: &mut Io, x: u32, y: u32, width: u32, height: u32, word: u32) {
             io.write_u32(GPU_GP0, 0xa000_0000);
@@ -45142,6 +48592,7 @@ mod tests {
     #[test]
     fn mdec_decode_produces_only_dma_requested_macroblocks() {
         let mut io = Io::default();
+        io.write_u32(MDEC_STATUS, 0x6000_0000);
         let macroblock = [
             0xfe00_2000,
             0xfe00_2000,
@@ -45179,6 +48630,7 @@ mod tests {
     #[test]
     fn mdec_output_request_completion_preserves_valid_remaining_stream() {
         let mut io = Io::default();
+        io.write_u32(MDEC_STATUS, 0x6000_0000);
         let macroblock = [
             0xfe00_2000,
             0xfe00_2000,
@@ -45214,7 +48666,6 @@ mod tests {
 
         io.mdec.begin_dma_output_request(128);
         assert_eq!(io.mdec.decoded_output_words(), 256);
-        assert!(io.mdec.decode_input_halfwords_remaining() < remaining_before);
         assert!(io.mdec.decode_complete());
         assert_eq!(io.read_u32(MDEC_STATUS) & (1 << 31), 0);
     }
@@ -45246,6 +48697,40 @@ mod tests {
         assert_eq!(io.mdec.discarded_input_halfwords(), 0);
         assert_ne!(io.read_u32(MDEC_STATUS) & (1 << 31), 0);
         assert_eq!(io.read_u32(MDEC_STATUS) & (1 << 29), 0);
+    }
+
+    #[test]
+    fn mdec_empty_output_fifo_accepts_new_command_and_discards_hidden_tail() {
+        let mut io = Io::default();
+        let macroblock = [
+            0xfe00_2000,
+            0xfe00_2000,
+            0xfe00_2040,
+            0xfe00_2060,
+            0xfe00_2080,
+            0xfe00_20a0,
+        ];
+
+        io.write_u32(MDEC_COMMAND, 0x3a00_000c);
+        for word in macroblock.into_iter().chain(macroblock) {
+            io.write_u32(MDEC_COMMAND, word);
+        }
+        io.mdec.begin_dma_output_request(128);
+        for _ in 0..128 {
+            io.mdec.read_dma_output();
+        }
+        io.mdec.complete_dma_output_request();
+
+        let remaining = io.mdec.decode_input_halfwords_remaining();
+        io.write_u32(MDEC_COMMAND, 0x4000_0001);
+
+        assert!(remaining > 0);
+        assert_eq!(io.mdec.command(), 0x4000_0001);
+        assert_eq!(io.mdec.input_words_remaining(), 32);
+        assert_eq!(io.mdec.decode_input_halfwords_remaining(), 0);
+        assert_eq!(io.mdec.discarded_input_halfwords(), remaining as u64);
+        assert_eq!(io.mdec.rejected_command_writes(), 0);
+        assert_ne!(io.read_u32(MDEC_STATUS) & (1 << 29), 0);
     }
 
     #[test]
@@ -45450,6 +48935,110 @@ mod tests {
     }
 
     #[test]
+    fn mdec_1920_word_dma_output_forms_vertical_16x240_strip() {
+        fn unpack_words(words: &[u32]) -> Vec<u16> {
+            let mut pixels = Vec::with_capacity(words.len() * 2);
+            for word in words {
+                pixels.push((word & 0xffff) as u16);
+                pixels.push((word >> 16) as u16);
+            }
+            pixels
+        }
+
+        fn push_dc_macroblock(words: &mut Vec<u32>, y_dc: u16) {
+            let neutral_chroma = 0xfe00_2000;
+            let y = 0xfe00_0000 | u32::from(0x2000 | (y_dc & 0x03ff));
+            words.extend([neutral_chroma, neutral_chroma, y, y, y, y]);
+        }
+
+        let mut input_words = Vec::new();
+        for macroblock_index in 0..MDEC_16X240_RGB555_MACROBLOCKS {
+            push_dc_macroblock(&mut input_words, (macroblock_index * 8) as u16);
+        }
+
+        let mut io = Io::default();
+        io.write_u32(MDEC_STATUS, 0x6000_0000);
+        io.write_u32(
+            MDEC_COMMAND,
+            0x2000_0000 | input_words.len().try_into().unwrap_or(0),
+        );
+        for word in input_words {
+            io.mdec.write_dma_input(word);
+        }
+
+        io.mdec
+            .begin_dma_output_request(MDEC_16X240_RGB555_DMA_WORDS);
+        let words = (0..MDEC_16X240_RGB555_DMA_WORDS)
+            .map(|_| io.mdec.read_dma_output())
+            .collect::<Vec<_>>();
+        let pixels = unpack_words(&words);
+
+        assert_eq!(
+            words.len(),
+            (MDEC_16X240_RGB555_WIDTH * MDEC_16X240_RGB555_HEIGHT) / MDEC_RGB555_PIXELS_PER_WORD
+        );
+        assert_eq!(io.mdec.decoded_output_words(), words.len());
+        assert_eq!(pixels[0], pixels[15]);
+        assert_eq!(
+            pixels[0], pixels[16],
+            "each 16-pixel row must remain contiguous inside the vertical strip"
+        );
+        assert_ne!(
+            pixels[0], pixels[MDEC_MACROBLOCK_PIXELS],
+            "the second macroblock must begin after the first complete 16x16 block"
+        );
+    }
+
+    #[test]
+    fn mdec_output_dma_keeps_requests_bounded_to_guest_slice() {
+        fn push_dc_macroblock(words: &mut Vec<u32>, y_dc: u16) {
+            let neutral_chroma = 0xfe00_2000;
+            let y = 0xfe00_0000 | u32::from(0x2000 | (y_dc & 0x03ff));
+            words.extend([neutral_chroma, neutral_chroma, y, y, y, y]);
+        }
+
+        let mut input_words = Vec::new();
+        for macroblock_index in 0..30 {
+            push_dc_macroblock(&mut input_words, (macroblock_index * 8) as u16);
+        }
+
+        let mut io = Io::default();
+        io.write_u32(MDEC_STATUS, 0x6000_0000);
+        io.write_u32(
+            MDEC_COMMAND,
+            0x2000_0000 | input_words.len().try_into().unwrap_or(0),
+        );
+        for word in input_words {
+            io.mdec.write_dma_input(word);
+        }
+
+        io.mdec
+            .begin_dma_output_request(MDEC_16X240_RGB555_DMA_WORDS);
+        let first_output = (0..MDEC_16X240_RGB555_DMA_WORDS)
+            .map(|_| io.mdec.read_dma_output())
+            .collect::<Vec<_>>();
+        assert!(first_output.iter().any(|word| *word != 0));
+        io.mdec.complete_dma_output_request();
+
+        assert!(!io.mdec.output_fifo_pending());
+        assert!(!io.mdec.decode_complete());
+        assert_ne!(io.read_u32(MDEC_STATUS) & (1 << 31), 0);
+        assert_eq!(io.read_u32(MDEC_STATUS) & (1 << 27), 0);
+
+        io.mdec
+            .begin_dma_output_request(MDEC_16X240_RGB555_DMA_WORDS);
+        let second_output = (0..MDEC_16X240_RGB555_DMA_WORDS)
+            .map(|_| io.mdec.read_dma_output())
+            .collect::<Vec<_>>();
+        assert!(second_output.iter().any(|word| *word != 0));
+        io.mdec.complete_dma_output_request();
+
+        assert_eq!(io.mdec.discarded_input_halfwords(), 0);
+        assert!(io.mdec.decode_complete());
+        assert!(!io.mdec.output_fifo_pending());
+    }
+
+    #[test]
     fn mdec_240p_frame_packing_keeps_trailing_padding_macroblocks() {
         let macroblocks = (0..303)
             .map(|index| [index as u16; 16 * 16])
@@ -45550,6 +49139,22 @@ mod tests {
         super::read_mdec_block(&halfwords, &mut cursor, &[8; 64], &[0; 64]).unwrap();
 
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn mdec_qscale_zero_ac_coefficients_still_use_zigzag_order() {
+        let halfwords = [0x0000, 0x0500, 0xfe00];
+        let mut cursor = 0;
+
+        let block = super::read_mdec_block(&halfwords, &mut cursor, &[8; 64], &[0; 64]).unwrap();
+
+        let mut expected_coefficients = [0_i32; 64];
+        expected_coefficients[MDEC_ZIGZAG[2]] = 512;
+        let mut wrong_coefficients = [0_i32; 64];
+        wrong_coefficients[2] = 512;
+        assert_eq!(block, super::idct_8x8(&expected_coefficients));
+        assert_ne!(block, super::idct_8x8(&wrong_coefficients));
+        assert_eq!(cursor, 3);
     }
 
     #[test]

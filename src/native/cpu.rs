@@ -1,4 +1,5 @@
 use crate::native::bus::{Br2NativeCreditHleCheck, Bus};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 const CP0_STATUS: usize = 12;
@@ -1289,6 +1290,27 @@ const BR2_RUNTIME_ALLOCATOR_LINK_HALFWORD_LOAD_PC: u32 = 0x8035_1298;
 const BR2_RUNTIME_ALLOCATOR_LINK_HALFWORD_RELOAD_PC: u32 = 0x8035_12b4;
 const BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN: u32 = 0x8035_0720;
 const BR2_RUNTIME_ALLOCATOR_LINK_HLE_CYCLES: u64 = 8;
+const BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC: u32 = 0x8035_12c4;
+const BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_SIGNATURE: [(u32, u32); 11] = [
+    (0x8035_12bc, 0x1440_fff9),
+    (0x8035_12c0, 0x0000_0000),
+    (0x8035_12c4, 0x8ce2_0008),
+    (0x8035_12c8, 0x0000_0000),
+    (0x8035_12cc, 0x0046_102a),
+    (0x8035_12d0, 0x1440_fff4),
+    (0x8035_12d4, 0x2403_fffc),
+    (0x8035_12d8, 0x24c4_0003),
+    (0x8035_12dc, 0x8ce2_0008),
+    (0x8035_12e0, 0x0083_3024),
+    (0x8035_12e4, 0x0046_1023),
+];
+const BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_CALLER_SIGNATURE: [(u32, u32); 5] = [
+    (0x8035_0718, 0x0c0d_4499),
+    (0x8035_071c, 0x24c6_001c),
+    (0x8035_0720, 0x0040_2021),
+    (0x8035_0724, 0x1480_0003),
+    (0x8035_0728, 0x0011_1080),
+];
 const BR2_RUNTIME_ALLOCATOR_LINK_SIGNATURE: [(u32, u32); 20] = [
     (0x8035_1264, 0x0080_4821),
     (0x8035_1268, 0x0009_2100),
@@ -2638,6 +2660,135 @@ impl Br2MatrixMultiplySample {
     }
 }
 
+const BR2_RUNTIME_CALLBACK_TRACE_SITE_COUNT: usize = 4;
+const BR2_RUNTIME_CALLBACK_TRACE_MAX_UNIQUE_ENTRIES: usize = 512;
+const BR2_RUNTIME_CALLBACK_TRACE_EXECUTED: u8 = 0;
+const BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_TARGET: u8 = 1;
+const BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_OBJECT_ARGUMENT: u8 = 2;
+const BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_MODEL_CHILD_ARGUMENT: u8 = 3;
+const BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_CALLBACK_OBJECT_ARGUMENT: u8 = 4;
+const BR2_RUNTIME_CALLBACK_TRACE_SITE_REJECTED: u8 = 5;
+const BR2_RUNTIME_CALLBACK_TRACE_DELAY_SLOT: u8 = 6;
+
+#[derive(Clone, Debug, Default)]
+struct Br2RuntimeCallbackJalrDiagnostics {
+    visits: [u64; BR2_RUNTIME_CALLBACK_TRACE_SITE_COUNT],
+    dropped_unique_entries: u64,
+    entries: BTreeMap<(u32, u32, u32, u8, u8), u64>,
+}
+
+impl Br2RuntimeCallbackJalrDiagnostics {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn record(
+        &mut self,
+        site_pc: u32,
+        target: u32,
+        return_address: u32,
+        target_register: usize,
+        reason: u8,
+    ) {
+        if !trace_runtime_callback_jalr() {
+            return;
+        }
+        let Some(site_index) = br2_runtime_callback_trace_site_index(site_pc) else {
+            return;
+        };
+        self.visits[site_index] = self.visits[site_index].saturating_add(1);
+        let key = (
+            site_pc,
+            target,
+            return_address,
+            target_register as u8,
+            reason,
+        );
+        if let Some(count) = self.entries.get_mut(&key) {
+            *count = count.saturating_add(1);
+        } else if self.entries.len() < BR2_RUNTIME_CALLBACK_TRACE_MAX_UNIQUE_ENTRIES {
+            self.entries.insert(key, 1);
+        } else {
+            self.dropped_unique_entries = self.dropped_unique_entries.saturating_add(1);
+        }
+    }
+
+    fn json(&self) -> String {
+        let sites = [
+            BR2_RUNTIME_RENDER_CALLBACK_JALR_PC,
+            BR2_RUNTIME_SCENE_CALLBACK_JALR_PC,
+            BR2_RUNTIME_MODEL_CALLBACK_JALR_PC,
+            BR2_RUNTIME_NULL_CALLBACK_JALR_PC,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, site_pc)| {
+            format!(
+                "{{\"name\":\"{}\",\"pc\":{},\"pc_hex\":\"0x{site_pc:08x}\",\"visits\":{}}}",
+                br2_runtime_callback_trace_site_name(site_pc),
+                site_pc,
+                self.visits[index],
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+        let mut entries = self
+            .entries
+            .iter()
+            .map(
+                |(&(site_pc, target, return_address, target_register, reason), &count)| {
+                    (
+                        site_pc,
+                        target,
+                        return_address,
+                        target_register,
+                        reason,
+                        count,
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| {
+            right
+                .5
+                .cmp(&left.5)
+                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.4.cmp(&right.4))
+        });
+        let entries = entries
+            .into_iter()
+            .map(
+                |(site_pc, target, return_address, target_register, reason, count)| {
+                    format!(
+                        "{{\"site\":\"{}\",\"site_pc\":{},\"site_pc_hex\":\"0x{site_pc:08x}\",\"target\":{},\"target_hex\":\"0x{target:08x}\",\"return_address\":{},\"return_address_hex\":\"0x{return_address:08x}\",\"target_register\":{},\"reason\":\"{}\",\"count\":{count}}}",
+                        br2_runtime_callback_trace_site_name(site_pc),
+                        site_pc,
+                        target,
+                        return_address,
+                        target_register,
+                        br2_runtime_callback_trace_reason_name(reason),
+                    )
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(",");
+        let total = self
+            .visits
+            .iter()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count));
+        format!(
+            "{{\"enabled\":{},\"total\":{},\"dropped_unique_entries\":{},\"sites\":[{}],\"entries\":[{}]}}",
+            trace_runtime_callback_jalr(),
+            total,
+            self.dropped_unique_entries,
+            sites,
+            entries,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Cpu {
     pub regs: [u32; 32],
@@ -2664,6 +2815,7 @@ pub struct Cpu {
     gte_nclip_positive: u64,
     gte_nclip_negative: u64,
     gte_nclip_zero: u64,
+    gte_pc_command_counts: BTreeMap<(u32, u8), u64>,
     br2_packet_rtpt_calls: u64,
     br2_packet_rtpt_saturated_calls: u64,
     br2_packet_rtpt_normal_samples: usize,
@@ -2718,6 +2870,7 @@ pub struct Cpu {
     br2_render_submit_gate: Br2RenderSubmitGateDiagnostics,
     br2_packed_vertex_helper: Br2PackedVertexHelperDiagnostics,
     br2_packed_pointer_table_caller: Br2PackedPointerTableCallerDiagnostics,
+    br2_runtime_callback_jalr: Br2RuntimeCallbackJalrDiagnostics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2903,6 +3056,7 @@ impl Default for Cpu {
             gte_nclip_positive: 0,
             gte_nclip_negative: 0,
             gte_nclip_zero: 0,
+            gte_pc_command_counts: BTreeMap::new(),
             br2_packet_rtpt_calls: 0,
             br2_packet_rtpt_saturated_calls: 0,
             br2_packet_rtpt_normal_samples: 0,
@@ -2957,6 +3111,7 @@ impl Default for Cpu {
             br2_render_submit_gate: Br2RenderSubmitGateDiagnostics::default(),
             br2_packed_vertex_helper: Br2PackedVertexHelperDiagnostics::default(),
             br2_packed_pointer_table_caller: Br2PackedPointerTableCallerDiagnostics::default(),
+            br2_runtime_callback_jalr: Br2RuntimeCallbackJalrDiagnostics::default(),
         }
     }
 }
@@ -3432,7 +3587,7 @@ impl Cpu {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"badvaddr\":{},\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{},\"r8\":{},\"r9\":{},\"r10\":{},\"r11\":{},\"r16\":{},\"r17\":{},\"r18\":{},\"r19\":{},\"r20\":{},\"r21\":{},\"r22\":{},\"r23\":{},\"r29\":{},\"r31\":{},\"br2_corrupt_runtime_recovery_hles\":{},\"br2_control_callback_cycle\":{},\"br2_render_submit_gate\":{},\"br2_packed_vertex_helper\":{},\"br2_packed_pointer_table_caller\":{},\"gte_command_counts\":[{}]}}",
+            "{{\"pc\":{},\"next_pc\":{},\"cycles\":{},\"halted\":{},\"status\":{},\"cause\":{},\"epc\":{},\"badvaddr\":{},\"r2\":{},\"r3\":{},\"r4\":{},\"r5\":{},\"r6\":{},\"r8\":{},\"r9\":{},\"r10\":{},\"r11\":{},\"r16\":{},\"r17\":{},\"r18\":{},\"r19\":{},\"r20\":{},\"r21\":{},\"r22\":{},\"r23\":{},\"r29\":{},\"r31\":{},\"br2_corrupt_runtime_recovery_hles\":{},\"br2_control_callback_cycle\":{},\"br2_render_submit_gate\":{},\"br2_packed_vertex_helper\":{},\"br2_packed_pointer_table_caller\":{},\"br2_runtime_callback_jalr\":{},\"gte_command_counts\":[{}]}}",
             self.pc,
             self.next_pc,
             self.cycles,
@@ -3465,6 +3620,7 @@ impl Cpu {
             self.br2_render_submit_gate.json(),
             self.br2_packed_vertex_helper.json(),
             self.br2_packed_pointer_table_caller.json(),
+            self.br2_runtime_callback_jalr.json(),
             self.gte_command_counts_json()
         )
     }
@@ -3596,6 +3752,18 @@ impl Cpu {
         optional_u32_hex_json(self.delay_slot_branch_pc)
     }
 
+    pub fn reset_gte_pc_histogram(&mut self) {
+        self.gte_pc_command_counts.clear();
+    }
+
+    pub fn reset_br2_runtime_callback_jalr_diagnostics(&mut self) {
+        self.br2_runtime_callback_jalr.reset();
+    }
+
+    pub fn br2_runtime_callback_jalr_diagnostics_json(&self) -> String {
+        self.br2_runtime_callback_jalr.json()
+    }
+
     pub fn gte_json(&self) -> String {
         let packet_rtpt_samples = self
             .br2_packet_rtpt_samples
@@ -3609,8 +3777,9 @@ impl Cpu {
             .map(Br2MatrixMultiplySample::json)
             .collect::<Vec<_>>()
             .join(",");
+        let gte_pc_histogram = self.gte_pc_histogram_json();
         format!(
-            "{{\"projected_vertices\":{},\"zero_depth_vertices\":{},\"projection_saturated_vertices\":{},\"screen_outlier_vertices\":{},\"screen_min_x\":{},\"screen_max_x\":{},\"screen_min_y\":{},\"screen_max_y\":{},\"depth_min\":{},\"depth_max\":{},\"otz_min\":{},\"otz_max\":{},\"mvmva_mx_counts\":[{}],\"mvmva_v_counts\":[{}],\"mvmva_cv_counts\":[{}],\"mvmva_cv2_special_cases\":{},\"nclip_positive\":{},\"nclip_negative\":{},\"nclip_zero\":{},\"br2_packet_rtpt\":{{\"pc_hex\":\"0x{:08x}\",\"calls\":{},\"saturated_calls\":{},\"samples\":[{}]}},\"br2_matrix_multiply\":{{\"entry_pc_hex\":\"0x{:08x}\",\"result_pc_hex\":\"0x{:08x}\",\"calls\":{},\"saturated_calls\":{},\"samples\":[{}]}},\"sxy0\":{},\"sxy1\":{},\"sxy2\":{},\"sz1\":{},\"sz2\":{},\"sz3\":{},\"otz\":{},\"ir0\":{},\"ir1\":{},\"ir2\":{},\"ir3\":{},\"mac0\":{},\"mac1\":{},\"mac2\":{},\"mac3\":{},\"flag\":{},\"lzcr\":{},\"ofx\":{},\"ofy\":{},\"h\":{},\"dqa\":{},\"dqb\":{},\"zsf3\":{},\"zsf4\":{}}}",
+            "{{\"projected_vertices\":{},\"zero_depth_vertices\":{},\"projection_saturated_vertices\":{},\"screen_outlier_vertices\":{},\"screen_min_x\":{},\"screen_max_x\":{},\"screen_min_y\":{},\"screen_max_y\":{},\"depth_min\":{},\"depth_max\":{},\"otz_min\":{},\"otz_max\":{},\"mvmva_mx_counts\":[{}],\"mvmva_v_counts\":[{}],\"mvmva_cv_counts\":[{}],\"mvmva_cv2_special_cases\":{},\"nclip_positive\":{},\"nclip_negative\":{},\"nclip_zero\":{},\"pc_histogram\":{},\"br2_packet_rtpt\":{{\"pc_hex\":\"0x{:08x}\",\"calls\":{},\"saturated_calls\":{},\"samples\":[{}]}},\"br2_matrix_multiply\":{{\"entry_pc_hex\":\"0x{:08x}\",\"result_pc_hex\":\"0x{:08x}\",\"calls\":{},\"saturated_calls\":{},\"samples\":[{}]}},\"sxy0\":{},\"sxy1\":{},\"sxy2\":{},\"sz1\":{},\"sz2\":{},\"sz3\":{},\"otz\":{},\"ir0\":{},\"ir1\":{},\"ir2\":{},\"ir3\":{},\"mac0\":{},\"mac1\":{},\"mac2\":{},\"mac3\":{},\"flag\":{},\"lzcr\":{},\"ofx\":{},\"ofy\":{},\"h\":{},\"dqa\":{},\"dqb\":{},\"zsf3\":{},\"zsf4\":{}}}",
             self.gte_projected_vertices,
             self.gte_zero_depth_vertices,
             self.gte_projection_saturated_vertices,
@@ -3636,6 +3805,7 @@ impl Cpu {
             self.gte_nclip_positive,
             self.gte_nclip_negative,
             self.gte_nclip_zero,
+            gte_pc_histogram,
             BR2_PACKET_RTPT_PC,
             self.br2_packet_rtpt_calls,
             self.br2_packet_rtpt_saturated_calls,
@@ -3669,6 +3839,43 @@ impl Cpu {
             self.cop2_control[28],
             self.cop2_control[29],
             self.cop2_control[30]
+        )
+    }
+
+    fn gte_pc_histogram_json(&self) -> String {
+        let mut entries = self
+            .gte_pc_command_counts
+            .iter()
+            .map(|((pc, command), count)| (*pc, *command, *count))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let total = entries
+            .iter()
+            .fold(0_u64, |sum, (_, _, count)| sum.saturating_add(*count));
+        let entries_json = entries
+            .iter()
+            .take(256)
+            .map(|(pc, command, count)| {
+                format!(
+                    "{{\"pc\":{},\"pc_hex\":\"0x{pc:08x}\",\"opcode\":{},\"opcode_hex\":\"0x{command:02x}\",\"count\":{count}}}",
+                    pc,
+                    command,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"enabled\":{},\"total\":{},\"unique\":{},\"entries\":[{}]}}",
+            trace_gte_pc_histogram(),
+            total,
+            entries.len(),
+            entries_json,
         )
     }
 
@@ -7416,6 +7623,15 @@ impl Cpu {
             }
             0x23 => {
                 let address = self.regs[rs(instruction)].wrapping_add(sign_extend_16(instruction));
+                if self.try_hle_br2_runtime_invalid_allocator_scan_word_load(
+                    current_pc,
+                    delay_slot_branch_pc,
+                    instruction,
+                    address,
+                    bus,
+                ) {
+                    return StepOutcome::Continue;
+                }
                 if self.try_hle_br2_runtime_invalid_model_child_load(
                     current_pc,
                     delay_slot_branch_pc,
@@ -9631,6 +9847,52 @@ impl Cpu {
         true
     }
 
+    fn try_hle_br2_runtime_invalid_allocator_scan_word_load(
+        &mut self,
+        current_pc: u32,
+        delay_slot_branch_pc: Option<u32>,
+        instruction: u32,
+        address: u32,
+        bus: &Bus,
+    ) -> bool {
+        if self.br2_runtime_recovery_hle_disabled("runtime_invalid_allocator_link")
+            || current_pc != BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC
+            || delay_slot_branch_pc.is_some()
+            || instruction != BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_SIGNATURE[2].1
+            || self.regs[31] != BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN
+            || self.regs[7] & 0x03 == 0
+            || address & 0x03 == 0
+            || br2_readable_byte_range(address, 4, bus)
+            || !br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_SIGNATURE,
+            )
+            || !br2_instruction_signature_matches(
+                bus,
+                &BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_CALLER_SIGNATURE,
+            )
+        {
+            return false;
+        }
+
+        // This allocator dereferences the selected node again at 0x803512dc
+        // after leaving the scan loop. A synthetic scan value only postpones
+        // the same AddressLoad exception. Treat the corrupt list link as an
+        // ordinary allocation failure and return through the verified caller.
+        self.regs[2] = 0;
+        self.pc = self.regs[31];
+        self.next_pc = self.pc.wrapping_add(4);
+        self.cycles = self
+            .cycles
+            .saturating_add(BR2_RUNTIME_ALLOCATOR_LINK_HLE_CYCLES);
+        self.regs[0] = 0;
+        self.pending_load = None;
+        self.load_commit_register = None;
+        self.load_commit_value = None;
+        self.load_commit_cancelled = false;
+        true
+    }
+
     fn try_hle_br2_runtime_invalid_link_splice_load(
         &mut self,
         current_pc: u32,
@@ -10280,9 +10542,38 @@ impl Cpu {
                 bus,
                 &BR2_RUNTIME_INVALID_CALLBACK_OBJECT_SIGNATURE,
             );
+        let site_matches =
+            br2_runtime_callback_jalr_site(current_pc, target_register, self.regs[31], bus);
+        let target_valid = br2_runtime_callback_target_valid(current_pc, target, bus);
+        let trace_reason = if delay_slot_branch_pc.is_some() {
+            BR2_RUNTIME_CALLBACK_TRACE_DELAY_SLOT
+        } else if !site_matches {
+            BR2_RUNTIME_CALLBACK_TRACE_SITE_REJECTED
+        } else if target_valid
+            && !invalid_object_argument
+            && !invalid_model_child_argument
+            && !invalid_callback_object_argument
+        {
+            BR2_RUNTIME_CALLBACK_TRACE_EXECUTED
+        } else if invalid_object_argument {
+            BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_OBJECT_ARGUMENT
+        } else if invalid_model_child_argument {
+            BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_MODEL_CHILD_ARGUMENT
+        } else if invalid_callback_object_argument {
+            BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_CALLBACK_OBJECT_ARGUMENT
+        } else {
+            BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_TARGET
+        };
+        self.br2_runtime_callback_jalr.record(
+            current_pc,
+            target,
+            self.regs[31],
+            target_register,
+            trace_reason,
+        );
         if std::env::var_os("BR2_NATIVE_DEBUG_SCENE_CALLBACK").is_some()
             && current_pc == BR2_RUNTIME_SCENE_CALLBACK_JALR_PC
-            && !br2_runtime_callback_target_valid(current_pc, target, bus)
+            && !target_valid
         {
             eprintln!(
                 "BR2 scene-callback invalid-target: target=0x{target:08x} outer_ra=0x{:08x} site={} context={} body_signature={} caller_signature={} original_caller_signature={} alt_caller_signature={} second_alt_caller_signature={}",
@@ -10308,9 +10599,9 @@ impl Cpu {
                 ),
             );
         }
-        if !br2_runtime_callback_jalr_site(current_pc, target_register, self.regs[31], bus)
+        if !site_matches
             || delay_slot_branch_pc.is_some()
-            || (br2_runtime_callback_target_valid(current_pc, target, bus)
+            || (target_valid
                 && !invalid_object_argument
                 && !invalid_model_child_argument
                 && !invalid_callback_object_argument)
@@ -10759,6 +11050,16 @@ impl Cpu {
 
     fn execute_gte_command_at(&mut self, instruction: u32, current_pc: Option<u32>) {
         let command = instruction & 0x3f;
+        if trace_gte_pc_histogram()
+            && let Some(pc) = current_pc
+            && br2_game_runtime_pc(pc)
+        {
+            let count = self
+                .gte_pc_command_counts
+                .entry((pc, command as u8))
+                .or_default();
+            *count = count.saturating_add(1);
+        }
         let packet_rtpt_inputs =
             (current_pc == Some(BR2_PACKET_RTPT_PC) && command == 0x30).then(|| {
                 (
@@ -12211,6 +12512,57 @@ fn invert_gte_nclip() -> bool {
     cached_bool(&INVERT_GTE_NCLIP, || {
         std::env::var_os("BR2_NATIVE_INVERT_GTE_NCLIP").is_some()
     })
+}
+
+fn trace_gte_pc_histogram() -> bool {
+    static TRACE_GTE_PC_HISTOGRAM: OnceLock<bool> = OnceLock::new();
+    cached_bool(&TRACE_GTE_PC_HISTOGRAM, || {
+        std::env::var_os("BR2_NATIVE_TRACE_GTE_PC_HISTOGRAM").is_some()
+    })
+}
+
+fn trace_runtime_callback_jalr() -> bool {
+    static TRACE_RUNTIME_CALLBACK_JALR: OnceLock<bool> = OnceLock::new();
+    cached_bool(&TRACE_RUNTIME_CALLBACK_JALR, || {
+        std::env::var_os("BR2_NATIVE_TRACE_RUNTIME_CALLBACK_JALR").is_some()
+    })
+}
+
+fn br2_runtime_callback_trace_site_index(site_pc: u32) -> Option<usize> {
+    match site_pc {
+        BR2_RUNTIME_RENDER_CALLBACK_JALR_PC => Some(0),
+        BR2_RUNTIME_SCENE_CALLBACK_JALR_PC => Some(1),
+        BR2_RUNTIME_MODEL_CALLBACK_JALR_PC => Some(2),
+        BR2_RUNTIME_NULL_CALLBACK_JALR_PC => Some(3),
+        _ => None,
+    }
+}
+
+fn br2_runtime_callback_trace_site_name(site_pc: u32) -> &'static str {
+    match site_pc {
+        BR2_RUNTIME_RENDER_CALLBACK_JALR_PC => "render",
+        BR2_RUNTIME_SCENE_CALLBACK_JALR_PC => "scene",
+        BR2_RUNTIME_MODEL_CALLBACK_JALR_PC => "model",
+        BR2_RUNTIME_NULL_CALLBACK_JALR_PC => "null",
+        _ => "unknown",
+    }
+}
+
+fn br2_runtime_callback_trace_reason_name(reason: u8) -> &'static str {
+    match reason {
+        BR2_RUNTIME_CALLBACK_TRACE_EXECUTED => "executed",
+        BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_TARGET => "hle_invalid_target",
+        BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_OBJECT_ARGUMENT => "hle_invalid_object_argument",
+        BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_MODEL_CHILD_ARGUMENT => {
+            "hle_invalid_model_child_argument"
+        }
+        BR2_RUNTIME_CALLBACK_TRACE_HLE_INVALID_CALLBACK_OBJECT_ARGUMENT => {
+            "hle_invalid_callback_object_argument"
+        }
+        BR2_RUNTIME_CALLBACK_TRACE_SITE_REJECTED => "site_rejected",
+        BR2_RUNTIME_CALLBACK_TRACE_DELAY_SLOT => "delay_slot",
+        _ => "unknown",
+    }
 }
 
 fn shamt(instruction: u32) -> u32 {
@@ -13971,6 +14323,8 @@ mod tests {
         for (address, instruction) in super::BR2_RUNTIME_ALLOCATOR_LINK_SIGNATURE
             .iter()
             .chain(super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_SIGNATURE.iter())
+            .chain(super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_SIGNATURE.iter())
+            .chain(super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_CALLER_SIGNATURE.iter())
             .copied()
         {
             bus.write_u32(address, instruction);
@@ -26410,6 +26764,88 @@ mod tests {
         assert_eq!(
             cpu.cp0[CP0_EPC],
             super::BR2_RUNTIME_ALLOCATOR_LINK_HALFWORD_RELOAD_PC
+        );
+        assert_eq!(cpu.pc, EXCEPTION_VECTOR);
+    }
+
+    #[test]
+    fn hle_br2_runtime_allocator_scan_with_corrupt_word_link_returns_allocation_failure() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_allocator_link(&mut bus);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = 0x1122_3344;
+        cpu.regs[6] = 0x0000_00ae;
+        cpu.regs[7] = 0xf8de_01ca;
+        cpu.regs[31] = super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.pc, super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN);
+        assert_eq!(
+            cpu.next_pc,
+            super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN + 4
+        );
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+    }
+
+    #[test]
+    fn preserves_br2_runtime_allocator_scan_with_valid_word_link() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_allocator_link(&mut bus);
+        let list_link = 0x8038_4000;
+        bus.write_u32(list_link + 8, 0x20);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[6] = 0x0000_00ae;
+        cpu.regs[7] = list_link;
+        cpu.regs[31] = super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN;
+
+        for _ in 0..5 {
+            let report = cpu.step_report(&mut bus);
+            assert_eq!(report.outcome, StepOutcome::Continue);
+        }
+
+        assert_eq!(cpu.pc, 0x8035_12a4);
+        assert_eq!(cpu.next_pc, 0x8035_12a8);
+        assert_eq!(cpu.regs[2], 1);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+    }
+
+    #[test]
+    fn allocator_corrupt_word_link_with_bad_signature_traps() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_allocator_link(&mut bus);
+        bus.write_u32(
+            super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_SIGNATURE[0].0,
+            0xffff_ffff,
+        );
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[6] = 0x0000_00ae;
+        cpu.regs[7] = 0xf8de_01ca;
+        cpu.regs[31] = super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0xf8de_01d2);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 4 << 2);
+        assert_eq!(
+            cpu.cp0[CP0_EPC],
+            super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC
         );
         assert_eq!(cpu.pc, EXCEPTION_VECTOR);
     }

@@ -17,7 +17,7 @@ LIVE_MAX_FRAMES=${BR2_LIVE_QA_MAX_FRAMES:-4200}
 GUI_CAPTURE_INTERVAL=${BR2_NATIVE_GUI_CAPTURE_INTERVAL:-60}
 SMOKE_WALL_TIMEOUT_SECS=${BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS:-600}
 WINDOW_SCALE=${BR2_E2E_QA_WINDOW_SCALE:-1}
-SMOKE_SELECT_CONFIRM_WAIT_FRAMES=${BR2_E2E_QA_SMOKE_SELECT_CONFIRM_WAIT_FRAMES:-420}
+SMOKE_SELECT_CONFIRM_WAIT_FRAMES=${BR2_E2E_QA_SMOKE_SELECT_CONFIRM_WAIT_FRAMES:-240}
 SMOKE_GAMEPLAY_WAIT_FRAMES=${BR2_E2E_QA_SMOKE_GAMEPLAY_WAIT_FRAMES:-1500}
 
 usage() {
@@ -50,7 +50,7 @@ Environment overrides:
   BR2_E2E_QA_SMOKE_SCRIPT     Space-separated action:frames script for smoke.
   BR2_E2E_QA_LIVE_SCRIPT      Space-separated action:frames script for live GUI test input.
   BR2_E2E_QA_SMOKE_SELECT_CONFIRM_WAIT_FRAMES
-                              Wait after select confirmation before P2 join input. Default: 420.
+                              Wait for the P1 select screen before P2 joins. Default: 240.
   BR2_E2E_QA_SMOKE_GAMEPLAY_WAIT_FRAMES
                               Wait before gameplay-only smoke controls. Default: 1500.
 
@@ -197,9 +197,9 @@ LIVE_STDOUT="$LIVE_DIR/native-play.stdout.json"
 LIVE_STDERR="$LIVE_DIR/native-play.stderr.log"
 
 SMOKE_SEGMENTS=(
-    coin:18 noop:24 start:24 noop:240
-    punch:36 "noop:${SMOKE_SELECT_CONFIRM_WAIT_FRAMES}"
-    p2+coin:18 noop:24 p2+start:24 "noop:${SMOKE_GAMEPLAY_WAIT_FRAMES}"
+    coin:18 noop:24 start:24 "noop:${SMOKE_SELECT_CONFIRM_WAIT_FRAMES}"
+    p2+coin:18 noop:24 p2+start:24 noop:90
+    punch:36 noop:36 p2+punch:36 noop:36 "noop:${SMOKE_GAMEPLAY_WAIT_FRAMES}"
     right:24 noop:18 down:24 noop:18 left:24 noop:18 up:24 noop:18
     punch:36 noop:60 kick:36 noop:60 beast:36 noop:240 guard:36 noop:120
     p2+right:24 noop:18 p2+down:24 noop:18 p2+left:24 noop:18 p2+up:24 noop:18

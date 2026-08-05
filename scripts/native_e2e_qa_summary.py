@@ -124,9 +124,17 @@ SELECT_ROSTER_MIN_QUANTIZED_COLORS = 48
 SELECT_LARGE_PORTRAIT_MIN_GP0_ROI_OVERLAP = 0.45
 SELECT_LARGE_PORTRAIT_MIN_NONBLACK_RATIO = 0.30
 SELECT_LARGE_PORTRAIT_MIN_CHROMA_RATIO = 0.14
-SELECT_LARGE_PORTRAIT_MIN_EDGE_RATIO = 0.06
+SELECT_LARGE_PORTRAIT_MIN_EDGE_RATIO = 0.05
 SELECT_LARGE_PORTRAIT_MAX_EDGE_RATIO = 0.30
 SELECT_LARGE_PORTRAIT_MIN_QUANTIZED_COLORS = 48
+SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_EDGE_RATIO = 0.05
+SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_NONBLACK_RATIO = 0.45
+SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_CHROMA_RATIO = 0.18
+SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_QUANTIZED_COLORS = 96
+SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MAX_DOMINANT_RATIO = 0.15
+SELECT_LARGE_PORTRAIT_BLOCKY_MIN_EXACT_HORIZONTAL_RATIO = 0.70
+SELECT_LARGE_PORTRAIT_BLOCKY_MIN_EXACT_VERTICAL_RATIO = 0.68
+SELECT_LARGE_PORTRAIT_BLOCKY_MAX_QUANTIZED_COLORS = 512
 TITLE_LOGO_REUSE_COMPARE_SIZE = (64, 56)
 TITLE_LOGO_REUSE_SEARCH_STEP = 4
 TITLE_LOGO_REUSE_MAX_SOURCE_LEFT = 296
@@ -161,6 +169,16 @@ COMBAT_IMAGE_MIN_EDGE_RATIO = 0.025
 COMBAT_IMAGE_MAX_EDGE_RATIO = 0.42
 COMBAT_IMAGE_MIN_QUANTIZED_COLORS = 32
 COMBAT_IMAGE_MAX_DOMINANT_RATIO = 0.78
+COMBAT_SELECT_FIELD_OVERLAY_ROI = (0, 0, 512, 64)
+COMBAT_SELECT_FIELD_OVERLAY_MIN_NONBLACK_RATIO = 0.55
+COMBAT_SELECT_FIELD_OVERLAY_MIN_CHROMA_RATIO = 0.30
+COMBAT_SELECT_FIELD_OVERLAY_MAX_BLACK_RATIO = 0.50
+COMBAT_SELECT_FIELD_OVERLAY_MIN_ACTIVE_ROW_SPAN = 48
+COMBAT_SELECT_FIELD_OVERLAY_MAX_QUANTIZED_COLORS = 96
+COMBAT_WAIT_A_CHALLENGER_ROI = (360, 0, 500, 30)
+COMBAT_WAIT_A_CHALLENGER_MIN_YELLOW_RATIO = 0.05
+COMBAT_WAIT_A_CHALLENGER_MIN_EDGE_RATIO = 0.05
+COMBAT_WAIT_A_CHALLENGER_MIN_ACTIVE_ROWS = 8
 COMBAT_CHALLENGER_OVERLAY_ROI = (16, 208, 496, 326)
 COMBAT_MODEL_CENTER_ROI = (96, 120, 416, 420)
 COMBAT_LOWER_MODEL_ROI = (48, 176, 464, 430)
@@ -600,6 +618,89 @@ def capture_scene_image_diagnostics(
     return diagnostics
 
 
+def capture_select_model_diagnostics(
+    capture: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(capture, dict):
+        return {"status": "fail", "reasons": ["capture_missing"]}
+    cache_key = "_qa_select_model_diagnostics"
+    cached = capture.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+
+    recovery = get_path(capture, "native_sync", "native_otc_dma_recovery")
+    if not isinstance(recovery, dict):
+        recovery = get_path(capture, "state", "native_sync", "native_otc_dma_recovery")
+    telemetry_keys = {
+        "last_chain_model_selection_reason",
+        "last_chain_model_texture_draws",
+        "last_chain_model_packets",
+        "last_model_candidate_packets",
+        "last_model_candidate_chains",
+        "last_model_packets",
+        "last_model_selection_reason",
+    }
+    if not isinstance(recovery, dict) or not telemetry_keys.intersection(recovery):
+        result = {
+            "status": "fail",
+            "reasons": ["select_model_telemetry_missing"],
+            "telemetry_status": "missing",
+        }
+        capture[cache_key] = result
+        return result
+
+    chain_reason = str(recovery.get("last_chain_model_selection_reason") or "")
+    model_reason = str(recovery.get("last_model_selection_reason") or "")
+    chain_texture_draws = intish(recovery.get("last_chain_model_texture_draws"))
+    chain_packets = intish(recovery.get("last_chain_model_packets"))
+    candidate_packets = intish(recovery.get("last_model_candidate_packets"))
+    candidate_chains = intish(recovery.get("last_model_candidate_chains"))
+    model_packets = intish(recovery.get("last_model_packets"))
+    chain_present = chain_texture_draws > 0 or chain_packets > 0
+    recovered_present = model_packets > 0 and model_reason == "selected"
+    model_present = chain_present or recovered_present
+    human_portrait = select_human_portrait_telemetry_diagnostics(capture)
+    human_portrait_present = human_portrait.get("status") == "pass"
+
+    reasons: list[str] = []
+    if not model_present and not human_portrait_present:
+        if chain_reason == "no_model_draws" and chain_texture_draws == 0:
+            reasons.append("select_model_chain_no_draws")
+        if model_reason == "no_model_chains" or (
+            candidate_packets > 0 and candidate_chains == 0
+        ):
+            reasons.append("select_model_recovery_no_chains")
+        if not reasons:
+            reasons.append("select_model_telemetry_no_rendered_model")
+
+    result = {
+        "status": (
+            "pass"
+            if model_present
+            else "not_checked"
+            if human_portrait_present
+            else "fail"
+        ),
+        "reasons": reasons,
+        "reason": (
+            "verified_human_portrait_replay"
+            if human_portrait_present and not model_present
+            else None
+        ),
+        "telemetry_status": "present",
+        "chain_selection_reason": chain_reason or None,
+        "chain_texture_draws": chain_texture_draws,
+        "chain_packets": chain_packets,
+        "candidate_packets": candidate_packets,
+        "candidate_chains": candidate_chains,
+        "model_packets": model_packets,
+        "model_selection_reason": model_reason or None,
+        "human_portrait": human_portrait,
+    }
+    capture[cache_key] = result
+    return result
+
+
 def capture_select_scene_diagnostics(
     capture: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -614,10 +715,11 @@ def capture_select_scene_diagnostics(
     portrait = select_large_portrait_image_diagnostics(
         existing_png(capture.get("_png_path"))
     )
+    model = capture_select_model_diagnostics(capture)
     reasons = unique_reasons(
         [
             reason
-            for diagnostics in (layout, image, portrait)
+            for diagnostics in (layout, image, portrait, model)
             if diagnostics.get("status") == "fail"
             for reason in diagnostics.get("reasons", [])
             if isinstance(reason, str)
@@ -629,6 +731,7 @@ def capture_select_scene_diagnostics(
         "layout": layout,
         "image": image,
         "large_portrait_image": portrait,
+        "model": model,
     }
     capture[cache_key] = result
     return result
@@ -1280,6 +1383,8 @@ def frame_image_diagnostics(
 
     playfield = None
     playfield_tile_grid = None
+    select_field_overlay = None
+    wait_a_challenger_overlay = None
     challenger_overlay = None
     model_center = None
     lower_model = None
@@ -1304,6 +1409,40 @@ def frame_image_diagnostics(
             >= REPEATING_TILE_MIN_SIMILARITY
         ):
             reasons.append(f"{kind}_image_repeating_tile_grid")
+        select_field_overlay = {
+            "region": image_region_metrics(image, COMBAT_SELECT_FIELD_OVERLAY_ROI),
+            "colors": image_color_class_metrics(image, COMBAT_SELECT_FIELD_OVERLAY_ROI),
+        }
+        select_field_region = select_field_overlay["region"]
+        select_field_colors = select_field_overlay["colors"]
+        if (
+            float(select_field_region.get("nonblack_ratio") or 0.0)
+            >= COMBAT_SELECT_FIELD_OVERLAY_MIN_NONBLACK_RATIO
+            and float(select_field_region.get("chroma_ratio") or 0.0)
+            >= COMBAT_SELECT_FIELD_OVERLAY_MIN_CHROMA_RATIO
+            and float(select_field_colors.get("black_ratio") or 0.0)
+            <= COMBAT_SELECT_FIELD_OVERLAY_MAX_BLACK_RATIO
+            and intish(select_field_region.get("active_row_span"))
+            >= COMBAT_SELECT_FIELD_OVERLAY_MIN_ACTIVE_ROW_SPAN
+            and intish(select_field_region.get("quantized_colors"))
+            <= COMBAT_SELECT_FIELD_OVERLAY_MAX_QUANTIZED_COLORS
+        ):
+            reasons.append(f"{kind}_image_character_select_field_overlay_stale")
+        wait_a_challenger_overlay = {
+            "region": image_region_metrics(image, COMBAT_WAIT_A_CHALLENGER_ROI),
+            "colors": image_color_class_metrics(image, COMBAT_WAIT_A_CHALLENGER_ROI),
+        }
+        wait_region = wait_a_challenger_overlay["region"]
+        wait_colors = wait_a_challenger_overlay["colors"]
+        if (
+            float(wait_colors.get("yellow_ratio") or 0.0)
+            >= COMBAT_WAIT_A_CHALLENGER_MIN_YELLOW_RATIO
+            and float(wait_region.get("edge_ratio") or 0.0)
+            >= COMBAT_WAIT_A_CHALLENGER_MIN_EDGE_RATIO
+            and intish(wait_region.get("active_rows"))
+            >= COMBAT_WAIT_A_CHALLENGER_MIN_ACTIVE_ROWS
+        ):
+            reasons.append(f"{kind}_image_wait_a_challenger_overlay_stale")
         challenger_overlay = {
             "region": image_region_metrics(image, COMBAT_CHALLENGER_OVERLAY_ROI),
             "colors": image_color_class_metrics(image, COMBAT_CHALLENGER_OVERLAY_ROI),
@@ -1372,6 +1511,8 @@ def frame_image_diagnostics(
         "bottom_half": bottom,
         "playfield": playfield,
         "playfield_repeating_tile_grid": playfield_tile_grid,
+        "select_field_overlay": select_field_overlay,
+        "wait_a_challenger_overlay": wait_a_challenger_overlay,
         "challenger_overlay": challenger_overlay,
         "model_center": model_center,
         "lower_model": lower_model,
@@ -1439,6 +1580,90 @@ def attach_select_portrait_image_diagnostics(
     stage["status"] = "fail"
     reasons = stage.setdefault("reasons", [])
     for reason in portrait["reasons"]:
+        if reason not in reasons:
+            reasons.append(reason)
+
+
+def select_human_portrait_telemetry_diagnostics(
+    snapshot: dict[str, Any] | None,
+    *,
+    player_two: bool = False,
+) -> dict[str, Any]:
+    player = "p2" if player_two else "p1"
+    telemetry = find_first_key(snapshot, "human_portrait_packets")
+    if not isinstance(telemetry, dict):
+        return {
+            "status": "not_checked",
+            "reasons": [],
+            "reason": "human_portrait_telemetry_missing",
+            "player": player,
+        }
+    recovery = telemetry.get("recovery")
+    if not isinstance(recovery, dict):
+        return {
+            "status": "fail",
+            "reasons": [f"select_{player}_human_portrait_recovery_missing"],
+            "player": player,
+        }
+
+    selected_slot_key = "selected_p2_slot" if player_two else "selected_slot"
+    selected_slot = recovery.get(selected_slot_key)
+    portrait = recovery.get(player)
+    replay_source = recovery.get(f"{player}_replay_source")
+    replay_age = recovery.get("last_replay_age_vblanks")
+
+    reasons: list[str] = []
+    if not boolish(recovery.get("present")):
+        reasons.append(f"select_{player}_human_portrait_replay_not_present")
+    if not isinstance(selected_slot, int):
+        reasons.append(f"select_{player}_human_portrait_selected_slot_missing")
+    if not isinstance(portrait, dict):
+        reasons.append(f"select_{player}_human_portrait_packet_missing")
+    else:
+        if (
+            not isinstance(selected_slot, int)
+            or portrait.get("slot") != selected_slot
+            or portrait.get("selected_slot") != selected_slot
+            or not boolish(portrait.get("slot_matches"))
+        ):
+            reasons.append(f"select_{player}_human_portrait_slot_mismatch")
+        if not boolish(portrait.get("descriptor_valid")):
+            reasons.append(f"select_{player}_human_portrait_descriptor_invalid")
+        if not boolish(portrait.get("asset_generation_valid")):
+            reasons.append(f"select_{player}_human_portrait_asset_generation_invalid")
+    if replay_source not in {"exact", "verified_roster_fallback"}:
+        reasons.append(f"select_{player}_human_portrait_replay_source_invalid")
+    if not isinstance(replay_age, int) or replay_age > 1:
+        reasons.append(f"select_{player}_human_portrait_replay_stale")
+
+    return {
+        "status": "pass" if not reasons else "fail",
+        "reasons": reasons,
+        "player": player,
+        "present": boolish(recovery.get("present")),
+        "selected_slot": selected_slot,
+        "replay_source": replay_source,
+        "last_replay_age_vblanks": replay_age,
+        "portrait": portrait,
+    }
+
+
+def attach_select_human_portrait_telemetry_diagnostics(
+    stage: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+    *,
+    player_two: bool = False,
+) -> None:
+    diagnostics = select_human_portrait_telemetry_diagnostics(
+        snapshot,
+        player_two=player_two,
+    )
+    stage["human_portrait_telemetry"] = diagnostics
+    if diagnostics["status"] != "fail":
+        return
+    stage["status"] = "fail"
+    reasons = stage.setdefault("reasons", [])
+    for reason in diagnostics["reasons"]:
         if reason not in reasons:
             reasons.append(reason)
 
@@ -1593,6 +1818,21 @@ def select_large_portrait_image_diagnostics(
     nonblack_ratio = nonblack / total
     chroma_ratio = chroma / total
     edge_ratio = edge / edge_basis
+    exact_horizontal_matches = 0
+    for y in range(height):
+        row = y * width
+        for x in range(width - 1):
+            if pixels[row + x] == pixels[row + x + 1]:
+                exact_horizontal_matches += 1
+    exact_vertical_matches = 0
+    for y in range(height - 1):
+        row = y * width
+        next_row = (y + 1) * width
+        for x in range(width):
+            if pixels[row + x] == pixels[next_row + x]:
+                exact_vertical_matches += 1
+    exact_horizontal_ratio = exact_horizontal_matches / max((width - 1) * height, 1)
+    exact_vertical_ratio = exact_vertical_matches / max(width * (height - 1), 1)
     dominant = quantized_counter.most_common(1)[0][1] if quantized_counter else 0
     dominant_quantized_ratio = dominant / max(nonblack, 1)
     tile_grid = repeating_tile_grid_metrics(image, portrait_roi)
@@ -1602,13 +1842,32 @@ def select_large_portrait_image_diagnostics(
         title_frame,
         portrait_roi=portrait_roi,
     )
+    strong_low_edge_fallback = select_large_portrait_has_strong_low_edge_fallback(
+        edge_ratio,
+        nonblack_ratio,
+        chroma_ratio,
+        len(quantized_counter),
+        dominant_quantized_ratio,
+    )
+    blocky_low_resolution_portrait = (
+        exact_horizontal_ratio >= SELECT_LARGE_PORTRAIT_BLOCKY_MIN_EXACT_HORIZONTAL_RATIO
+        and exact_vertical_ratio >= SELECT_LARGE_PORTRAIT_BLOCKY_MIN_EXACT_VERTICAL_RATIO
+        and len(quantized_counter) <= SELECT_LARGE_PORTRAIT_BLOCKY_MAX_QUANTIZED_COLORS
+        and nonblack_ratio >= SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_NONBLACK_RATIO
+        and chroma_ratio >= SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_CHROMA_RATIO
+    )
     reasons: list[str] = []
     if nonblack_ratio < SELECT_LARGE_PORTRAIT_MIN_NONBLACK_RATIO:
         reasons.append("select_large_portrait_low_nonblack")
     if chroma_ratio < SELECT_LARGE_PORTRAIT_MIN_CHROMA_RATIO:
         reasons.append("select_large_portrait_low_chroma")
     if edge_ratio < SELECT_LARGE_PORTRAIT_MIN_EDGE_RATIO:
-        reasons.append("select_large_portrait_low_edge")
+        if strong_low_edge_fallback or blocky_low_resolution_portrait:
+            reasons.append("select_large_portrait_blocky_low_resolution_fallback")
+        else:
+            reasons.append("select_large_portrait_low_edge")
+    elif blocky_low_resolution_portrait:
+        reasons.append("select_large_portrait_blocky_low_resolution_fallback")
     if edge_ratio > SELECT_LARGE_PORTRAIT_MAX_EDGE_RATIO:
         reasons.append("select_large_portrait_noisy_texture_artifact")
     if len(quantized_counter) < SELECT_LARGE_PORTRAIT_MIN_QUANTIZED_COLORS:
@@ -1634,11 +1893,34 @@ def select_large_portrait_image_diagnostics(
         "chroma_ratio": round(chroma_ratio, 4),
         "edge_pixels": edge,
         "edge_ratio": round(edge_ratio, 4),
+        "exact_horizontal_match_ratio": round(exact_horizontal_ratio, 4),
+        "exact_vertical_match_ratio": round(exact_vertical_ratio, 4),
         "quantized_colors": len(quantized_counter),
         "dominant_quantized_ratio": round(dominant_quantized_ratio, 4),
+        "strong_low_edge_fallback": strong_low_edge_fallback,
+        "blocky_low_resolution_portrait": blocky_low_resolution_portrait,
         "repeating_tile_grid": tile_grid,
         "title_logo_reuse": title_logo_reuse,
     }
+
+
+def select_large_portrait_has_strong_low_edge_fallback(
+    edge_ratio: float,
+    nonblack_ratio: float,
+    chroma_ratio: float,
+    quantized_colors: int,
+    dominant_quantized_ratio: float,
+) -> bool:
+    return (
+        edge_ratio >= SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_EDGE_RATIO
+        and nonblack_ratio
+        >= SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_NONBLACK_RATIO
+        and chroma_ratio >= SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_CHROMA_RATIO
+        and quantized_colors
+        >= SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MIN_QUANTIZED_COLORS
+        and dominant_quantized_ratio
+        <= SELECT_LARGE_PORTRAIT_LOW_EDGE_FALLBACK_MAX_DOMINANT_RATIO
+    )
 
 
 def iter_gpu_draw_commands(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -1686,13 +1968,12 @@ def select_preview_diagnostics(
     )
     candidates = [draw for draw in iter_gpu_draw_commands(snapshot) if is_select_preview_draw(draw)]
     if not candidates:
-        reasons: list[str] = []
+        reasons = ["select_model_preview_no_texture_draws"]
         if image["status"] == "fail":
             reasons.extend(image["reasons"])
-            reasons.append("select_model_preview_no_texture_draws")
         return {
-            "status": "fail" if reasons else "pass",
-            "reasons": reasons,
+            "status": "fail",
+            "reasons": unique_reasons(reasons),
             "candidate_count": 0,
             "large_portrait_image": image,
             "telemetry_status": "missing",
@@ -1851,7 +2132,11 @@ def recovery_verdict(recoveries: list[dict[str, Any]]) -> dict[str, Any]:
     final_model_selected = (
         newest.get("last_reason") in {"submitted", "submitted_chain_model_replacement"}
         and newest.get("last_chain_model_selection_reason")
-        in {"selected", "selected_reused_current_otc"}
+        in {
+            "selected",
+            "selected_reused_current_otc",
+            "selected_complete_fighter_pair",
+        }
         and intish(newest.get("last_chain_model_texture_draws")) > 0
         and intish(newest.get("last_chain_model_packets")) > 0
     )
@@ -1920,6 +2205,95 @@ def snapshot_is_gameplay(snapshot: dict[str, Any] | None) -> bool:
     return isinstance(snapshot, dict) and boolish(
         get_path(snapshot, "window_frame", "gameplay_scene")
     )
+
+
+def snapshot_has_complete_two_player_select_image(
+    snapshot: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(snapshot, dict) or snapshot_is_gameplay(snapshot):
+        return False
+    frame = snapshot.get("window_frame")
+    if boolish(get_path(frame, "title_screen_frame")):
+        return False
+    telemetry = find_first_key(snapshot, "human_portrait_packets")
+    recovery = telemetry.get("recovery") if isinstance(telemetry, dict) else None
+    if (
+        not isinstance(recovery, dict)
+        or boolish(recovery.get("gameplay_scene_observed"))
+        or boolish(recovery.get("transition_pending"))
+        or select_human_portrait_telemetry_diagnostics(snapshot).get("status") != "pass"
+        or select_human_portrait_telemetry_diagnostics(
+            snapshot,
+            player_two=True,
+        ).get("status")
+        != "pass"
+    ):
+        return False
+    png = snapshot_png(snapshot)
+    left = select_large_portrait_image_diagnostics(png)
+    right = select_large_portrait_image_diagnostics(
+        png,
+        portrait_roi=SELECT_RIGHT_LARGE_PORTRAIT_ROI,
+    )
+    return left.get("status") == "pass" and right.get("status") == "pass"
+
+
+def smoke_select_snapshot(
+    snapshots: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, bool]:
+    p2_start_index = first_snapshot_index_after_action(snapshots, "p2+start")
+    if p2_start_index is not None:
+        candidates = snapshots[p2_start_index:]
+        for snap in candidates:
+            if snap.get("action") == "noop" and snapshot_has_complete_two_player_select_image(
+                snap
+            ):
+                return snap, True
+        for snap in candidates:
+            if snapshot_has_complete_two_player_select_image(snap):
+                return snap, True
+    fallback = snapshots[3] if len(snapshots) > 3 else (snapshots[-1] if snapshots else None)
+    return fallback, False
+
+
+def snapshot_is_visually_valid_smoke_combat(
+    snapshot: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(snapshot, dict) or not snapshot_is_gameplay(snapshot):
+        return False
+    frame = get_path(snapshot, "window_frame")
+    if summarize_frame(frame, "combat").get("status") != "pass":
+        return False
+    return (
+        frame_image_diagnostics(snapshot_png(snapshot), "combat", frame).get("status")
+        == "pass"
+    )
+
+
+def smoke_combat_snapshot(
+    snapshots: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    first_beast_index = next(
+        (
+            index
+            for index, snap in enumerate(snapshots)
+            if snapshot_has_smoke_beast_action(snap)
+        ),
+        len(snapshots),
+    )
+    before_beast = snapshots[:first_beast_index]
+    for snap in before_beast:
+        if snap.get("action") == "noop" and snapshot_is_visually_valid_smoke_combat(
+            snap
+        ):
+            return snap
+    for snap in before_beast:
+        if snapshot_is_visually_valid_smoke_combat(snap):
+            return snap
+    for snap in snapshots[first_beast_index:]:
+        if snapshot_is_visually_valid_smoke_combat(snap):
+            return snap
+    return snapshots[-1] if snapshots else None
 
 
 def snapshot_has_smoke_beast_action(snapshot: dict[str, Any] | None) -> bool:
@@ -2384,17 +2758,9 @@ def summarize_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
     snapshots = [snap for snap in data.get("snapshots", []) if isinstance(snap, dict)]
     boot = data.get("boot") if isinstance(data.get("boot"), dict) else {}
-    select = snapshots[3] if len(snapshots) > 3 else (snapshots[-1] if snapshots else None)
+    select, select_requires_p2_portrait = smoke_select_snapshot(snapshots)
     final = snapshots[-1] if snapshots else None
-    combat = next(
-        (
-            snap
-            for snap in snapshots
-            if int(snap.get("tail_index") or 0) >= 5
-            and boolish(get_path(snap, "window_frame", "gameplay_scene"))
-        ),
-        snapshots[-1] if snapshots else None,
-    )
+    combat = smoke_combat_snapshot(snapshots)
     beast_effect_summary = beast_effect_verdict(snapshots)
     selected_beast_index = beast_effect_summary.get("post_snapshot_index")
     if not isinstance(selected_beast_index, int):
@@ -2447,21 +2813,54 @@ def summarize_smoke(args: argparse.Namespace) -> dict[str, Any]:
     attach_stage_image_diagnostics(stage_items["boot"], "boot")
     attach_stage_image_diagnostics(stage_items["select"], "select")
     attach_select_portrait_image_diagnostics(stage_items["select"], stage_items["boot"])
+    attach_select_human_portrait_telemetry_diagnostics(stage_items["select"], select)
+    if select_requires_p2_portrait:
+        right_portrait = select_large_portrait_image_diagnostics(
+            stage_items["select"].get("png"),
+            title_png=stage_items["boot"].get("png"),
+            title_frame=stage_items["boot"].get("frame"),
+            portrait_roi=SELECT_RIGHT_LARGE_PORTRAIT_ROI,
+        )
+        stage_items["select"]["right_large_portrait_image"] = right_portrait
+        if right_portrait["status"] == "fail":
+            stage_items["select"]["status"] = "fail"
+            reasons = stage_items["select"].setdefault("reasons", [])
+            for reason in right_portrait["reasons"]:
+                if reason not in reasons:
+                    reasons.append(reason)
+        elif boolish(get_path(select, "window_frame", "title_logo_overlay_blocking")):
+            reasons = [
+                reason
+                for reason in stage_items["select"].get("reasons", [])
+                if reason
+                not in {"blocking_display_artifact", "title_logo_overlay_blocking"}
+            ]
+            stage_items["select"]["reasons"] = reasons
+            stage_items["select"]["status"] = "pass" if not reasons else "fail"
+            stage_items["select"]["title_logo_overlay_false_positive_suppressed"] = True
+        attach_select_human_portrait_telemetry_diagnostics(
+            stage_items["select"],
+            select,
+            player_two=True,
+        )
     attach_stage_image_diagnostics(stage_items["combat"], "combat")
     attach_stage_image_diagnostics(stage_items["beast"], "beast")
     attach_stage_image_diagnostics(stage_items["final"], "combat")
 
-    select_rec = get_path(select, "native_sync", "native_otc_dma_recovery", default={})
-    select_model_missing = (
-        isinstance(select_rec, dict)
-        and select_rec.get("last_chain_model_selection_reason") == "no_model_draws"
-        and intish(select_rec.get("last_chain_model_texture_draws")) == 0
-    )
+    select_model = capture_select_model_diagnostics(select)
     select_preview = select_preview_diagnostics(
         select,
         title_png=stage_items["boot"].get("png"),
         title_frame=stage_items["boot"].get("frame"),
     )
+    select_model_missing = select_model["status"] == "fail"
+    stage_items["select"]["select_model"] = select_model
+    if select_model_missing:
+        stage_items["select"]["status"] = "fail"
+        reasons = stage_items["select"].setdefault("reasons", [])
+        for reason in select_model["reasons"]:
+            if reason not in reasons:
+                reasons.append(reason)
     if (
         not select_model_missing
         and select_preview["candidate_count"] == 0
@@ -3351,11 +3750,20 @@ def summarize_live(args: argparse.Namespace) -> dict[str, Any]:
     attach_stage_image_diagnostics(stage_items["boot"], "boot")
     attach_stage_image_diagnostics(stage_items["select"], "select")
     attach_select_portrait_image_diagnostics(stage_items["select"], stage_items["boot"])
+    attach_select_human_portrait_telemetry_diagnostics(
+        stage_items["select"],
+        select_capture,
+    )
     attach_stage_image_diagnostics(stage_items["p2_select"], "select")
     attach_select_portrait_image_diagnostics(
         stage_items["p2_select"],
         stage_items["boot"],
         portrait_roi=SELECT_RIGHT_LARGE_PORTRAIT_ROI,
+    )
+    attach_select_human_portrait_telemetry_diagnostics(
+        stage_items["p2_select"],
+        p2_select_capture,
+        player_two=True,
     )
     attach_stage_image_diagnostics(stage_items["combat"], "combat")
     attach_stage_image_diagnostics(stage_items["beast"], "beast")

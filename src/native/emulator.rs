@@ -923,6 +923,22 @@ impl NativeEmulator {
         self.bus.io.gpu.vram_png()
     }
 
+    pub fn decoded_texture_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
+        self.bus.io.gpu.decoded_texture_png(texture_page, clut)
+    }
+
+    pub fn raw_texture_page_png(&self, texture_page: u16) -> Vec<u8> {
+        self.bus.io.gpu.raw_texture_page_png(texture_page)
+    }
+
+    pub fn texture_palette_png(&self, texture_page: u16, clut: u16) -> Vec<u8> {
+        self.bus.io.gpu.texture_palette_png(texture_page, clut)
+    }
+
+    pub fn texture_diagnostics_json(&self, texture_page: u16, clut: u16) -> String {
+        self.bus.io.gpu.texture_diagnostics_json(texture_page, clut)
+    }
+
     pub fn set_draw_capture_range(&mut self, start: u64, end: u64) {
         self.bus.set_gpu_draw_capture_range(start, end);
     }
@@ -944,6 +960,18 @@ impl NativeEmulator {
 
     pub fn display_candidates(&self) -> Vec<NativeGpuDisplayCandidate> {
         self.bus.gpu_display_candidates()
+    }
+
+    pub fn retained_br2_character_select_portrait_diagnostic_images(
+        &self,
+    ) -> Vec<(String, Vec<u8>)> {
+        self.bus
+            .gpu_retained_br2_character_select_portrait_diagnostic_images()
+    }
+
+    pub fn retained_br2_character_select_portrait_diagnostics_json(&self) -> String {
+        self.bus
+            .gpu_retained_br2_character_select_portrait_diagnostics_json()
     }
 
     pub fn input_activity_json(&self) -> String {
@@ -1589,6 +1617,27 @@ impl NativeEmulator {
 
     pub fn native_sync_timeline_summary_json(&self) -> String {
         self.bus.native_sync_timeline_summary_json()
+    }
+
+    pub fn native_fighter_model_recovery_is_complete(&self) -> bool {
+        self.bus.native_fighter_model_recovery_is_complete()
+    }
+
+    pub fn native_character_model_recovery_is_present(&self) -> bool {
+        self.bus.native_character_model_recovery_is_present()
+    }
+
+    pub fn native_character_select_human_portrait_is_present(&self) -> bool {
+        self.bus.native_character_select_human_portrait_is_present()
+    }
+
+    pub fn native_character_select_two_player_human_portraits_are_present(&self) -> bool {
+        self.bus
+            .native_character_select_two_player_human_portraits_are_present()
+    }
+
+    pub fn br2_character_select_human_portrait_packets_json(&self) -> String {
+        self.bus.br2_character_select_human_portrait_packets_json()
     }
 }
 

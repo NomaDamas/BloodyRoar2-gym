@@ -97,6 +97,57 @@ class NativeE2EQASummaryTest(unittest.TestCase):
             "last_chain_model_texture_draws": 0,
         }
 
+    def _model_recovery(self) -> dict[str, object]:
+        return {
+            "last_reason": "submitted",
+            "last_chain_model_selection_reason": "selected",
+            "last_chain_model_texture_draws": 69,
+            "last_chain_model_packets": 37,
+        }
+
+    def _human_portrait_telemetry(
+        self,
+        *,
+        player_two: bool = False,
+        present: bool = True,
+        source: str | None = "verified_roster_fallback",
+        selected_slot: int = 0,
+        portrait_slot: int | None = None,
+        replay_age: int | None = 1,
+    ) -> dict[str, object]:
+        player = "p2" if player_two else "p1"
+        selected_slot_key = "selected_p2_slot" if player_two else "selected_slot"
+        portrait_slot = selected_slot if portrait_slot is None else portrait_slot
+        return {
+            "human_portrait_packets": {
+                "recovery": {
+                    "present": present,
+                    selected_slot_key: selected_slot,
+                    f"{player}_replay_source": source,
+                    "last_replay_age_vblanks": replay_age,
+                    player: {
+                        "slot": portrait_slot,
+                        "selected_slot": selected_slot,
+                        "slot_matches": portrait_slot == selected_slot,
+                        "descriptor_valid": True,
+                        "asset_generation_valid": True,
+                    },
+                }
+            }
+        }
+
+    def _two_player_human_portrait_telemetry(self) -> dict[str, object]:
+        p1 = self._human_portrait_telemetry()
+        p2 = self._human_portrait_telemetry(
+            player_two=True,
+            selected_slot=4,
+        )
+        recovery = p1["human_portrait_packets"]["recovery"]
+        recovery.update(p2["human_portrait_packets"]["recovery"])
+        recovery["gameplay_scene_observed"] = False
+        recovery["transition_pending"] = False
+        return p1
+
     def _write_select_png(
         self,
         *,
@@ -222,6 +273,25 @@ class NativeE2EQASummaryTest(unittest.TestCase):
                         )
         image.save(path)
 
+    def _write_stale_select_field_overlay_combat_png(self, path: Path) -> None:
+        self._write_combat_png(path)
+        image = Image.open(path).convert("RGB")
+        for y in range(64):
+            for x in range(512):
+                tooth_band = ((x // 32) + (y // 16)) % 3 == 0
+                color = (12, 8, 8) if tooth_band else (104 + (x + y) % 72, 8, 12)
+                image.putpixel((x, y), color)
+        image.save(path)
+
+    def _write_wait_a_challenger_overlay_combat_png(self, path: Path) -> None:
+        self._write_combat_png(path)
+        image = Image.open(path).convert("RGB")
+        for y in range(4, 26):
+            for x in range(360, 500):
+                if (x // 3 + y // 2) % 3 == 0:
+                    image.putpixel((x, y), (240, 184, 32))
+        image.save(path)
+
     def _write_half_title_png(self, path: Path) -> None:
         image = Image.new("RGB", (512, 480), (0, 0, 0))
         for y in range(0, 180):
@@ -258,6 +328,35 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         )
         select.paste(patch, (left, top))
         select.save(self.png)
+
+    def _write_blocky_low_resolution_select_png(self, path: Path) -> None:
+        self._write_select_png(large_portrait=False)
+        image = Image.open(self.png).convert("RGB")
+        small = Image.new("RGB", (56, 63), (0, 0, 0))
+        for y in range(63):
+            for x in range(56):
+                cx = (x - 28) / 21.0
+                cy = (y - 34) / 25.0
+                if cx * cx + cy * cy <= 1.0:
+                    color = (
+                        150 + (x % 8) * 8,
+                        92 + (y % 8) * 7,
+                        62 + ((x + y) % 5) * 6,
+                    )
+                elif x < 20 and y > 8:
+                    color = (152 + (y % 5) * 18, 12, 8)
+                elif x > 34 and y > 6:
+                    color = (196 + (x % 4) * 9, 142 + (y % 4) * 8, 68)
+                elif 18 <= x <= 42 and y < 34:
+                    shade = 30 + ((x * 3 + y * 5) % 36)
+                    color = (shade, shade - 8, shade - 12)
+                else:
+                    color = (2, 2, 8)
+                small.putpixel((x, y), color)
+        left, top, right, bottom = summary.SELECT_LARGE_PORTRAIT_ROI
+        resampling = getattr(getattr(Image, "Resampling", Image), "NEAREST")
+        image.paste(small.resize((right - left, bottom - top), resampling), (left, top))
+        image.save(path)
 
     def _write_low_color_stage_png(self, path: Path) -> None:
         image = Image.new("RGB", (512, 480), (190, 42, 34))
@@ -712,7 +811,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         )
         return summary.summarize_smoke(args)
 
-    def test_select_preview_draw_suppresses_no_model_draws_false_positive(self) -> None:
+    def test_select_preview_draw_does_not_suppress_missing_model(self) -> None:
         result = self._summarize(
             self._snapshot(
                 3,
@@ -722,7 +821,9 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         )
 
         select = result["stages"]["select"]
-        self.assertEqual(select["status"], "pass")
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(select["status"], "fail")
+        self.assertIn("select_model_chain_no_draws", select["reasons"])
         self.assertNotIn("select_model_preview_no_texture_draws", select["reasons"])
         self.assertEqual(select["select_preview"]["drawn_pixels"], 43_127)
         self.assertEqual(select["select_preview"]["palette_fallback_ratio"], 0.0)
@@ -745,6 +846,36 @@ class NativeE2EQASummaryTest(unittest.TestCase):
                     "last_chain_model_selection_reason": "selected",
                     "last_chain_model_texture_draws": 69,
                     "last_chain_model_packets": 32,
+                },
+            ]
+        )
+
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["warn_reason_counts"], {})
+        self.assertEqual(
+            result["transient_warn_reason_counts"],
+            {
+                "preserved_sparse_recovered_presentation": 1,
+                "no_model_draws": 1,
+            },
+        )
+
+    def test_recovery_complete_fighter_pair_clears_transient_model_warnings(
+        self,
+    ) -> None:
+        result = summary.recovery_verdict(
+            [
+                {
+                    "last_reason": "preserved_sparse_recovered_presentation",
+                    "last_chain_model_selection_reason": "no_model_draws",
+                    "last_chain_model_texture_draws": 0,
+                    "last_chain_model_packets": 0,
+                },
+                {
+                    "last_reason": "submitted",
+                    "last_chain_model_selection_reason": "selected_complete_fighter_pair",
+                    "last_chain_model_texture_draws": 627,
+                    "last_chain_model_packets": 541,
                 },
             ]
         )
@@ -783,7 +914,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         result = self._summarize(
             self._snapshot(
                 3,
-                recovery=self._no_model_recovery(),
+                recovery=self._model_recovery(),
                 draw=self._preview_draw(),
             ),
             boot_png=title,
@@ -812,7 +943,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         result = self._summarize(
             self._snapshot(
                 3,
-                recovery=self._no_model_recovery(),
+                recovery=self._model_recovery(),
                 draw=self._preview_draw(),
             ),
             boot_png=title,
@@ -861,11 +992,69 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         self.assertNotIn("select_model_preview_no_texture_draws", select["reasons"])
         self.assertEqual(select["select_preview"]["source_address_hex"], "0x003910fc")
 
+    def test_select_human_portrait_telemetry_accepts_current_verified_fallback(
+        self,
+    ) -> None:
+        diagnostics = summary.select_human_portrait_telemetry_diagnostics(
+            self._human_portrait_telemetry()
+        )
+
+        self.assertEqual(diagnostics["status"], "pass")
+        self.assertEqual(diagnostics["selected_slot"], 0)
+        self.assertEqual(
+            diagnostics["replay_source"],
+            "verified_roster_fallback",
+        )
+
+    def test_select_human_portrait_telemetry_rejects_beast_atlas_false_pass(
+        self,
+    ) -> None:
+        snapshot = self._human_portrait_telemetry(
+            present=False,
+            source=None,
+            replay_age=None,
+        )
+        stage = {"status": "pass", "reasons": []}
+
+        summary.attach_select_human_portrait_telemetry_diagnostics(stage, snapshot)
+
+        self.assertEqual(stage["status"], "fail")
+        self.assertIn(
+            "select_p1_human_portrait_replay_not_present",
+            stage["reasons"],
+        )
+        self.assertIn(
+            "select_p1_human_portrait_replay_source_invalid",
+            stage["reasons"],
+        )
+        self.assertIn(
+            "select_p1_human_portrait_replay_stale",
+            stage["reasons"],
+        )
+
+    def test_select_p2_human_portrait_telemetry_rejects_wrong_selected_slot(
+        self,
+    ) -> None:
+        diagnostics = summary.select_human_portrait_telemetry_diagnostics(
+            self._human_portrait_telemetry(
+                player_two=True,
+                selected_slot=4,
+                portrait_slot=5,
+            ),
+            player_two=True,
+        )
+
+        self.assertEqual(diagnostics["status"], "fail")
+        self.assertIn(
+            "select_p2_human_portrait_slot_mismatch",
+            diagnostics["reasons"],
+        )
+
     def test_select_preview_allows_expected_blank_clut_alias_with_new_palette(self) -> None:
         result = self._summarize(
             self._snapshot(
                 3,
-                recovery=self._no_model_recovery(),
+                recovery=self._model_recovery(),
                 draw=self._preview_draw(
                     clut_blank_samples=43_284,
                     palette_fallback_samples=43_284,
@@ -879,7 +1068,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         self.assertEqual(select["select_preview"]["clut_blank_ratio"], 0.8887)
         self.assertEqual(select["select_preview"]["palette_fallback_ratio"], 0.8887)
 
-    def test_missing_select_preview_telemetry_passes_when_large_portrait_is_visually_valid(
+    def test_missing_select_model_draws_fail_even_when_large_portrait_is_visually_valid(
         self,
     ) -> None:
         result = self._summarize(
@@ -887,14 +1076,187 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         )
 
         select = result["stages"]["select"]
-        self.assertEqual(select["status"], "pass")
-        self.assertNotIn("select_model_preview_no_texture_draws", select["reasons"])
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(select["status"], "fail")
+        self.assertIn("select_model_chain_no_draws", select["reasons"])
+        self.assertIn("select_model_preview_no_texture_draws", select["reasons"])
         self.assertEqual(select["select_preview"]["candidate_count"], 0)
         self.assertEqual(select["select_preview"]["telemetry_status"], "missing")
         self.assertIn(
             "select_model_preview_no_texture_draws",
             select["select_preview"]["telemetry_reasons"],
         )
+
+    def test_verified_human_portrait_replay_supersedes_missing_select_model_draws(
+        self,
+    ) -> None:
+        select_snapshot = self._snapshot(3, recovery=self._no_model_recovery())
+        select_snapshot.update(self._human_portrait_telemetry())
+
+        result = self._summarize(select_snapshot)
+
+        select = result["stages"]["select"]
+        self.assertEqual(result["status"], "warn")
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(select["status"], "pass")
+        self.assertEqual(select["select_model"]["status"], "not_checked")
+        self.assertEqual(
+            select["select_model"]["reason"],
+            "verified_human_portrait_replay",
+        )
+        self.assertNotIn("select_model_chain_no_draws", select["reasons"])
+        self.assertEqual(select["select_preview"]["status"], "not_checked")
+        self.assertNotIn("select_model_preview_no_texture_draws", select["reasons"])
+
+    def test_missing_select_model_telemetry_never_silently_passes(self) -> None:
+        result = self._summarize(self._snapshot(3))
+
+        select = result["stages"]["select"]
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(select["status"], "fail")
+        self.assertIn("select_model_telemetry_missing", select["reasons"])
+        self.assertEqual(select["select_model"]["telemetry_status"], "missing")
+
+    def test_aggregated_select_model_chain_allows_trimmed_draw_telemetry(self) -> None:
+        result = self._summarize(
+            self._snapshot(
+                3,
+                recovery={
+                    "last_reason": "submitted",
+                    "last_chain_model_selection_reason": "selected_current_otc",
+                    "last_chain_model_texture_draws": 69,
+                    "last_chain_model_packets": 37,
+                    "last_model_candidate_packets": 0,
+                    "last_model_candidate_chains": 0,
+                    "last_model_packets": 0,
+                    "last_model_selection_reason": "not_evaluated",
+                },
+            )
+        )
+
+        select = result["stages"]["select"]
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(select["status"], "pass")
+        self.assertEqual(select["select_model"]["status"], "pass")
+        self.assertEqual(select["select_preview"]["status"], "not_checked")
+
+    def test_blocky_low_resolution_portrait_fails_with_explicit_reason(self) -> None:
+        self.assertTrue(
+            summary.select_large_portrait_has_strong_low_edge_fallback(
+                edge_ratio=0.0559,
+                nonblack_ratio=0.5875,
+                chroma_ratio=0.4405,
+                quantized_colors=406,
+                dominant_quantized_ratio=0.0437,
+            )
+        )
+        self.assertFalse(
+            summary.select_large_portrait_has_strong_low_edge_fallback(
+                edge_ratio=0.0559,
+                nonblack_ratio=0.22,
+                chroma_ratio=0.05,
+                quantized_colors=18,
+                dominant_quantized_ratio=0.72,
+            )
+        )
+        blocky = self.artifact_dir / "blocky-low-resolution-select.window.png"
+        self._write_blocky_low_resolution_select_png(blocky)
+
+        diagnostics = summary.select_large_portrait_image_diagnostics(str(blocky))
+
+        self.assertEqual(diagnostics["status"], "fail")
+        self.assertTrue(diagnostics["blocky_low_resolution_portrait"])
+        self.assertGreaterEqual(
+            diagnostics["exact_horizontal_match_ratio"],
+            summary.SELECT_LARGE_PORTRAIT_BLOCKY_MIN_EXACT_HORIZONTAL_RATIO,
+        )
+        self.assertGreaterEqual(
+            diagnostics["exact_vertical_match_ratio"],
+            summary.SELECT_LARGE_PORTRAIT_BLOCKY_MIN_EXACT_VERTICAL_RATIO,
+        )
+        self.assertIn(
+            "select_large_portrait_blocky_low_resolution_fallback",
+            diagnostics["reasons"],
+        )
+
+    def test_smoke_stage_selection_prefers_complete_p2_and_stable_combat(
+        self,
+    ) -> None:
+        p1_png = self.artifact_dir / "p1-select.png"
+        self._write_select_png(large_portrait=True)
+        Image.open(self.png).save(p1_png)
+
+        p2_png = self.artifact_dir / "p2-select.png"
+        self._write_select_png(large_portrait=True, right_large_portrait=True)
+        Image.open(self.png).save(p2_png)
+
+        vs_png = self.artifact_dir / "vs-transition.png"
+        Image.new("RGB", (512, 480), (0, 0, 0)).save(vs_png)
+        snapshots = [
+            {
+                "tail_index": 3,
+                "action": "noop",
+                "window_output": str(p1_png),
+                "window_frame": self._frame(),
+            },
+            {
+                "tail_index": 6,
+                "action": "p2+start",
+                "window_output": str(p2_png),
+                "window_frame": self._frame(),
+                **self._two_player_human_portrait_telemetry(),
+            },
+            {
+                "tail_index": 7,
+                "action": "noop",
+                "window_output": str(p2_png),
+                "window_frame": self._frame(),
+                **self._two_player_human_portrait_telemetry(),
+            },
+            {
+                "tail_index": 10,
+                "action": "p2+punch",
+                "window_output": str(vs_png),
+                "window_frame": self._frame(gameplay=True),
+            },
+            {
+                "tail_index": 12,
+                "action": "noop",
+                "window_output": str(self.combat_png),
+                "window_frame": self._frame(gameplay=True),
+            },
+        ]
+
+        select, requires_p2 = summary.smoke_select_snapshot(snapshots)
+        combat = summary.smoke_combat_snapshot(snapshots)
+
+        self.assertTrue(requires_p2)
+        self.assertEqual(select["window_output"], str(p2_png))
+        self.assertEqual(select["tail_index"], 7)
+        self.assertEqual(combat["window_output"], str(self.combat_png))
+        self.assertEqual(combat["tail_index"], 12)
+
+    def test_smoke_stage_selection_rejects_stale_combat_portraits(self) -> None:
+        self._write_select_png(large_portrait=True, right_large_portrait=True)
+        stale = {
+            "tail_index": 37,
+            "action": "noop",
+            "window_output": str(self.png),
+            "window_frame": self._frame(),
+            **self._two_player_human_portrait_telemetry(),
+        }
+        recovery = stale["human_portrait_packets"]["recovery"]
+        recovery["present"] = False
+        recovery["gameplay_scene_observed"] = True
+        recovery["selected_slot"] = None
+        recovery["selected_p2_slot"] = None
+        recovery["p1"] = None
+        recovery["p2"] = None
+        recovery["p1_replay_source"] = None
+        recovery["p2_replay_source"] = None
+        recovery["last_replay_age_vblanks"] = None
+
+        self.assertFalse(summary.snapshot_has_complete_two_player_select_image(stale))
 
     def test_fixed_smoke_blank_large_portrait_regression_fails_when_available(self) -> None:
         stdout = Path(
@@ -950,7 +1312,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
                 self._snapshot(2),
                 self._snapshot(
                     3,
-                    recovery=self._no_model_recovery(),
+                    recovery=self._model_recovery(),
                     draw=self._preview_draw(),
                 ),
                 self._snapshot(5, action="punch", gameplay=True),
@@ -1051,6 +1413,38 @@ class NativeE2EQASummaryTest(unittest.TestCase):
         self.assertNotIn("combat_image_challenger_overlay_stale", diagnostics["reasons"])
         self.assertNotIn("combat_image_black_character_silhouette", diagnostics["reasons"])
         self.assertNotIn("combat_image_vs_texture_corruption", diagnostics["reasons"])
+
+    def test_character_select_field_overlay_does_not_false_pass_combat(self) -> None:
+        stale_overlay = self.artifact_dir / "stale-select-field-overlay.window.png"
+        self._write_stale_select_field_overlay_combat_png(stale_overlay)
+
+        diagnostics = summary.frame_image_diagnostics(
+            str(stale_overlay),
+            "combat",
+            self._frame(gameplay=True),
+        )
+
+        self.assertEqual(diagnostics["status"], "fail")
+        self.assertIn(
+            "combat_image_character_select_field_overlay_stale",
+            diagnostics["reasons"],
+        )
+
+    def test_wait_a_challenger_overlay_does_not_false_pass_combat(self) -> None:
+        stale_overlay = self.artifact_dir / "wait-a-challenger-overlay.window.png"
+        self._write_wait_a_challenger_overlay_combat_png(stale_overlay)
+
+        diagnostics = summary.frame_image_diagnostics(
+            str(stale_overlay),
+            "combat",
+            self._frame(gameplay=True),
+        )
+
+        self.assertEqual(diagnostics["status"], "fail")
+        self.assertIn(
+            "combat_image_wait_a_challenger_overlay_stale",
+            diagnostics["reasons"],
+        )
 
     def test_failure_evidence_challenger_overlay_does_not_false_pass(self) -> None:
         self._assert_evidence_fails_gameplay_image_gate(
@@ -1177,7 +1571,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
                 self._snapshot(0),
                 self._snapshot(1),
                 self._snapshot(2),
-                self._snapshot(3, recovery=self._no_model_recovery(), draw=self._preview_draw()),
+                self._snapshot(3, recovery=self._model_recovery(), draw=self._preview_draw()),
                 self._snapshot(5, action="punch", gameplay=True),
                 self._snapshot(6, action="beast", gameplay=True),
                 transient_post,
@@ -1265,7 +1659,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
                 self._snapshot(0),
                 self._snapshot(1),
                 self._snapshot(2),
-                self._snapshot(3, recovery=self._no_model_recovery(), draw=self._preview_draw()),
+                self._snapshot(3, recovery=self._model_recovery(), draw=self._preview_draw()),
                 early_beast,
                 early_post,
                 self._snapshot(6, action="punch", gameplay=True),
@@ -1391,7 +1785,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
                 self._snapshot(0),
                 self._snapshot(1),
                 self._snapshot(2),
-                self._snapshot(3, recovery=self._no_model_recovery(), draw=self._preview_draw()),
+                self._snapshot(3, recovery=self._model_recovery(), draw=self._preview_draw()),
                 self._snapshot(5, action="punch", gameplay=True),
                 beast_transition,
                 beast_result,
@@ -1435,7 +1829,7 @@ class NativeE2EQASummaryTest(unittest.TestCase):
                 self._snapshot(0),
                 self._snapshot(1),
                 self._snapshot(2),
-                self._snapshot(3, recovery=self._no_model_recovery(), draw=self._preview_draw()),
+                self._snapshot(3, recovery=self._model_recovery(), draw=self._preview_draw()),
                 self._snapshot(5, action="punch", gameplay=True),
                 beast_transition,
                 recovered_post,
