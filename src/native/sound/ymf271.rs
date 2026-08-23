@@ -10,6 +10,12 @@ const ENV_DECAY1: u8 = 1;
 const ENV_DECAY2: u8 = 2;
 const ENV_RELEASE: u8 = 3;
 const ENV_VOLUME_SHIFT: i32 = 16;
+const FM_WAVE_LENGTH: usize = 1024;
+const FM_WAVE_MASK: i64 = (FM_WAVE_LENGTH - 1) as i64;
+const LFO_LENGTH: u32 = 256;
+const LFO_SHIFT: u32 = 8;
+const OP_INPUT_FEEDBACK: i64 = i64::MIN;
+const OP_INPUT_NONE: i64 = i64::MIN + 1;
 const MAX_I16_AS_I32: i32 = i16::MAX as i32;
 const SLOT_MIX_HEADROOM_SHIFT: u32 = 2;
 const OUTPUT_SOFT_KNEE: i32 = 24_000;
@@ -31,6 +37,12 @@ const FS_FREQUENCY: [f64; 4] = [1.0, 0.5, 0.25, 0.125];
 const CHANNEL_ATTENUATION_DB: [f64; 16] = [
     0.0, 2.5, 6.0, 8.5, 12.0, 14.5, 18.1, 20.6, 24.1, 26.6, 30.1, 32.6, 36.1, 96.1, 96.1, 96.1,
 ];
+const MODULATION_LEVEL: [i64; 8] = [16, 8, 4, 2, 1, 32, 64, 128];
+const FEEDBACK_LEVEL: [i64; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
+const PMS_CENTS: [f64; 8] = [
+    0.0, 3.378, 5.0646, 6.7495, 10.1143, 20.1699, 40.1076, 79.307,
+];
+const AMS_SCALE: [i64; 4] = [0, 33_124, 16_742, 4_277];
 
 // MAME src/devices/sound/ymf271.cpp is BSD-3-Clause. The Rust code below is a
 // clean port of the public register decode, PCM addressing, loop/end status,
@@ -161,6 +173,10 @@ struct Slot {
     env_decay1_step: i32,
     env_decay2_step: i32,
     env_release_step: i32,
+    feedback_modulation: [i64; 2],
+    lfo_phase: u32,
+    lfo_step: u32,
+    lfo_amplitude: i64,
     lfo_phase_mod: f64,
 }
 
@@ -212,6 +228,10 @@ impl Default for Slot {
             env_decay1_step: 0,
             env_decay2_step: 0,
             env_release_step: 0,
+            feedback_modulation: [0; 2],
+            lfo_phase: 0,
+            lfo_step: 0,
+            lfo_amplitude: 0,
             lfo_phase_mod: 1.0,
         }
     }
@@ -250,6 +270,8 @@ pub struct Ymf271 {
     attenuation_lut: [i64; 16],
     total_level_lut: [i64; 128],
     env_volume_lut: [i64; 256],
+    wave_lut: [[i16; FM_WAVE_LENGTH]; 7],
+    phase_lfo_lut: [[[f64; LFO_LENGTH as usize]; 8]; 4],
     stats: Ymf271Stats,
 }
 
@@ -274,6 +296,8 @@ impl Ymf271 {
             attenuation_lut: [0; 16],
             total_level_lut: [0; 128],
             env_volume_lut: [0; 256],
+            wave_lut: [[0; FM_WAVE_LENGTH]; 7],
+            phase_lfo_lut: [[[1.0; LFO_LENGTH as usize]; 8]; 4],
             stats: Ymf271Stats::default(),
         };
         ymf.init_tables();
@@ -343,10 +367,11 @@ impl Ymf271 {
             let mut mix = [0i32; 4];
             for group_index in 0..GROUP_COUNT {
                 match self.groups[group_index].sync {
+                    0 | 1 => {
+                        self.mix_fm_group(group_index, &mut mix);
+                    }
                     2 => {
-                        self.mix_fm_slot(group_index, &mut mix);
-                        self.mix_fm_slot(group_index + 12, &mut mix);
-                        self.mix_fm_slot(group_index + 24, &mut mix);
+                        self.mix_three_operator_fm_group(group_index, &mut mix);
                         let slot = group_index + 36;
                         self.mix_pcm_slot(slot, &mut mix);
                     }
@@ -356,11 +381,7 @@ impl Ymf271 {
                         self.mix_pcm_slot(group_index + 24, &mut mix);
                         self.mix_pcm_slot(group_index + 36, &mut mix);
                     }
-                    _ => {
-                        if self.group_has_active_fm(group_index) {
-                            self.mix_fm_group(group_index, &mut mix);
-                        }
-                    }
+                    _ => {}
                 }
             }
 
@@ -431,6 +452,47 @@ impl Ymf271 {
         }
         for i in 0..256 {
             self.env_volume_lut[i] = db_to_linear((i as f64) / (256.0 / 96.0));
+        }
+        for i in 0..FM_WAVE_LENGTH {
+            let phase = i as f64;
+            let wave = (((phase * 2.0) + 1.0) * std::f64::consts::PI / FM_WAVE_LENGTH as f64).sin();
+            let double_wave =
+                (((phase * 4.0) + 1.0) * std::f64::consts::PI / FM_WAVE_LENGTH as f64).sin();
+            self.wave_lut[0][i] = (wave * f64::from(i16::MAX)) as i16;
+            self.wave_lut[1][i] = if i < FM_WAVE_LENGTH / 2 {
+                (wave * wave * f64::from(i16::MAX)) as i16
+            } else {
+                (wave * wave * f64::from(i16::MIN)) as i16
+            };
+            self.wave_lut[2][i] = if i < FM_WAVE_LENGTH / 2 {
+                (wave * f64::from(i16::MAX)) as i16
+            } else {
+                (-wave * f64::from(i16::MAX)) as i16
+            };
+            self.wave_lut[3][i] = if i < FM_WAVE_LENGTH / 2 {
+                (wave * f64::from(i16::MAX)) as i16
+            } else {
+                0
+            };
+            self.wave_lut[4][i] = if i < FM_WAVE_LENGTH / 2 {
+                (double_wave * f64::from(i16::MAX)) as i16
+            } else {
+                0
+            };
+            self.wave_lut[5][i] = if i < FM_WAVE_LENGTH / 2 {
+                (double_wave.abs() * f64::from(i16::MAX)) as i16
+            } else {
+                0
+            };
+            self.wave_lut[6][i] = i16::MAX;
+        }
+        for wave in 0..4 {
+            for (pms, cents) in PMS_CENTS.iter().copied().enumerate() {
+                for index in 0..LFO_LENGTH as usize {
+                    self.phase_lfo_lut[wave][pms][index] =
+                        2.0_f64.powf((cents * lfo_phase(wave as u8, index)) / 1200.0);
+                }
+            }
         }
     }
 
@@ -642,22 +704,21 @@ impl Ymf271 {
                 slot.ext_en = u8::from(data & 0x80 != 0);
                 slot.ext_out = (data >> 3) & 0x0f;
                 if data & 1 != 0 {
-                    if should_restart_slot_on_key_on(slot, self.stats.generated_frames) {
-                        let program_signature = slot_program_signature(slot);
-                        slot.key_on_latched = true;
-                        slot.program_dirty_since_key_on = false;
-                        slot.last_key_on_program_signature = program_signature;
-                        slot.last_key_on_frame = self.stats.generated_frames;
-                        slot.ended_frame = None;
-                        slot.step = 0;
-                        slot.step_ptr = 0;
-                        slot.active = true;
-                        calculate_step(slot);
-                        calculate_status_end(&mut self.end_status, slot_index, false);
-                        init_envelope(slot);
-                        init_lfo(slot);
-                        self.stats.key_on_events = self.stats.key_on_events.saturating_add(1);
-                    }
+                    let program_signature = slot_program_signature(slot);
+                    slot.key_on_latched = true;
+                    slot.program_dirty_since_key_on = false;
+                    slot.last_key_on_program_signature = program_signature;
+                    slot.last_key_on_frame = self.stats.generated_frames;
+                    slot.ended_frame = None;
+                    slot.step = 0;
+                    slot.step_ptr = 0;
+                    slot.active = true;
+                    calculate_step(slot);
+                    calculate_status_end(&mut self.end_status, slot_index, false);
+                    init_envelope(slot);
+                    init_lfo(slot);
+                    slot.feedback_modulation = [0; 2];
+                    self.stats.key_on_events = self.stats.key_on_events.saturating_add(1);
                 } else {
                     slot.key_on_latched = false;
                     slot.ended_frame = None;
@@ -777,6 +838,7 @@ impl Ymf271 {
             self.finish_envelope_ended_slot(slot_index);
             return;
         }
+        self.update_slot_lfo(slot_index);
 
         let final_volume = self.calculate_slot_volume(slot_index);
         let channel_levels = self.slots[slot_index].ch_level;
@@ -797,40 +859,311 @@ impl Ymf271 {
     }
 
     fn mix_fm_group(&mut self, group_index: usize, mix: &mut [i32; 4]) {
-        for base in [0usize, 12, 24, 36] {
-            self.mix_fm_slot(base + group_index, mix);
+        match self.groups[group_index].sync {
+            0 => self.mix_four_operator_fm_group(group_index, mix),
+            1 => {
+                self.mix_two_operator_fm_pair(group_index, group_index + 24, mix);
+                self.mix_two_operator_fm_pair(group_index + 12, group_index + 36, mix);
+            }
+            _ => {}
         }
     }
 
-    fn mix_fm_slot(&mut self, slot_index: usize, mix: &mut [i32; 4]) {
-        if slot_index >= self.slots.len() || !self.slots[slot_index].active {
-            return;
-        }
-        if self.slots[slot_index].waveform == 7 {
+    fn mix_four_operator_fm_group(&mut self, group_index: usize, mix: &mut [i32; 4]) {
+        let slot1 = group_index;
+        let slot2 = group_index + 12;
+        let slot3 = group_index + 24;
+        let slot4 = group_index + 36;
+        if !self.slots[slot1].active {
             return;
         }
 
-        let sample = self.current_fm_sample(slot_index);
-        let final_volume = self.calculate_slot_volume(slot_index);
-        let channel_levels = self.slots[slot_index].ch_level;
-
-        for channel in 0..4 {
-            let mut channel_volume =
-                (final_volume * self.attenuation_lut[channel_levels[channel] as usize]) >> 16;
-            if channel_volume > 65_536 {
-                channel_volume = 65_536;
+        let mut outputs = [(slot1, 0i64), (slot2, 0), (slot3, 0), (slot4, 0)];
+        match self.slots[slot1].algorithm {
+            0 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                let phase2 = self.calculate_fm_operator(slot2, phase3);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase2);
             }
-            mix[channel] = mix[channel].saturating_add(mix_slot_sample(sample, channel_volume));
+            1 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                self.set_fm_feedback(slot1, phase3);
+                let phase2 = self.calculate_fm_operator(slot2, phase3);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase2);
+            }
+            2 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                let phase3 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                let phase2 = self.calculate_fm_operator(slot2, phase1 + phase3);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase2);
+            }
+            3 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                let phase3 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                let phase2 = self.calculate_fm_operator(slot2, phase3);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase1 + phase2);
+            }
+            4 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                let phase2 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase3 + phase2);
+            }
+            5 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                self.set_fm_feedback(slot1, phase3);
+                let phase2 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase3 + phase2);
+            }
+            6 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[2].1 = self.calculate_fm_operator(slot3, phase1);
+                let phase2 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase2);
+            }
+            7 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                self.set_fm_feedback(slot1, phase3);
+                outputs[2].1 = phase3;
+                let phase2 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase2);
+            }
+            8 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                let phase3 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                let phase2 = self.calculate_fm_operator(slot2, phase3);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase2);
+            }
+            9 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                let phase3 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                let phase2 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase3 + phase2);
+            }
+            10 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[2].1 = self.calculate_fm_operator(slot3, phase1);
+                outputs[1].1 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, OP_INPUT_NONE);
+            }
+            11 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                self.set_fm_feedback(slot1, phase3);
+                outputs[2].1 = phase3;
+                outputs[1].1 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, OP_INPUT_NONE);
+            }
+            12 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[2].1 = self.calculate_fm_operator(slot3, phase1);
+                outputs[1].1 = self.calculate_fm_operator(slot2, phase1);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase1);
+            }
+            13 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                let phase3 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                outputs[1].1 = self.calculate_fm_operator(slot2, phase3);
+                outputs[3].1 = self.calculate_fm_operator(slot4, OP_INPUT_NONE);
+            }
+            14 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                outputs[2].1 = self.calculate_fm_operator(slot3, phase1);
+                let phase2 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, phase2);
+            }
+            15 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                outputs[2].1 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                outputs[1].1 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+                outputs[3].1 = self.calculate_fm_operator(slot4, OP_INPUT_NONE);
+            }
+            _ => unreachable!(),
+        }
+        self.mix_fm_outputs(&outputs, mix);
+    }
+
+    fn mix_two_operator_fm_pair(&mut self, slot1: usize, slot3: usize, mix: &mut [i32; 4]) {
+        if !self.slots[slot1].active {
+            return;
+        }
+
+        let mut outputs = [(slot1, 0i64), (slot3, 0)];
+        match self.slots[slot1].algorithm & 3 {
+            0 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[1].1 = self.calculate_fm_operator(slot3, phase1);
+            }
+            1 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                self.set_fm_feedback(slot1, phase3);
+                outputs[1].1 = phase3;
+            }
+            2 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                outputs[1].1 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+            }
+            3 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                outputs[1].1 = self.calculate_fm_operator(slot3, phase1);
+            }
+            _ => unreachable!(),
+        }
+        self.mix_fm_outputs(&outputs, mix);
+    }
+
+    fn mix_three_operator_fm_group(&mut self, group_index: usize, mix: &mut [i32; 4]) {
+        let slot1 = group_index;
+        let slot2 = group_index + 12;
+        let slot3 = group_index + 24;
+        if !self.slots[slot1].active {
+            return;
+        }
+
+        let mut outputs = [(slot1, 0i64), (slot2, 0), (slot3, 0)];
+        match self.slots[slot1].algorithm & 7 {
+            0 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                outputs[1].1 = self.calculate_fm_operator(slot2, phase3);
+            }
+            1 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                self.set_fm_feedback(slot1, phase3);
+                outputs[1].1 = self.calculate_fm_operator(slot2, phase3);
+            }
+            2 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                let phase3 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                outputs[1].1 = self.calculate_fm_operator(slot2, phase1 + phase3);
+            }
+            3 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                let phase3 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                outputs[1].1 = self.calculate_fm_operator(slot2, phase3);
+            }
+            4 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[2].1 = self.calculate_fm_operator(slot3, phase1);
+                outputs[1].1 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+            }
+            5 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                let phase3 = self.calculate_fm_operator(slot3, phase1);
+                self.set_fm_feedback(slot1, phase3);
+                outputs[2].1 = phase3;
+                outputs[1].1 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+            }
+            6 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                outputs[2].1 = self.calculate_fm_operator(slot3, OP_INPUT_NONE);
+                outputs[1].1 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+            }
+            7 => {
+                let phase1 = self.calculate_fm_operator(slot1, OP_INPUT_FEEDBACK);
+                self.set_fm_feedback(slot1, phase1);
+                outputs[0].1 = phase1;
+                outputs[2].1 = self.calculate_fm_operator(slot3, phase1);
+                outputs[1].1 = self.calculate_fm_operator(slot2, OP_INPUT_NONE);
+            }
+            _ => unreachable!(),
+        }
+        self.mix_fm_outputs(&outputs, mix);
+    }
+
+    fn calculate_fm_operator(&mut self, slot_index: usize, input: i64) -> i64 {
+        if slot_index >= self.slots.len()
+            || !self.slots[slot_index].active
+            || self.slots[slot_index].waveform == 7
+        {
+            return 0;
         }
 
         update_envelope(&mut self.slots[slot_index]);
         if !self.slots[slot_index].active {
             self.finish_envelope_ended_slot(slot_index);
-            return;
+            return 0;
         }
-        self.slots[slot_index].step_ptr = self.slots[slot_index]
-            .step_ptr
-            .wrapping_add(u64::from(self.slots[slot_index].step));
+        self.update_slot_lfo(slot_index);
+
+        let final_volume = self.calculate_slot_volume(slot_index);
+        let slot = &mut self.slots[slot_index];
+        let phase_input = if input == OP_INPUT_FEEDBACK {
+            let phase_input = (slot.feedback_modulation[0] + slot.feedback_modulation[1]) / 2;
+            slot.feedback_modulation[0] = slot.feedback_modulation[1];
+            phase_input
+        } else if input == OP_INPUT_NONE {
+            0
+        } else {
+            input
+                .saturating_mul(1 << 8)
+                .saturating_mul(MODULATION_LEVEL[slot.feedback as usize])
+        };
+        let phase = (slot.step_ptr as i64)
+            .wrapping_add(phase_input)
+            .wrapping_shr(16)
+            & FM_WAVE_MASK;
+        let sample = i64::from(self.wave_lut[slot.waveform as usize][phase as usize]);
+        let output = (sample * final_volume) >> 16;
+        slot.step_ptr = slot.step_ptr.wrapping_add(u64::from(slot.step));
+        output
+    }
+
+    fn set_fm_feedback(&mut self, slot_index: usize, output: i64) {
+        let slot = &mut self.slots[slot_index];
+        slot.feedback_modulation[1] = output
+            .saturating_mul(1 << 8)
+            .saturating_mul(FEEDBACK_LEVEL[slot.feedback as usize])
+            / 16;
+    }
+
+    fn mix_fm_outputs(&self, outputs: &[(usize, i64)], mix: &mut [i32; 4]) {
+        for (channel, mixed) in mix.iter_mut().enumerate() {
+            let channel_output = outputs.iter().fold(0i64, |sum, (slot_index, output)| {
+                let attenuation =
+                    self.attenuation_lut[self.slots[*slot_index].ch_level[channel] as usize];
+                sum.saturating_add(output.saturating_mul(attenuation))
+            }) >> 16;
+            let channel_output = channel_output >> SLOT_MIX_HEADROOM_SHIFT;
+            *mixed = mixed.saturating_add(
+                channel_output.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            );
+        }
     }
 
     fn current_pcm_sample(&self, slot_index: usize) -> i16 {
@@ -853,26 +1186,14 @@ impl Ymf271 {
         raw as i16
     }
 
+    #[cfg(test)]
     fn current_fm_sample(&self, slot_index: usize) -> i16 {
         let slot = self.slots[slot_index];
-        let phase = ((slot.step_ptr >> 16) & 0xffff) as u32;
-        let sample = match slot.waveform & 0x07 {
-            0 => triangle_wave_sample(phase),
-            1 => saw_wave_sample(phase),
-            2 => square_wave_sample(phase),
-            3 => -triangle_wave_sample(phase),
-            4 => triangle_wave_sample(phase).unsigned_abs() as i32 - 16_384,
-            5 => saw_wave_sample(phase).unsigned_abs() as i32 - 16_384,
-            6 => {
-                if phase < 0x4000 || (0x8000..0xc000).contains(&phase) {
-                    24_576
-                } else {
-                    -24_576
-                }
-            }
-            _ => 0,
-        };
-        sample.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+        if slot.waveform >= 7 {
+            return 0;
+        }
+        let phase = ((slot.step_ptr >> 16) & FM_WAVE_MASK as u64) as usize;
+        self.wave_lut[slot.waveform as usize][phase]
     }
 
     fn prepare_pcm_slot_for_sample(&mut self, slot_index: usize) -> bool {
@@ -1010,8 +1331,14 @@ impl Ymf271 {
     fn calculate_slot_volume(&self, slot_index: usize) -> i64 {
         let slot = self.slots[slot_index];
         let volume = (slot.volume >> ENV_VOLUME_SHIFT).clamp(0, 255) as usize;
-        let env_volume = self.env_volume_lut[255usize.saturating_sub(volume)];
+        let lfo_volume = 65_536 - ((slot.lfo_amplitude * AMS_SCALE[slot.ams as usize]) >> 16);
+        let env_volume = (self.env_volume_lut[255usize.saturating_sub(volume)] * lfo_volume) >> 16;
         (env_volume * self.total_level_lut[slot.total_level as usize]) >> 16
+    }
+
+    fn update_slot_lfo(&mut self, slot_index: usize) {
+        let phase_lfo_lut = &self.phase_lfo_lut;
+        update_lfo(&mut self.slots[slot_index], phase_lfo_lut);
     }
 
     fn read_rom_byte(&self, address: u32) -> u8 {
@@ -1041,13 +1368,6 @@ impl Ymf271 {
         self.stats.active_slots = active;
         self.stats.pcm_slots_active = pcm;
         self.stats.fm_slots_active = fm;
-    }
-
-    fn group_has_active_fm(&self, group_index: usize) -> bool {
-        [0usize, 12, 24, 36].iter().any(|base| {
-            let slot = self.slots[*base + group_index];
-            slot.active && slot.waveform != 7
-        })
     }
 }
 
@@ -1091,21 +1411,6 @@ fn mark_program_dirty(slot: &mut Slot, changed: bool) {
     if changed {
         slot.program_dirty_since_key_on = true;
     }
-}
-
-fn should_restart_slot_on_key_on(slot: &Slot, _current_frame: u64) -> bool {
-    if !slot.key_on_latched {
-        return true;
-    }
-    if slot.active {
-        return false;
-    }
-    if slot.program_dirty_since_key_on
-        && slot_program_signature(slot) != slot.last_key_on_program_signature
-    {
-        return true;
-    }
-    false
 }
 
 fn slot_program_signature(slot: &Slot) -> u64 {
@@ -1190,8 +1495,89 @@ fn init_envelope(slot: &mut Slot) {
 }
 
 fn init_lfo(slot: &mut Slot) {
+    slot.lfo_phase = 0;
+    slot.lfo_step = lfo_step(slot.lfo_freq);
+    slot.lfo_amplitude = 0;
     slot.lfo_phase_mod = 1.0;
     calculate_step(slot);
+}
+
+fn update_lfo(slot: &mut Slot, phase_lfo_lut: &[[[f64; LFO_LENGTH as usize]; 8]; 4]) {
+    slot.lfo_phase = slot.lfo_phase.wrapping_add(slot.lfo_step);
+    let index = ((slot.lfo_phase >> LFO_SHIFT) & (LFO_LENGTH - 1)) as usize;
+    slot.lfo_amplitude = lfo_amplitude(slot.lfo_wave, index);
+    if slot.pms == 0 {
+        slot.lfo_phase_mod = 1.0;
+    } else {
+        slot.lfo_phase_mod = phase_lfo_lut[(slot.lfo_wave & 3) as usize][slot.pms as usize][index];
+        calculate_step(slot);
+    }
+}
+
+fn lfo_step(lfo_freq: u8) -> u32 {
+    let entry = 256u32.saturating_sub(u32::from(lfo_freq));
+    let mantissa = entry & 0x0f;
+    let exponent = entry >> 4;
+    let period = if exponent == 0 {
+        u64::from(mantissa) << 7
+    } else {
+        u64::from(mantissa | 16) << (exponent + 6)
+    };
+    if period == 0 {
+        return 0;
+    }
+    (u64::from(LFO_LENGTH) << LFO_SHIFT)
+        .checked_div(period)
+        .unwrap_or_default()
+        .min(u64::from(u32::MAX)) as u32
+}
+
+fn lfo_phase(wave: u8, index: usize) -> f64 {
+    let index = index % LFO_LENGTH as usize;
+    match wave & 3 {
+        0 => 0.0,
+        1 => {
+            let ramp = (index % 128) as f64 / 127.0;
+            if index < 128 { ramp } else { ramp - 1.0 }
+        }
+        2 => {
+            if index < 128 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        3 => {
+            let ramp = (index % 64) as f64 / 64.0;
+            match index / 64 {
+                0 => ramp,
+                1 => 1.0 - ramp,
+                2 => -ramp,
+                _ => -(1.0 - ramp),
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn lfo_amplitude(wave: u8, index: usize) -> i64 {
+    let index = index % LFO_LENGTH as usize;
+    match wave & 3 {
+        0 => 0,
+        1 => 65_536 - (index as i64 * 65_536 / i64::from(LFO_LENGTH)),
+        2 => {
+            if index < 128 {
+                65_536
+            } else {
+                0
+            }
+        }
+        3 => {
+            let ramp = (index % 128) as i64 * 65_536 / 128;
+            if index < 128 { 65_536 - ramp } else { ramp }
+        }
+        _ => unreachable!(),
+    }
 }
 
 fn update_envelope(slot: &mut Slot) {
@@ -1267,23 +1653,6 @@ fn soft_limit_i16(value: i32) -> (i16, bool) {
     let limited_abs = limited_abs.min(MAX_I16_AS_I32 - 1);
     let limited = if value < 0 { -limited_abs } else { limited_abs };
     (limited as i16, true)
-}
-
-fn triangle_wave_sample(phase: u32) -> i32 {
-    let phase = (phase & 0xffff) as i32;
-    if phase < 0x8000 {
-        phase.saturating_mul(2).saturating_sub(0x8000)
-    } else {
-        0x7fff - (phase - 0x8000).saturating_mul(2)
-    }
-}
-
-fn saw_wave_sample(phase: u32) -> i32 {
-    (phase & 0xffff) as i32 - 0x8000
-}
-
-fn square_wave_sample(phase: u32) -> i32 {
-    if phase & 0x8000 == 0 { 0x7fff } else { -0x8000 }
 }
 
 fn integer_sqrt(value: u64) -> u64 {
@@ -1368,6 +1737,20 @@ mod tests {
         ymf.slots[slot_index].env_state = super::ENV_DECAY2;
         ymf.slots[slot_index].env_decay2_step = 0;
         ymf.slots[slot_index].ch_level = [0, 0, 0, 0];
+    }
+
+    fn activate_direct_fm_slot(ymf: &mut Ymf271, slot_index: usize, waveform: u8) {
+        ymf.slots[slot_index].active = true;
+        ymf.slots[slot_index].key_on_latched = true;
+        ymf.slots[slot_index].waveform = waveform;
+        ymf.slots[slot_index].fns = 0x07ff;
+        ymf.slots[slot_index].block = 0;
+        ymf.slots[slot_index].multiple = 1;
+        ymf.slots[slot_index].volume = 255 << ENV_VOLUME_SHIFT;
+        ymf.slots[slot_index].env_state = super::ENV_DECAY2;
+        ymf.slots[slot_index].env_decay2_step = 0;
+        ymf.slots[slot_index].ch_level = [0, 0, 0, 0];
+        super::init_lfo(&mut ymf.slots[slot_index]);
     }
 
     #[test]
@@ -1460,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_key_on_write_does_not_restart_active_pcm_voice() {
+    fn repeated_key_on_write_restarts_active_pcm_voice() {
         let mut ymf = Ymf271::new(vec![0x7f; 128]);
         ymf.groups[0].sync = 3;
         ymf.slots[0].waveform = 7;
@@ -1473,17 +1856,17 @@ mod tests {
         write_fm_bank0(&mut ymf, 0x00, 0x01);
         ymf.render_stereo(16);
         let step_ptr = ymf.slots[0].step_ptr;
-        let volume = ymf.slots[0].volume;
 
         write_fm_bank0(&mut ymf, 0x00, 0x01);
         let duplicate = ymf.stats();
 
         assert_eq!(duplicate.key_register_writes, 2, "{duplicate:?}");
-        assert_eq!(duplicate.key_on_events, 1, "{duplicate:?}");
+        assert_eq!(duplicate.key_on_events, 2, "{duplicate:?}");
         assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
-        assert_eq!(ymf.slots[0].step_ptr, step_ptr);
-        assert_eq!(ymf.slots[0].volume, volume);
+        assert_eq!(ymf.slots[0].step_ptr, 0);
+        assert_eq!(ymf.slots[0].env_state, super::ENV_ATTACK);
+        assert_ne!(ymf.slots[0].step_ptr, step_ptr);
 
         write_fm_bank0(&mut ymf, 0x00, 0x00);
         assert!(!ymf.slots[0].key_on_latched);
@@ -1491,7 +1874,7 @@ mod tests {
 
         write_fm_bank0(&mut ymf, 0x00, 0x01);
         let retrigger = ymf.stats();
-        assert_eq!(retrigger.key_on_events, 2, "{retrigger:?}");
+        assert_eq!(retrigger.key_on_events, 3, "{retrigger:?}");
         assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
         assert_eq!(ymf.slots[0].step_ptr, 0);
@@ -1599,6 +1982,164 @@ mod tests {
     }
 
     #[test]
+    fn fm_phase_wraps_at_the_1024_entry_wavetable_boundary() {
+        let mut ymf = Ymf271::new(vec![]);
+        ymf.slots[0].waveform = 0;
+
+        ymf.slots[0].step_ptr = 0;
+        let start = ymf.current_fm_sample(0);
+        ymf.slots[0].step_ptr = 256 << 16;
+        let quarter = ymf.current_fm_sample(0);
+        ymf.slots[0].step_ptr = 1024 << 16;
+        let wrapped = ymf.current_fm_sample(0);
+
+        assert_ne!(quarter, start);
+        assert_eq!(wrapped, start);
+    }
+
+    #[test]
+    fn fm_internal_waveforms_match_mame_shapes() {
+        let mut ymf = Ymf271::new(vec![]);
+
+        ymf.slots[0].waveform = 3;
+        ymf.slots[0].step_ptr = 768 << 16;
+        assert_eq!(ymf.current_fm_sample(0), 0);
+
+        ymf.slots[0].waveform = 6;
+        let constant = ymf.current_fm_sample(0);
+        for phase in [0u64, 127, 511, 1023] {
+            ymf.slots[0].step_ptr = phase << 16;
+            assert_eq!(ymf.current_fm_sample(0), constant);
+        }
+        assert_eq!(constant, i16::MAX);
+    }
+
+    #[test]
+    fn four_operator_algorithm_routes_only_declared_carriers() {
+        let mut serial = Ymf271::new(vec![]);
+        serial.groups[0].sync = 0;
+        for slot in [0usize, 12, 24, 36] {
+            activate_direct_fm_slot(&mut serial, slot, 6);
+        }
+        serial.slots[0].algorithm = 0;
+        let mut serial_mix = [0i32; 4];
+        serial.mix_four_operator_fm_group(0, &mut serial_mix);
+
+        let mut parallel = serial.clone();
+        for slot in [0usize, 12, 24, 36] {
+            parallel.slots[slot].step_ptr = 0;
+            parallel.slots[slot].feedback_modulation = [0; 2];
+        }
+        parallel.slots[0].algorithm = 15;
+        let mut parallel_mix = [0i32; 4];
+        parallel.mix_four_operator_fm_group(0, &mut parallel_mix);
+
+        assert!(serial_mix[0] > 0, "{serial_mix:?}");
+        assert!(
+            parallel_mix[0].abs_diff(serial_mix[0] * 4) <= 3,
+            "{parallel_mix:?}"
+        );
+    }
+
+    #[test]
+    fn two_and_three_operator_algorithms_route_mame_carrier_counts() {
+        let mut two_serial = Ymf271::new(vec![]);
+        for slot in [0usize, 24] {
+            activate_direct_fm_slot(&mut two_serial, slot, 6);
+        }
+        two_serial.slots[0].algorithm = 0;
+        let mut two_serial_mix = [0i32; 4];
+        two_serial.mix_two_operator_fm_pair(0, 24, &mut two_serial_mix);
+
+        let mut two_parallel = two_serial.clone();
+        two_parallel.slots[0].algorithm = 2;
+        let mut two_parallel_mix = [0i32; 4];
+        two_parallel.mix_two_operator_fm_pair(0, 24, &mut two_parallel_mix);
+        assert!(
+            two_parallel_mix[0].abs_diff(two_serial_mix[0] * 2) <= 1,
+            "{two_parallel_mix:?}"
+        );
+
+        let mut three_serial = Ymf271::new(vec![]);
+        for slot in [0usize, 12, 24] {
+            activate_direct_fm_slot(&mut three_serial, slot, 6);
+        }
+        three_serial.slots[0].algorithm = 0;
+        let mut three_serial_mix = [0i32; 4];
+        three_serial.mix_three_operator_fm_group(0, &mut three_serial_mix);
+
+        let mut three_parallel = three_serial.clone();
+        three_parallel.slots[0].algorithm = 6;
+        let mut three_parallel_mix = [0i32; 4];
+        three_parallel.mix_three_operator_fm_group(0, &mut three_parallel_mix);
+        assert!(
+            three_parallel_mix[0].abs_diff(three_serial_mix[0] * 3) <= 2,
+            "{three_parallel_mix:?}"
+        );
+    }
+
+    #[test]
+    fn fm_feedback_changes_followup_operator_phase() {
+        let mut feedback = Ymf271::new(vec![]);
+        activate_direct_fm_slot(&mut feedback, 0, 0);
+        feedback.slots[0].feedback = 7;
+        feedback.slots[0].step_ptr = 128 << 16;
+
+        let mut no_feedback = feedback.clone();
+        no_feedback.slots[0].feedback = 0;
+
+        let mut feedback_outputs = Vec::new();
+        let mut plain_outputs = Vec::new();
+        for _ in 0..4 {
+            let output = feedback.calculate_fm_operator(0, super::OP_INPUT_FEEDBACK);
+            feedback.set_fm_feedback(0, output);
+            feedback_outputs.push(output);
+
+            let output = no_feedback.calculate_fm_operator(0, super::OP_INPUT_FEEDBACK);
+            no_feedback.set_fm_feedback(0, output);
+            plain_outputs.push(output);
+        }
+
+        assert_ne!(feedback_outputs, plain_outputs);
+        assert_ne!(feedback.slots[0].feedback_modulation, [0; 2]);
+        assert_eq!(no_feedback.slots[0].feedback_modulation, [0; 2]);
+    }
+
+    #[test]
+    fn pms_changes_step_and_ams_attenuates_volume() {
+        let mut ymf = Ymf271::new(vec![]);
+        activate_direct_fm_slot(&mut ymf, 0, 0);
+        ymf.slots[0].lfo_freq = 255;
+        ymf.slots[0].lfo_wave = 2;
+        ymf.slots[0].pms = 7;
+        super::init_lfo(&mut ymf.slots[0]);
+        let neutral_step = ymf.slots[0].step;
+
+        ymf.update_slot_lfo(0);
+        assert!(ymf.slots[0].step > neutral_step);
+
+        ymf.slots[0].lfo_amplitude = 65_536;
+        ymf.slots[0].ams = 0;
+        let neutral_volume = ymf.calculate_slot_volume(0);
+        ymf.slots[0].ams = 1;
+        let modulated_volume = ymf.calculate_slot_volume(0);
+        assert!(modulated_volume < neutral_volume);
+    }
+
+    #[test]
+    fn key_on_restarts_voice_and_clears_feedback_history_like_mame() {
+        let mut ymf = Ymf271::new(vec![]);
+        ymf.slots[0].feedback_modulation = [123, 456];
+
+        write_fm_bank0(&mut ymf, 0x00, 0x01);
+
+        assert!(ymf.slots[0].active);
+        assert_eq!(ymf.slots[0].feedback_modulation, [0; 2]);
+        assert_eq!(ymf.slots[0].step_ptr, 0);
+        assert_eq!(ymf.slots[0].lfo_phase, 0);
+    }
+
+    #[test]
     fn extreme_pcm_mix_uses_headroom_instead_of_i16_clipping() {
         let mut ymf = Ymf271::new(vec![0x80; 128]);
         for group in 0..GROUP_COUNT {
@@ -1646,11 +2187,10 @@ mod tests {
     fn sync_mode_two_mixes_three_fm_slots_before_pcm_slot() {
         let mut ymf = Ymf271::new(vec![0; 64]);
         ymf.groups[0].sync = 2;
-        ymf.slots[0].active = true;
-        ymf.slots[0].waveform = 0;
-        ymf.slots[0].step = 1 << 16;
-        ymf.slots[0].volume = 255 << ENV_VOLUME_SHIFT;
-        ymf.slots[0].ch_level = [0, 0, 0, 0];
+        for slot in [0usize, 12, 24] {
+            activate_direct_fm_slot(&mut ymf, slot, 0);
+        }
+        ymf.slots[0].algorithm = 0;
 
         let frames = ymf.render_stereo(8);
         let stats = ymf.stats();
@@ -1856,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn ended_one_shot_pcm_keeps_key_latch_until_key_off_to_block_stuck_retrigger() {
+    fn ended_one_shot_pcm_retriggers_on_each_key_on_write() {
         let mut ymf = Ymf271::new(vec![0x7f; 8]);
         ymf.groups[0].sync = 3;
         ymf.slots[0].waveform = 7;
@@ -1876,22 +2416,24 @@ mod tests {
 
         write_fm_bank0(&mut ymf, 0x00, 0x01);
         let duplicate = ymf.stats();
-        assert_eq!(duplicate.key_on_events, 1, "{duplicate:?}");
-        assert!(!ymf.slots[0].active);
+        assert_eq!(duplicate.key_on_events, 2, "{duplicate:?}");
+        assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
+        assert!(ymf.slots[0].ended_frame.is_none());
+        assert_eq!(ymf.slots[0].step_ptr, 0);
 
         write_fm_bank0(&mut ymf, 0x00, 0x00);
         assert!(!ymf.slots[0].key_on_latched);
         write_fm_bank0(&mut ymf, 0x00, 0x01);
         let retrigger = ymf.stats();
-        assert_eq!(retrigger.key_on_events, 2, "{retrigger:?}");
+        assert_eq!(retrigger.key_on_events, 3, "{retrigger:?}");
         assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
         assert_eq!(ymf.slots[0].step_ptr, 0);
     }
 
     #[test]
-    fn ended_one_shot_pcm_suppresses_immediate_same_program_retrigger_without_key_off() {
+    fn ended_one_shot_pcm_accepts_immediate_same_program_retrigger_without_key_off() {
         let mut ymf = Ymf271::new(vec![0x40, 0x7f, 0x7f, 0x7f]);
         ymf.groups[0].sync = 3;
         ymf.slots[0].waveform = 7;
@@ -1913,15 +2455,16 @@ mod tests {
         write_fm_bank0(&mut ymf, 0x00, 0x01);
         let retrigger = ymf.stats();
 
-        assert_eq!(retrigger.key_on_events, 1, "{retrigger:?}");
-        assert!(!ymf.slots[0].active);
+        assert_eq!(retrigger.key_on_events, 2, "{retrigger:?}");
+        assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
-        assert!(ymf.slots[0].ended_frame.is_some());
-        assert_ne!(ymf.slots[0].last_key_on_frame, retrigger.generated_frames);
+        assert!(ymf.slots[0].ended_frame.is_none());
+        assert_eq!(ymf.slots[0].last_key_on_frame, retrigger.generated_frames);
+        assert_eq!(ymf.slots[0].step_ptr, 0);
     }
 
     #[test]
-    fn ended_one_shot_pcm_does_not_replay_same_program_while_key_latched() {
+    fn ended_one_shot_pcm_replays_same_program_while_key_latched() {
         let mut ymf = Ymf271::new(vec![0x40, 0x7f, 0x7f, 0x7f]);
         ymf.groups[0].sync = 3;
         ymf.slots[0].waveform = 7;
@@ -1945,16 +2488,16 @@ mod tests {
         }
         let duplicate = ymf.stats();
 
-        assert_eq!(duplicate.key_on_events, 1, "{duplicate:?}");
-        assert!(!ymf.slots[0].active);
+        assert_eq!(duplicate.key_on_events, 9, "{duplicate:?}");
+        assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
-        assert!(ymf.slots[0].ended_frame.is_some());
+        assert!(ymf.slots[0].ended_frame.is_none());
 
         write_fm_bank0(&mut ymf, 0x00, 0x00);
         write_fm_bank0(&mut ymf, 0x00, 0x01);
         let retrigger = ymf.stats();
 
-        assert_eq!(retrigger.key_on_events, 2, "{retrigger:?}");
+        assert_eq!(retrigger.key_on_events, 10, "{retrigger:?}");
         assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
         assert_eq!(ymf.slots[0].step_ptr, 0);
@@ -2108,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_ended_pcm_marks_ended_and_debounces_same_program_retrigger() {
+    fn envelope_ended_pcm_retriggers_same_program_on_key_on_write() {
         let mut ymf = Ymf271::new(vec![0x7f; 16]);
         ymf.groups[0].sync = 3;
         ymf.slots[0].waveform = 7;
@@ -2138,28 +2681,16 @@ mod tests {
         assert!(ymf.slots[0].key_on_latched);
 
         write_fm_bank0(&mut ymf, 0x00, 0x01);
-        let duplicate = ymf.stats();
-        assert_eq!(duplicate.key_on_events, 1, "{duplicate:?}");
-        assert!(!ymf.slots[0].active);
-        assert!(ymf.slots[0].key_on_latched);
-
-        ymf.render_stereo((YMF271_SAMPLE_RATE_HZ * 2) as usize);
-        write_fm_bank0(&mut ymf, 0x00, 0x01);
-        let duplicate = ymf.stats();
-        assert_eq!(duplicate.key_on_events, 1, "{duplicate:?}");
-        assert!(!ymf.slots[0].active);
-        assert!(ymf.slots[0].key_on_latched);
-
-        write_fm_bank0(&mut ymf, 0x00, 0x00);
-        assert!(!ymf.slots[0].key_on_latched);
-        write_fm_bank0(&mut ymf, 0x00, 0x01);
         let retrigger = ymf.stats();
         assert_eq!(retrigger.key_on_events, 2, "{retrigger:?}");
         assert!(ymf.slots[0].active);
+        assert!(ymf.slots[0].key_on_latched);
+        assert!(ymf.slots[0].ended_frame.is_none());
+        assert_eq!(ymf.slots[0].step_ptr, 0);
     }
 
     #[test]
-    fn same_program_parameter_rewrites_do_not_retrigger_latched_ended_effect() {
+    fn same_program_parameter_rewrites_still_allow_latched_effect_retrigger() {
         let mut ymf = Ymf271::new(vec![0x7f; 16]);
         ymf.groups[0].sync = 3;
         ymf.slots[0].waveform = 7;
@@ -2181,9 +2712,10 @@ mod tests {
         write_fm_bank0(&mut ymf, 0x00, 0x01);
 
         let duplicate = ymf.stats();
-        assert_eq!(duplicate.key_on_events, 1, "{duplicate:?}");
-        assert!(!ymf.slots[0].active);
+        assert_eq!(duplicate.key_on_events, 2, "{duplicate:?}");
+        assert!(ymf.slots[0].active);
         assert!(ymf.slots[0].key_on_latched);
+        assert_eq!(ymf.slots[0].step_ptr, 0);
     }
 
     #[test]

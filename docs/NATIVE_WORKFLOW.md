@@ -397,6 +397,37 @@ binary, defaults to 4,200 frames, and rejects budgets below the complete
 3,973-frame P1/P2 sequence. The default post-selection wait places the P1/P2
 movement, attack, and Beast checks after the VS transition in actual gameplay.
 
+To reuse a preserved release binary without rebuilding `target`, point the QA
+wrapper at it explicitly:
+
+```sh
+BR2_E2E_QA_BIN="$PWD/.runtime-cache/bin/bloodyroar2-gym" \
+  scripts/native-e2e-qa-macos.sh \
+  --rom-cache "$ROM_CACHE" --mode all --no-build
+```
+
+Run the long roster QA separately. It branches all 11 character-select slots
+into combat and verifies preview portraits, P1/P2 controls, attacks, Beast
+effects, effect settling, terminal state, and missed vblanks. Pass an optional
+slot index from `0` through `10` to isolate one character:
+
+```sh
+"${BR2_E2E_QA_BIN:-target/release/bloodyroar2-gym}" \
+  native-roster-qa "$ROM_CACHE" 600000 tmp/native-roster-qa
+```
+
+Run stage QA independently. It clones one character-select checkpoint, applies
+the fixed QA-only stage selector before each match transition, captures combat
+and a 420-frame settled state, and requires all tested stage background
+checksums to be unique. The nine verified indices are `0..6` for STAGE 1
+through STAGE 7, `7` for FINAL STAGE, and `8` for SPECIAL STAGE. Pass one of
+those indices to isolate a stage:
+
+```sh
+"${BR2_E2E_QA_BIN:-target/release/bloodyroar2-gym}" \
+  native-stage-qa "$ROM_CACHE" 600000 tmp/native-stage-qa
+```
+
 Capture a deterministic visual artifact for review:
 
 ```sh

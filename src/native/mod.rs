@@ -12,9 +12,9 @@ pub mod sound;
 pub use backend::NativeBackend;
 pub use bus::NativeInputActivity;
 pub use emulator::{
-    NativeDisplayFrame, NativeEmulator, NativeTraceConfig, native_aspect_corrected_gui_frame,
-    native_update_aspect_corrected_gui_frame, native_window_frame_from_display,
-    native_window_prefers_stronger_stacked_field,
+    BR2_STAGE_QA_STAGE_COUNT, NativeBr2StageQaOverrideReport, NativeDisplayFrame, NativeEmulator,
+    NativeTraceConfig, native_aspect_corrected_gui_frame, native_update_aspect_corrected_gui_frame,
+    native_window_frame_from_display, native_window_prefers_stronger_stacked_field,
 };
 pub use framebuffer::png_from_rgb888_pixels;
 pub use io::{NativeGpuDisplayCandidate, NativeGpuDrawCapturePredicate};

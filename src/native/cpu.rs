@@ -9855,14 +9855,19 @@ impl Cpu {
         address: u32,
         bus: &Bus,
     ) -> bool {
+        let node = self.regs[7];
+        let aligned_self_loop = node != self.regs[4]
+            && node & 0x03 == 0
+            && br2_readable_byte_range(node, 0x10, bus)
+            && bus.read_u32(node.wrapping_add(4)) == node;
+        let invalid_load =
+            node & 0x03 != 0 || address & 0x03 != 0 || !br2_readable_byte_range(address, 4, bus);
         if self.br2_runtime_recovery_hle_disabled("runtime_invalid_allocator_link")
             || current_pc != BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC
             || delay_slot_branch_pc.is_some()
             || instruction != BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_SIGNATURE[2].1
             || self.regs[31] != BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN
-            || self.regs[7] & 0x03 == 0
-            || address & 0x03 == 0
-            || br2_readable_byte_range(address, 4, bus)
+            || (!invalid_load && !aligned_self_loop)
             || !br2_instruction_signature_matches(
                 bus,
                 &BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_SIGNATURE,
@@ -26779,6 +26784,34 @@ mod tests {
         cpu.regs[2] = 0x1122_3344;
         cpu.regs[6] = 0x0000_00ae;
         cpu.regs[7] = 0xf8de_01ca;
+        cpu.regs[31] = super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN;
+
+        let report = cpu.step_report(&mut bus);
+
+        assert_eq!(report.outcome, StepOutcome::Continue);
+        assert_eq!(cpu.pc, super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN);
+        assert_eq!(
+            cpu.next_pc,
+            super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN + 4
+        );
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(cpu.cp0[CP0_BADVADDR], 0);
+        assert_eq!(cpu.cp0[CP0_CAUSE], 0);
+        assert_eq!(cpu.cp0[CP0_EPC], 0);
+    }
+
+    #[test]
+    fn hle_br2_runtime_allocator_scan_with_null_self_link_returns_allocation_failure() {
+        let mut bus = Bus::new(Vec::new(), 4 * 1024 * 1024);
+        install_br2_runtime_allocator_link(&mut bus);
+
+        let mut cpu = Cpu::default();
+        cpu.pc = super::BR2_RUNTIME_ALLOCATOR_SCAN_WORD_LOAD_PC;
+        cpu.next_pc = cpu.pc + 4;
+        cpu.regs[2] = 0x1122_3344;
+        cpu.regs[4] = 0x8039_37f4;
+        cpu.regs[6] = 0x0000_00ae;
+        cpu.regs[7] = 0;
         cpu.regs[31] = super::BR2_RUNTIME_ALLOCATOR_LINK_CALLER_RETURN;
 
         let report = cpu.step_report(&mut bus);

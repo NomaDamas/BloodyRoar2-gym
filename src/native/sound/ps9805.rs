@@ -24,6 +24,7 @@ const PS9805_REALTIME_CATCHUP_TARGET_FRAMES: usize = (YMF271_SAMPLE_RATE_HZ as u
 const PS9805_REALTIME_CATCHUP_MIN_DEFICIT_FRAMES: usize = 64;
 const PS9805_REALTIME_CATCHUP_MAX_FRAMES_PER_TICK: usize = 1_024;
 const PS9805_EXECUTION_QUANTUM_CYCLES: u64 = 8192;
+const PS9805_CPU_BATCH_CYCLES: u64 = 512;
 const PS9805_MAX_EXECUTION_QUANTA_PER_MAIN_TICK: u64 = 32;
 const PS9805_MAX_PENDING_SOUND_CYCLES: u64 = PS9805_EXECUTION_QUANTUM_CYCLES * 96;
 const PS9805_LATCH_QUEUE_CAPACITY: usize = 64;
@@ -56,6 +57,9 @@ pub struct Ps9805SoundStats {
     pub ram_writes: u64,
     pub ymf_reads: u64,
     pub ymf_writes: u64,
+    pub ymf_timed_writes: u64,
+    pub first_ymf_timed_write_frame: u64,
+    pub last_ymf_timed_write_frame: u64,
     pub unmapped_reads: u64,
     pub unmapped_writes: u64,
     pub generated_frames: u64,
@@ -63,6 +67,7 @@ pub struct Ps9805SoundStats {
     pub audio_cpu_dropped_cycles: u64,
     pub audio_cpu_throttled_ticks: u64,
     pub audio_render_batches: u64,
+    pub audio_stream_flushes: u64,
     pub audio_queue_push_batches: u64,
     pub audio_realtime_catchup_batches: u64,
     pub audio_realtime_catchup_frames: u64,
@@ -81,7 +86,7 @@ impl Ps9805SoundStats {
     pub fn json(self, ymf: Ymf271Stats, queue: StereoQueueStats) -> String {
         let health = AudioHealth::from_stats(self, ymf, queue);
         format!(
-            "{{\"available\":{},\"audio_cpu_clock_hz\":{},\"ymf_sample_rate_hz\":{},\"audio_cpu_rom_bytes\":{},\"audio_cpu_mapped_bytes\":{},\"ymf_sample_rom_bytes\":{},\"cpu_steps\":{},\"cpu_steps_exact\":false,\"cpu_execute_batches\":{},\"cpu_cycles\":{},\"main_cycles_seen\":{},\"irq2_assertions\":{},\"irq2_acks\":{},\"ymf_irq_assertions\":{},\"ymf_irq_clears\":{},\"ymf_irq_state\":{},\"ymf_irq_state_hex\":\"0x{:02x}\",\"sound_irq_line\":{},\"latch_writes\":{},\"latch_reads\":{},\"latch_nonzero_writes\":{},\"latch_dropped_writes\":{},\"last_latch_write\":{},\"last_latch_write_hex\":\"0x{:02x}\",\"last_latch_read\":{},\"last_latch_read_hex\":\"0x{:02x}\",\"rom_reads\":{},\"ram_reads\":{},\"ram_writes\":{},\"ymf_reads\":{},\"ymf_writes\":{},\"unmapped_reads\":{},\"unmapped_writes\":{},\"generated_frames\":{},\"audio_cpu_backlog_cycles\":{},\"audio_cpu_dropped_cycles\":{},\"audio_cpu_throttled_ticks\":{},\"audio_render_batches\":{},\"audio_queue_push_batches\":{},\"audio_realtime_catchup_batches\":{},\"audio_realtime_catchup_frames\":{},\"audio_realtime_freewheel_batches\":{},\"audio_realtime_freewheel_frames\":{},\"audio_realtime_catchup_lock_busy_ticks\":{},\"coreaudio_start_attempts\":{},\"coreaudio_started\":{},\"cpu_pc\":{},\"cpu_pc_hex\":\"0x{:08x}\",\"cpu_stopped\":{},\"last_step_cycles\":{},\"last_step_result\":\"{}\",\"health\":{},\"ymf271\":{},\"queue\":{}}}",
+            "{{\"available\":{},\"audio_cpu_clock_hz\":{},\"ymf_sample_rate_hz\":{},\"audio_cpu_rom_bytes\":{},\"audio_cpu_mapped_bytes\":{},\"ymf_sample_rom_bytes\":{},\"cpu_steps\":{},\"cpu_steps_exact\":false,\"cpu_execute_batches\":{},\"cpu_cycles\":{},\"main_cycles_seen\":{},\"irq2_assertions\":{},\"irq2_acks\":{},\"ymf_irq_assertions\":{},\"ymf_irq_clears\":{},\"ymf_irq_state\":{},\"ymf_irq_state_hex\":\"0x{:02x}\",\"sound_irq_line\":{},\"latch_writes\":{},\"latch_reads\":{},\"latch_nonzero_writes\":{},\"latch_dropped_writes\":{},\"last_latch_write\":{},\"last_latch_write_hex\":\"0x{:02x}\",\"last_latch_read\":{},\"last_latch_read_hex\":\"0x{:02x}\",\"rom_reads\":{},\"ram_reads\":{},\"ram_writes\":{},\"ymf_reads\":{},\"ymf_writes\":{},\"ymf_timed_writes\":{},\"first_ymf_timed_write_frame\":{},\"last_ymf_timed_write_frame\":{},\"unmapped_reads\":{},\"unmapped_writes\":{},\"generated_frames\":{},\"audio_cpu_backlog_cycles\":{},\"audio_cpu_dropped_cycles\":{},\"audio_cpu_throttled_ticks\":{},\"audio_render_batches\":{},\"audio_stream_flushes\":{},\"audio_queue_push_batches\":{},\"audio_realtime_catchup_batches\":{},\"audio_realtime_catchup_frames\":{},\"audio_realtime_freewheel_batches\":{},\"audio_realtime_freewheel_frames\":{},\"audio_realtime_catchup_lock_busy_ticks\":{},\"coreaudio_start_attempts\":{},\"coreaudio_started\":{},\"cpu_pc\":{},\"cpu_pc_hex\":\"0x{:08x}\",\"cpu_stopped\":{},\"last_step_cycles\":{},\"last_step_result\":\"{}\",\"health\":{},\"ymf271\":{},\"queue\":{}}}",
             self.available,
             PS9805_AUDIO_CPU_CLOCK_HZ,
             YMF271_SAMPLE_RATE_HZ,
@@ -112,6 +117,9 @@ impl Ps9805SoundStats {
             self.ram_writes,
             self.ymf_reads,
             self.ymf_writes,
+            self.ymf_timed_writes,
+            self.first_ymf_timed_write_frame,
+            self.last_ymf_timed_write_frame,
             self.unmapped_reads,
             self.unmapped_writes,
             self.generated_frames,
@@ -119,6 +127,7 @@ impl Ps9805SoundStats {
             self.audio_cpu_dropped_cycles,
             self.audio_cpu_throttled_ticks,
             self.audio_render_batches,
+            self.audio_stream_flushes,
             self.audio_queue_push_batches,
             self.audio_realtime_catchup_batches,
             self.audio_realtime_catchup_frames,
@@ -147,9 +156,11 @@ pub struct Ps9805SoundBoard {
     batched_main_cycles: u64,
     main_cycle_accumulator: u64,
     pending_sound_cycles: u64,
+    sound_timeline_lead_cycles: u64,
     audio_frame_accumulator: u64,
     render_scratch: Vec<StereoSample>,
     ymf_irq_line_asserted: bool,
+    sound_irq_service_active: bool,
     stats: Ps9805SoundStats,
 }
 
@@ -164,8 +175,10 @@ impl Clone for Ps9805SoundBoard {
         cloned.batched_main_cycles = self.batched_main_cycles;
         cloned.main_cycle_accumulator = self.main_cycle_accumulator;
         cloned.pending_sound_cycles = self.pending_sound_cycles;
+        cloned.sound_timeline_lead_cycles = self.sound_timeline_lead_cycles;
         cloned.audio_frame_accumulator = self.audio_frame_accumulator;
         cloned.ymf_irq_line_asserted = self.ymf_irq_line_asserted;
+        cloned.sound_irq_service_active = self.sound_irq_service_active;
         cloned.stats = self.stats;
         cloned.stats.coreaudio_started = false;
         cloned
@@ -195,9 +208,11 @@ impl Ps9805SoundBoard {
             batched_main_cycles: 0,
             main_cycle_accumulator: 0,
             pending_sound_cycles: 0,
+            sound_timeline_lead_cycles: 0,
             audio_frame_accumulator: 0,
             render_scratch: Vec::new(),
             ymf_irq_line_asserted: false,
+            sound_irq_service_active: false,
             stats,
         }
     }
@@ -281,8 +296,10 @@ impl Ps9805SoundBoard {
             quanta_to_run.saturating_mul(PS9805_EXECUTION_QUANTUM_CYCLES),
         ));
         for _ in 0..quanta_to_run {
-            self.run_cpu_for_sound_cycles(PS9805_EXECUTION_QUANTUM_CYCLES);
-            self.render_for_sound_cycles_into(PS9805_EXECUTION_QUANTUM_CYCLES, &mut rendered);
+            self.run_cpu_and_render_for_sound_cycles_into(
+                PS9805_EXECUTION_QUANTUM_CYCLES,
+                &mut rendered,
+            );
             self.pending_sound_cycles = self
                 .pending_sound_cycles
                 .saturating_sub(PS9805_EXECUTION_QUANTUM_CYCLES);
@@ -302,42 +319,118 @@ impl Ps9805SoundBoard {
         let mut rendered = std::mem::take(&mut self.render_scratch);
         rendered.clear();
         rendered.reserve(estimated_frames_for_sound_cycles(target_cycles));
-        self.run_cpu_for_sound_cycles(target_cycles);
-        self.render_for_sound_cycles_into(target_cycles, &mut rendered);
+        self.run_cpu_and_render_for_sound_cycles_into(target_cycles, &mut rendered);
         self.push_rendered_audio(&mut rendered);
         self.render_scratch = rendered;
     }
 
-    fn run_cpu_for_sound_cycles(&mut self, target_cycles: u64) {
-        let mut remaining = target_cycles;
-        let mut consumed_total = 0u64;
-        while remaining > 0 {
+    fn run_cpu_and_render_for_sound_cycles_into(
+        &mut self,
+        target_cycles: u64,
+        rendered: &mut Vec<StereoSample>,
+    ) {
+        if target_cycles == 0 {
+            return;
+        }
+        if self.sound_timeline_lead_cycles >= target_cycles {
+            self.sound_timeline_lead_cycles -= target_cycles;
+            return;
+        }
+
+        let cycles_due = target_cycles - std::mem::take(&mut self.sound_timeline_lead_cycles);
+        let rendered_start = rendered.len();
+        let mut timeline_cycles = 0u64;
+        while timeline_cycles < cycles_due {
+            let remaining = cycles_due - timeline_cycles;
+            let batch_budget = remaining.min(PS9805_CPU_BATCH_CYCLES);
+            if self.cpu.reset_cycles > 0 {
+                let reset_cycles = batch_budget.min(u64::from(self.cpu.reset_cycles));
+                self.cpu.reset_cycles -= reset_cycles as u32;
+                timeline_cycles = timeline_cycles.saturating_add(reset_cycles);
+                self.stats.cpu_cycles = self.stats.cpu_cycles.saturating_add(reset_cycles);
+                self.stats.last_step_cycles = reset_cycles as u32;
+                self.stats.last_step_result = "reset_wait";
+                self.render_batch_before_ymf_writes(reset_cycles, rendered);
+                continue;
+            }
+
             self.sync_sound_irq_line();
+            let interrupt_service_entry = self.cpu.check_interrupts();
+            if interrupt_service_entry {
+                self.sound_irq_service_active = true;
+            }
             if self.cpu.is_stopped() && !self.cpu.check_interrupts() {
                 self.stats.last_step_cycles = 0;
                 self.stats.last_step_result = "stopped_waiting_irq";
-                break;
+                timeline_cycles = timeline_cycles.saturating_add(batch_budget);
+                self.render_batch_before_ymf_writes(batch_budget, rendered);
+                continue;
             }
 
-            let budget = remaining.min(i32::MAX as u64) as i32;
-            let consumed = self.cpu.execute(&mut self.bus, budget).max(0) as u64;
-            self.sync_sound_irq_line();
+            // Deferred YMF IRQ clears must become visible before an RTE can
+            // expose the same level again. IRQ handling is rare, so use
+            // single-instruction execute budgets only for this interval.
+            let execute_budget = if self.sound_irq_service_active {
+                1
+            } else {
+                batch_budget
+            };
+            self.bus.begin_timed_ymf_write_capture();
+            let consumed = self
+                .cpu
+                .execute(&mut self.bus, execute_budget as i32)
+                .max(0) as u64;
+            self.bus.end_timed_ymf_write_capture();
             self.stats.cpu_execute_batches = self.stats.cpu_execute_batches.saturating_add(1);
+            // Legacy cpu_steps is a non-exact CPU work-unit counter in batch mode.
             self.stats.cpu_steps = self.stats.cpu_steps.saturating_add(1);
             self.stats.last_step_cycles = consumed.min(u64::from(u32::MAX)) as u32;
-            self.stats.last_step_result = if self.cpu.is_stopped() {
+            self.stats.last_step_result = if consumed == 0 {
+                "batch_no_progress"
+            } else if interrupt_service_entry {
+                "interrupt_service"
+            } else if self.sound_irq_service_active {
+                "irq_handler_batch"
+            } else if self.cpu.is_stopped() {
                 "batch_stopped"
             } else {
                 "batch_execute"
             };
-            consumed_total = consumed_total.saturating_add(consumed);
-            if consumed == 0 || self.cpu.is_stopped() {
-                break;
+            self.stats.cpu_cycles = self.stats.cpu_cycles.saturating_add(consumed);
+
+            let timeline_advance = if consumed == 0 {
+                batch_budget
+            } else {
+                consumed
+            };
+            timeline_cycles = timeline_cycles.saturating_add(timeline_advance);
+            self.render_batch_before_ymf_writes(timeline_advance, rendered);
+            self.bus.apply_timed_ymf_writes();
+            self.sync_sound_irq_line();
+            if self.sound_irq_service_active
+                && !self.bus.irq2_pending
+                && !self.bus.ymf.irq_pending()
+            {
+                self.sound_irq_service_active = false;
             }
-            remaining = remaining.saturating_sub(consumed.min(remaining));
         }
 
-        self.stats.cpu_cycles = self.stats.cpu_cycles.saturating_add(consumed_total);
+        self.sound_timeline_lead_cycles = timeline_cycles.saturating_sub(cycles_due);
+        if rendered.len() > rendered_start {
+            self.stats.audio_render_batches = self.stats.audio_render_batches.saturating_add(1);
+        }
+    }
+
+    fn render_batch_before_ymf_writes(
+        &mut self,
+        sound_cycles: u64,
+        rendered: &mut Vec<StereoSample>,
+    ) {
+        if sound_cycles == 0 {
+            return;
+        }
+        self.render_for_sound_cycles_into(sound_cycles, rendered);
+        self.stats.audio_stream_flushes = self.stats.audio_stream_flushes.saturating_add(1);
     }
 
     fn sync_sound_irq_line(&mut self) {
@@ -398,6 +491,9 @@ impl Ps9805SoundBoard {
         stats.ram_writes = self.bus.stats.ram_writes;
         stats.ymf_reads = self.bus.stats.ymf_reads;
         stats.ymf_writes = self.bus.stats.ymf_writes;
+        stats.ymf_timed_writes = self.bus.stats.ymf_timed_writes;
+        stats.first_ymf_timed_write_frame = self.bus.stats.first_ymf_timed_write_frame;
+        stats.last_ymf_timed_write_frame = self.bus.stats.last_ymf_timed_write_frame;
         stats.unmapped_reads = self.bus.stats.unmapped_reads;
         stats.unmapped_writes = self.bus.stats.unmapped_writes;
         stats.generated_frames = self.bus.ymf.stats().generated_frames;
@@ -444,7 +540,6 @@ impl Ps9805SoundBoard {
         self.bus
             .ymf
             .render_stereo_into(usize::try_from(frames).unwrap_or(usize::MAX), rendered);
-        self.stats.audio_render_batches = self.stats.audio_render_batches.saturating_add(1);
         self.sync_sound_irq_line();
     }
 
@@ -484,8 +579,7 @@ impl Ps9805SoundBoard {
 
         rendered.clear();
         rendered.reserve(estimated_frames_for_sound_cycles(catchup_cycles));
-        self.run_cpu_for_sound_cycles(catchup_cycles);
-        self.render_for_sound_cycles_into(catchup_cycles, rendered);
+        self.run_cpu_and_render_for_sound_cycles_into(catchup_cycles, rendered);
         self.pending_sound_cycles = self.pending_sound_cycles.saturating_sub(catchup_cycles);
         let rendered_frames = rendered.len();
         if rendered_frames == 0 {
@@ -569,6 +663,8 @@ struct Ps9805Bus {
     latch_pending: bool,
     latch_queue: VecDeque<u8>,
     irq2_pending: bool,
+    capture_timed_ymf_writes: bool,
+    timed_ymf_writes: Vec<(u32, u8)>,
     stats: Ps9805BusStats,
 }
 
@@ -582,6 +678,8 @@ impl Ps9805Bus {
             latch_pending: false,
             latch_queue: VecDeque::with_capacity(PS9805_LATCH_QUEUE_CAPACITY),
             irq2_pending: false,
+            capture_timed_ymf_writes: false,
+            timed_ymf_writes: Vec::with_capacity(4),
             stats: Ps9805BusStats::default(),
         }
     }
@@ -592,6 +690,28 @@ impl Ps9805Bus {
 
     fn ymf_sample_rom_slice(&self) -> &[u8] {
         self.ymf.sample_rom()
+    }
+
+    fn begin_timed_ymf_write_capture(&mut self) {
+        debug_assert!(!self.capture_timed_ymf_writes);
+        debug_assert!(self.timed_ymf_writes.is_empty());
+        self.capture_timed_ymf_writes = true;
+    }
+
+    fn end_timed_ymf_write_capture(&mut self) {
+        self.capture_timed_ymf_writes = false;
+    }
+
+    fn apply_timed_ymf_writes(&mut self) {
+        let write_frame = self.ymf.stats().generated_frames;
+        for (offset, value) in self.timed_ymf_writes.drain(..) {
+            if self.stats.ymf_timed_writes == 0 {
+                self.stats.first_ymf_timed_write_frame = write_frame;
+            }
+            self.stats.last_ymf_timed_write_frame = write_frame;
+            self.stats.ymf_timed_writes = self.stats.ymf_timed_writes.saturating_add(1);
+            self.ymf.write(offset, value);
+        }
     }
 }
 
@@ -683,8 +803,12 @@ impl AddressBus for Ps9805Bus {
             return;
         }
         if let Some(offset) = ymf_low_lane_offset(address) {
-            self.ymf.write(offset, value);
             self.stats.ymf_writes = self.stats.ymf_writes.saturating_add(1);
+            if self.capture_timed_ymf_writes {
+                self.timed_ymf_writes.push((offset, value));
+            } else {
+                self.ymf.write(offset, value);
+            }
             return;
         }
         if (PS9805_ROM_START..=PS9805_ROM_END).contains(&address)
@@ -759,6 +883,9 @@ struct Ps9805BusStats {
     ram_writes: u64,
     ymf_reads: u64,
     ymf_writes: u64,
+    ymf_timed_writes: u64,
+    first_ymf_timed_write_frame: u64,
+    last_ymf_timed_write_frame: u64,
     unmapped_reads: u64,
     unmapped_writes: u64,
 }
@@ -794,14 +921,14 @@ fn ymf_low_lane_offset(address: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use m68k::AddressBus;
+    use m68k::{AddressBus, CpuCore, CpuType, NoOpHleHandler};
 
     use crate::native::sound::health::AudioHealthState;
     use crate::native::sound::queue::{BoundedStereoQueue, StereoSample};
 
     use super::{
         PS9805_AUDIO_CPU_CLOCK_HZ, PS9805_AUDIO_PREBUFFER_FRAMES, PS9805_AUDIO_QUEUE_FRAMES,
-        PS9805_EXECUTION_QUANTUM_CYCLES, PS9805_LATCH_QUEUE_CAPACITY,
+        PS9805_CPU_BATCH_CYCLES, PS9805_EXECUTION_QUANTUM_CYCLES, PS9805_LATCH_QUEUE_CAPACITY,
         PS9805_MAIN_CYCLE_BATCH_THRESHOLD, PS9805_MAX_EXECUTION_QUANTA_PER_MAIN_TICK,
         PS9805_MAX_PENDING_SOUND_CYCLES, PS9805_REALTIME_CATCHUP_MAX_FRAMES_PER_TICK,
         PS9805_REALTIME_CATCHUP_TARGET_FRAMES, PSX_CPU_CLOCK_HZ, Ps9805Bus, Ps9805SoundBoard,
@@ -827,6 +954,41 @@ mod tests {
         rom[0x106..0x108].copy_from_slice(&0x60feu16.to_be_bytes());
         rom[0x200..0x202].copy_from_slice(&0x4e73u16.to_be_bytes());
         rom
+    }
+
+    fn delayed_ymf_key_off_rom(delay_nops: usize) -> Vec<u8> {
+        let mut rom = minimal_loop_rom();
+        let mut cursor = 0x100usize;
+        for _ in 0..delay_nops {
+            rom[cursor..cursor + 2].copy_from_slice(&0x4e71u16.to_be_bytes());
+            cursor += 2;
+        }
+        for word in [
+            0x13fcu16, 0x0000, 0x0010, 0x0001, 0x13fc, 0x0000, 0x0010, 0x0003, 0x60fe,
+        ] {
+            rom[cursor..cursor + 2].copy_from_slice(&word.to_be_bytes());
+            cursor += 2;
+        }
+        rom
+    }
+
+    fn exact_first_ymf_write_cycle(rom: Vec<u8>) -> u64 {
+        let mut bus = Ps9805Bus::new(rom, vec![0; 0x400000]);
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.reset(&mut bus);
+        let mut hle_handler = NoOpHleHandler;
+        let mut elapsed = 0u64;
+
+        loop {
+            bus.begin_timed_ymf_write_capture();
+            let result = cpu.step_with_hle_handler(&mut bus, &mut hle_handler);
+            bus.end_timed_ymf_write_capture();
+            elapsed = elapsed.saturating_add(result.cycles().unwrap_or_default().max(0) as u64);
+            if !bus.timed_ymf_writes.is_empty() {
+                return elapsed;
+            }
+        }
     }
 
     fn board_program_one_pcm_voice(board: &mut Ps9805SoundBoard) {
@@ -1057,6 +1219,92 @@ mod tests {
         assert!(board.bus.ymf.stats().last_rms_left > 0);
         assert!(board.bus.ymf.stats().last_rms_right > 0);
         assert!(board.queue.stats().pushed_frames > 0);
+    }
+
+    #[test]
+    fn ymf_data_write_flushes_audio_to_the_instruction_timestamp() {
+        let rom = delayed_ymf_key_off_rom(192);
+        let exact_write_cycle = exact_first_ymf_write_cycle(rom.clone());
+        let exact_write_frame = super::scaled_ticks_with_remainder(
+            exact_write_cycle,
+            u64::from(super::YMF271_SAMPLE_RATE_HZ),
+            u64::from(PS9805_AUDIO_CPU_CLOCK_HZ),
+            0,
+        )
+        .0;
+        let max_batch_timing_error_frames = super::scaled_ticks_with_remainder(
+            PS9805_CPU_BATCH_CYCLES,
+            u64::from(super::YMF271_SAMPLE_RATE_HZ),
+            u64::from(PS9805_AUDIO_CPU_CLOCK_HZ),
+            u64::from(PS9805_AUDIO_CPU_CLOCK_HZ) - 1,
+        )
+        .0;
+        let mut board = Ps9805SoundBoard::new(rom, vec![0x7f; 0x400000]);
+        board_program_one_pcm_voice(&mut board);
+
+        board.tick_sound_cycles(PS9805_EXECUTION_QUANTUM_CYCLES);
+
+        let stats = board.stats();
+        let pcm = board.pcm_snapshot(64);
+        assert_eq!(stats.ymf_timed_writes, 2, "{stats:?}");
+        assert_eq!(
+            stats.first_ymf_timed_write_frame,
+            stats.last_ymf_timed_write_frame
+        );
+        assert!(
+            stats.first_ymf_timed_write_frame >= exact_write_frame,
+            "the batched write must not precede its instruction timestamp: {stats:?}"
+        );
+        assert!(
+            stats.first_ymf_timed_write_frame - exact_write_frame <= max_batch_timing_error_frames,
+            "batch timing error must stay within two samples: exact_frame={exact_write_frame}, \
+             max_error={max_batch_timing_error_frames}, stats={stats:?}"
+        );
+        assert!(stats.audio_stream_flushes >= 2, "{stats:?}");
+        assert_eq!(board.bus.ymf.stats().key_off_events, 1);
+        assert!(
+            pcm.iter().any(|frame| frame.left != 0 || frame.right != 0),
+            "the active PCM voice must render before the delayed key-off"
+        );
+    }
+
+    #[test]
+    fn sound_cpu_uses_bounded_execute_batches_and_reports_non_exact_steps() {
+        let mut board = Ps9805SoundBoard::new(minimal_loop_rom(), vec![0; 0x400000]);
+
+        board.tick_sound_cycles(PS9805_EXECUTION_QUANTUM_CYCLES);
+
+        let stats = board.stats();
+        assert_eq!(stats.cpu_steps, stats.cpu_execute_batches, "{stats:?}");
+        assert!(
+            stats.cpu_execute_batches
+                <= PS9805_EXECUTION_QUANTUM_CYCLES.div_ceil(PS9805_CPU_BATCH_CYCLES) + 1,
+            "{stats:?}"
+        );
+        assert!(stats.cpu_execute_batches < 32, "{stats:?}");
+        assert!(board.stats_json().contains("\"cpu_steps_exact\":false"));
+    }
+
+    #[test]
+    fn reset_wait_cycles_are_consumed_before_cpu_execute_batches() {
+        let mut board = Ps9805SoundBoard::new(minimal_loop_rom(), vec![0; 0x400000]);
+        let reset_cycles = PS9805_CPU_BATCH_CYCLES + 64;
+        let reset_pc = board.cpu.pc;
+        board.cpu.reset_cycles = reset_cycles as u32;
+
+        board.tick_sound_cycles(reset_cycles);
+
+        let stats = board.stats();
+        assert_eq!(board.cpu.reset_cycles, 0);
+        assert_eq!(board.cpu.pc, reset_pc);
+        assert_eq!(stats.cpu_execute_batches, 0, "{stats:?}");
+        assert_eq!(stats.cpu_steps, 0, "{stats:?}");
+        assert_eq!(stats.cpu_cycles, reset_cycles, "{stats:?}");
+        assert_eq!(stats.last_step_result, "reset_wait");
+
+        board.tick_sound_cycles(1);
+        assert_eq!(board.stats().cpu_execute_batches, 1);
+        assert_ne!(board.cpu.pc, reset_pc);
     }
 
     #[test]

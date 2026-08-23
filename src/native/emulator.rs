@@ -20,12 +20,103 @@ const NATIVE_WINDOW_FRAME_WIDTH: usize = 512;
 const NATIVE_WINDOW_FRAME_HEIGHT: usize = 480;
 const NATIVE_GUI_FRAME_WIDTH: usize = 640;
 const NATIVE_GUI_FRAME_HEIGHT: usize = 480;
+const BR2_STAGE_QA_SELECTOR_ADDRESS: u32 = 0x1f80_00a4;
+const BR2_STAGE_QA_MAME_SELECTOR_INIT_WRITE_PC: u32 = 0x802f_e630;
+const BR2_STAGE_QA_MAME_SELECTOR_READ_PC: u32 = 0x802f_72f4;
+const BR2_STAGE_QA_MAME_SELECTOR_READ_INSTRUCTION: u32 = 0x8622_00a4;
+pub const BR2_STAGE_QA_STAGE_COUNT: usize = 9;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDisplayFrame {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeBr2StageQaOverrideReport {
+    pub stage_index: usize,
+    pub p1_confirm_hold_vblank_frames: u64,
+    pub p1_punch_reads_before: u64,
+    pub p1_punch_reads_after: u64,
+    pub p1_confirm_release_executed_step: u64,
+    pub p1_confirm_release_vblank: u64,
+    pub selector_read_after_p1_confirm_release: bool,
+    pub selector_read_pc: u32,
+    pub selector_read_instruction: u32,
+    pub selector_base: u32,
+    pub selector_effective_address: u32,
+    pub previous_selector_write_sequence: u64,
+    pub previous_selector_write_pc: Option<u32>,
+    pub previous_selector_write_value: u16,
+    pub previous_selector_write_vblank: u64,
+    pub previous_selector_write_cycles: u64,
+    pub selector_before_override: u16,
+    pub selector_after_override: u16,
+    pub selector_after_read: u16,
+    pub selector_write_sequence_before_override: u64,
+    pub selector_write_sequence_after_override: u64,
+    pub start_executed_steps: u64,
+    pub end_executed_steps: u64,
+    pub executed_instructions: u64,
+    pub start_vblank: u64,
+    pub end_vblank: u64,
+}
+
+impl NativeBr2StageQaOverrideReport {
+    pub fn json(self) -> String {
+        let previous_selector_write_pc = self
+            .previous_selector_write_pc
+            .map_or_else(|| "null".to_string(), |pc| pc.to_string());
+        let previous_selector_write_pc_hex = self
+            .previous_selector_write_pc
+            .map_or_else(|| "null".to_string(), |pc| format!("\"0x{pc:08x}\""));
+        let selector_read_input_phase = if self.selector_read_after_p1_confirm_release {
+            "released"
+        } else {
+            "pressed"
+        };
+        format!(
+            "{{\"stage_index\":{},\"p1_confirm_hold_vblank_frames\":{},\"p1_punch_reads_before\":{},\"p1_punch_reads_after\":{},\"p1_confirm_release_executed_step\":{},\"p1_confirm_release_vblank\":{},\"selector_read_after_p1_confirm_release\":{},\"selector_read_input_phase\":\"{}\",\"selector_read_pc\":{},\"selector_read_pc_hex\":\"0x{:08x}\",\"selector_read_instruction\":{},\"selector_read_instruction_hex\":\"0x{:08x}\",\"selector_base\":{},\"selector_base_hex\":\"0x{:08x}\",\"selector_effective_address\":{},\"selector_effective_address_hex\":\"0x{:08x}\",\"previous_selector_write_sequence\":{},\"previous_selector_write_pc\":{},\"previous_selector_write_pc_hex\":{},\"previous_selector_write_value\":{},\"previous_selector_write_vblank\":{},\"previous_selector_write_cycles\":{},\"matches_mame_selector_init_write\":{},\"selector_before_override\":{},\"selector_after_override\":{},\"selector_after_read\":{},\"selector_write_sequence_before_override\":{},\"selector_write_sequence_after_override\":{},\"matches_fixed_selector_read\":{},\"matches_known_mame_selector_read\":{},\"start_executed_steps\":{},\"end_executed_steps\":{},\"executed_instructions\":{},\"start_vblank\":{},\"end_vblank\":{},\"vblank_frames\":{}}}",
+            self.stage_index,
+            self.p1_confirm_hold_vblank_frames,
+            self.p1_punch_reads_before,
+            self.p1_punch_reads_after,
+            self.p1_confirm_release_executed_step,
+            self.p1_confirm_release_vblank,
+            self.selector_read_after_p1_confirm_release,
+            selector_read_input_phase,
+            self.selector_read_pc,
+            self.selector_read_pc,
+            self.selector_read_instruction,
+            self.selector_read_instruction,
+            self.selector_base,
+            self.selector_base,
+            self.selector_effective_address,
+            self.selector_effective_address,
+            self.previous_selector_write_sequence,
+            previous_selector_write_pc,
+            previous_selector_write_pc_hex,
+            self.previous_selector_write_value,
+            self.previous_selector_write_vblank,
+            self.previous_selector_write_cycles,
+            self.previous_selector_write_pc == Some(BR2_STAGE_QA_MAME_SELECTOR_INIT_WRITE_PC),
+            self.selector_before_override,
+            self.selector_after_override,
+            self.selector_after_read,
+            self.selector_write_sequence_before_override,
+            self.selector_write_sequence_after_override,
+            self.selector_effective_address & 0x1fff_ffff == BR2_STAGE_QA_SELECTOR_ADDRESS,
+            self.selector_read_pc == BR2_STAGE_QA_MAME_SELECTOR_READ_PC
+                && self.selector_read_instruction == BR2_STAGE_QA_MAME_SELECTOR_READ_INSTRUCTION,
+            self.start_executed_steps,
+            self.end_executed_steps,
+            self.executed_instructions,
+            self.start_vblank,
+            self.end_vblank,
+            self.end_vblank.saturating_sub(self.start_vblank),
+        )
+    }
 }
 
 fn insert_bounded_unique<T: Ord>(values: &mut Vec<T>, value: T, limit: usize) {
@@ -636,6 +727,177 @@ impl NativeEmulator {
 
     pub fn set_input(&mut self, buttons: ActionButtons) {
         self.bus.set_input(buttons);
+    }
+
+    fn apply_br2_stage_qa_override_immediately(
+        &mut self,
+        stage_index: usize,
+    ) -> Result<u16, BackendError> {
+        if stage_index >= BR2_STAGE_QA_STAGE_COUNT {
+            return Err(BackendError::new(format!(
+                "BR2 stage QA index must be an integer from 0 through {}",
+                BR2_STAGE_QA_STAGE_COUNT - 1
+            )));
+        }
+
+        let expected = stage_index as u16;
+        let read_back = self.bus.apply_br2_stage_qa_override(expected);
+        self.invalidate_native_frame_cache();
+        if read_back != expected {
+            return Err(BackendError::new(format!(
+                "BR2 stage QA selector read-back mismatch: wrote {expected}, read {read_back}"
+            )));
+        }
+        Ok(read_back)
+    }
+
+    fn br2_stage_qa_selector_read_at_current_pc(&self) -> Option<(u32, u32, u32)> {
+        let instruction = self.debug_read_u32(self.cpu.pc);
+        let opcode = instruction >> 26;
+        if !matches!(opcode, 0x21 | 0x25) {
+            return None;
+        }
+
+        let base_register = ((instruction >> 21) & 0x1f) as usize;
+        let base = self.cpu.regs[base_register];
+        let offset = (instruction as u16 as i16) as i32 as u32;
+        let effective_address = base.wrapping_add(offset);
+        (effective_address & 0x1fff_ffff == BR2_STAGE_QA_SELECTOR_ADDRESS).then_some((
+            instruction,
+            base,
+            effective_address,
+        ))
+    }
+
+    pub fn confirm_br2_stage_qa_p1_and_apply_override_before_selector_read(
+        &mut self,
+        stage_index: usize,
+        p1_confirm_hold_vblank_frames: u64,
+        max_instructions: u64,
+    ) -> Result<NativeBr2StageQaOverrideReport, BackendError> {
+        if stage_index >= BR2_STAGE_QA_STAGE_COUNT {
+            return Err(BackendError::new(format!(
+                "BR2 stage QA index must be an integer from 0 through {}",
+                BR2_STAGE_QA_STAGE_COUNT - 1
+            )));
+        }
+        if max_instructions == 0 {
+            return Err(BackendError::new(
+                "BR2 stage QA selector-read instruction budget must be positive",
+            ));
+        }
+
+        let p1_punch_reads_before = self.input_activity().p1_punch_active_reads;
+        let buttons = ActionButtons {
+            punch: true,
+            ..ActionButtons::default()
+        };
+        self.set_input(buttons);
+        let start_executed_steps = self.executed_steps;
+        let start_vblank = self.bus.vblank_count();
+        let (start_selector_write_sequence, _) = self.bus.br2_stage_qa_selector_write_state();
+        let mut p1_confirm_pressed = true;
+        let mut p1_confirm_release_executed_step = start_executed_steps;
+        let mut p1_confirm_release_vblank = start_vblank;
+        for _ in 0..max_instructions {
+            if p1_confirm_pressed
+                && self.bus.vblank_count().saturating_sub(start_vblank)
+                    >= p1_confirm_hold_vblank_frames
+            {
+                self.set_input(ActionButtons::default());
+                p1_confirm_pressed = false;
+                p1_confirm_release_executed_step = self.executed_steps;
+                p1_confirm_release_vblank = self.bus.vblank_count();
+            }
+
+            let p1_confirm_observed = p1_confirm_hold_vblank_frames == 0
+                || self.input_activity().p1_punch_active_reads > p1_punch_reads_before;
+            if let Some((selector_read_instruction, selector_base, selector_effective_address)) =
+                p1_confirm_observed
+                    .then(|| self.br2_stage_qa_selector_read_at_current_pc())
+                    .flatten()
+            {
+                let selector_read_after_p1_confirm_release = !p1_confirm_pressed;
+                let selector_before_override = self.bus.br2_stage_qa_selector();
+                let (selector_write_sequence_before_override, previous_selector_write) =
+                    self.bus.br2_stage_qa_selector_write_state();
+                let previous_selector_write = previous_selector_write.ok_or_else(|| {
+                    BackendError::new(
+                        "BR2 stage QA selector read was reached without a prior selector write",
+                    )
+                })?;
+                let selector_after_override =
+                    self.apply_br2_stage_qa_override_immediately(stage_index)?;
+                let (selector_write_sequence_after_override, _) =
+                    self.bus.br2_stage_qa_selector_write_state();
+                let report = self.step_instruction();
+                let selector_after_read = self.bus.br2_stage_qa_selector();
+                if report.outcome != StepOutcome::Continue || self.is_terminal() {
+                    self.set_input(ActionButtons::default());
+                    return Err(BackendError::new(
+                        "BR2 stage QA reached terminal state while consuming the fixed selector",
+                    ));
+                }
+                if p1_confirm_pressed {
+                    self.set_input(ActionButtons::default());
+                    p1_confirm_release_executed_step = self.executed_steps;
+                    p1_confirm_release_vblank = self.bus.vblank_count();
+                }
+                let end_executed_steps = self.executed_steps;
+                return Ok(NativeBr2StageQaOverrideReport {
+                    stage_index,
+                    p1_confirm_hold_vblank_frames,
+                    p1_punch_reads_before,
+                    p1_punch_reads_after: self.input_activity().p1_punch_active_reads,
+                    p1_confirm_release_executed_step,
+                    p1_confirm_release_vblank,
+                    selector_read_after_p1_confirm_release,
+                    selector_read_pc: report.start_pc,
+                    selector_read_instruction,
+                    selector_base,
+                    selector_effective_address,
+                    previous_selector_write_sequence: previous_selector_write.sequence,
+                    previous_selector_write_pc: previous_selector_write.pc,
+                    previous_selector_write_value: previous_selector_write.value,
+                    previous_selector_write_vblank: previous_selector_write.vblank,
+                    previous_selector_write_cycles: previous_selector_write.cycles,
+                    selector_before_override,
+                    selector_after_override,
+                    selector_after_read,
+                    selector_write_sequence_before_override,
+                    selector_write_sequence_after_override,
+                    start_executed_steps,
+                    end_executed_steps,
+                    executed_instructions: end_executed_steps.saturating_sub(start_executed_steps),
+                    start_vblank,
+                    end_vblank: self.bus.vblank_count(),
+                });
+            }
+            let report = self.step_instruction();
+            if report.outcome != StepOutcome::Continue || self.is_terminal() {
+                self.set_input(ActionButtons::default());
+                return Err(BackendError::new(format!(
+                    "BR2 stage QA reached terminal state after {} instructions before the fixed selector read",
+                    self.executed_steps.saturating_sub(start_executed_steps)
+                )));
+            }
+        }
+
+        self.set_input(ActionButtons::default());
+        let (end_selector_write_sequence, _) = self.bus.br2_stage_qa_selector_write_state();
+        let p1_punch_reads_after = self.input_activity().p1_punch_active_reads;
+        let end_vblank = self.bus.vblank_count();
+        let end_executed_steps = self.executed_steps;
+        Err(BackendError::new(format!(
+            "BR2 stage QA fixed selector read was not reached within {max_instructions} instructions \
+             (write sequence {start_selector_write_sequence} -> {end_selector_write_sequence}, \
+             selector {}, vblank {start_vblank} -> {end_vblank}, P1 confirm release at vblank \
+             {p1_confirm_release_vblank} / executed step {p1_confirm_release_executed_step}, \
+             P1 punch active reads {p1_punch_reads_before} -> {p1_punch_reads_after}, executed \
+             steps {start_executed_steps} -> {end_executed_steps}, pc 0x{:08x})",
+            self.bus.br2_stage_qa_selector(),
+            self.cpu.pc,
+        )))
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -3389,8 +3651,10 @@ fn native_display_frame_has_periodic_horizontal_ghosting(frame: &NativeDisplayFr
 #[cfg(test)]
 mod tests {
     use super::{
-        Bus, Cpu, NativeDisplayFrame, NativeEmulator, NativeFrameCache, StepOutcome,
-        apply_at28c16_mode_override, native_at28c16_mode_is_blank,
+        BR2_STAGE_QA_MAME_SELECTOR_INIT_WRITE_PC, BR2_STAGE_QA_MAME_SELECTOR_READ_INSTRUCTION,
+        BR2_STAGE_QA_MAME_SELECTOR_READ_PC, BR2_STAGE_QA_SELECTOR_ADDRESS,
+        BR2_STAGE_QA_STAGE_COUNT, Bus, Cpu, NativeDisplayFrame, NativeEmulator, NativeFrameCache,
+        StepOutcome, apply_at28c16_mode_override, native_at28c16_mode_is_blank,
         native_display_frame_has_context_full_live_scene,
         native_display_frame_has_context_stage_letterbox,
         native_display_frame_has_periodic_horizontal_ghosting,
@@ -3450,6 +3714,152 @@ mod tests {
             last_step: None,
             frame_cache: RefCell::new(NativeFrameCache::default()),
         }
+    }
+
+    #[test]
+    fn br2_stage_qa_override_accepts_only_the_nine_verified_stage_indices() {
+        let mut emulator = test_emulator();
+
+        emulator
+            .apply_br2_stage_qa_override_immediately(BR2_STAGE_QA_STAGE_COUNT - 1)
+            .expect("verified final stage index must be accepted");
+        let scratchpad = emulator.scratchpad_snapshot();
+        assert_eq!(
+            u16::from_le_bytes([scratchpad[0xa4], scratchpad[0xa5]]),
+            (BR2_STAGE_QA_STAGE_COUNT - 1) as u16
+        );
+
+        let error = emulator
+            .apply_br2_stage_qa_override_immediately(BR2_STAGE_QA_STAGE_COUNT)
+            .expect_err("out-of-range stage index must be rejected");
+        assert!(error.to_string().contains("0 through 8"));
+        assert_eq!(emulator.scratchpad_snapshot(), scratchpad);
+    }
+
+    #[test]
+    fn br2_stage_qa_override_runs_immediately_before_guest_selector_read() {
+        let mut emulator = NativeEmulator {
+            cpu: Cpu::default(),
+            bus: Bus::new(
+                program(&[i_type(0x23, 4, 2, 0), r_type(5, 0, 0, 0, 0x08), 0]),
+                4 * 1024 * 1024,
+            ),
+            rom_compatibility: NativeRomCompatibilityReport::missing_all_required_assets(),
+            last_outcome: StepOutcome::Continue,
+            executed_steps: 0,
+            last_step: None,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
+        };
+        emulator.bus.write_u32(
+            BR2_STAGE_QA_MAME_SELECTOR_READ_PC,
+            BR2_STAGE_QA_MAME_SELECTOR_READ_INSTRUCTION,
+        );
+        emulator.cpu.regs[4] = 0x1fa0_0000;
+        emulator.cpu.regs[5] = BR2_STAGE_QA_MAME_SELECTOR_READ_PC;
+        emulator.cpu.regs[17] = BR2_STAGE_QA_SELECTOR_ADDRESS - 0xa4;
+        emulator
+            .bus
+            .set_trace_context(BR2_STAGE_QA_MAME_SELECTOR_INIT_WRITE_PC, 123);
+        emulator.bus.apply_br2_stage_qa_override(2);
+        emulator.bus.clear_trace_context();
+
+        let report = emulator
+            .confirm_br2_stage_qa_p1_and_apply_override_before_selector_read(8, 36, 8)
+            .expect("fixed selector read must trigger the stage override");
+
+        assert_eq!(report.p1_confirm_hold_vblank_frames, 36);
+        assert_eq!(report.p1_punch_reads_before, 0);
+        assert_eq!(report.p1_punch_reads_after, 1);
+        assert_eq!(report.p1_confirm_release_executed_step, 4);
+        assert_eq!(report.p1_confirm_release_vblank, 0);
+        assert!(!report.selector_read_after_p1_confirm_release);
+        assert_eq!(report.selector_read_pc, BR2_STAGE_QA_MAME_SELECTOR_READ_PC);
+        assert_eq!(
+            report.selector_read_instruction,
+            BR2_STAGE_QA_MAME_SELECTOR_READ_INSTRUCTION
+        );
+        assert_eq!(report.selector_base, BR2_STAGE_QA_SELECTOR_ADDRESS - 0xa4);
+        assert_eq!(
+            report.selector_effective_address,
+            BR2_STAGE_QA_SELECTOR_ADDRESS
+        );
+        assert_eq!(report.previous_selector_write_sequence, 1);
+        assert_eq!(
+            report.previous_selector_write_pc,
+            Some(BR2_STAGE_QA_MAME_SELECTOR_INIT_WRITE_PC)
+        );
+        assert_eq!(report.previous_selector_write_value, 2);
+        assert_eq!(report.selector_before_override, 2);
+        assert_eq!(report.selector_after_override, 8);
+        assert_eq!(report.selector_after_read, 8);
+        assert_eq!(report.selector_write_sequence_before_override, 1);
+        assert_eq!(report.selector_write_sequence_after_override, 2);
+        assert_eq!(report.executed_instructions, 4);
+        assert_eq!(emulator.cpu.pc, BR2_STAGE_QA_MAME_SELECTOR_READ_PC + 4);
+        assert_eq!(emulator.bus.br2_stage_qa_selector(), 8);
+        emulator.debug_read_u32(0x1fa0_0000);
+        assert_eq!(emulator.input_activity().p1_punch_active_reads, 1);
+    }
+
+    #[test]
+    fn br2_stage_qa_override_keeps_watching_after_p1_confirm_release() {
+        let mut emulator = NativeEmulator {
+            cpu: Cpu::default(),
+            bus: Bus::new(
+                program(&[i_type(0x23, 4, 2, 0), r_type(5, 0, 0, 0, 0x08), 0]),
+                4 * 1024 * 1024,
+            ),
+            rom_compatibility: NativeRomCompatibilityReport::missing_all_required_assets(),
+            last_outcome: StepOutcome::Continue,
+            executed_steps: 0,
+            last_step: None,
+            frame_cache: RefCell::new(NativeFrameCache::default()),
+        };
+        emulator.bus.write_u32(
+            BR2_STAGE_QA_MAME_SELECTOR_READ_PC,
+            BR2_STAGE_QA_MAME_SELECTOR_READ_INSTRUCTION,
+        );
+        emulator.cpu.regs[4] = 0x1fa0_0000;
+        emulator.cpu.regs[5] = BR2_STAGE_QA_MAME_SELECTOR_READ_PC;
+        emulator.cpu.regs[17] = BR2_STAGE_QA_SELECTOR_ADDRESS - 0xa4;
+        emulator
+            .bus
+            .set_trace_context(BR2_STAGE_QA_MAME_SELECTOR_INIT_WRITE_PC, 123);
+        emulator.bus.apply_br2_stage_qa_override(2);
+        emulator.bus.clear_trace_context();
+
+        let report = emulator
+            .confirm_br2_stage_qa_p1_and_apply_override_before_selector_read(1, 0, 8)
+            .expect("fixed selector read after release must trigger the stage override");
+
+        assert_eq!(report.p1_confirm_hold_vblank_frames, 0);
+        assert_eq!(report.p1_punch_reads_before, 0);
+        assert_eq!(report.p1_punch_reads_after, 0);
+        assert_eq!(report.p1_confirm_release_executed_step, 0);
+        assert_eq!(report.p1_confirm_release_vblank, 0);
+        assert!(report.selector_read_after_p1_confirm_release);
+        assert_eq!(report.selector_before_override, 2);
+        assert_eq!(report.selector_after_override, 1);
+        assert_eq!(report.selector_after_read, 1);
+        assert_eq!(report.executed_instructions, 4);
+        assert_eq!(emulator.bus.br2_stage_qa_selector(), 1);
+    }
+
+    #[test]
+    fn br2_stage_qa_override_fails_without_the_fixed_selector_read() {
+        let mut emulator = test_emulator();
+        let scratchpad = emulator.scratchpad_snapshot();
+
+        let error = emulator
+            .confirm_br2_stage_qa_p1_and_apply_override_before_selector_read(1, 36, 1)
+            .expect_err("instruction limit must reject a missing selector read");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fixed selector read was not reached within 1 instructions")
+        );
+        assert_eq!(emulator.scratchpad_snapshot(), scratchpad);
     }
 
     #[test]

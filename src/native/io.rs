@@ -1881,6 +1881,9 @@ pub struct Gpu {
     focus_draw_commands: GpuDrawTraceBuffer,
     overlap_draw_commands: GpuDrawTraceBuffer,
     draw_sequence: u64,
+    detached_combat_hud_verification_draw_sequence: Option<u64>,
+    verified_detached_combat_hud_draw_sequence: Option<u64>,
+    detached_combat_hud_raster_failure_draw_sequence: Option<u64>,
     draw_capture_range: Option<(u64, u64)>,
     draw_capture_predicates: Vec<NativeGpuDrawCapturePredicate>,
     draw_captures: Vec<NativeGpuDrawCapture>,
@@ -2013,6 +2016,9 @@ impl Default for Gpu {
             focus_draw_commands: GpuDrawTraceBuffer::new(),
             overlap_draw_commands: GpuDrawTraceBuffer::new(),
             draw_sequence: 0,
+            detached_combat_hud_verification_draw_sequence: None,
+            verified_detached_combat_hud_draw_sequence: None,
+            detached_combat_hud_raster_failure_draw_sequence: None,
             draw_capture_range: None,
             draw_capture_predicates: Vec::new(),
             draw_captures: Vec::new(),
@@ -2251,6 +2257,7 @@ impl Gpu {
             return false;
         };
         self.framebuffer.restore_region_snapshot(snapshot);
+        self.clear_verified_detached_combat_hud_provenance();
         self.invalidate_recovery_presentation_caches();
         true
     }
@@ -2499,6 +2506,7 @@ impl Gpu {
             return false;
         };
         self.framebuffer.restore_region_snapshot(snapshot);
+        self.clear_verified_detached_combat_hud_provenance();
         self.invalidate_recovery_presentation_caches();
         true
     }
@@ -2630,6 +2638,7 @@ impl Gpu {
         self.write_recovery_gp0_command_with_filter(words, command_address, pc, false);
     }
 
+    #[cfg(test)]
     pub(crate) fn write_recovery_alpha_bilinear_gp0_command(
         &mut self,
         words: &[u32],
@@ -2781,6 +2790,7 @@ impl Gpu {
         self.vertical_range = 0;
         self.status_reads.set(0);
         self.field_parity.set(false);
+        self.clear_verified_detached_combat_hud_provenance();
         self.gp0_fifo.clear();
         self.gp0_fifo_sources.clear();
         self.drawing_area_top_left = 0;
@@ -4262,20 +4272,27 @@ impl Gpu {
         )
     }
 
-    fn high_vertical_full_output_gate_json(&self) -> String {
+    pub(crate) fn high_vertical_full_output_gate_json(&self) -> String {
         let (width, height) = self.display_dimensions();
         let high_vertical_interlace = self.high_vertical_interlace_enabled();
         let height_even = height.is_multiple_of(2);
+        let verified_detached_combat_hud_provenance =
+            self.has_verified_detached_combat_hud_provenance();
+        let verified_detached_combat_hud_draw_sequence =
+            optional_u64_json(self.verified_detached_combat_hud_draw_sequence);
         let candidate_present =
             high_vertical_interlace && height >= DEFAULT_DISPLAY_HEIGHT * 2 && height_even;
         if !candidate_present {
             return format!(
-                "{{\"candidate_present\":false,\"width\":{},\"height\":{},\"high_vertical_interlace\":{},\"height_even\":{},\"minimum_height\":{},\"reason\":\"candidate_not_present\"}}",
+                "{{\"candidate_present\":false,\"width\":{},\"height\":{},\"high_vertical_interlace\":{},\"height_even\":{},\"minimum_height\":{},\"verified_detached_combat_hud_provenance\":{},\"verified_detached_combat_hud_draw_sequence\":{},\"current_draw_sequence\":{},\"verified_exact_combat\":false,\"reason\":\"candidate_not_present\"}}",
                 width,
                 height,
                 high_vertical_interlace,
                 height_even,
-                DEFAULT_DISPLAY_HEIGHT * 2
+                DEFAULT_DISPLAY_HEIGHT * 2,
+                verified_detached_combat_hud_provenance,
+                verified_detached_combat_hud_draw_sequence,
+                self.draw_sequence,
             );
         }
 
@@ -4345,6 +4362,7 @@ impl Gpu {
             && !field_intro_caption
             && both_halves_visible
             && full_has_more_information;
+        let verified_exact_combat = full_frame_scene && verified_detached_combat_hud_provenance;
         let stale_live_field_split = halves.is_some_and(|(top, bottom, field_height)| {
             self.high_vertical_full_output_has_stale_live_field_split(
                 output,
@@ -4519,7 +4537,14 @@ impl Gpu {
         let live_draw_overlap = self.display_candidate_has_live_draw_overlap(output.window);
         let scene_upload_overlap = self.display_candidate_has_scene_upload_overlap(output.window);
         let allowed = self.should_use_high_vertical_full_output(output);
-        let reason = if allowed {
+        let allowed_verified_detached_combat_hud = allowed
+            && !preserve_character_select_full_frame
+            && blocking_field_texture_artifact
+            && !recoverable_field_texture_artifact
+            && verified_exact_combat;
+        let reason = if allowed_verified_detached_combat_hud {
+            "allowed_verified_detached_combat_hud"
+        } else if allowed {
             "allowed"
         } else if !worth_saving {
             "not_worth_saving"
@@ -4550,7 +4575,7 @@ impl Gpu {
         };
 
         format!(
-            "{{\"candidate_present\":true,\"allowed\":{},\"reason\":\"{}\",\"width\":{},\"height\":{},\"window\":{},\"worth_saving\":{},\"saturated_logo_transition\":{},\"origin_matches\":{},\"color\":{},\"color_diversity\":{},\"low_bucket_scene_range_signal\":{},\"low_bucket_playfield_brightness\":{},\"strong_native_3d_textured_playfield\":{},\"has_color_signal\":{},\"halves_present\":{},\"field_height\":{},\"top\":{},\"bottom\":{},\"full_score\":{},\"top_score\":{},\"bottom_score\":{},\"both_halves_visible\":{},\"full_has_more_information\":{},\"field_intro_caption\":{},\"full_frame_scene\":{},\"trusted_live_full_scene\":{},\"single_field_scene\":{},\"stale_live_field_split\":{},\"top_glyph\":{},\"bottom_glyph\":{},\"blocking_field_texture_artifact\":{},\"recoverable_field_texture_artifact\":{},\"character_select_snapshot_present\":{},\"character_select_snapshot_active\":{},\"character_select_snapshot_full_match\":{},\"character_select_snapshot_bottom_match\":{},\"preserve_character_select_full_frame\":{},\"character_select_top_ui_recovery\":{},\"character_select_live_pair_fallback\":{},\"character_select_full_contains_both_fields\":{},\"character_select_bottom_color_diversity\":{},\"character_select_intro_video_caption\":{},\"character_select_bottom_warning_overlay\":{},\"character_select_bottom_title_logo_artifact\":{},\"character_select_bottom_glyph\":{},\"character_select_workspace_artifact\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{}}}",
+            "{{\"candidate_present\":true,\"allowed\":{},\"reason\":\"{}\",\"width\":{},\"height\":{},\"window\":{},\"worth_saving\":{},\"saturated_logo_transition\":{},\"origin_matches\":{},\"color\":{},\"color_diversity\":{},\"low_bucket_scene_range_signal\":{},\"low_bucket_playfield_brightness\":{},\"strong_native_3d_textured_playfield\":{},\"has_color_signal\":{},\"halves_present\":{},\"field_height\":{},\"top\":{},\"bottom\":{},\"full_score\":{},\"top_score\":{},\"bottom_score\":{},\"both_halves_visible\":{},\"full_has_more_information\":{},\"field_intro_caption\":{},\"full_frame_scene\":{},\"verified_detached_combat_hud_provenance\":{},\"verified_detached_combat_hud_draw_sequence\":{},\"current_draw_sequence\":{},\"verified_exact_combat\":{},\"trusted_live_full_scene\":{},\"single_field_scene\":{},\"stale_live_field_split\":{},\"top_glyph\":{},\"bottom_glyph\":{},\"blocking_field_texture_artifact\":{},\"recoverable_field_texture_artifact\":{},\"character_select_snapshot_present\":{},\"character_select_snapshot_active\":{},\"character_select_snapshot_full_match\":{},\"character_select_snapshot_bottom_match\":{},\"preserve_character_select_full_frame\":{},\"character_select_top_ui_recovery\":{},\"character_select_live_pair_fallback\":{},\"character_select_full_contains_both_fields\":{},\"character_select_bottom_color_diversity\":{},\"character_select_intro_video_caption\":{},\"character_select_bottom_warning_overlay\":{},\"character_select_bottom_title_logo_artifact\":{},\"character_select_bottom_glyph\":{},\"character_select_workspace_artifact\":{},\"live_draw_overlap\":{},\"scene_upload_overlap\":{}}}",
             allowed,
             reason,
             width,
@@ -4576,6 +4601,10 @@ impl Gpu {
             full_has_more_information,
             field_intro_caption,
             full_frame_scene,
+            verified_detached_combat_hud_provenance,
+            verified_detached_combat_hud_draw_sequence,
+            self.draw_sequence,
+            verified_exact_combat,
             trusted_live_full_scene,
             single_field_scene,
             stale_live_field_split,
@@ -5971,6 +6000,8 @@ impl Gpu {
             && !self.field_composed_output_is_intro_video_caption(output)
             && both_halves_visible
             && full_has_more_information;
+        let verified_exact_combat =
+            full_frame_scene && self.has_verified_detached_combat_hud_provenance();
         let recoverable_live_full_scene = self.high_vertical_full_output_recovers_live_scene(
             output,
             top,
@@ -5985,6 +6016,7 @@ impl Gpu {
             output.width,
             field_height,
         ) && !recoverable_live_full_scene
+            && !verified_exact_combat
         {
             return false;
         }
@@ -10256,6 +10288,10 @@ impl Gpu {
 
     fn capture_recovered_presented_frame_with_guard(&mut self, before: Option<&Gpu>) -> bool {
         self.last_recovery_presentation_reason = "evaluating";
+        if self.detached_combat_hud_raster_verification_failed() {
+            return self
+                .reject_recovered_presented_frame("fighter_model_raster_generation_incomplete");
+        }
         let (display_width, display_height) = self.display_dimensions();
         let (display_x, display_y) = display_area_start_xy(self.display_area_start);
         if display_x.saturating_add(display_width) > VRAM_WIDTH {
@@ -13233,6 +13269,73 @@ impl Gpu {
         self.draw_sequence
     }
 
+    pub(crate) fn clear_verified_detached_combat_hud_provenance(&mut self) {
+        let verification_changed = self
+            .detached_combat_hud_verification_draw_sequence
+            .take()
+            .is_some();
+        let verified_changed = self
+            .verified_detached_combat_hud_draw_sequence
+            .take()
+            .is_some();
+        let raster_failure_changed = self
+            .detached_combat_hud_raster_failure_draw_sequence
+            .take()
+            .is_some();
+        let changed = verification_changed || verified_changed || raster_failure_changed;
+        if changed {
+            self.invalidate_display_selection_caches();
+        }
+    }
+
+    pub(crate) fn verify_detached_combat_hud_for_current_draw_sequence(&mut self) -> bool {
+        let draw_sequence = Some(self.draw_sequence);
+        let verified = self
+            .detached_combat_hud_raster_failure_draw_sequence
+            .is_none();
+        let verified_draw_sequence = verified.then_some(self.draw_sequence);
+        if self.detached_combat_hud_verification_draw_sequence != draw_sequence
+            || self.verified_detached_combat_hud_draw_sequence != verified_draw_sequence
+        {
+            self.detached_combat_hud_verification_draw_sequence = draw_sequence;
+            self.verified_detached_combat_hud_draw_sequence = verified_draw_sequence;
+            self.invalidate_display_selection_caches();
+        }
+        verified
+    }
+
+    fn has_verified_detached_combat_hud_provenance(&self) -> bool {
+        self.verified_detached_combat_hud_draw_sequence.is_some()
+    }
+
+    fn detached_combat_hud_raster_verification_failed(&self) -> bool {
+        self.detached_combat_hud_verification_draw_sequence
+            .is_some()
+            && self.verified_detached_combat_hud_draw_sequence.is_none()
+    }
+
+    fn record_detached_combat_hud_raster_failure(&mut self, trace: &GpuDrawTrace) {
+        if !recovered_br2_fighter_draw_has_missing_texture_material(trace) {
+            return;
+        }
+
+        self.detached_combat_hud_raster_failure_draw_sequence = Some(trace.sequence);
+        if self
+            .verified_detached_combat_hud_draw_sequence
+            .take()
+            .is_some()
+        {
+            self.invalidate_display_selection_caches();
+        }
+    }
+
+    fn invalidate_display_selection_caches(&mut self) {
+        *self.display_resolve_cache.borrow_mut() = None;
+        *self.display_output_window_cache.borrow_mut() = None;
+        *self.visibility_cache.borrow_mut() = None;
+        *self.stable_display_frame_cache.borrow_mut() = None;
+    }
+
     pub fn draw_captures(&self) -> &[NativeGpuDrawCapture] {
         &self.draw_captures
     }
@@ -14947,6 +15050,7 @@ impl Gpu {
         trace.drawing_area_top_left = self.drawing_area_top_left;
         trace.drawing_area_bottom_right = self.drawing_area_bottom_right;
         trace.drawing_offset = self.drawing_offset;
+        self.record_detached_combat_hud_raster_failure(&trace);
         if native_draw_sequence_trace_range()
             .is_some_and(|(start, end)| (start..=end).contains(&trace.sequence))
         {
@@ -15254,34 +15358,19 @@ impl Gpu {
         &self,
         words: &[u32],
     ) -> bool {
-        if words.len() != 9
-            || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f)
-            || texture_page(words[4]) & !0x0200 != 0x009d
-        {
+        if words.len() != 9 || !matches!((words[0] >> 24) as u8, 0x2c..=0x2f) {
             return false;
         }
-        let (clut_x, clut_y) = clut_origin_for_diagnostics(clut(words[2]));
-        if clut_x != 0 || !(480..=490).contains(&clut_y) {
-            return false;
+        match (texture_page(words[4]) & !0x0200, clut(words[2])) {
+            (0x0088, 0x7d40) => {
+                self.retained_br2_character_select_large_portrait_transfer_generation_valid(words)
+            }
+            (0x0088 | 0x008a, 0x7d80) => self
+                .retained_br2_character_select_right_large_portrait_transfer_generation_valid(
+                    words,
+                ),
+            _ => false,
         }
-        let texture_uvs = [words[2], words[4], words[6], words[8]]
-            .map(texture_coordinate)
-            .map(|uv| (uv.u, uv.v));
-        let min_u = texture_uvs.iter().map(|(u, _)| *u).min();
-        let max_u = texture_uvs.iter().map(|(u, _)| *u).max();
-        let min_v = texture_uvs.iter().map(|(_, v)| *v).min();
-        let max_v = texture_uvs.iter().map(|(_, v)| *v).max();
-        if min_u
-            .zip(max_u)
-            .is_none_or(|(min_u, max_u)| max_u.saturating_sub(min_u) < 160)
-            || min_v
-                .zip(max_v)
-                .is_none_or(|(min_v, max_v)| max_v.saturating_sub(min_v) < 224)
-        {
-            return false;
-        }
-
-        self.retained_textured_polygon_transfer_generation_valid_with_policy(words, true)
     }
 
     pub(crate) fn retained_br2_character_select_large_portrait_transfer_generation_valid(
@@ -25098,6 +25187,35 @@ fn first_command_source(sources: &[Option<GpuCommandSource>]) -> Option<GpuComma
     sources.first().and_then(Clone::clone)
 }
 
+fn recovered_br2_fighter_draw_has_missing_texture_material(trace: &GpuDrawTrace) -> bool {
+    let Some(source) = trace.source.as_ref() else {
+        return false;
+    };
+    let Some(texture_page) = trace.texture_page else {
+        return false;
+    };
+    let Some(clut) = trace.clut else {
+        return false;
+    };
+    if source.kind != "recovery_dma_linked_list"
+        || !trace.is_textured_polygon()
+        || !br2_low_bank_gameplay_character_texture_descriptor(texture_page, clut)
+        || trace.bounds.area() <= 0
+        || trace.bounds.right < 0
+        || trace.bounds.left > 511
+        || trace.bounds.bottom < 0
+        || trace.bounds.top > 479
+    {
+        return false;
+    }
+
+    let stats = trace.stats;
+    let visible_samples = stats.sampled_pixels.saturating_sub(stats.clipped_pixels);
+    let missing_texture = stats.texture_nonzero_samples == 0 && stats.zero_texel_samples > 0;
+    let missing_palette = stats.clut_blank_samples > 0 && stats.palette_fallback_samples == 0;
+    visible_samples > 0 && stats.written_pixels == 0 && (missing_texture || missing_palette)
+}
+
 fn preserve_br2_recovery_fighter_texture_origin(
     options: &mut TextureDrawOptions,
     source: Option<&GpuCommandSource>,
@@ -32132,6 +32250,28 @@ mod tests {
     }
 
     #[test]
+    fn gpu_recovery_scene_snapshot_restore_clears_detached_hud_provenance() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0001);
+        io.write_u32(GPU_GP1, 0x0503_c000);
+        io.gpu.framebuffer.set_raw_pixel(10, 250, 0x001f);
+        io.gpu.commit_recovery_scene_snapshot();
+        assert!(
+            io.gpu
+                .verify_detached_combat_hud_for_current_draw_sequence()
+        );
+        assert!(io.gpu.has_verified_detached_combat_hud_provenance());
+
+        io.gpu.framebuffer.set_raw_pixel(10, 250, 0x7c00);
+        assert!(io.gpu.restore_recovery_scene_snapshot());
+
+        assert!(
+            !io.gpu.has_verified_detached_combat_hud_provenance(),
+            "a restored scene has not passed the detached HUD raster verification"
+        );
+    }
+
+    #[test]
     fn gpu_character_select_snapshot_isolated_from_general_recovery_scene() {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0001);
@@ -32835,6 +32975,92 @@ mod tests {
         assert_eq!((presented.x, presented.y), (0, 0));
         assert_eq!(io.gpu.presentation_captures, 1);
         assert_eq!(io.gpu.presented_frame_capture_index, 1);
+    }
+
+    fn recovered_fighter_raster_trace(stats: TexturedDrawStats) -> GpuDrawTrace {
+        let source = GpuCommandSource::recovery_dma_linked_list(0x000d_787c, Some(0x802d_080c));
+        GpuDrawTrace::textured(
+            "textured_quad",
+            0x000c,
+            0x7884,
+            DrawBounds {
+                left: 96,
+                top: 96,
+                right: 159,
+                bottom: 191,
+            },
+            stats,
+            &[0x2c80_8080],
+            &[
+                Point { x: 96, y: 96 },
+                Point { x: 159, y: 96 },
+                Point { x: 96, y: 191 },
+                Point { x: 159, y: 191 },
+            ],
+            Some(&source),
+        )
+    }
+
+    #[test]
+    fn gpu_recovery_capture_rejects_fighter_draw_with_missing_clut_generation() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let before = io.gpu.clone();
+        io.gpu
+            .push_recent_draw_command(recovered_fighter_raster_trace(TexturedDrawStats {
+                sampled_pixels: 6_144,
+                drawn_pixels: 0,
+                written_pixels: 0,
+                texture_nonzero_samples: 6_144,
+                clut_blank_samples: 6_144,
+                ..TexturedDrawStats::default()
+            }));
+
+        assert!(
+            !io.gpu
+                .verify_detached_combat_hud_for_current_draw_sequence()
+        );
+        assert!(!io.gpu.has_verified_detached_combat_hud_provenance());
+        assert!(
+            !io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
+        assert_eq!(
+            io.gpu.last_recovery_presentation_reason(),
+            "fighter_model_raster_generation_incomplete"
+        );
+    }
+
+    #[test]
+    fn gpu_recovery_capture_accepts_fighter_draw_with_resolved_persisted_clut() {
+        let mut io = Io::default();
+        io.write_u32(GPU_GP1, 0x0800_0026);
+        let (width, height) = io.gpu.display_dimensions();
+        fill_multicolor_scene(&mut io, 0, 0, width, height);
+        let before = io.gpu.clone();
+        io.gpu
+            .push_recent_draw_command(recovered_fighter_raster_trace(TexturedDrawStats {
+                sampled_pixels: 6_144,
+                drawn_pixels: 6_144,
+                written_pixels: 5_632,
+                texture_nonzero_samples: 6_144,
+                clut_blank_samples: 6_144,
+                palette_fallback_samples: 6_144,
+                color_changes: 128,
+                ..TexturedDrawStats::default()
+            }));
+
+        assert!(
+            io.gpu
+                .verify_detached_combat_hud_for_current_draw_sequence()
+        );
+        assert!(io.gpu.has_verified_detached_combat_hud_provenance());
+        assert!(
+            io.gpu
+                .capture_recovered_presented_frame_after_recovery(&before)
+        );
     }
 
     #[test]
@@ -40471,8 +40697,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gpu_high_vertical_colorful_atlas_top_uses_live_bottom_field() {
+    fn high_vertical_colorful_atlas_top_with_live_bottom_fixture() -> Io {
         let mut io = Io::default();
         io.write_u32(GPU_GP1, 0x0800_0026);
         let (width, display_height) = io.gpu.display_dimensions();
@@ -40481,7 +40706,7 @@ mod tests {
 
         for y in 0..field_height {
             for x in 0..width {
-                let selector = (x * 11 + y * 17) % 5;
+                let selector = (x * 11 + y * 17) % 6;
                 let low_red = ((x * 5 + y * 7) % 96) as u32;
                 let low_green = ((x * 7 + y * 19) % 96) as u32;
                 let low_blue = ((x * 23 + y * 3) % 128) as u32;
@@ -40489,11 +40714,10 @@ mod tests {
                 let high_green = 144 + ((x * 13 + y * 5) % 112) as u32;
                 let high_blue = 144 + ((x * 3 + y * 23) % 112) as u32;
                 let color = match selector {
-                    0 => 0x0008_0808,
-                    1 => (high_red << 16) | (low_green << 8) | low_blue,
-                    2 => (high_red << 16) | (low_green << 8) | high_blue,
-                    3 => (low_red << 16) | (high_green << 8) | high_blue,
-                    _ => (high_red << 16) | (low_green << 8) | low_blue,
+                    0..=2 => 0x0008_0808,
+                    3 => (high_red << 16) | (low_green << 8) | low_blue,
+                    4 => (high_red << 16) | (low_green << 8) | high_blue,
+                    _ => (low_red << 16) | (high_green << 8) | high_blue,
                 };
                 io.gpu
                     .framebuffer
@@ -40511,6 +40735,14 @@ mod tests {
         };
         io.gpu.presentation_captures = 180;
 
+        io
+    }
+
+    #[test]
+    fn gpu_high_vertical_colorful_atlas_top_uses_live_bottom_field() {
+        let io = high_vertical_colorful_atlas_top_with_live_bottom_fixture();
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
         let full = DisplayOutputWindow {
             source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
             field_composed: true,
@@ -40590,6 +40822,173 @@ mod tests {
         assert_eq!(actual_frame, bottom_frame);
         assert_eq!((gui_width, gui_height), (width, display_height));
         assert_eq!(gui_frame, line_doubled_rgb_frame(&bottom_frame, width));
+    }
+
+    #[test]
+    fn gpu_high_vertical_verified_detached_combat_hud_preserves_full_frame() {
+        let mut io = high_vertical_colorful_atlas_top_with_live_bottom_fixture();
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        io.gpu
+            .verify_detached_combat_hud_for_current_draw_sequence();
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io
+                .gpu
+                .current_display_window_with_dimensions(width, display_height),
+        };
+        let (top, _bottom, _) = io
+            .gpu
+            .field_composed_output_half_windows(full)
+            .expect("high vertical halves");
+        let top_color = io
+            .gpu
+            .display_window_color_stats(top, width, field_height, true);
+        let diagnostics =
+            io.gpu
+                .field_half_texture_artifact_diagnostics_json(top, width, field_height);
+        let gate = io.gpu.high_vertical_full_output_gate_json();
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+        let (actual_width, actual_height, actual_frame) = io.gpu.actual_display_rgb_frame();
+        let (gui_width, gui_height, gui_frame) = io.gpu.display_rgb_frame();
+        let full_frame = io.gpu.framebuffer.psx_display_rgb_window_with_depth(
+            0,
+            0,
+            width,
+            display_height,
+            io.gpu.display_24bit_enabled(),
+        );
+
+        assert!(
+            io.gpu.field_half_texture_artifact_blocks_playability(
+                top,
+                width,
+                field_height,
+                top_color,
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            !io.gpu
+                .high_vertical_blocking_field_is_recoverable_live_scene(
+                    top,
+                    width,
+                    field_height,
+                    top_color,
+                ),
+            "{diagnostics}"
+        );
+        assert!(io.gpu.should_use_high_vertical_full_output(full), "{gate}");
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            "{playability}"
+        );
+        assert_eq!((actual_width, actual_height), (width, display_height));
+        assert_eq!((gui_width, gui_height), (width, display_height));
+        assert_eq!(actual_frame, full_frame);
+        assert_eq!(gui_frame, full_frame);
+        assert!(
+            gate.contains("\"reason\":\"allowed_verified_detached_combat_hud\""),
+            "{gate}"
+        );
+        assert!(
+            gate.contains("\"verified_detached_combat_hud_provenance\":true"),
+            "{gate}"
+        );
+        assert!(gate.contains("\"verified_exact_combat\":true"), "{gate}");
+    }
+
+    #[test]
+    fn gpu_high_vertical_verified_detached_combat_hud_survives_followup_draws() {
+        let mut io = high_vertical_colorful_atlas_top_with_live_bottom_fixture();
+        let (width, display_height) = io.gpu.display_dimensions();
+        io.gpu
+            .verify_detached_combat_hud_for_current_draw_sequence();
+        let verified_draw_sequence = io.gpu.draw_sequence;
+        io.gpu.draw_sequence = io.gpu.draw_sequence.saturating_add(1);
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io
+                .gpu
+                .current_display_window_with_dimensions(width, display_height),
+        };
+        let gate = io.gpu.high_vertical_full_output_gate_json();
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(io.gpu.should_use_high_vertical_full_output(full), "{gate}");
+        assert_eq!(
+            output.source, DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            "{playability}"
+        );
+        assert!(
+            gate.contains("\"reason\":\"allowed_verified_detached_combat_hud\""),
+            "{gate}"
+        );
+        assert!(
+            gate.contains("\"verified_detached_combat_hud_provenance\":true"),
+            "{gate}"
+        );
+        assert!(
+            gate.contains(&format!(
+                "\"verified_detached_combat_hud_draw_sequence\":{verified_draw_sequence}"
+            )),
+            "{gate}"
+        );
+        assert!(
+            gate.contains(&format!(
+                "\"current_draw_sequence\":{}",
+                io.gpu.draw_sequence
+            )),
+            "{gate}"
+        );
+    }
+
+    #[test]
+    fn gpu_high_vertical_verified_detached_combat_hud_expires_at_recovery_boundary() {
+        let mut io = high_vertical_colorful_atlas_top_with_live_bottom_fixture();
+        let (width, display_height) = io.gpu.display_dimensions();
+        let field_height = display_height / 2;
+        io.gpu
+            .verify_detached_combat_hud_for_current_draw_sequence();
+        io.gpu.clear_verified_detached_combat_hud_provenance();
+
+        let full = DisplayOutputWindow {
+            source: DISPLAY_SOURCE_HIGH_VERTICAL_FULL,
+            field_composed: true,
+            cached: false,
+            width,
+            height: display_height,
+            window: io
+                .gpu
+                .current_display_window_with_dimensions(width, display_height),
+        };
+        let gate = io.gpu.high_vertical_full_output_gate_json();
+        let output = io.gpu.current_display_output_window();
+        let playability = io.gpu.native_playability_json();
+
+        assert!(!io.gpu.should_use_high_vertical_full_output(full), "{gate}");
+        assert_eq!(output.source, DISPLAY_SOURCE_ACTIVE_FIELD, "{playability}");
+        assert_eq!(output.window.y, field_height, "{playability}");
+        assert!(
+            gate.contains("\"reason\":\"blocking_field_texture_artifact\""),
+            "{gate}"
+        );
+        assert!(
+            gate.contains("\"verified_detached_combat_hud_provenance\":false"),
+            "{gate}"
+        );
     }
 
     #[test]
@@ -48086,9 +48485,9 @@ mod tests {
         let portrait = [
             0x2c80_8080,
             0x0071_0021,
-            0x7800_0000,
+            0x7d40_0000,
             0x0071_00e0,
-            0x009d_00bf,
+            0x0088_00bf,
             0x0170_0021,
             0x0000_ff00,
             0x0170_00e0,
@@ -48100,8 +48499,8 @@ mod tests {
                 .br2_character_select_human_portrait_transfer_generation_valid(&portrait)
         );
 
-        upload(&mut io, 832, 256, 96, 256, 0x3210_1234);
-        upload(&mut io, 0, 480, 256, 1, 0x7fff_03e0);
+        upload(&mut io, 512, 0, 96, 256, 0x3210_1234);
+        upload(&mut io, 0, 496, 256, 1, 0x7fff_03e0);
         assert!(
             io.gpu
                 .br2_character_select_human_portrait_transfer_generation_valid(&portrait)
@@ -48119,6 +48518,7 @@ mod tests {
         );
 
         let mut roster_source = portrait;
+        roster_source[2] = 0x7a00_0000;
         roster_source[4] = 0x009d_0038;
         roster_source[6] = 0x0000_3f00;
         roster_source[8] = 0x0000_3f38;

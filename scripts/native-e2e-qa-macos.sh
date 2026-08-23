@@ -19,6 +19,7 @@ SMOKE_WALL_TIMEOUT_SECS=${BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS:-600}
 WINDOW_SCALE=${BR2_E2E_QA_WINDOW_SCALE:-1}
 SMOKE_SELECT_CONFIRM_WAIT_FRAMES=${BR2_E2E_QA_SMOKE_SELECT_CONFIRM_WAIT_FRAMES:-240}
 SMOKE_GAMEPLAY_WAIT_FRAMES=${BR2_E2E_QA_SMOKE_GAMEPLAY_WAIT_FRAMES:-1500}
+BIN=${BR2_E2E_QA_BIN:-"$ROOT_DIR/target/release/bloodyroar2-gym"}
 
 usage() {
     cat <<'USAGE'
@@ -42,7 +43,7 @@ Options:
   --capture-interval <n>      Gameplay GUI capture interval in frames. Default: 60.
                               Non-gameplay transitions are sampled at most every 15 frames.
   --window-scale <scale>      native-play scale argument. Default: 1.
-  --no-build                  Use target/release/bloodyroar2-gym as-is.
+  --no-build                  Use the configured existing bloodyroar2-gym binary as-is.
   --dry-run                   Print commands only; do not build, run, or write artifacts.
   -h, --help                  Show this help.
 
@@ -53,6 +54,7 @@ Environment overrides:
                               Wait for the P1 select screen before P2 joins. Default: 240.
   BR2_E2E_QA_SMOKE_GAMEPLAY_WAIT_FRAMES
                               Wait before gameplay-only smoke controls. Default: 1500.
+  BR2_E2E_QA_BIN              Existing bloodyroar2-gym binary to run. Use with --no-build.
 
 Representative checks:
   smoke: PNG stages, P1/P2 input counters, missed_vblank, OTC recovery/model state.
@@ -181,8 +183,10 @@ esac
 if [ "$DRY_RUN" -eq 0 ] && [ ! -d "$ROM_CACHE" ]; then
     die "ROM cache path must be an existing directory: $ROM_CACHE"
 fi
+if [ "$DRY_RUN" -eq 0 ] && [ "$BUILD" -eq 0 ] && [ ! -x "$BIN" ]; then
+    die "bloodyroar2-gym binary must be executable when --no-build is used: $BIN"
+fi
 
-BIN="$ROOT_DIR/target/release/bloodyroar2-gym"
 ARTIFACT_ROOT="$OUT_DIR/artifacts"
 COMMANDS_LOG="$OUT_DIR/commands.txt"
 BUILD_STDOUT="$ARTIFACT_ROOT/cargo-build.stdout.log"

@@ -9,13 +9,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bloodyroar2_gym::{
-    ACTION_SPACE, Action, ActionButtons, BloodyRoar2Env, MameConfig, MameRuntime,
-    NativeDisplayFrame, NativeEmulator, NativeGpuDrawCapturePredicate, NativeInputActivity,
-    NativeRomSet, NativeTraceConfig, NullBackend, StereoSample, YMF271_SAMPLE_RATE_HZ, ZincConfig,
-    ZincRuntime, action_space_json, api_index_json, native_aspect_corrected_gui_frame,
-    native_playable_match_entry_script, native_update_aspect_corrected_gui_frame,
-    native_window_frame_from_display, native_window_prefers_stronger_stacked_field,
-    observation_space_json, png_from_rgb888_pixels,
+    ACTION_SPACE, Action, ActionButtons, BR2_STAGE_QA_STAGE_COUNT, BloodyRoar2Env, MameConfig,
+    MameRuntime, NativeDisplayFrame, NativeEmulator, NativeGpuDrawCapturePredicate,
+    NativeInputActivity, NativeRomSet, NativeTraceConfig, NullBackend, StereoSample,
+    YMF271_SAMPLE_RATE_HZ, ZincConfig, ZincRuntime, action_space_json, api_index_json,
+    native_aspect_corrected_gui_frame, native_playable_match_entry_script,
+    native_update_aspect_corrected_gui_frame, native_window_frame_from_display,
+    native_window_prefers_stronger_stacked_field, observation_space_json, png_from_rgb888_pixels,
 };
 use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 #[cfg(target_os = "macos")]
@@ -76,6 +76,7 @@ const NATIVE_PLAY_GUI_TEST_INPUT_SCRIPT_ENV: &str = "BR2_NATIVE_GUI_TEST_INPUT_S
 const NATIVE_PLAY_GUI_TEST_EXCLUSIVE_INPUT_ENV: &str = "BR2_NATIVE_GUI_TEST_EXCLUSIVE_INPUT";
 const NATIVE_PLAY_GUI_DISPLAY_REFRESH_FRAMES_ENV: &str = "BR2_NATIVE_GUI_DISPLAY_REFRESH_FRAMES";
 const NATIVE_PLAY_GUI_OTC_RECOVERY_INTERVAL_ENV: &str = "BR2_NATIVE_GUI_OTC_RECOVERY_INTERVAL";
+const NATIVE_PLAY_DISABLE_AUDIO_ENV: &str = "BR2_NATIVE_DISABLE_AUDIO";
 const NATIVE_PLAY_GUI_CAPTURE_INTERVAL_FRAMES: u64 = 60;
 const NATIVE_PLAY_GUI_TRANSITION_CAPTURE_INTERVAL_FRAMES: u64 = 15;
 const NATIVE_PLAY_GUI_P2_JOIN_CAPTURE_FRAMES: u64 = 600;
@@ -147,10 +148,24 @@ const NATIVE_ROSTER_SELECT_CONFIRM_RELEASE_FRAMES: u64 = 36;
 const NATIVE_ROSTER_P2_JOIN_SETTLE_FRAMES: u64 = 90;
 const NATIVE_ROSTER_GAMEPLAY_WAIT_FRAMES: u64 = 1_800;
 const NATIVE_ROSTER_COMBAT_STABLE_SAMPLES: u8 = 3;
+const NATIVE_STAGE_QA_SELECTOR_READ_MAX_INSTRUCTIONS: u64 = 120_000_000;
+const NATIVE_STAGE_QA_SETTLE_FRAMES: u64 = 420;
+const NATIVE_STAGE_QA_LABELS: [&str; BR2_STAGE_QA_STAGE_COUNT] = [
+    "stage_1",
+    "stage_2",
+    "stage_3",
+    "stage_4",
+    "stage_5",
+    "stage_6",
+    "stage_7",
+    "final_stage",
+    "special_stage",
+];
 const NATIVE_ROSTER_ACTION_PULSE_FRAMES: u64 = 24;
 const NATIVE_ROSTER_ACTION_SETTLE_FRAMES: u64 = 60;
 const NATIVE_ROSTER_BEAST_PULSE_FRAMES: u64 = 36;
 const NATIVE_ROSTER_BEAST_SETTLE_FRAMES: u64 = 240;
+const NATIVE_ROSTER_EFFECT_CAPTURE_SEARCH_FRAMES: u64 = NATIVE_ROSTER_ACTION_SETTLE_FRAMES;
 const NATIVE_ROSTER_EFFECT_PERSISTENCE_SETTLE_FRAMES: u64 = 420;
 const NATIVE_ROSTER_PORTRAIT_LEFT_PERCENT: usize = 6;
 const NATIVE_ROSTER_PORTRAIT_TOP_PERCENT: usize = 23;
@@ -3168,6 +3183,46 @@ fn run() -> Result<(), String> {
             }
             run_native_roster_qa(rom, instructions_per_frame.max(1), &output_dir, slot)
         }
+        "native-stage-qa" => {
+            let usage = "usage: bloodyroar2-gym native-stage-qa [rom_zip_or_dir] [instructions_per_frame] <output_dir> [stage_index]";
+            let rom = next_native_rom_source_or_default(&mut args);
+            let instructions_per_frame = args
+                .next()
+                .unwrap_or_else(|| NATIVE_PLAY_DEFAULT_INSTRUCTIONS_PER_FRAME_ARG.to_string())
+                .parse::<u64>()
+                .map_err(|_| "instructions_per_frame must be a positive integer".to_string())?;
+            let output_dir = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| usage.to_string())?;
+            let stage_index = args
+                .next()
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| {
+                            format!(
+                                "stage_index must be an integer from 0 through {}",
+                                BR2_STAGE_QA_STAGE_COUNT - 1
+                            )
+                        })
+                        .and_then(|stage_index| {
+                            (stage_index < BR2_STAGE_QA_STAGE_COUNT)
+                                .then_some(stage_index)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "stage_index must be an integer from 0 through {}",
+                                        BR2_STAGE_QA_STAGE_COUNT - 1
+                                    )
+                                })
+                        })
+                })
+                .transpose()?;
+            if args.next().is_some() {
+                return Err(usage.to_string());
+            }
+            run_native_stage_qa(rom, instructions_per_frame.max(1), &output_dir, stage_index)
+        }
         "native-character-select-diagnose" => {
             let usage = "usage: bloodyroar2-gym native-character-select-diagnose [rom_zip_or_dir] [instructions_per_frame] <output_prefix>";
             let rom = next_native_rom_source_or_default(&mut args);
@@ -4436,10 +4491,16 @@ fn run_native_play(
     // Hidden boot can generate minutes of queued audio before the first
     // visible frame. Start playback only after the initial window is ready;
     // the sound board keeps a short latest-sample prebuffer for a clean handoff.
-    let coreaudio_output = emulator
-        .start_coreaudio_output()
-        .map_err(|error| format!("failed to start native audio: {error}"))?;
-    if coreaudio_output.is_none() {
+    let audio_disabled = native_env_flag_enabled(NATIVE_PLAY_DISABLE_AUDIO_ENV);
+    let coreaudio_output = if audio_disabled {
+        eprintln!("native audio disabled by {NATIVE_PLAY_DISABLE_AUDIO_ENV}");
+        None
+    } else {
+        emulator
+            .start_coreaudio_output()
+            .map_err(|error| format!("failed to start native audio: {error}"))?
+    };
+    if !audio_disabled && coreaudio_output.is_none() {
         eprintln!("native audio unavailable: PS9805 ROM assets were not loaded");
     }
     // AppKit cannot reliably promote the native window until minifb has
@@ -6847,6 +6908,21 @@ fn native_roster_slot_position(slot: usize) -> Option<(usize, usize)> {
 }
 
 fn native_roster_match_entry_segments() -> Vec<NativeScriptSegment> {
+    let mut segments = native_roster_match_entry_before_p2_confirm_segments();
+    segments.extend([
+        NativeScriptSegment {
+            action: Action::P2Punch,
+            frames: NATIVE_ROSTER_SELECT_CONFIRM_FRAMES,
+        },
+        NativeScriptSegment {
+            action: Action::Noop,
+            frames: NATIVE_ROSTER_SELECT_CONFIRM_RELEASE_FRAMES,
+        },
+    ]);
+    segments
+}
+
+fn native_roster_match_entry_before_p2_confirm_segments() -> Vec<NativeScriptSegment> {
     vec![
         NativeScriptSegment {
             action: Action::P2Coin,
@@ -6866,14 +6942,6 @@ fn native_roster_match_entry_segments() -> Vec<NativeScriptSegment> {
         },
         NativeScriptSegment {
             action: Action::Punch,
-            frames: NATIVE_ROSTER_SELECT_CONFIRM_FRAMES,
-        },
-        NativeScriptSegment {
-            action: Action::Noop,
-            frames: NATIVE_ROSTER_SELECT_CONFIRM_RELEASE_FRAMES,
-        },
-        NativeScriptSegment {
-            action: Action::P2Punch,
             frames: NATIVE_ROSTER_SELECT_CONFIRM_FRAMES,
         },
         NativeScriptSegment {
@@ -6932,6 +7000,119 @@ fn run_native_roster_match_entry(
     .summary
 }
 
+struct NativeStageQaGameplayWaitResult {
+    summary: NativeScriptRunSummary,
+    visual_frame: Option<NativeDisplayFrame>,
+    visual_frame_native_playable_candidate: bool,
+    fighter_model_recovery_observed: bool,
+}
+
+fn run_native_stage_qa_gameplay_wait(
+    emulator: &mut NativeEmulator,
+    instructions_per_frame: u64,
+) -> NativeStageQaGameplayWaitResult {
+    let segments = [NativeScriptSegment {
+        action: Action::Noop,
+        frames: NATIVE_ROSTER_GAMEPLAY_WAIT_FRAMES,
+    }];
+    let mut stable_visual_samples = 0u8;
+    let mut stable_combat_samples = 0u8;
+    let mut visual_frame = None;
+    let mut visual_frame_native_playable_candidate = false;
+    let mut fighter_model_recovery_observed = false;
+    let trace_samples = std::env::var_os("BR2_NATIVE_TRACE_STAGE_QA_SAMPLES").is_some();
+    let mut gameplay_observer = |emulator: &mut NativeEmulator,
+                                 _segment_index: usize,
+                                 _segment_frame: u64,
+                                 _segment: NativeScriptSegment,
+                                 total_frames: u64| {
+        if !total_frames.is_multiple_of(NATIVE_PLAY_HANDOFF_CHECK_STRIDE_FRAMES) {
+            return false;
+        }
+        emulator.capture_vblank_presented_frame();
+        let frame = native_play_window_frame_for_emulator(emulator);
+        let native_playable_candidate = emulator.native_playable_candidate();
+        let stats = NativeFrameStats::from_frame(&frame);
+        let visual_frame_passes =
+            native_stage_qa_frame_passes(&frame, stats, true, native_playable_candidate);
+        if trace_samples {
+            let hud = NativeRosterCombatHudStats::from_frame(&frame);
+            let scene_passes = native_stage_qa_scene_passes(stats, native_playable_candidate);
+            let verified_complete_fight_context = hud.passes() && scene_passes;
+            let incomplete_character_select =
+                native_play_frame_is_incomplete_br2_character_select(&frame, stats);
+            let wait_a_challenger = !verified_complete_fight_context
+                && native_play_frame_has_wait_a_challenger_overlay(&frame, stats);
+            let repeating_rock_atlas =
+                native_play_frame_has_br2_repeating_rock_atlas_artifact(&frame);
+            let stable_combat_transition =
+                NativePlayStableCombatTransitionArtifactStats::from_frame(&frame);
+            let blocking_structural_artifact = incomplete_character_select
+                || wait_a_challenger
+                || repeating_rock_atlas
+                || stable_combat_transition.has_stable_combat_transition_residue(stats);
+            eprintln!(
+                "BR2 stage QA sample: {{\"vblank\":{},\"total_frames\":{},\"native_playable_candidate\":{},\"fighter_model_recovery_complete\":{},\"visual_frame_passes\":{},\"hud\":{},\"scene_passes\":{},\"occupied_row_span_passes\":{},\"blocking_display_artifact\":{},\"missing_texture_recovery_artifact\":{},\"structural\":{{\"blocking\":{},\"incomplete_character_select\":{},\"wait_a_challenger\":{},\"repeating_rock_atlas\":{},\"stable_combat_transition\":{}}},\"blocking_render_artifact\":{},\"frame\":{}}}",
+                emulator.vblank_count(),
+                total_frames,
+                native_playable_candidate,
+                emulator.native_fighter_model_recovery_is_complete(),
+                visual_frame_passes,
+                hud.json(),
+                scene_passes,
+                stats.occupied_row_span >= 390,
+                stats.has_blocking_display_artifact(),
+                stats.has_missing_texture_recovery_artifact(),
+                blocking_structural_artifact,
+                incomplete_character_select,
+                wait_a_challenger,
+                repeating_rock_atlas,
+                stable_combat_transition.json(stats),
+                native_play_frame_has_blocking_render_artifact_with_title_logo_policy(stats, true),
+                native_frame_compact_stats_json(stats),
+            );
+        }
+        stable_visual_samples = native_roster_next_stable_combat_sample_count(
+            stable_visual_samples,
+            visual_frame_passes,
+        );
+        if visual_frame.is_none() && stable_visual_samples >= NATIVE_ROSTER_COMBAT_STABLE_SAMPLES {
+            visual_frame = Some(frame);
+            visual_frame_native_playable_candidate = native_playable_candidate;
+        }
+        fighter_model_recovery_observed |= emulator.native_fighter_model_recovery_is_complete();
+        let combat_evidence_passes = native_stage_qa_combat_evidence_passes(
+            fighter_model_recovery_observed,
+            visual_frame.is_some(),
+        );
+        stable_combat_samples = native_roster_next_stable_combat_sample_count(
+            stable_combat_samples,
+            combat_evidence_passes,
+        );
+        stable_combat_samples >= NATIVE_ROSTER_COMBAT_STABLE_SAMPLES
+    };
+
+    let summary = run_native_script_observed_with_stop_and_timeout_policy_observed(
+        emulator,
+        instructions_per_frame,
+        &segments,
+        NativeScriptStopMode::SnapshotGameplayFrame,
+        Some(native_script_max_frames_for_segments(&segments)),
+        Some(Duration::from_secs(
+            NATIVE_PLAYABLE_SCRIPT_WALL_TIMEOUT_SECS,
+        )),
+        false,
+        Some(&mut gameplay_observer),
+    )
+    .summary;
+    NativeStageQaGameplayWaitResult {
+        summary,
+        visual_frame,
+        visual_frame_native_playable_candidate,
+        fighter_model_recovery_observed,
+    }
+}
+
 fn native_roster_direction_segments() -> Vec<NativeScriptSegment> {
     [
         Action::Right,
@@ -6976,6 +7157,50 @@ fn native_roster_action_segments(action: Action, settle_frames: u64) -> [NativeS
     ]
 }
 
+fn run_native_roster_beast_settle_with_effect_capture(
+    emulator: &mut NativeEmulator,
+    instructions_per_frame: u64,
+) -> (NativeScriptRunSummary, NativeEmulator) {
+    let initial_frame = native_play_window_frame_for_emulator(emulator);
+    let mut effect_capture = emulator.clone();
+    let mut effect_capture_passes =
+        native_roster_effect_frame_passes(NativeFrameStats::from_frame(&initial_frame));
+    let settle_segments =
+        native_roster_action_segments(Action::Noop, NATIVE_ROSTER_BEAST_SETTLE_FRAMES);
+    let settle_run = if effect_capture_passes {
+        run_native_script_observed(emulator, instructions_per_frame, &settle_segments)
+    } else {
+        let mut frame_observer = |candidate: &mut NativeEmulator,
+                                  _segment_index: usize,
+                                  _segment_frame: u64,
+                                  _segment: NativeScriptSegment,
+                                  total_frame: u64| {
+            if !effect_capture_passes && total_frame <= NATIVE_ROSTER_EFFECT_CAPTURE_SEARCH_FRAMES {
+                let frame = native_play_window_frame_for_emulator(candidate);
+                let stats = NativeFrameStats::from_frame(&frame);
+                if native_roster_effect_frame_passes(stats) {
+                    effect_capture = candidate.clone();
+                    effect_capture_passes = true;
+                }
+            }
+            false
+        };
+        run_native_script_observed_with_stop_and_timeout_policy_observed(
+            emulator,
+            instructions_per_frame,
+            &settle_segments,
+            NativeScriptStopMode::None,
+            Some(native_script_max_frames_for_segments(&settle_segments)),
+            None,
+            true,
+            Some(&mut frame_observer),
+        )
+        .summary
+    };
+
+    (settle_run, effect_capture)
+}
+
 fn native_roster_preview_frame_passes(stats: NativeFrameStats) -> bool {
     stats.width >= NATIVE_PLAY_MIN_WINDOW_WIDTH
         && stats.height >= NATIVE_PLAY_MIN_WINDOW_HEIGHT
@@ -7011,6 +7236,109 @@ fn native_roster_combat_frame_passes(
     fighter_model_recovery_complete
         && native_roster_combat_scene_passes(stats)
         && NativeRosterCombatHudStats::from_frame(frame).passes()
+}
+
+fn native_stage_qa_scene_passes(stats: NativeFrameStats, native_playable_candidate: bool) -> bool {
+    native_roster_combat_scene_passes(stats)
+        || (native_playable_candidate && stats.has_render_ready_scene())
+        || native_stage_qa_title_logo_overlay_is_scene_false_positive(stats)
+}
+
+fn native_stage_qa_title_logo_overlay_is_scene_false_positive(stats: NativeFrameStats) -> bool {
+    stats.has_blocking_title_logo_overlay()
+        && !stats.has_blocking_display_artifact_except_title_logo()
+        && stats.has_visible_content()
+        && stats.has_scene_detail()
+        && stats.occupied_row_span >= 390
+        && !stats.has_title_screen_frame()
+        && !stats.has_warning_text_overlay()
+}
+
+fn native_stage_qa_settled_fighter_recovery_verified(
+    combat_pass: bool,
+    settled_fighter_model_recovery_complete: bool,
+) -> bool {
+    combat_pass || settled_fighter_model_recovery_complete
+}
+
+fn native_stage_qa_combat_evidence_passes(
+    fighter_model_recovery_observed: bool,
+    visual_frame_observed: bool,
+) -> bool {
+    fighter_model_recovery_observed && visual_frame_observed
+}
+
+fn native_stage_qa_frame_has_blocking_structural_artifact(
+    frame: &NativeDisplayFrame,
+    stats: NativeFrameStats,
+    verified_complete_fight_context: bool,
+) -> bool {
+    native_play_frame_is_incomplete_br2_character_select(frame, stats)
+        || (!verified_complete_fight_context
+            && native_play_frame_has_wait_a_challenger_overlay(frame, stats))
+        || native_play_frame_has_br2_repeating_rock_atlas_artifact(frame)
+        || NativePlayStableCombatTransitionArtifactStats::from_frame(frame)
+            .has_stable_combat_transition_residue(stats)
+}
+
+fn native_stage_qa_frame_passes(
+    frame: &NativeDisplayFrame,
+    stats: NativeFrameStats,
+    fighter_model_recovery_verified: bool,
+    native_playable_candidate: bool,
+) -> bool {
+    native_stage_qa_frame_passes_with_prior_combat(
+        frame,
+        stats,
+        fighter_model_recovery_verified,
+        native_playable_candidate,
+        false,
+    )
+}
+
+fn native_stage_qa_settled_frame_passes(
+    frame: &NativeDisplayFrame,
+    stats: NativeFrameStats,
+    fighter_model_recovery_verified: bool,
+    native_playable_candidate: bool,
+    prior_complete_combat_verified: bool,
+) -> bool {
+    native_stage_qa_frame_passes_with_prior_combat(
+        frame,
+        stats,
+        fighter_model_recovery_verified,
+        native_playable_candidate,
+        prior_complete_combat_verified,
+    )
+}
+
+fn native_stage_qa_frame_passes_with_prior_combat(
+    frame: &NativeDisplayFrame,
+    stats: NativeFrameStats,
+    fighter_model_recovery_verified: bool,
+    native_playable_candidate: bool,
+    prior_complete_combat_verified: bool,
+) -> bool {
+    let title_logo_scene_false_positive =
+        native_stage_qa_title_logo_overlay_is_scene_false_positive(stats);
+    let complete_combat_hud_verified =
+        prior_complete_combat_verified || NativeRosterCombatHudStats::from_frame(frame).passes();
+    let verified_complete_fight_context = fighter_model_recovery_verified
+        && complete_combat_hud_verified
+        && native_stage_qa_scene_passes(stats, native_playable_candidate);
+    verified_complete_fight_context
+        && stats.occupied_row_span >= 390
+        && (!stats.has_blocking_display_artifact() || title_logo_scene_false_positive)
+        && !stats.has_missing_texture_recovery_artifact()
+        && !native_stage_qa_frame_has_blocking_structural_artifact(
+            frame,
+            stats,
+            verified_complete_fight_context,
+        )
+        && !native_play_frame_has_blocking_render_artifact_with_title_logo_policy(
+            stats,
+            !title_logo_scene_false_positive,
+        )
 }
 
 fn native_roster_next_stable_combat_sample_count(previous: u8, frame_passes: bool) -> u8 {
@@ -7773,7 +8101,19 @@ fn native_play_frame_has_blocking_render_artifact_for_frame(
     }
 }
 
+const NATIVE_PLAY_BR2_REPEATING_ROCK_ATLAS_MIN_MATCH_PER_MILLE: usize = 500;
+
 fn native_play_frame_has_br2_repeating_rock_atlas_artifact(frame: &NativeDisplayFrame) -> bool {
+    native_play_frame_has_br2_repeating_rock_atlas_artifact_with_min_match(
+        frame,
+        NATIVE_PLAY_BR2_REPEATING_ROCK_ATLAS_MIN_MATCH_PER_MILLE,
+    )
+}
+
+fn native_play_frame_has_br2_repeating_rock_atlas_artifact_with_min_match(
+    frame: &NativeDisplayFrame,
+    min_match_per_mille: usize,
+) -> bool {
     const SAMPLE_STEP: usize = 4;
 
     if frame.width < NATIVE_PLAY_MIN_WINDOW_WIDTH
@@ -7848,7 +8188,7 @@ fn native_play_frame_has_br2_repeating_rock_atlas_artifact(frame: &NativeDisplay
         })
         .max()
         .unwrap_or(0)
-        >= 130
+        >= min_match_per_mille
 }
 
 fn native_play_stats_has_complete_native_fight_context(stats: NativeFrameStats) -> bool {
@@ -8058,6 +8398,63 @@ fn native_roster_stage_report(
     ))
 }
 
+fn native_stage_qa_frame_report(
+    output_dir: &Path,
+    stage_index: Option<usize>,
+    stage_label: &str,
+    phase: &str,
+    emulator: &NativeEmulator,
+    frame: &NativeDisplayFrame,
+    native_playable_candidate: bool,
+) -> Result<(String, NativeFrameStats, u32, u32), String> {
+    let stats = NativeFrameStats::from_frame(frame);
+    let checksum = native_frame_checksum(frame);
+    let background_checksum = native_stage_background_checksum(frame);
+    let output_stem = stage_index.map_or_else(
+        || "checkpoint".to_string(),
+        |index| format!("stage-{index:02}-{stage_label}-{phase}"),
+    );
+    let output = output_dir.join(format!("{output_stem}.window.png"));
+    write_native_display_frame_png(frame, &output)?;
+    let diagnostics_enabled = std::env::var_os("BR2_NATIVE_STAGE_QA_DIAGNOSTICS").is_some();
+    let diagnostic_output = if diagnostics_enabled
+        || native_play_frame_has_blocking_render_artifact_for_frame(frame, stats)
+        || stats.has_missing_texture_recovery_artifact()
+    {
+        let diagnostic_output = output_dir.join(format!("{output_stem}.diagnostic.json"));
+        std::fs::write(&diagnostic_output, emulator.diagnostic_json()).map_err(|error| {
+            format!(
+                "failed to write native stage QA diagnostics {}: {error}",
+                diagnostic_output.display()
+            )
+        })?;
+        format!(
+            "\"{}\"",
+            escape_json(&diagnostic_output.display().to_string())
+        )
+    } else {
+        "null".to_string()
+    };
+
+    Ok((
+        format!(
+            "{{\"stage_index\":{},\"stage\":\"{}\",\"phase\":\"{}\",\"output\":\"{}\",\"diagnostic_output\":{},\"checksum\":{},\"background_checksum\":{},\"frame\":{},\"native_playable_candidate\":{}}}",
+            stage_index.map_or_else(|| "null".to_string(), |index| index.to_string()),
+            escape_json(stage_label),
+            escape_json(phase),
+            escape_json(&output.display().to_string()),
+            diagnostic_output,
+            checksum,
+            background_checksum,
+            native_frame_compact_stats_json(stats),
+            native_playable_candidate,
+        ),
+        stats,
+        checksum,
+        background_checksum,
+    ))
+}
+
 fn run_native_roster_qa(
     rom: PathBuf,
     instructions_per_frame: u64,
@@ -8197,13 +8594,13 @@ fn run_native_roster_qa(
             fast_forward_instructions_per_frame,
             &native_roster_action_segments(Action::Beast, 0),
         );
+        let (beast_settle_run, beast_effect_capture) =
+            run_native_roster_beast_settle_with_effect_capture(
+                &mut branch,
+                fast_forward_instructions_per_frame,
+            );
         let (beast_effect_report, beast_effect_stats, beast_effect_checksum, _) =
-            native_roster_stage_report(output_dir, slot, "beast-effect", &branch)?;
-        let beast_settle_run = run_native_script_observed(
-            &mut branch,
-            fast_forward_instructions_per_frame,
-            &native_roster_action_segments(Action::Noop, NATIVE_ROSTER_BEAST_SETTLE_FRAMES),
-        );
+            native_roster_stage_report(output_dir, slot, "beast-effect", &beast_effect_capture)?;
         let (beast_report, beast_stats, beast_checksum, _) =
             native_roster_stage_report(output_dir, slot, "beast", &branch)?;
         let beast_pass = {
@@ -8251,13 +8648,18 @@ fn run_native_roster_qa(
             fast_forward_instructions_per_frame,
             &native_roster_action_segments(Action::P2Beast, 0),
         );
+        let (p2_beast_settle_run, p2_beast_effect_capture) =
+            run_native_roster_beast_settle_with_effect_capture(
+                &mut branch,
+                fast_forward_instructions_per_frame,
+            );
         let (p2_beast_effect_report, p2_beast_effect_stats, p2_beast_effect_checksum, _) =
-            native_roster_stage_report(output_dir, slot, "p2-beast-effect", &branch)?;
-        let p2_beast_settle_run = run_native_script_observed(
-            &mut branch,
-            fast_forward_instructions_per_frame,
-            &native_roster_action_segments(Action::Noop, NATIVE_ROSTER_BEAST_SETTLE_FRAMES),
-        );
+            native_roster_stage_report(
+                output_dir,
+                slot,
+                "p2-beast-effect",
+                &p2_beast_effect_capture,
+            )?;
         let (p2_beast_report, p2_beast_stats, p2_beast_checksum, _) =
             native_roster_stage_report(output_dir, slot, "p2-beast", &branch)?;
         let p2_beast_pass = {
@@ -8489,6 +8891,269 @@ fn run_native_roster_qa(
     } else {
         Err(format!(
             "native roster QA failed: checkpoint_pass={checkpoint_pass}, passed_slots={passed_slots}/{tested_slots}, unique_previews={unique_previews}/{tested_slots}, unique_preview_portraits={unique_preview_portraits}/{tested_slots}, missed_vblank_frames={missed_vblank_frames}"
+        ))
+    }
+}
+
+fn run_native_stage_qa(
+    rom: PathBuf,
+    instructions_per_frame: u64,
+    output_dir: &Path,
+    selected_stage_index: Option<usize>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(output_dir).map_err(|error| {
+        format!(
+            "failed to create native stage QA output directory {}: {error}",
+            output_dir.display()
+        )
+    })?;
+
+    let started_at = Instant::now();
+    let mut checkpoint = native_emulator_from_rom_source(rom)?;
+    let handoff_segments = native_snapshot_match_entry_script();
+    let boot_wait_segments = native_play_boot_wait_segments(&handoff_segments);
+    let fast_forward_instructions_per_frame =
+        native_snapshot_instructions_per_frame(instructions_per_frame);
+    let boot_progress = run_native_title_ready_boot_wait_with_timeout(
+        &mut checkpoint,
+        fast_forward_instructions_per_frame,
+        &boot_wait_segments,
+        Some(Duration::from_secs(
+            NATIVE_PLAY_SNAPSHOT_MATCH_BOOT_WALL_TIMEOUT_SECS,
+        )),
+        "skipped_native_stage_qa_boot_timeout",
+    );
+    let select_segments = native_roster_select_checkpoint_segments();
+    let select_run = run_native_script_observed(
+        &mut checkpoint,
+        fast_forward_instructions_per_frame,
+        &select_segments,
+    );
+    let checkpoint_frame = native_play_window_frame_for_emulator(&checkpoint);
+    let checkpoint_portrait = NativeRosterPortraitStats::from_frame(&checkpoint_frame);
+    let (checkpoint_report, checkpoint_stats, _, _) = native_stage_qa_frame_report(
+        output_dir,
+        None,
+        "checkpoint",
+        "select",
+        &checkpoint,
+        &checkpoint_frame,
+        checkpoint.native_playable_candidate(),
+    )?;
+    let checkpoint_pass = native_roster_preview_frame_passes(checkpoint_stats)
+        && checkpoint_portrait.passes()
+        && boot_progress.summary.missed_vblank_frames == 0
+        && select_run.missed_vblank_frames == 0
+        && !checkpoint.is_terminal();
+
+    let stage_indices = selected_stage_index
+        .map(|stage_index| vec![stage_index])
+        .unwrap_or_else(|| (0..BR2_STAGE_QA_STAGE_COUNT).collect());
+    let tested_stages = stage_indices.len();
+    let mut stage_reports = Vec::with_capacity(tested_stages);
+    let mut stage_background_checksums = Vec::with_capacity(tested_stages);
+    let mut passed_stages = 0usize;
+    let mut total_frames = boot_progress
+        .summary
+        .total_frames
+        .saturating_add(select_run.total_frames);
+    let mut missed_vblank_frames = boot_progress
+        .summary
+        .missed_vblank_frames
+        .saturating_add(select_run.missed_vblank_frames);
+
+    for stage_index in stage_indices {
+        let stage_started_at = Instant::now();
+        let stage_label = NATIVE_STAGE_QA_LABELS[stage_index];
+        let mut branch = checkpoint.clone();
+        let branch_baseline = branch.input_activity();
+
+        let selector_override = branch
+            .confirm_br2_stage_qa_p1_and_apply_override_before_selector_read(
+                stage_index,
+                NATIVE_ROSTER_SELECT_CONFIRM_FRAMES,
+                NATIVE_STAGE_QA_SELECTOR_READ_MAX_INSTRUCTIONS,
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to confirm P1 selection and apply native stage QA override {stage_index} ({stage_label}) before the guest selector read: {error}"
+                )
+            })?;
+        let selector_override_frames = selector_override
+            .end_vblank
+            .saturating_sub(selector_override.start_vblank);
+
+        let gameplay_result =
+            run_native_stage_qa_gameplay_wait(&mut branch, fast_forward_instructions_per_frame);
+        let NativeStageQaGameplayWaitResult {
+            summary: gameplay_run,
+            visual_frame,
+            visual_frame_native_playable_candidate,
+            fighter_model_recovery_observed,
+        } = gameplay_result;
+        let combat_visual_frame_observed = visual_frame.is_some();
+        let combat_frame =
+            visual_frame.unwrap_or_else(|| native_play_window_frame_for_emulator(&branch));
+        let (combat_report, _combat_stats, combat_checksum, combat_background_checksum) =
+            native_stage_qa_frame_report(
+                output_dir,
+                Some(stage_index),
+                stage_label,
+                "combat",
+                &branch,
+                &combat_frame,
+                if combat_visual_frame_observed {
+                    visual_frame_native_playable_candidate
+                } else {
+                    branch.native_playable_candidate()
+                },
+            )?;
+        let combat_fighter_model_recovery_complete =
+            branch.native_fighter_model_recovery_is_complete();
+        let combat_pass = native_stage_qa_combat_evidence_passes(
+            fighter_model_recovery_observed,
+            combat_visual_frame_observed,
+        );
+
+        let settle_run = run_native_script_observed(
+            &mut branch,
+            fast_forward_instructions_per_frame,
+            &[NativeScriptSegment {
+                action: Action::Noop,
+                frames: NATIVE_STAGE_QA_SETTLE_FRAMES,
+            }],
+        );
+        let settled_frame = native_play_window_frame_for_emulator(&branch);
+        let settled_fighter_model_recovery_complete =
+            branch.native_fighter_model_recovery_is_complete();
+        let settled_fighter_model_recovery_verified =
+            native_stage_qa_settled_fighter_recovery_verified(
+                combat_pass,
+                settled_fighter_model_recovery_complete,
+            );
+        let (settled_report, settled_stats, settled_checksum, settled_background_checksum) =
+            native_stage_qa_frame_report(
+                output_dir,
+                Some(stage_index),
+                stage_label,
+                "settled",
+                &branch,
+                &settled_frame,
+                branch.native_playable_candidate(),
+            )?;
+        let settled_pass = native_stage_qa_settled_frame_passes(
+            &settled_frame,
+            settled_stats,
+            settled_fighter_model_recovery_verified,
+            branch.native_playable_candidate(),
+            combat_pass,
+        );
+        stage_background_checksums.push(settled_background_checksum);
+        let stage_frames = selector_override_frames
+            .saturating_add(gameplay_run.total_frames)
+            .saturating_add(settle_run.total_frames);
+        let stage_missed_vblank_frames = gameplay_run
+            .missed_vblank_frames
+            .saturating_add(settle_run.missed_vblank_frames);
+        total_frames = total_frames.saturating_add(stage_frames);
+        missed_vblank_frames = missed_vblank_frames.saturating_add(stage_missed_vblank_frames);
+        let activity = branch
+            .input_activity()
+            .saturating_subtracted(branch_baseline);
+        let frame_progressed = combat_checksum != settled_checksum;
+        let selector_override_pass = selector_override.selector_after_override
+            == stage_index as u16
+            && selector_override.selector_after_read == stage_index as u16;
+        let stage_pass = selector_override_pass
+            && combat_pass
+            && settled_pass
+            && frame_progressed
+            && stage_missed_vblank_frames == 0
+            && !branch.is_terminal();
+        if stage_pass {
+            passed_stages = passed_stages.saturating_add(1);
+        }
+        let elapsed = stage_started_at.elapsed().as_secs_f64();
+        let emulated_fps = if elapsed > 0.0 {
+            stage_frames as f64 / elapsed
+        } else {
+            0.0
+        };
+        stage_reports.push(format!(
+            "{{\"stage_index\":{},\"stage\":\"{}\",\"status\":\"{}\",\"frames\":{},\"missed_vblank_frames\":{},\"elapsed_seconds\":{:.3},\"emulated_fps\":{:.3},\"selector_override_instruction_budget\":{},\"checks\":{{\"selector_override\":{},\"combat\":{},\"settled\":{},\"combat_visual_frame_observed\":{},\"combat_fighter_model_recovery_observed\":{},\"combat_fighter_model_recovery_complete\":{},\"settled_fighter_model_recovery_complete\":{},\"settled_fighter_model_recovery_verified\":{},\"frame_progressed\":{},\"terminal\":{}}},\"combat_background_checksum\":{},\"stage_background_checksum\":{},\"runs\":{{\"selector_read_override\":{},\"gameplay\":{},\"settle\":{}}},\"captures\":{{\"combat\":{},\"settled\":{}}},\"input_delta\":{}}}",
+            stage_index,
+            escape_json(stage_label),
+            if stage_pass { "pass" } else { "fail" },
+            stage_frames,
+            stage_missed_vblank_frames,
+            elapsed,
+            emulated_fps,
+            NATIVE_STAGE_QA_SELECTOR_READ_MAX_INSTRUCTIONS,
+            selector_override_pass,
+            combat_pass,
+            settled_pass,
+            combat_visual_frame_observed,
+            fighter_model_recovery_observed,
+            combat_fighter_model_recovery_complete,
+            settled_fighter_model_recovery_complete,
+            settled_fighter_model_recovery_verified,
+            frame_progressed,
+            branch.is_terminal(),
+            combat_background_checksum,
+            settled_background_checksum,
+            selector_override.json(),
+            gameplay_run.json(),
+            settle_run.json(),
+            combat_report,
+            settled_report,
+            activity.json(),
+        ));
+    }
+
+    stage_background_checksums.sort_unstable();
+    stage_background_checksums.dedup();
+    let unique_stage_backgrounds = stage_background_checksums.len();
+    let stage_diversity_verified = tested_stages <= 1 || unique_stage_backgrounds == tested_stages;
+    let elapsed = started_at.elapsed().as_secs_f64();
+    let emulated_fps = if elapsed > 0.0 {
+        total_frames as f64 / elapsed
+    } else {
+        0.0
+    };
+    let overall_pass = checkpoint_pass
+        && passed_stages == tested_stages
+        && stage_diversity_verified
+        && missed_vblank_frames == 0;
+    let selected_stage_index_json = selected_stage_index
+        .map_or_else(|| "null".to_string(), |stage_index| stage_index.to_string());
+    println!(
+        "{{\"command\":\"native-stage-qa\",\"status\":\"{}\",\"instructions_per_frame\":{},\"fast_forward_instructions_per_frame\":{},\"stage_count\":{},\"stage_labels\":[{}],\"stages\":{},\"selected_stage_index\":{},\"passed_stages\":{},\"unique_stage_background_checksums\":{},\"stage_diversity_verified\":{},\"total_frames\":{},\"missed_vblank_frames\":{},\"elapsed_seconds\":{:.3},\"emulated_fps\":{:.3},\"checkpoint\":{{\"status\":\"{}\",\"boot_run\":{},\"select_run\":{},\"capture\":{}}},\"stage_reports\":[{}]}}",
+        if overall_pass { "pass" } else { "fail" },
+        instructions_per_frame,
+        fast_forward_instructions_per_frame,
+        BR2_STAGE_QA_STAGE_COUNT,
+        native_json_string_array(&NATIVE_STAGE_QA_LABELS),
+        tested_stages,
+        selected_stage_index_json,
+        passed_stages,
+        unique_stage_backgrounds,
+        stage_diversity_verified,
+        total_frames,
+        missed_vblank_frames,
+        elapsed,
+        emulated_fps,
+        if checkpoint_pass { "pass" } else { "fail" },
+        boot_progress.summary.json(),
+        select_run.json(),
+        checkpoint_report,
+        stage_reports.join(","),
+    );
+
+    if overall_pass {
+        Ok(())
+    } else {
+        Err(format!(
+            "native stage QA failed: checkpoint_pass={checkpoint_pass}, passed_stages={passed_stages}/{tested_stages}, unique_stage_backgrounds={unique_stage_backgrounds}/{tested_stages}, stage_diversity_verified={stage_diversity_verified}, missed_vblank_frames={missed_vblank_frames}"
         ))
     }
 }
@@ -18919,6 +19584,30 @@ fn native_frame_checksum(frame: &NativeDisplayFrame) -> u32 {
     checksum
 }
 
+fn native_stage_background_checksum(frame: &NativeDisplayFrame) -> u32 {
+    let mut checksum = native_frame_checksum_seed(frame.width, frame.height);
+    if frame.width == 0
+        || frame.height == 0
+        || frame.pixels.len() < frame.width.saturating_mul(frame.height)
+    {
+        return checksum;
+    }
+    let top = frame.height * 15 / 100;
+    let bottom = frame.height * 82 / 100;
+    let band_width = (frame.width * 14 / 100).max(1);
+    let right_start = frame.width.saturating_sub(band_width);
+    for y in top..bottom {
+        let row = y * frame.width;
+        for x in 0..band_width {
+            checksum = native_frame_checksum_pixel(checksum, frame.pixels[row + x]);
+        }
+        for x in right_start..frame.width {
+            checksum = native_frame_checksum_pixel(checksum, frame.pixels[row + x]);
+        }
+    }
+    checksum
+}
+
 fn native_frame_checksum_seed(width: usize, height: usize) -> u32 {
     let mut checksum = 0x811c_9dc5_u32;
     checksum ^= width as u32;
@@ -21364,6 +22053,9 @@ fn print_help() {
         "  native-match-tail-timeline-compact <rom_zip_or_dir> <instructions_per_frame> [action:frames...]"
     );
     println!("  native-roster-qa [rom_zip_or_dir] [instructions_per_frame] <output_dir> [slot]");
+    println!(
+        "  native-stage-qa [rom_zip_or_dir] [instructions_per_frame] <output_dir> [stage_index]"
+    );
     println!(
         "  native-scripted-playability-diagnose <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
     );
@@ -25258,6 +25950,13 @@ fn native_play_gameplay_scene_with_context(
 }
 
 fn native_play_frame_has_blocking_render_artifact(stats: NativeFrameStats) -> bool {
+    native_play_frame_has_blocking_render_artifact_with_title_logo_policy(stats, true)
+}
+
+fn native_play_frame_has_blocking_render_artifact_with_title_logo_policy(
+    stats: NativeFrameStats,
+    block_title_logo_overlay: bool,
+) -> bool {
     if native_play_scaled_active_field_artifact_false_positive(stats)
         || native_play_sparse_captioned_native_field_false_positive(stats)
         || stats.has_complete_sparse_title_frame()
@@ -25271,7 +25970,9 @@ fn native_play_frame_has_blocking_render_artifact(stats: NativeFrameStats) -> bo
         || native_play_vertical_color_bars_artifact(stats)
         || stats.has_stage_texture_field_smear()
         || stats.has_stage_texture_replay_fragment_artifact()
-        || (stats.has_blocking_title_logo_overlay() && !title_warning_false_positive)
+        || (block_title_logo_overlay
+            && stats.has_blocking_title_logo_overlay()
+            && !title_warning_false_positive)
         || stats.has_br2_character_select_texture_atlas_overlay()
         || stats.has_br2_character_select_name_overlay_artifact()
         || stats.has_br2_select_name_texture_atlas_overlay()
@@ -27047,7 +27748,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        NATIVE_PLAY_GUI_GAMEPLAY_PRESENTED_CAPTURE_HEARTBEAT_FRAMES,
+        BR2_STAGE_QA_STAGE_COUNT, NATIVE_PLAY_GUI_GAMEPLAY_PRESENTED_CAPTURE_HEARTBEAT_FRAMES,
         NATIVE_PLAY_GUI_IDLE_FAST_PATH_POLL_SLICES,
         NATIVE_PLAY_GUI_PRESENTED_CAPTURE_HEARTBEAT_FRAMES, NATIVE_PLAY_MIN_WINDOW_HEIGHT,
         NATIVE_PLAY_MIN_WINDOW_WIDTH, NATIVE_PLAY_TEST_FIXTURE_WIDTH,
@@ -27057,7 +27758,7 @@ mod tests {
         NATIVE_ROSTER_PORTRAIT_LEFT_PERCENT, NATIVE_ROSTER_PORTRAIT_MIN_DIFFERENCE_PER_MILLE,
         NATIVE_ROSTER_PORTRAIT_RIGHT_PERCENT, NATIVE_ROSTER_PORTRAIT_TOP_PERCENT,
         NATIVE_ROSTER_PREVIEW_SETTLE_FRAMES, NATIVE_ROSTER_SELECT_CONFIRM_FRAMES,
-        NATIVE_ROSTER_SELECT_CONFIRM_RELEASE_FRAMES, NATIVE_ROSTER_SLOTS,
+        NATIVE_ROSTER_SELECT_CONFIRM_RELEASE_FRAMES, NATIVE_ROSTER_SLOTS, NATIVE_STAGE_QA_LABELS,
         NATIVE_TITLE_RENDER_CHECK_STRIDE_FRAMES, NativeFrameStats, NativeGpuDrawCapturePredicate,
         NativeGuiInputTrace, NativeGuiTestInputScript, NativeGuiTimingStats, NativeInputActivity,
         NativeInputLatch, NativePcmStats, NativePlayGuiDrawCapture, NativeRosterPortraitStats,
@@ -27119,8 +27820,13 @@ mod tests {
         native_script_first_credit_position_after_progress, native_script_max_frames_for_segments,
         native_script_segment_is_credit_attempt, native_script_tail_progress_to_original_position,
         native_script_wall_timeout, native_snapshot_handoff_script,
-        native_snapshot_instructions_per_frame, native_title_render_probe_ready,
-        native_title_runtime_input_ready, native_window_button_sample_for_exclusive_test_input,
+        native_snapshot_instructions_per_frame, native_stage_background_checksum,
+        native_stage_qa_combat_evidence_passes, native_stage_qa_frame_passes,
+        native_stage_qa_scene_passes, native_stage_qa_settled_fighter_recovery_verified,
+        native_stage_qa_settled_frame_passes,
+        native_stage_qa_title_logo_overlay_is_scene_false_positive,
+        native_title_render_probe_ready, native_title_runtime_input_ready,
+        native_window_button_sample_for_exclusive_test_input,
         native_window_button_sample_with_test_sidecar, next_native_rom_source_or_default,
         next_scripted_action, parse_action_token, parse_native_autoplay_tail,
         parse_native_credit_state_probe_options, parse_native_gui_test_input_script,
@@ -27251,6 +27957,19 @@ mod tests {
         }
     }
 
+    fn draw_test_wait_a_challenger_overlay(frame: &mut NativeDisplayFrame) {
+        let left = frame.width * 71 / 100;
+        let right = frame.width * 98 / 100;
+        let bottom = frame.height * 7 / 100;
+        for y in 4..bottom.saturating_sub(4) {
+            for x in left..right {
+                if (x / 3 + y / 2).is_multiple_of(3) {
+                    frame.pixels[y * frame.width + x] = 0x00f0_b820;
+                }
+            }
+        }
+    }
+
     #[test]
     fn native_play_gui_frame_corrects_512_by_480_to_four_by_three() {
         let width = 512;
@@ -27325,6 +28044,67 @@ mod tests {
                 (Action::Noop, NATIVE_ROSTER_SELECT_CONFIRM_RELEASE_FRAMES),
             ]
         );
+    }
+
+    #[test]
+    fn native_stage_background_checksum_excludes_center_fighters() {
+        let baseline = test_solid_frame(0x0012_3456);
+        let baseline_checksum = native_stage_background_checksum(&baseline);
+        let mut center_changed = baseline.clone();
+        let center_x = center_changed.width / 2;
+        let center_y = center_changed.height / 2;
+        center_changed.pixels[center_y * center_changed.width + center_x] = 0x00ff_ffff;
+        assert_eq!(
+            native_stage_background_checksum(&center_changed),
+            baseline_checksum
+        );
+
+        let mut side_changed = baseline;
+        side_changed.pixels[center_y * side_changed.width] = 0x00ff_ffff;
+        assert_ne!(
+            native_stage_background_checksum(&side_changed),
+            baseline_checksum
+        );
+    }
+
+    #[test]
+    fn native_stage_qa_labels_cover_all_verified_selector_values() {
+        assert_eq!(NATIVE_STAGE_QA_LABELS.len(), BR2_STAGE_QA_STAGE_COUNT);
+        assert_eq!(
+            NATIVE_STAGE_QA_LABELS,
+            [
+                "stage_1",
+                "stage_2",
+                "stage_3",
+                "stage_4",
+                "stage_5",
+                "stage_6",
+                "stage_7",
+                "final_stage",
+                "special_stage",
+            ]
+        );
+    }
+
+    #[test]
+    fn native_stage_qa_retains_combat_fighter_recovery_for_settled_overlap() {
+        assert!(!native_stage_qa_settled_fighter_recovery_verified(
+            false, false
+        ));
+        assert!(native_stage_qa_settled_fighter_recovery_verified(
+            true, false
+        ));
+        assert!(native_stage_qa_settled_fighter_recovery_verified(
+            false, true
+        ));
+    }
+
+    #[test]
+    fn native_stage_qa_combines_visual_and_fighter_recovery_evidence_from_one_branch() {
+        assert!(!native_stage_qa_combat_evidence_passes(false, false));
+        assert!(!native_stage_qa_combat_evidence_passes(true, false));
+        assert!(!native_stage_qa_combat_evidence_passes(false, true));
+        assert!(native_stage_qa_combat_evidence_passes(true, true));
     }
 
     #[test]
@@ -27558,8 +28338,186 @@ mod tests {
             "HUD pixels cannot hide incomplete fighter model recovery"
         );
         assert!(
+            !native_stage_qa_frame_passes(&frame, combat_stats, false, true),
+            "stage QA context cannot hide incomplete fighter model recovery"
+        );
+        assert!(
             native_roster_combat_frame_passes(&frame, combat_stats, true),
             "both health bars, timer, complete scene, and both fighters must pass"
+        );
+        assert!(native_stage_qa_frame_passes(
+            &frame,
+            combat_stats,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn native_stage_qa_context_accepts_runtime_verified_render_ready_scene() {
+        let stats = NativeFrameStats::from_frame(&test_dark_native_match_frame());
+
+        assert!(stats.has_render_ready_scene(), "{stats:?}");
+        assert!(!stats.has_gameplay_scene(), "{stats:?}");
+        assert!(!native_stage_qa_scene_passes(stats, false), "{stats:?}");
+        assert!(native_stage_qa_scene_passes(stats, true), "{stats:?}");
+    }
+
+    #[test]
+    fn native_stage_qa_accepts_hud_verified_dark_stage_title_logo_false_positive() {
+        let stats = NativeFrameStats {
+            width: 512,
+            height: 480,
+            total_pixels: 245_760,
+            nonzero_pixels: 145_800,
+            black_pixels: 99_960,
+            warm_pixels: 24_000,
+            red_dominant_pixels: 32_000,
+            magenta_dominant_pixels: 0,
+            unique_colors: 257,
+            dominant_color_bucket_pixels: 104_977,
+            horizontal_color_changes: 55_660,
+            periodic_horizontal_match_per_mille: 80,
+            occupied_rows: 472,
+            occupied_row_span: 472,
+            right_title_red_pixels: 3_000,
+            right_title_bright_pixels: 1_000,
+            top_left_warning_region_dark_pixels: 10_027,
+            top_left_warning_text_pixels: 202,
+            top_left_warning_text_rows: 14,
+            bottom_caption_pixels: 31_135,
+            bottom_dark_pixels: 7_240,
+        };
+        let mut frame = NativeDisplayFrame {
+            width: 512,
+            height: 480,
+            pixels: vec![0; 512 * 480],
+        };
+        for y in 220..frame.height {
+            for x in 0..frame.width {
+                let red = 80 + ((x * 7 + y * 3) % 144) as u32;
+                let green = 64 + ((x * 11 + y * 5) % 160) as u32;
+                let blue = 32 + ((x * 13 + y * 17) % 112) as u32;
+                frame.pixels[y * frame.width + x] = (red << 16) | (green << 8) | blue;
+            }
+        }
+        fill_percent_roi(
+            &mut frame,
+            super::NATIVE_ROSTER_LEFT_HEALTH_BAR_LEFT_PERCENT,
+            super::NATIVE_ROSTER_HEALTH_BAR_TOP_PERCENT,
+            super::NATIVE_ROSTER_LEFT_HEALTH_BAR_RIGHT_PERCENT,
+            super::NATIVE_ROSTER_HEALTH_BAR_BOTTOM_PERCENT,
+            0x00ff_d000,
+        );
+        fill_percent_roi(
+            &mut frame,
+            super::NATIVE_ROSTER_RIGHT_HEALTH_BAR_LEFT_PERCENT,
+            super::NATIVE_ROSTER_HEALTH_BAR_TOP_PERCENT,
+            super::NATIVE_ROSTER_RIGHT_HEALTH_BAR_RIGHT_PERCENT,
+            super::NATIVE_ROSTER_HEALTH_BAR_BOTTOM_PERCENT,
+            0x00f0_c000,
+        );
+        fill_percent_roi(
+            &mut frame,
+            super::NATIVE_ROSTER_TIMER_LEFT_PERCENT,
+            super::NATIVE_ROSTER_HEALTH_BAR_TOP_PERCENT,
+            super::NATIVE_ROSTER_TIMER_RIGHT_PERCENT,
+            super::NATIVE_ROSTER_TIMER_BOTTOM_PERCENT,
+            0x00ff_ffff,
+        );
+        let timer_left = frame.width * super::NATIVE_ROSTER_TIMER_LEFT_PERCENT / 100;
+        let timer_top = frame.height * super::NATIVE_ROSTER_HEALTH_BAR_TOP_PERCENT / 100;
+        let timer_right = frame.width * super::NATIVE_ROSTER_TIMER_RIGHT_PERCENT / 100;
+        let timer_bottom = frame.height * super::NATIVE_ROSTER_TIMER_BOTTOM_PERCENT / 100;
+        for y in timer_top..timer_bottom {
+            for x in timer_left..timer_right {
+                if (x + y).is_multiple_of(4) || (x + y) % 4 == 1 {
+                    frame.pixels[y * frame.width + x] = 0;
+                }
+            }
+        }
+
+        assert!(stats.has_blocking_title_logo_overlay(), "{stats:?}");
+        assert!(
+            !stats.has_blocking_display_artifact_except_title_logo(),
+            "{stats:?}"
+        );
+        assert!(
+            super::native_play_frame_has_blocking_render_artifact(stats),
+            "{stats:?}"
+        );
+        assert!(
+            !super::native_play_frame_has_blocking_structural_artifact(&frame, stats),
+            "{stats:?}"
+        );
+        assert!(
+            native_stage_qa_title_logo_overlay_is_scene_false_positive(stats),
+            "{stats:?}"
+        );
+        assert!(native_stage_qa_scene_passes(stats, false), "{stats:?}");
+        assert!(native_stage_qa_frame_passes(&frame, stats, true, false));
+        assert!(
+            !native_stage_qa_frame_passes(&frame, stats, false, false),
+            "title-logo tolerance cannot hide incomplete fighter recovery"
+        );
+    }
+
+    #[test]
+    fn native_stage_qa_accepts_wait_a_challenger_only_with_verified_fight_context() {
+        let mut frame = test_complete_native_fight_frame();
+        draw_test_wait_a_challenger_overlay(&mut frame);
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_gameplay_scene(), "{stats:?}");
+        assert!(super::native_play_frame_has_wait_a_challenger_overlay(
+            &frame, stats,
+        ));
+        assert!(super::native_play_frame_has_blocking_structural_artifact(
+            &frame, stats,
+        ));
+        assert!(native_stage_qa_frame_passes(&frame, stats, true, true));
+        assert!(
+            !native_stage_qa_frame_passes(&frame, stats, false, true),
+            "the expected one-player overlay cannot hide incomplete fighter recovery"
+        );
+
+        fill_percent_roi(
+            &mut frame,
+            super::NATIVE_ROSTER_TIMER_LEFT_PERCENT,
+            super::NATIVE_ROSTER_HEALTH_BAR_TOP_PERCENT,
+            super::NATIVE_ROSTER_TIMER_RIGHT_PERCENT,
+            super::NATIVE_ROSTER_TIMER_BOTTOM_PERCENT,
+            0,
+        );
+        let incomplete_hud_stats = NativeFrameStats::from_frame(&frame);
+        assert!(
+            !super::NativeRosterCombatHudStats::from_frame(&frame).passes(),
+            "{incomplete_hud_stats:?}"
+        );
+        assert!(
+            !native_stage_qa_frame_passes(&frame, incomplete_hud_stats, true, true),
+            "the expected one-player overlay cannot hide an incomplete combat HUD"
+        );
+    }
+
+    #[test]
+    fn native_stage_qa_settled_frame_retains_prior_complete_combat_hud_evidence() {
+        let frame = test_gradient_playfield_frame();
+        let stats = NativeFrameStats::from_frame(&frame);
+
+        assert!(stats.has_gameplay_scene(), "{stats:?}");
+        assert!(
+            !super::NativeRosterCombatHudStats::from_frame(&frame).passes(),
+            "{stats:?}"
+        );
+        assert!(!native_stage_qa_frame_passes(&frame, stats, true, true));
+        assert!(
+            !native_stage_qa_settled_frame_passes(&frame, stats, true, true, false),
+            "settled frames still need current HUD evidence without a prior complete combat"
+        );
+        assert!(
+            native_stage_qa_settled_frame_passes(&frame, stats, true, true, true),
+            "a verified prior combat should permit a later artifact-free zoomed fight scene"
         );
     }
 
@@ -27574,6 +28532,10 @@ mod tests {
         assert!(!stats.has_blocking_display_artifact(), "{stats:?}");
         assert!(
             super::native_play_frame_has_blocking_structural_artifact(&frame, stats),
+            "{stats:?}"
+        );
+        assert!(
+            super::native_stage_qa_frame_has_blocking_structural_artifact(&frame, stats, true),
             "{stats:?}"
         );
         assert!(
@@ -27866,6 +28828,13 @@ mod tests {
             &broken,
             broken_select_stats,
         ));
+        assert!(
+            super::native_stage_qa_frame_has_blocking_structural_artifact(
+                &broken,
+                broken_select_stats,
+                true,
+            )
+        );
     }
 
     #[test]
@@ -28795,6 +29764,13 @@ mod tests {
             &artifact,
             artifact_stats,
         ));
+        assert!(
+            super::native_stage_qa_frame_has_blocking_structural_artifact(
+                &artifact,
+                artifact_stats,
+                true,
+            )
+        );
         let fallback = super::native_play_gui_structural_artifact_fallback(&Some(safe))
             .expect("a clean last-safe frame should be retained");
         assert_eq!(native_frame_checksum(&fallback.frame), safe_checksum);
@@ -28830,16 +29806,7 @@ mod tests {
     #[test]
     fn native_play_gui_rejects_wait_a_challenger_overlay_over_fight() {
         let mut artifact = test_complete_native_fight_frame();
-        let left = artifact.width * 71 / 100;
-        let right = artifact.width * 98 / 100;
-        let bottom = artifact.height * 7 / 100;
-        for y in 4..bottom.saturating_sub(4) {
-            for x in left..right {
-                if (x / 3 + y / 2).is_multiple_of(3) {
-                    artifact.pixels[y * artifact.width + x] = 0x00f0_b820;
-                }
-            }
-        }
+        draw_test_wait_a_challenger_overlay(&mut artifact);
         let stats = NativeFrameStats::from_frame(&artifact);
         assert!(stats.has_gameplay_scene(), "{stats:?}");
         assert!(super::native_play_frame_has_wait_a_challenger_overlay(
@@ -30785,6 +31752,30 @@ mod tests {
             height,
             pixels,
         }
+    }
+
+    fn test_varied_br2_rock_stage_frame() -> NativeDisplayFrame {
+        let mut frame = test_scaled_br2_repeating_rock_atlas_artifact_frame();
+        let band_height = frame.height / 3;
+        for y in 0..frame.height {
+            if y >= band_height && y < frame.height - band_height {
+                continue;
+            }
+            for x in 0..frame.width {
+                if (x * 3 + y * 7).is_multiple_of(5) {
+                    continue;
+                }
+                let index = y * frame.width + x;
+                let color = frame.pixels[index];
+                let red = (color >> 16) & 0xff;
+                let green = (color >> 8) & 0xff;
+                let blue = color & 0xff;
+                let variation = 1 + ((x * 17 + y * 13) % 23) as u32;
+                frame.pixels[index] =
+                    (red << 16) | (green << 8) | blue.saturating_add(variation).min(255);
+            }
+        }
+        frame
     }
 
     fn test_dark_native_match_frame() -> NativeDisplayFrame {
@@ -36629,6 +37620,54 @@ mod tests {
         let visible =
             super::native_play_visible_window_frame(artifact.clone(), &Some(safe.clone()));
         assert_eq!(visible.pixels, safe.pixels);
+    }
+
+    #[test]
+    fn native_play_repeating_rock_atlas_detector_requires_strong_exact_repetition() {
+        let artifact = test_scaled_br2_repeating_rock_atlas_artifact_frame();
+        assert!(
+            super::native_play_frame_has_br2_repeating_rock_atlas_artifact(&artifact),
+            "the exact repeating atlas must remain blocked"
+        );
+
+        let varied_stage = test_varied_br2_rock_stage_frame();
+        let band_height = varied_stage.height / 3;
+        let varied_match_per_mille = [52usize, 55, 64, 67, 80]
+            .into_iter()
+            .map(|period| {
+                super::native_frame_periodic_horizontal_band_match_per_mille(
+                    &varied_stage,
+                    0,
+                    band_height,
+                    period,
+                )
+                .min(
+                    super::native_frame_periodic_horizontal_band_match_per_mille(
+                        &varied_stage,
+                        varied_stage.height - band_height,
+                        varied_stage.height,
+                        period,
+                    ),
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (130..super::NATIVE_PLAY_BR2_REPEATING_ROCK_ATLAS_MIN_MATCH_PER_MILLE)
+                .contains(&varied_match_per_mille),
+            "the varied stage score must reproduce the old false positive without reaching the exact-repeat threshold: {varied_match_per_mille}"
+        );
+        assert!(
+            super::native_play_frame_has_br2_repeating_rock_atlas_artifact_with_min_match(
+                &varied_stage,
+                130,
+            ),
+            "the previous low threshold must reproduce the Stage 3 false positive"
+        );
+        assert!(
+            !super::native_play_frame_has_br2_repeating_rock_atlas_artifact(&varied_stage),
+            "per-tile stage variation must not be classified as an exact atlas repeat"
+        );
     }
 
     #[test]
