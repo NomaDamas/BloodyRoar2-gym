@@ -12,10 +12,11 @@ use bloodyroar2_gym::{
     ACTION_SPACE, Action, ActionButtons, BR2_STAGE_QA_STAGE_COUNT, BloodyRoar2Env, MameConfig,
     MameRuntime, NativeDisplayFrame, NativeEmulator, NativeGpuDrawCapturePredicate,
     NativeInputActivity, NativeRomSet, NativeTraceConfig, NullBackend, StereoSample,
-    YMF271_SAMPLE_RATE_HZ, ZincConfig, ZincRuntime, action_space_json, api_index_json,
-    native_aspect_corrected_gui_frame, native_playable_match_entry_script,
-    native_update_aspect_corrected_gui_frame, native_window_frame_from_display,
-    native_window_prefers_stronger_stacked_field, observation_space_json, png_from_rgb888_pixels,
+    YMF271_SAMPLE_RATE_HZ, ZincConfig, ZincRuntime, action_space_json, analysis_manifest_json,
+    analysis_plan_json, api_index_json, native_aspect_corrected_gui_frame, native_platform_json,
+    native_playable_match_entry_script, native_update_aspect_corrected_gui_frame,
+    native_window_frame_from_display, native_window_prefers_stronger_stacked_field,
+    observation_space_json, png_from_rgb888_pixels,
 };
 use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 #[cfg(target_os = "macos")]
@@ -221,6 +222,7 @@ const NATIVE_MIPS_IMM_SEARCH_DEFAULT_LIMIT: usize = 256;
 const NATIVE_MIPS_IMM_SEARCH_MAX_LIMIT: usize = 4096;
 const NATIVE_BR2_RUNTIME_CODE_START: u32 = 0x002c_0000;
 const NATIVE_BR2_RUNTIME_CODE_END: u32 = 0x0037_0000;
+const CLI_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 fn default_native_rom_source() -> PathBuf {
     if let Some(path) = NativeRomSet::latest_cached_runtime_rom_dir() {
@@ -272,10 +274,29 @@ fn native_arg_looks_like_rom_source(value: &str) -> bool {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
+    // The command dispatcher contains many large native-diagnostic arms.  A
+    // platform's default main-thread stack can be too small even for a
+    // ROM-free command such as `help` or `analysis-manifest`; keep CLI
+    // metadata and headless MCP entry points reliable on every host.
+    let result = std::thread::Builder::new()
+        .name("bloodyroar2-cli".to_string())
+        .stack_size(CLI_THREAD_STACK_SIZE)
+        .spawn(run)
+        .and_then(|thread| {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("CLI worker thread panicked"))
+        });
+    match result {
+        Ok(result) => match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::from(1)
+            }
+        },
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("failed to start CLI worker thread: {error}");
             ExitCode::from(1)
         }
     }
@@ -300,6 +321,22 @@ fn run() -> Result<(), String> {
         }
         "observation-space" => {
             println!("{}", observation_space_json());
+            Ok(())
+        }
+        "analysis-manifest" => {
+            println!("{}", analysis_manifest_json());
+            Ok(())
+        }
+        "analysis-plan" => {
+            let target = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                return Err("usage: bloodyroar2-gym analysis-plan [binary_path]".to_string());
+            }
+            println!("{}", analysis_plan_json(target.as_deref()));
+            Ok(())
+        }
+        "platform" => {
+            println!("{}", native_platform_json());
             Ok(())
         }
         "reset" => {
@@ -5369,6 +5406,10 @@ fn run_native_play(
     );
     let audio_realtime_verified = coreaudio_output.is_some()
         && audio_health.is_some_and(|health| health.audible() && health.realtime_ok);
+    // CoreAudio is an optional host sink.  The emulator's PCM renderer and
+    // Gym/MCP surfaces remain portable when a target has no CoreAudio API
+    // (Linux, Windows, BSD, or a headless CI runner).
+    let audio_realtime_required = cfg!(target_os = "macos");
     let gui_performance_gate = native_gui_performance_gate(
         &gui_frame_timing,
         &gui_attack_frame_timing,
@@ -5617,7 +5658,7 @@ fn run_native_play(
             required_test_input_buttons.json(),
         ));
     }
-    if strict_playability_required && !audio_realtime_verified {
+    if strict_playability_required && audio_realtime_required && !audio_realtime_verified {
         return Err(format!(
             "native play GUI audio verification failed: coreaudio_started={} health={audio_health_json}",
             coreaudio_output.is_some()
@@ -22015,7 +22056,7 @@ fn parse_native_window_scale(value: Option<String>) -> Result<Scale, String> {
 
 fn print_help() {
     #[allow(unused_parens)]
-    let help = ("bloodyroar2-gym\n\nCommands:\n  info\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-frame-stats-png <project_png>\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-character-select-diagnose [rom_zip_or_dir] [instructions_per_frame] <output_prefix>\n  native-gap-probe [rom_zip_or_dir] [instructions_per_frame] [--match-script|--handoff-only] [--max-frames n]\n  native-startup-probe [rom_zip_or_dir] [instructions_per_frame] [optimized|tracked]\n  native-enter-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [--gui-test-input action:frames...]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-compact <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip_or_dir] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play fast-forwards only the warning sequence and opens at the title screen. Controls: P1 arrows + Z/Space/X/Q/E, coin C, start P; P2 WASD + J/K/U/I, coin N, start O; Enter sequences P1 coin then start using guest feedback; V service; Esc quit. Pass --gui-test-input only for bounded GUI QA; its actions traverse the same GUI latch and guest input registers without being counted as physical input. native-enter-probe boots the real title state and verifies the same feedback-driven Enter sequencer without opening a window. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 512x480 GUI frame without opening a window; native-frame-stats-png prints Rust classifier stats for project-generated PNGs. native-autoplay keeps the visible or custom scripted-assist path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-character-select-diagnose reproduces the GUI title-to-select path without opening a window and writes the exact select RAM, frame, VRAM, and high-bank portrait draw captures. native-startup-probe runs the exact pre-window native-play path without opening a GUI and compares the optimized hidden-capture path with the legacy diagnostic path. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git.");
+    let help = ("bloodyroar2-gym\n\nCommands:\n  info\n  platform\n  analysis-manifest\n  analysis-plan [binary_path]\n  action-space\n  observation-space\n  reset\n  step <action_index> [frames]\n  serve [address]\n  serve-native [address] [rom_zip_or_dir] [instructions_per_frame]\n  prepare-assets <archive.zip> [rom_dir]\n  mame-required [rom_dir]\n  rom-ident [rom_dir]\n  mame-check [rom_dir]\n  doctor [rom_dir]\n  play [rom_dir] [extra_mame_args...]\n  prepare-zinc <archive.zip> [extract_dir]\n  zinc-check [bundle_dir]\n  zinc-play [bundle_dir] [extra_zinc_args...]\n  native-inspect [rom_zip_or_dir]\n  native-rom-summary [rom_zip_or_dir]\n  native-cache-prepare [rom_zip_or_dir]\n  native-cache-path [rom_zip_or_dir]\n  native-step [rom_zip_or_dir] [instruction_count]\n  native-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-display-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-vram-screenshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-screen-dump [rom_zip_or_dir] [instruction_count] [output_prefix]\n  native-window-snapshot [rom_zip_or_dir] [instruction_count] [output.png]\n  native-frame-stats-png <project_png>\n  native-play-snapshot [rom_zip_or_dir] [instructions_per_frame] [output_prefix] [--complete-script] [--match-script] [--fast-forward-frames n] [--draw-capture-predicate key=value,...] [action:frames...]\n  native-character-select-diagnose [rom_zip_or_dir] [instructions_per_frame] <output_prefix>\n  native-gap-probe [rom_zip_or_dir] [instructions_per_frame] [--match-script|--handoff-only] [--max-frames n]\n  native-startup-probe [rom_zip_or_dir] [instructions_per_frame] [optimized|tracked]\n  native-enter-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames]\n  native-play [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [--gui-test-input action:frames...]\n  native-manual [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames]\n  native-autoplay [rom_zip_or_dir] [instructions_per_frame] [scale] [max_frames] [action:frames...]\n  native-input-check [rom_zip_or_dir] [instructions_per_frame]\n  native-health-check [rom_zip_or_dir] [instructions_per_frame] [branch_frames] [settle_frames] [wall_timeout_secs]\n  native-credit-mapping-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping...]\n  native-credit-bit-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit...]\n  native-credit-projection-probe [rom_zip_or_dir] [instructions_per_frame] [max_frames] [mapping] [bit] [projection...]\n  native-scripted-step <rom_zip_or_dir> <instructions_per_frame> <output.png> <action:frames>...\n  native-scripted-dump <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-candidates <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-probe <rom_zip_or_dir> <instructions_per_frame> <action:frames>...\n  native-scripted-frame-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-compact-probe <rom_zip_or_dir> <instructions_per_frame> <probe_stride_frames> <action:frames>...\n  native-scripted-live-probe <rom_zip_or_dir> <instructions_per_frame> <emit_stride_frames> <action:frames>...\n  native-scripted-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <action:frames>... [-- <trace options>]\n  native-scripted-vblank-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... [-- <trace options>]\n  native-scripted-vblank-watch-trace <rom_zip_or_dir> <instructions_per_frame> <hot_limit> <recent_limit> <warmup_action:frames>... --trace <trace_action:frames>... -- <trace options>\n  native-scripted-timeline <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <action:frames>...\n  native-scripted-branch <rom_zip_or_dir> <instructions_per_frame> <output_prefix> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-compact <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-branch-summary <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>...\n  native-scripted-ram-diff <rom_zip_or_dir> <instructions_per_frame> <branch_frames> <settle_frames> <warmup_action:frames>... [--actions action...]\n  native-draw-snapshot <rom_zip_or_dir> <instruction_count> <sequence_start> <sequence_end> <output_prefix>\n  native-scripted-draw-snapshot <rom_zip_or_dir> <instructions_per_frame> <sequence_start> <sequence_end> <output_prefix> <action:frames>...\n  native-trace [rom_zip_or_dir] [instruction_count] [hot_limit] [recent_limit] [stop_pc] [stop_below_pc] [--stop-above-pc address] [--stop-unmapped-pc] [--stop-watch-write] [--watch address [len]] [--watch-only]\n  native-env-step [rom_zip_or_dir] [action_index] [frames] [instructions_per_frame]\n  asset-check <path>\n\nnative-cache-prepare materializes ZIP assets once and records the latest cache directory; native-cache-path prints that reusable ROM directory. If a native command omits rom_zip_or_dir, it uses the latest cache dir first, then assets/BloodRoar2-combined.zip, then assets/roms. native-play fast-forwards only the warning sequence and opens at the title screen. Controls: P1 arrows + Z/Space/X/Q/E, coin C, start P; P2 WASD + J/K/U/I, coin N, start O; Enter sequences P1 coin then start using guest feedback; V service; Esc quit. Pass --gui-test-input only for bounded GUI QA; its actions traverse the same GUI latch and guest input registers without being counted as physical input. native-enter-probe boots the real title state and verifies the same feedback-driven Enter sequencer without opening a window. native-manual opens the cold-boot keyboard-controlled GUI with no entry script. native-window-snapshot writes the exact 512x480 GUI frame without opening a window; native-frame-stats-png prints Rust classifier stats for project-generated PNGs. native-autoplay keeps the visible or custom scripted-assist path for diagnostics and custom scripts. native-play-snapshot writes the bounded fast-forwarded frame without opening a window and reports stop_reason in JSON; --draw-capture-predicate accepts filters like kind=textured_rect,texture_page=0x0299,clut=0x7c80,min_area=50000,overlap=0:240:511:479 and arms after boot. native-character-select-diagnose reproduces the GUI title-to-select path without opening a window and writes the exact select RAM, frame, VRAM, and high-bank portrait draw captures. native-startup-probe runs the exact pre-window native-play path without opening a GUI and compares the optimized hidden-capture path with the legacy diagnostic path. native-credit-mapping-probe compares coin/start mappings without opening a window; native-credit-bit-probe reuses one booted title state to compare adapter bit masks; native-credit-projection-probe compares scratchpad projection targets such as default/current/edge/previous/copies/wide or 0x1f800080/4=0x8. max_frames is optional and intended for smoke tests. Set BR2_NATIVE_SCRIPT_TIMED_WALL_TIMEOUT_SECS to override timed native scripted diagnostic wall timeouts; set BR2_NATIVE_PLAY_SNAPSHOT_WALL_TIMEOUT_SECS to cap native-play-snapshot wall time; set BR2_NATIVE_GAP_PROBE_WALL_TIMEOUT_SECS to override native-gap-probe wall time during long macOS smoke tests.\nAnalysis commands only describe caller-provided binaries; they never download, execute, or commit game data.\nThis project never ships ROMs, BIOS files, Windows EXEs, or DLLs. Configure legally obtained assets outside Git.");
     println!("{help}");
     println!("  mcp");
     println!("  native-mcp [rom_zip_or_dir] [instructions_per_frame]");

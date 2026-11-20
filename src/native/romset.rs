@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
-use std::ffi::{CStr, c_char, c_int, c_uint, c_ulong, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::UNIX_EPOCH;
+
+use miniz_oxide::inflate::decompress_to_vec;
 
 use crate::backend::BackendError;
 use crate::native::bus::NativeBoardAssets;
@@ -330,7 +331,7 @@ impl NativeRomManifest {
         self.bios_assets.iter().chain(self.game_assets.iter())
     }
 
-    fn json(&self) -> String {
+    pub fn json(&self) -> String {
         let bios_assets = self
             .bios_assets
             .iter()
@@ -2377,147 +2378,20 @@ fn read_zip_entry_from_bytes(
     Ok(data)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn inflate_raw_deflate(compressed_data: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
-    zlib_inflate_raw_deflate(compressed_data, expected_len)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn inflate_raw_deflate(_compressed_data: &[u8], _expected_len: usize) -> Result<Vec<u8>, String> {
-    Err("deflated ZIP entries require zlib support on this platform".to_string())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn zlib_inflate_raw_deflate(
-    compressed_data: &[u8],
-    expected_len: usize,
-) -> Result<Vec<u8>, String> {
-    if compressed_data.len() > c_uint::MAX as usize {
-        return Err("compressed stream is too large for zlib".to_string());
-    }
-    if expected_len > c_uint::MAX as usize {
-        return Err("decoded stream is too large for zlib".to_string());
-    }
-
-    let mut output = vec![0; expected_len];
-    let mut stream = ZStream {
-        next_in: compressed_data.as_ptr(),
-        avail_in: compressed_data.len() as c_uint,
-        total_in: 0,
-        next_out: output.as_mut_ptr(),
-        avail_out: output.len() as c_uint,
-        total_out: 0,
-        msg: std::ptr::null_mut(),
-        state: std::ptr::null_mut(),
-        zalloc: None,
-        zfree: None,
-        opaque: std::ptr::null_mut(),
-        data_type: 0,
-        adler: 0,
-        reserved: 0,
-    };
-
-    // ZIP stores method 8 payloads as raw deflate streams without a zlib header.
-    let init_status = unsafe {
-        inflateInit2_(
-            &mut stream,
-            -MAX_WBITS,
-            zlibVersion(),
-            std::mem::size_of::<ZStream>() as c_int,
-        )
-    };
-    if init_status != Z_OK {
-        return Err(format_zlib_error("inflateInit2", init_status, &stream));
-    }
-
-    let inflate_status = unsafe { inflate(&mut stream, Z_NO_FLUSH) };
-    let inflate_error = (inflate_status != Z_STREAM_END)
-        .then(|| format_zlib_error("inflate", inflate_status, &stream));
-    let end_status = unsafe { inflateEnd(&mut stream) };
-    if let Some(error) = inflate_error {
-        return Err(error);
-    }
-    if end_status != Z_OK {
-        return Err(format_zlib_error("inflateEnd", end_status, &stream));
-    }
-    if stream.total_in as usize != compressed_data.len() {
+    // ZIP method 8 stores a raw DEFLATE stream without a zlib header.  Keeping
+    // this decoder in Rust removes the host zlib ABI dependency and makes ROM
+    // inspection/cache materialization behave the same on Windows, Linux,
+    // macOS, and other targets supported by Rust.
+    let output = decompress_to_vec(compressed_data)
+        .map_err(|error| format!("raw DEFLATE decode failed: {error:?}"))?;
+    if output.len() != expected_len {
         return Err(format!(
-            "zlib consumed {} of {} compressed bytes",
-            stream.total_in,
-            compressed_data.len()
+            "DEFLATE produced {} of {expected_len} expected bytes",
+            output.len()
         ));
     }
-    if stream.total_out as usize != expected_len {
-        return Err(format!(
-            "zlib produced {} of {expected_len} expected bytes",
-            stream.total_out
-        ));
-    }
-
     Ok(output)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn format_zlib_error(operation: &str, status: c_int, stream: &ZStream) -> String {
-    let message = if stream.msg.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(stream.msg) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    if message.is_empty() {
-        format!("{operation} returned zlib status {status}")
-    } else {
-        format!("{operation} returned zlib status {status}: {message}")
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-const Z_NO_FLUSH: c_int = 0;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-const Z_OK: c_int = 0;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-const Z_STREAM_END: c_int = 1;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-const MAX_WBITS: c_int = 15;
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-type ZAllocFunc = Option<unsafe extern "C" fn(*mut c_void, c_uint, c_uint) -> *mut c_void>;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-type ZFreeFunc = Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>;
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[repr(C)]
-struct ZStream {
-    next_in: *const u8,
-    avail_in: c_uint,
-    total_in: c_ulong,
-    next_out: *mut u8,
-    avail_out: c_uint,
-    total_out: c_ulong,
-    msg: *mut c_char,
-    state: *mut c_void,
-    zalloc: ZAllocFunc,
-    zfree: ZFreeFunc,
-    opaque: *mut c_void,
-    data_type: c_int,
-    adler: c_ulong,
-    reserved: c_ulong,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[link(name = "z")]
-unsafe extern "C" {
-    fn zlibVersion() -> *const c_char;
-    fn inflateInit2_(
-        stream: *mut ZStream,
-        window_bits: c_int,
-        version: *const c_char,
-        stream_size: c_int,
-    ) -> c_int;
-    fn inflate(stream: *mut ZStream, flush: c_int) -> c_int;
-    fn inflateEnd(stream: *mut ZStream) -> c_int;
 }
 
 fn zip_entry_compressed_data<'a>(

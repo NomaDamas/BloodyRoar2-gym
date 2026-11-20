@@ -9,14 +9,17 @@ future backend adapter only if you have the legal right to use them.
 
 ## Supported platform
 
-The primary supported development and execution platform is macOS on Apple
-Silicon. Build, CLI, HTTP API, native emulator, and local MAME workflows are
-validated first on arm64 macOS.
+The Rust core, deterministic PCM renderer, CLI metadata commands, HTTP API,
+headless Gym loop, and stdio MCP server build on macOS, Linux, and Windows. The
+native play window uses `minifb` with the host's display backend (X11/Wayland on
+Linux and native window APIs on macOS/Windows). Headless HTTP/MCP operation does
+not need a display server. Realtime speaker output is an optional CoreAudio
+sink on macOS; every host still receives deterministic emulated PCM and audio
+diagnostics.
 
-Other Unix-like hosts may work for asset-free Rust development, but they are
-secondary and should not be assumed to have the same runtime coverage. Windows
-ZiNc compatibility remains a default-denied legacy path and is not the default
-target for emulator-core work.
+The CI matrix checks Apple Silicon macOS, x86_64 Linux, and Windows. MAME and
+the legacy ZiNc compatibility path remain optional external backends and are
+not required for the portable Rust runtime.
 
 ## macOS Apple Silicon setup
 
@@ -53,21 +56,26 @@ other proprietary runtime assets in ignored local directories such as `assets/`,
 `roms/`, or `bios/`. The setup process must not download or commit proprietary
 game data.
 
+For Linux or Windows, install the stable Rust toolchain and use the same
+`cargo test`, `cargo run -- mcp`, and HTTP commands. A desktop native window
+also needs the normal host display environment; CI and agents can stay
+headless.
+
 ## Current status
 
-- macOS-safe Rust project scaffold.
+- Portable Rust project scaffold for macOS, Linux, and Windows hosts.
 - Discrete action space for fighter controls.
 - Observation contract compatible with RL loops.
 - CLI and HTTP JSON API using a deterministic `NullBackend`.
-- Apple Silicon-native Rust play window with GPU framebuffer presentation.
+- Native Rust play window with GPU framebuffer presentation.
 - Native scripted input validation for Gym/RL action wiring.
-- macOS MAME launch path for local compatibility checks with legally supplied
+- Optional MAME launch path for local compatibility checks with legally supplied
   ROM assets.
 - Asset policy and static security notes for the supplied Windows bundle.
 
 The original ZiNc Windows bundle is not republished and is not treated as
-portable Rust source. Human play on macOS can use the Rust-native window first;
-MAME remains useful as an external compatibility reference.
+portable Rust source. Human play can use the Rust-native window on a desktop
+host; MAME remains useful as an external compatibility reference.
 
 ## CLI
 
@@ -77,7 +85,16 @@ cargo run -- observation-space
 cargo run -- reset
 cargo run -- step 5 4
 cargo run -- serve 127.0.0.1:8765
+cargo run -- platform
+cargo run -- analysis-manifest
+cargo run -- analysis-plan /path/to/caller-owned/binary
 ```
+
+The analysis commands only describe a caller-provided binary and suggested REA
+operations. They never read or execute that path. See
+[the RECOMP/REA workflow](docs/RECOMP_REA_WORKFLOW.md) for the optional local
+analysis helper and [the asset policy](docs/ASSET_POLICY.md) for the GitHub
+boundary.
 
 ## macOS play path
 
@@ -274,7 +291,7 @@ installable from non-interactive automation.
 
 ## Native Emulator Development
 
-This repository also contains a from-scratch Apple Silicon-native emulator path.
+This repository also contains a from-scratch portable emulator path.
 It provides a ROM ZIP/directory inspector, boot ROM loader, MIPS R3000A/GTE
 execution foundation, memory bus, DMA, GPU framebuffer renderer, input mapping,
 Gym-style native backend, and a minifb-powered local play window:
@@ -296,13 +313,15 @@ cargo run --release -- serve-native 127.0.0.1:8765 "$ROM_CACHE" 500000
 The native path is intentionally separated from MAME and ZiNc compatibility
 commands so emulator-core work can proceed without republishing proprietary
 Windows binaries or ROM data.
-The current native core runs on macOS, opens a local framebuffer window, reads
-the mapped controls, uploads visible texture data to VRAM, tracks presentation
-quality, and exposes CPU/IO/GPU state for iterative validation.
-`native-health-check`, `native-play-snapshot --match-script`, and
-`scripts/native-e2e-qa-macos.sh --mode all` are the release gates for full-scene
-composition, all P1/P2 controls, non-silent PCM, realtime CoreAudio, and
-gameplay performance.
+The current native core runs on macOS, Linux, and Windows builds, opens a local
+framebuffer window when a desktop display is available, reads the mapped
+controls, uploads visible texture data to VRAM, tracks presentation quality,
+and exposes CPU/IO/GPU state for iterative validation. CoreAudio speaker output
+is macOS-only; deterministic PCM generation remains available on every host.
+`native-health-check`, `native-play-snapshot --match-script`, and the platform
+appropriate native QA script are the release gates for full-scene composition,
+all P1/P2 controls, non-silent PCM, and gameplay performance. Realtime
+CoreAudio is an additional macOS-only gate.
 `native-env-step` and `serve-native` connect the native core to the same
 Gym-style action/observation contract used by the null backend. Native backend
 creation performs the match-entry sequence once, stores a playable emulator
@@ -314,11 +333,11 @@ JSON for repeatable boot/input debugging. `native-play-snapshot` additionally
 writes the exact 640x480 aspect-corrected GUI presentation. `native-input-check`
 verifies that the game reads mapped coin/start/fighter controls,
 `native-health-check` fails on remaining full-scene rendering or branch-stability
-gaps, and `native-play` opens the native macOS framebuffer window.
+gaps, and `native-play` opens the native framebuffer window when a display is
+available.
 
-See [docs/NATIVE_WORKFLOW.md](docs/NATIVE_WORKFLOW.md) for the canonical macOS
-Apple Silicon build, test, native-step, Gym API, and asset-compliance validation
-path.
+See [docs/NATIVE_WORKFLOW.md](docs/NATIVE_WORKFLOW.md) for the canonical native
+build, test, Gym API, and asset-compliance validation path.
 
 ## HTTP API
 
@@ -405,9 +424,11 @@ Example stdio MCP server configuration:
 }
 ```
 
-The MCP server exposes `action_space`, `character_action_space`,
-`observation_space`, `health`, `reset`, `step`, `step_buttons`,
-`perform_action`, `step_sequence`, and `screenshot`. `step` uses the same
+The MCP server exposes `analysis_manifest`, `analysis_plan`, `asset_manifest`,
+`platform`, `action_space`, `character_action_space`, `observation_space`,
+`health`, `reset`, `step`, `step_buttons`, `perform_action`, `step_sequence`,
+and `screenshot`. `analysis_plan` is metadata-only: it serializes the supplied
+path and REA command list without opening the file. `step` uses the same
 `Discrete(38)` P1/P2 mapping as HTTP. `step_buttons` accepts simultaneous
 controls for both players, including movement, Punch, Kick, Beast, Guard, coin,
 and start. `perform_action` executes the same release-safe character action

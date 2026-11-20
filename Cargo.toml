@@ -4,10 +4,17 @@ version = "0.1.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Rust RL/LLM control harness for legally supplied Bloody Roar 2-compatible emulator backends."
+repository = "https://github.com/NomaDamas/BloodyRoar2-gym"
+homepage = "https://github.com/NomaDamas/BloodyRoar2-gym"
+keywords = ["gymnasium", "reinforcement-learning", "emulator", "mcp", "rust"]
+categories = ["games", "emulators", "command-line-utilities"]
 
 [dependencies]
 m68k = "0.2.5"
-minifb = { version = "0.28.0", default-features = false }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+# Keep the local play window available on Linux desktops as well as macOS and
+# Windows.  Headless HTTP/MCP execution does not require a display server.
+minifb = { version = "0.28.0", default-features = true }
 raw-window-handle = "0.6.2"
 serde_json = "1.0"
 

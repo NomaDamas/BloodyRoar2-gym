@@ -1,30 +1,29 @@
 # Native Emulator Workflow
 
 This runbook is the canonical validation path for the Rust-native Sony
-ZN/PS1-family emulator milestone on Apple Silicon macOS. It keeps proprietary
+ZN/PS1-family emulator milestone on macOS, Linux, and Windows. It keeps proprietary
 ROM, BIOS, save state, capture, and emulator binary assets outside Git while
 validating the native CPU/IO/GPU/DMA/input/play-window foundations that are
 currently implemented.
 
-For milestone handoff on Apple Silicon, run these build and test commands in
-order before native ROM diagnostics:
+For a desktop milestone handoff, run these build and test commands in order
+before native ROM diagnostics:
 
 ```sh
-rustup target add aarch64-apple-darwin
 rustup component add rustfmt clippy
-cargo build --target aarch64-apple-darwin
+cargo build
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-On Apple Silicon hosts, `cargo build` may also be used for local iteration, but
-the explicit `aarch64-apple-darwin` target above is the documented canonical
-build command for production validation evidence.
+On Apple Silicon hosts, `cargo build --target aarch64-apple-darwin` remains a
+useful explicit release check; Linux and Windows runners use their native host
+targets.
 
 ## 1. Build
 
-Install the Apple Silicon Rust target once:
+Install an explicit target when cross-compiling from another host:
 
 ```sh
 rustup target add aarch64-apple-darwin
@@ -58,7 +57,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Run cross-target compilation checks before merging native emulator changes:
+On a host with the targets installed, run cross-target compilation checks before
+merging native emulator changes:
 
 ```sh
 rustup target add aarch64-apple-darwin
@@ -69,10 +69,10 @@ cargo check --all-targets --target x86_64-unknown-linux-gnu
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The CI workflow in `.github/workflows/cross-target.yml` runs the same target
-checks on an Apple Silicon macOS runner and an Ubuntu Linux runner. The Linux
-target validates that the generic native platform path remains compilable and
-testable without Apple-specific symbols.
+The CI workflow in `.github/workflows/cross-target.yml` runs target checks on
+Apple Silicon macOS, Ubuntu Linux, and Windows runners. The non-macOS targets
+validate that the generic native platform path remains compilable and testable
+without Apple-specific symbols or CoreAudio.
 
 If a local MAME install is available, verify the legally supplied ROM set before
 using the external compatibility path:

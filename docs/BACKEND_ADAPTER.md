@@ -20,22 +20,24 @@ pub trait Backend {
 - Return health, meter, timer, terminal state, and optionally a screenshot.
 - Avoid writing generated captures or save states into Git-tracked paths.
 
-## macOS porting notes
+## Portable host notes
 
-macOS on Apple Silicon is the primary supported development and execution
-platform for this project. Backend work should assume arm64 macOS first for
-local tooling, deterministic stepping, and native emulator integration.
+The Rust backend is intended to build and run on macOS, Linux, and Windows.
+Backend work should keep deterministic stepping and the headless HTTP/MCP
+surfaces independent of display and audio-device APIs. macOS CoreAudio is an
+optional speaker sink; generated PCM and diagnostics remain available on every
+host. The native play window is a separate desktop convenience path.
 
-The supplied ZiNc bundle is Windows binary content, not Rust source. A practical
-macOS path is therefore an adapter around a macOS-compatible emulator core or a
-separate process that exposes deterministic frame stepping and input injection.
+The supplied ZiNc bundle is Windows binary content, not Rust source. A portable
+path is therefore an adapter around a compatible emulator core or a separate
+process that exposes deterministic frame stepping and input injection.
 
 The `NullBackend` is intentionally deterministic so CI, API clients, and agent
 code can be developed without ROMs or proprietary binaries.
 
 ## MAME runtime
 
-The repository provides a MAME runtime helper:
+The repository provides an optional MAME runtime helper:
 
 ```sh
 cargo run -- prepare-assets <local-rom-archive.zip> assets/roms
@@ -43,8 +45,8 @@ cargo run -- mame-check assets/roms
 cargo run -- play assets/roms
 ```
 
-This launches the macOS emulator for human play. It intentionally stores ROM zip
-files under ignored local paths and never commits them.
+This launches the host's MAME emulator for human play. It intentionally stores
+ROM zip files under ignored local paths and never commits them.
 
 The Rust-native backend is the RL-grade path: it maps actions directly into the
 emulated controller and advances `step(action, frames)` by emulated vblanks.

@@ -1256,8 +1256,20 @@ impl NativeEmulator {
         self.bus.audio_realtime_playback_needs_game_time()
     }
 
+    #[cfg(target_os = "macos")]
     pub fn start_coreaudio_output(&mut self) -> Result<Option<CoreAudioOutput>, String> {
         self.bus.start_coreaudio_output()
+    }
+
+    /// Audio rendering is part of the deterministic emulation state on every
+    /// target, while realtime speaker output is an optional host integration.
+    /// Keep the portable CLI/GUI usable when the host has no CoreAudio
+    /// implementation instead of turning an optional device into a startup
+    /// failure. The observation still reports generated PCM through the sound
+    /// board diagnostics.
+    #[cfg(not(target_os = "macos"))]
+    pub fn start_coreaudio_output(&mut self) -> Result<Option<CoreAudioOutput>, String> {
+        Ok(None)
     }
 
     pub fn audio_pcm_snapshot(&self, max_frames: usize) -> Option<Vec<StereoSample>> {

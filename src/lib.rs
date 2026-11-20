@@ -1,4 +1,5 @@
 pub mod action;
+pub mod analysis;
 pub mod backend;
 pub mod env;
 pub mod mame;
@@ -10,6 +11,7 @@ pub mod server;
 pub mod zinc;
 
 pub use action::{ACTION_SPACE, Action, ActionButtons};
+pub use analysis::{analysis_manifest, analysis_manifest_json, analysis_plan, analysis_plan_json};
 pub use backend::{Backend, BackendError, NullBackend};
 pub use env::{BloodyRoar2Env, MAX_STEP_FRAMES, StepResult};
 pub use mame::{MameConfig, MameRuntime};

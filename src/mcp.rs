@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use crate::action::{Action, ActionButtons};
+use crate::analysis::{analysis_manifest_json, analysis_plan_json};
 use crate::backend::{BackendError, NullBackend, Observation};
 use crate::env::{BloodyRoar2Env, MAX_STEP_FRAMES, StepResult};
 use crate::moves::{
@@ -11,6 +12,7 @@ use crate::moves::{
     Player, named_action_sequence,
 };
 use crate::native::NativeBackend;
+use crate::native::{bloody_roar_2_manifest, native_platform_json};
 use crate::protocol::{action_space_json, character_action_space_json, observation_space_json};
 use crate::server::{parse_action_buttons, parse_action_segments};
 
@@ -329,6 +331,22 @@ fn call_tool(params: &Value, runtime: &mut McpRuntime) -> Result<Value, (i64, St
         .ok_or_else(|| (-32602, "tool arguments must be an object".to_string()))?;
 
     let result = match name {
+        "analysis_manifest" => parse_json_contract(analysis_manifest_json()),
+        "analysis_plan" => {
+            let binary_path = arguments
+                .get("binary_path")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| (-32602, "binary_path must be a string".to_string()))
+                })
+                .transpose()?;
+            Ok(parse_json_contract(analysis_plan_json(
+                binary_path.map(std::path::Path::new),
+            ))?)
+        }
+        "asset_manifest" => parse_json_contract(bloody_roar_2_manifest().json()),
+        "platform" => parse_json_contract(native_platform_json()),
         "action_space" => parse_json_contract(action_space_json()),
         "character_action_space" => parse_json_contract(character_action_space_json()),
         "observation_space" => parse_json_contract(observation_space_json()),
@@ -672,6 +690,39 @@ fn tool_definitions() -> Vec<Value> {
 
     vec![
         tool_definition(
+            "analysis_manifest",
+            "Return pinned Recomp/REA provenance, region inputs, and the legal asset boundary.",
+            json!({ "type": "object", "additionalProperties": false }),
+            json!({ "type": "object", "additionalProperties": true }),
+        ),
+        tool_definition(
+            "analysis_plan",
+            "Return a read-only REA/objdump/Rizin analysis plan for a caller-supplied binary path.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "binary_path": {
+                        "type": "string",
+                        "description": "Optional local path; the plan does not read or execute it."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            json!({ "type": "object", "additionalProperties": true }),
+        ),
+        tool_definition(
+            "asset_manifest",
+            "Return the expected Bloody Roar 2 BIOS/ROM names and hashes without reading local assets.",
+            json!({ "type": "object", "additionalProperties": false }),
+            json!({ "type": "object", "additionalProperties": true }),
+        ),
+        tool_definition(
+            "platform",
+            "Return the host-independent native runtime platform contract.",
+            json!({ "type": "object", "additionalProperties": false }),
+            json!({ "type": "object", "additionalProperties": true }),
+        ),
+        tool_definition(
             "action_space",
             "Return the complete Discrete(38) P1/P2 action space and button mapping.",
             json!({ "type": "object", "additionalProperties": false }),
@@ -986,7 +1037,7 @@ mod tests {
         );
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),
-            10
+            14
         );
         assert_eq!(
             responses[3]["result"]["structuredContent"]["observation"]["frame"],
@@ -1042,6 +1093,34 @@ mod tests {
 
         assert_eq!(response["result"]["structuredContent"]["backend"], "native");
         assert_eq!(response["result"]["structuredContent"]["loaded"], false);
+    }
+
+    #[test]
+    fn analysis_and_asset_tools_are_metadata_only() {
+        let mut runtime = McpRuntime::null();
+        for (id, name) in [
+            (1, "analysis_manifest"),
+            (2, "analysis_plan"),
+            (3, "asset_manifest"),
+            (4, "platform"),
+        ] {
+            let arguments = if name == "analysis_plan" {
+                serde_json::json!({ "binary_path": "/caller-owned/game.bin" })
+            } else {
+                serde_json::json!({})
+            };
+            let response = process_message(
+                &request(
+                    id,
+                    "tools/call",
+                    serde_json::json!({ "name": name, "arguments": arguments }),
+                ),
+                &mut runtime,
+            )
+            .expect("metadata tool response");
+            assert_eq!(response["result"]["isError"], false, "{name}");
+            assert!(response["result"]["structuredContent"].is_object());
+        }
     }
 
     #[test]
