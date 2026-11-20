@@ -32,6 +32,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Validate caller-owned Recomp helper
+        run: |
+          bash -n scripts/recomp-macos.sh
+          scripts/recomp-macos.sh --dry-run \
+            --project-root "$RUNNER_TEMP/BloodyRoar2Recomp" \
+            --disc "$RUNNER_TEMP/BloodyRoar2.cue" \
+            --build-dir "$RUNNER_TEMP/BloodyRoar2Recomp/build-release"
+
       - name: Lint emulator validation targets
         run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
 

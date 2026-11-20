@@ -84,9 +84,20 @@ pub fn analysis_manifest() -> Value {
         },
         "outputs": {
             "portable_runtime": "Rust binary built for the host target",
-            "agent_control": ["HTTP JSON API", "stdio MCP"],
+            "agent_control": ["HTTP JSON API", "stdio MCP", "stdio MCP over caller-owned Recomp"],
             "analysis_evidence": "caller-owned file or artifact; not game data",
             "generated_recompilation": "caller-owned build directory; not tracked"
+        },
+        "recomp_runtime": {
+            "adapter": "RecompBackend",
+            "launch_command": "bloodyroar2-gym recomp-mcp <recompiled_executable> <disc_image> [debug_port]",
+            "debug_server": "JSON-over-newline, one request per localhost TCP connection",
+            "default_port": 4370,
+            "disc_argument": "caller-supplied .bin/.cue/.iso/.chd",
+            "generated_code": "must be generated/built by the caller and remains outside this repository",
+            "p1_controls": "mapped to active-low PS1 set_input word",
+            "p2_controls": "rejected because upstream set_input exposes pad1 only",
+            "screenshots": "temporary caller-host PNG via screenshot command"
         },
         "limitations": [
             "REA can inspect a caller-supplied executable but cannot make proprietary ROMs redistributable.",
@@ -169,6 +180,7 @@ mod tests {
             manifest["inputs"]["legal_disc_image"]["tracked_in_github"],
             false
         );
+        assert_eq!(manifest["recomp_runtime"]["default_port"], 4370);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::moves::{
 use crate::native::NativeBackend;
 use crate::native::{bloody_roar_2_manifest, native_platform_json};
 use crate::protocol::{action_space_json, character_action_space_json, observation_space_json};
+use crate::recomp::{DEFAULT_RECOMP_DEBUG_PORT, RecompBackend, RecompConfig};
 use crate::server::{parse_action_buttons, parse_action_segments};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -26,11 +27,17 @@ enum McpBackendSource {
         rom_path: PathBuf,
         instructions_per_frame: u64,
     },
+    Recomp {
+        executable: PathBuf,
+        disc: PathBuf,
+        debug_port: u16,
+    },
 }
 
 enum McpEnvironment {
     Null(BloodyRoar2Env<NullBackend>),
     Native(Box<BloodyRoar2Env<NativeBackend>>),
+    Recomp(Box<BloodyRoar2Env<RecompBackend>>),
 }
 
 impl McpEnvironment {
@@ -38,6 +45,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.set_observation_screenshot(enabled),
             Self::Native(env) => env.set_observation_screenshot(enabled),
+            Self::Recomp(env) => env.set_observation_screenshot(enabled),
         }
     }
 
@@ -45,6 +53,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.reset(),
             Self::Native(env) => env.reset(),
+            Self::Recomp(env) => env.reset(),
         }
     }
 
@@ -56,6 +65,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.reset_match(p1_character, p2_character),
             Self::Native(env) => env.reset_match(p1_character, p2_character),
+            Self::Recomp(env) => env.reset_match(p1_character, p2_character),
         }
     }
 
@@ -63,6 +73,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.active_characters(),
             Self::Native(env) => env.active_characters(),
+            Self::Recomp(env) => env.active_characters(),
         }
     }
 
@@ -74,6 +85,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.ensure_character_selected(character, player),
             Self::Native(env) => env.ensure_character_selected(character, player),
+            Self::Recomp(env) => env.ensure_character_selected(character, player),
         }
     }
 
@@ -81,6 +93,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.observe(),
             Self::Native(env) => env.observe(),
+            Self::Recomp(env) => env.observe(),
         }
     }
 
@@ -88,6 +101,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.step(action, frames),
             Self::Native(env) => env.step(action, frames),
+            Self::Recomp(env) => env.step(action, frames),
         }
     }
 
@@ -99,6 +113,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.step_buttons(buttons, frames),
             Self::Native(env) => env.step_buttons(buttons, frames),
+            Self::Recomp(env) => env.step_buttons(buttons, frames),
         }
     }
 
@@ -110,6 +125,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.step_sequence(segments, include_screenshot),
             Self::Native(env) => env.step_sequence(segments, include_screenshot),
+            Self::Recomp(env) => env.step_sequence(segments, include_screenshot),
         }
     }
 
@@ -117,6 +133,7 @@ impl McpEnvironment {
         match self {
             Self::Null(env) => env.last_observation(),
             Self::Native(env) => env.last_observation(),
+            Self::Recomp(env) => env.last_observation(),
         }
     }
 }
@@ -144,10 +161,26 @@ impl McpRuntime {
         }
     }
 
+    fn recomp(executable: PathBuf, disc: PathBuf, debug_port: u16) -> Self {
+        Self {
+            source: McpBackendSource::Recomp {
+                executable,
+                disc,
+                debug_port: if debug_port == 0 {
+                    DEFAULT_RECOMP_DEBUG_PORT
+                } else {
+                    debug_port
+                },
+            },
+            environment: None,
+        }
+    }
+
     fn backend_name(&self) -> &'static str {
         match self.source {
             McpBackendSource::Null => "null",
             McpBackendSource::Native { .. } => "native",
+            McpBackendSource::Recomp { .. } => "recomp",
         }
     }
 
@@ -163,6 +196,17 @@ impl McpRuntime {
                 } => McpEnvironment::Native(Box::new(BloodyRoar2Env::new(
                     NativeBackend::from_rom_zip(rom_path.clone(), *instructions_per_frame)?,
                 ))),
+                McpBackendSource::Recomp {
+                    executable,
+                    disc,
+                    debug_port,
+                } => {
+                    let mut config = RecompConfig::new(executable.clone(), disc.clone());
+                    config.debug_port = *debug_port;
+                    McpEnvironment::Recomp(Box::new(BloodyRoar2Env::new(RecompBackend::new(
+                        config,
+                    )?)))
+                }
             };
             self.environment = Some(environment);
         }
@@ -197,6 +241,18 @@ pub fn serve_native_stdio(
     instructions_per_frame: u64,
 ) -> Result<(), BackendError> {
     serve_runtime_stdio(McpRuntime::native(rom_path.into(), instructions_per_frame))
+}
+
+pub fn serve_recomp_stdio(
+    executable: impl Into<PathBuf>,
+    disc: impl Into<PathBuf>,
+    debug_port: u16,
+) -> Result<(), BackendError> {
+    serve_runtime_stdio(McpRuntime::recomp(
+        executable.into(),
+        disc.into(),
+        debug_port,
+    ))
 }
 
 fn serve_runtime_stdio(runtime: McpRuntime) -> Result<(), BackendError> {
@@ -347,6 +403,36 @@ fn call_tool(params: &Value, runtime: &mut McpRuntime) -> Result<Value, (i64, St
         }
         "asset_manifest" => parse_json_contract(bloody_roar_2_manifest().json()),
         "platform" => parse_json_contract(native_platform_json()),
+        "recomp_build_plan" => {
+            let project_root = required_string(arguments, "project_root")?;
+            let disc = required_string(arguments, "disc")?;
+            let build_dir = required_string(arguments, "build_dir")?;
+            let config = arguments
+                .get("config")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| (-32602, "config must be a string".to_string()))
+                })
+                .transpose()?
+                .unwrap_or("game.toml");
+            let target = arguments
+                .get("target")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| (-32602, "target must be a string".to_string()))
+                })
+                .transpose()?
+                .unwrap_or("psx-runtime");
+            parse_json_contract(crate::recomp::recomp_build_plan_json(
+                std::path::Path::new(project_root),
+                std::path::Path::new(disc),
+                std::path::Path::new(build_dir),
+                config,
+                target,
+            ))
+        }
         "action_space" => parse_json_contract(action_space_json()),
         "character_action_space" => parse_json_contract(character_action_space_json()),
         "observation_space" => parse_json_contract(observation_space_json()),
@@ -884,6 +970,23 @@ fn tool_definitions() -> Vec<Value> {
             json!({ "type": "object", "additionalProperties": false }),
             observation_output,
         ),
+        tool_definition(
+            "recomp_build_plan",
+            "Return the caller-owned macOS/Linux Recomp verify, generate, and rebuild command plan.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_root": { "type": "string" },
+                    "disc": { "type": "string" },
+                    "build_dir": { "type": "string" },
+                    "config": { "type": "string", "default": "game.toml" },
+                    "target": { "type": "string", "default": "psx-runtime" }
+                },
+                "required": ["project_root", "disc", "build_dir"],
+                "additionalProperties": false
+            }),
+            json!({ "type": "object", "additionalProperties": true }),
+        ),
     ]
 }
 
@@ -1037,7 +1140,7 @@ mod tests {
         );
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),
-            14
+            15
         );
         assert_eq!(
             responses[3]["result"]["structuredContent"]["observation"]["frame"],
@@ -1121,6 +1224,36 @@ mod tests {
             assert_eq!(response["result"]["isError"], false, "{name}");
             assert!(response["result"]["structuredContent"].is_object());
         }
+    }
+
+    #[test]
+    fn recomp_build_plan_is_available_without_loading_an_executable() {
+        let mut runtime = McpRuntime::null();
+        let response = process_message(
+            &request(
+                1,
+                "tools/call",
+                serde_json::json!({
+                    "name": "recomp_build_plan",
+                    "arguments": {
+                        "project_root": "/tmp/recomp",
+                        "disc": "/private/disc/game.cue",
+                        "build_dir": "/tmp/recomp/build-release"
+                    }
+                }),
+            ),
+            &mut runtime,
+        )
+        .expect("response");
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["tracked_outputs"],
+            false
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["config"],
+            "game.toml"
+        );
     }
 
     #[test]

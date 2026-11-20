@@ -96,6 +96,40 @@ operations. They never read or execute that path. See
 analysis helper and [the asset policy](docs/ASSET_POLICY.md) for the GitHub
 boundary.
 
+To use a caller-built `BloodyRoar2_Recompiled` process on macOS, keep the
+upstream checkout, disc image, generated C, and executable outside this
+repository:
+
+```sh
+scripts/recomp-macos.sh --project-root /path/to/BloodyRoar2Recomp \
+  --disc /path/to/your/BloodyRoar2.cue \
+  --build-dir /path/to/BloodyRoar2Recomp/build-release
+cargo run --release -- recomp-mcp \
+  /path/to/BloodyRoar2Recomp/build-release/BloodyRoar2_Recompiled \
+  /path/to/your/BloodyRoar2.cue 4370
+```
+
+The helper mirrors the upstream `verify-disc`, `generate`, and `rebuild` flow
+and forces `PSX_DEBUG_TOOLS=ON` so the TCP adapter is available;
+`--dry-run` prints it without touching the image. `recomp-mcp` starts the
+debug-tools build headlessly, maps P1 controls over the upstream JSON TCP
+server, and polls guest frames. The upstream stable `set_input` command only
+exposes pad1, so P2 requests are reported as unsupported. See
+[the backend adapter contract](docs/BACKEND_ADAPTER.md) for the limits of the
+Recomp observation fields and the caller-owned asset boundary.
+
+For the upstream universal executable, pass all three regional images; this
+generates the EU, USA, and Japan code before enabling the universal CMake
+target:
+
+```sh
+scripts/recomp-macos.sh --target psx-runtime-universal \
+  --project-root /path/to/BloodyRoar2Recomp \
+  --disc /path/to/eu.cue --disc-us /path/to/usa.cue \
+  --disc-japan /path/to/japan.cue \
+  --build-dir /path/to/BloodyRoar2Recomp/build-universal
+```
+
 ## macOS play path
 
 Run the Rust-native Apple Silicon play window with legally supplied local assets:
@@ -427,8 +461,9 @@ Example stdio MCP server configuration:
 The MCP server exposes `analysis_manifest`, `analysis_plan`, `asset_manifest`,
 `platform`, `action_space`, `character_action_space`, `observation_space`,
 `health`, `reset`, `step`, `step_buttons`, `perform_action`, `step_sequence`,
-and `screenshot`. `analysis_plan` is metadata-only: it serializes the supplied
-path and REA command list without opening the file. `step` uses the same
+`screenshot`, and `recomp_build_plan`. `analysis_plan` and
+`recomp_build_plan` are metadata-only: they serialize caller paths and command
+plans without opening the files. `step` uses the same
 `Discrete(38)` P1/P2 mapping as HTTP. `step_buttons` accepts simultaneous
 controls for both players, including movement, Punch, Kick, Beast, Guard, coin,
 and start. `perform_action` executes the same release-safe character action

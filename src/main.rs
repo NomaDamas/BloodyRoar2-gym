@@ -16,7 +16,7 @@ use bloodyroar2_gym::{
     analysis_plan_json, api_index_json, native_aspect_corrected_gui_frame, native_platform_json,
     native_playable_match_entry_script, native_update_aspect_corrected_gui_frame,
     native_window_frame_from_display, native_window_prefers_stronger_stacked_field,
-    observation_space_json, png_from_rgb888_pixels,
+    observation_space_json, png_from_rgb888_pixels, recomp_build_plan_json,
 };
 use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 #[cfg(target_os = "macos")]
@@ -397,6 +397,51 @@ fn run() -> Result<(), String> {
             }
             bloodyroar2_gym::serve_native_mcp_stdio(rom, instructions_per_frame)
                 .map_err(|error| error.to_string())
+        }
+        "recomp-mcp" => {
+            let executable = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym recomp-mcp <recompiled_executable> <disc_image> [debug_port]".to_string()
+            })?;
+            let disc = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym recomp-mcp <recompiled_executable> <disc_image> [debug_port]".to_string()
+            })?;
+            let debug_port = args
+                .next()
+                .unwrap_or_else(|| "4370".to_string())
+                .parse::<u16>()
+                .map_err(|_| "debug_port must be between 1 and 65535".to_string())?;
+            if args.next().is_some() {
+                return Err(
+                    "usage: bloodyroar2-gym recomp-mcp <recompiled_executable> <disc_image> [debug_port]"
+                        .to_string(),
+                );
+            }
+            bloodyroar2_gym::serve_recomp_mcp_stdio(executable, disc, debug_port)
+                .map_err(|error| error.to_string())
+        }
+        "recomp-build-plan" => {
+            let project_root = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym recomp-build-plan <project_root> <disc_image> <build_dir> [config] [target]".to_string()
+            })?;
+            let disc = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym recomp-build-plan <project_root> <disc_image> <build_dir> [config] [target]".to_string()
+            })?;
+            let build_dir = args.next().map(PathBuf::from).ok_or_else(|| {
+                "usage: bloodyroar2-gym recomp-build-plan <project_root> <disc_image> <build_dir> [config] [target]".to_string()
+            })?;
+            let config = args.next().unwrap_or_else(|| "game.toml".to_string());
+            let target = args.next().unwrap_or_else(|| "psx-runtime".to_string());
+            if args.next().is_some() {
+                return Err(
+                    "usage: bloodyroar2-gym recomp-build-plan <project_root> <disc_image> <build_dir> [config] [target]"
+                        .to_string(),
+                );
+            }
+            println!(
+                "{}",
+                recomp_build_plan_json(&project_root, &disc, &build_dir, &config, &target)
+            );
+            Ok(())
         }
         "prepare-assets" => {
             let archive = args.next().map(PathBuf::from).ok_or_else(|| {
@@ -22060,6 +22105,8 @@ fn print_help() {
     println!("{help}");
     println!("  mcp");
     println!("  native-mcp [rom_zip_or_dir] [instructions_per_frame]");
+    println!("  recomp-mcp <recompiled_executable> <disc_image> [debug_port]");
+    println!("  recomp-build-plan <project_root> <disc_image> <build_dir> [config] [target]");
     println!(
         "  native-scripted-fast-summary <rom_zip_or_dir> <instructions_per_frame> <action:frames>..."
     );

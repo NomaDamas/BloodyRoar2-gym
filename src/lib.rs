@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod moves;
 pub mod native;
 pub mod protocol;
+pub mod recomp;
 pub mod server;
 pub mod zinc;
 
@@ -15,7 +16,10 @@ pub use analysis::{analysis_manifest, analysis_manifest_json, analysis_plan, ana
 pub use backend::{Backend, BackendError, NullBackend};
 pub use env::{BloodyRoar2Env, MAX_STEP_FRAMES, StepResult};
 pub use mame::{MameConfig, MameRuntime};
-pub use mcp::{serve_native_stdio as serve_native_mcp_stdio, serve_stdio as serve_mcp_stdio};
+pub use mcp::{
+    serve_native_stdio as serve_native_mcp_stdio, serve_recomp_stdio as serve_recomp_mcp_stdio,
+    serve_stdio as serve_mcp_stdio,
+};
 pub use moves::{
     ActionSegment, BLOODY_ROAR_2_ROSTER, Facing, MAX_ACTION_SEQUENCE_SEGMENTS, NAMED_ACTIONS,
     NamedActionSpec, Player, canonical_character_name, canonical_named_action,
@@ -35,5 +39,9 @@ pub use native::{
 };
 pub use protocol::{
     action_space_json, api_index_json, character_action_space_json, observation_space_json,
+};
+pub use recomp::{
+    DEFAULT_RECOMP_DEBUG_PORT, RecompBackend, RecompConfig, RecompDebugClient,
+    action_buttons_to_pad_word, recomp_build_plan_json,
 };
 pub use zinc::{ZincConfig, ZincRuntime};
