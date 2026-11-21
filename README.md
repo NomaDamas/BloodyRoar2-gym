@@ -118,6 +118,34 @@ exposes pad1, so P2 requests are reported as unsupported. See
 [the backend adapter contract](docs/BACKEND_ADAPTER.md) for the limits of the
 Recomp observation fields and the caller-owned asset boundary.
 
+### Get the upstream Recomp executable
+
+The upstream project publishes ready-to-run releases separately from this
+repository:
+
+- [Latest BloodyRoar2Recomp release](https://github.com/novapowers0/BloodyRoar2Recomp/releases/latest)
+- [Windows x64 ZIP (v0.7.1)](https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-v0.7.1.zip)
+- [Linux x64 ZIP (v0.7.1)](https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-linux-x64-0.7.1.zip)
+
+Unpack the release, then place your legally owned Bloody Roar II disc image
+(`.cue` with its matching `.bin`, or `.iso`/`.chd`) beside the unpacked runtime
+and select it in the launcher. These release ZIPs include the compiled runtime,
+OpenBIOS, launcher resources, and authored mods; they do **not** include the
+copyrighted game disc data or a retail BIOS dump. The current upstream release
+does not publish a macOS binary, so macOS users should build from source with
+the helper above and use the resulting executable with `recomp-mcp`.
+
+The upstream follows a copyright-friendly static-recompilation model: its
+source, build tools, configuration, and authored runtime code are public, while
+the original disc remains a user-supplied input. The build extracts the boot
+executable and generates the region-specific C locally, compiles that code into
+the executable, and keeps the generated C and disc outside the public
+repository. Files such as `baserom.md` and the catalog identity records publish
+sizes, serials, and checksums so a user can verify a personal dump; they are not
+download links for the game. The same boundary applies here: do not place disc
+images, ROMs, retail BIOS files, or generated game C in GitHub issues, releases,
+CI artifacts, or this repository.
+
 For the upstream universal executable, pass all three regional images; this
 generates the EU, USA, and Japan code before enabling the universal CMake
 target:
