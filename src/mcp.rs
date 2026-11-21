@@ -366,7 +366,7 @@ fn initialize_result(params: &Value) -> Result<Value, (i64, String)> {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Gym-style Bloody Roar 2 control and vision tools"
         },
-        "instructions": "Call reset once, then use step or step_buttons. Set screenshot=true for vision observations."
+        "instructions": "Call reset once, then use step or step_buttons. Use observe to read without advancing and screenshot=true for vision observations."
     }))
 }
 
@@ -561,6 +561,26 @@ fn call_tool(params: &Value, runtime: &mut McpRuntime) -> Result<Value, (i64, St
                 .step_sequence(&segments, screenshot)
                 .map(|step| step_result_value(&step))
                 .map_err(tool_execution_error)
+        }
+        "observe" => {
+            let screenshot = optional_bool(arguments, "screenshot", false)?;
+            let has_observation = runtime
+                .environment
+                .as_ref()
+                .and_then(McpEnvironment::last_observation)
+                .is_some();
+            let environment = runtime.ensure_environment().map_err(tool_execution_error)?;
+            environment.set_observation_screenshot(screenshot);
+            let observation = if has_observation {
+                environment.observe()
+            } else {
+                environment.reset()
+            }
+            .map_err(tool_execution_error)?;
+            Ok(json!({
+                "observation": observation_value(&observation),
+                "info": parse_info_json(&observation.info_json),
+            }))
         }
         "screenshot" => {
             let environment = runtime.ensure_environment().map_err(tool_execution_error)?;
@@ -965,6 +985,18 @@ fn tool_definitions() -> Vec<Value> {
             observation_output.clone(),
         ),
         tool_definition(
+            "observe",
+            "Read the current observation without advancing emulation; optionally include a screenshot.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "screenshot": { "type": "boolean", "default": false }
+                },
+                "additionalProperties": false
+            }),
+            observation_output.clone(),
+        ),
+        tool_definition(
             "health",
             "Report MCP/native backend readiness and the latest observation if loaded.",
             json!({ "type": "object", "additionalProperties": false }),
@@ -1113,6 +1145,14 @@ mod tests {
                 "tools/call",
                 serde_json::json!({ "name": "health", "arguments": {} }),
             ),
+            request(
+                10,
+                "tools/call",
+                serde_json::json!({
+                    "name": "observe",
+                    "arguments": { "screenshot": false }
+                }),
+            ),
         ]
         .join("\n");
         let mut output = Vec::new();
@@ -1131,7 +1171,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             responses.len(),
-            9,
+            10,
             "notifications must not receive responses"
         );
         assert_eq!(
@@ -1140,7 +1180,7 @@ mod tests {
         );
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),
-            15
+            16
         );
         assert_eq!(
             responses[3]["result"]["structuredContent"]["observation"]["frame"],
@@ -1179,6 +1219,10 @@ mod tests {
             "null"
         );
         assert_eq!(responses[8]["result"]["structuredContent"]["loaded"], true);
+        assert_eq!(
+            responses[9]["result"]["structuredContent"]["observation"]["frame"],
+            11
+        );
     }
 
     #[test]

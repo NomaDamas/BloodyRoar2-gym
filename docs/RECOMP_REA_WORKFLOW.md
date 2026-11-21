@@ -75,9 +75,10 @@ surfaces; actual REA execution remains an explicit local step.
 
 `BloodyRoar2Recomp` is a native PSX port, so its input is a PlayStation disc
 image rather than the `bldyror2` arcade ROM set used by this repository's Rust
-native backend. Public releases include generated game code and OpenBIOS, but
-they do not include the copyrighted disc data. A local build still needs a
-caller-owned `.cue`/`.bin`, `.iso`, or `.chd`.
+native backend. Public runtime releases include the compiled recompiler
+runtime and OpenBIOS, but do not include the copyrighted disc data, retail BIOS,
+or pre-generated game C. A local build still needs a caller-owned
+`.cue`/`.bin`, `.iso`, or `.chd`.
 
 Run the repository helper from an Apple Silicon macOS checkout:
 
@@ -123,9 +124,17 @@ cargo run --release -- recomp-mcp \
 
 The adapter starts the process headlessly and translates P1 action/button
 requests to `set_input`/`clear_input`, advances by polling `frame`, and returns
-temporary PNG screenshots. The upstream server currently controls pad1 only;
+temporary PNG screenshots. `observe` polls the current frame without advancing
+it, so an agent can interleave bounded input steps with observation-only reads.
+The upstream server currently controls pad1 only;
 P2 actions are rejected with an explicit diagnostic. `PSX_HEADLESS=1` makes
 the process safe for MCP use, but `present_shot` is unavailable in headless
 mode, so the adapter uses the stable `screenshot` command. The helper forces
 `PSX_DEBUG_TOOLS=ON`; a release built with `PSX_NO_DEBUG_TOOLS` cannot be
 attached.
+
+The official release page currently lists Windows x64 and Linux x64 archives.
+These are executable programs, not MAME ROM sets; MAME cannot load them via
+`-rompath`. They contain the recompiled runtime/OpenBIOS but omit the retail
+disc image and retail BIOS. macOS requires a caller-built executable from the
+workflow above.

@@ -94,8 +94,8 @@ cargo run -- analysis-plan /path/to/caller-owned/binary
 The analysis commands only describe a caller-provided binary and suggested REA
 operations. They never read or execute that path. See
 [the RECOMP/REA workflow](docs/RECOMP_REA_WORKFLOW.md) for the optional local
-analysis helper and [the asset policy](docs/ASSET_POLICY.md) for the GitHub
-boundary.
+analysis helper and [the asset policy](docs/ASSET_POLICY.md) plus the
+[legal boundary](docs/LEGAL_BOUNDARY.md) for the GitHub distribution rules.
 
 To use a caller-built `BloodyRoar2_Recompiled` process on macOS, keep the
 upstream checkout, disc image, generated C, and executable outside this
@@ -555,7 +555,7 @@ executable in addition to the disc image.
 The MCP server exposes `analysis_manifest`, `analysis_plan`, `asset_manifest`,
 `platform`, `action_space`, `character_action_space`, `observation_space`,
 `health`, `reset`, `step`, `step_buttons`, `perform_action`, `step_sequence`,
-`screenshot`, and `recomp_build_plan`. `analysis_plan` and
+`observe`, `screenshot`, and `recomp_build_plan`. `analysis_plan` and
 `recomp_build_plan` are metadata-only: they serialize caller paths and command
 plans without opening the files. `step` uses the same
 `Discrete(38)` P1/P2 mapping as HTTP. `step_buttons` accepts simultaneous
@@ -563,8 +563,28 @@ controls for both players, including movement, Punch, Kick, Beast, Guard, coin,
 and start. `perform_action` executes the same release-safe character action
 macros as `POST /action`; `step_sequence` is the exact timed-controller surface
 for character-specific command strings and simultaneous self-play.
+`observe` reads the current state without advancing the emulator, while
+`step`/`step_buttons` hold the requested controls for the requested guest
+frames and release them before returning. This gives an agent a synchronous
+real-time control loop: issue a bounded step, inspect the returned observation,
+then poll `observe` or request another step. `screenshot` and
+`screenshot=true` return the current frame as MCP image content without
+duplicating the PNG in structured JSON.
 Screenshots are returned as MCP image content while the structured observation
 keeps `screenshot_b64` null to avoid duplicating the image payload.
+
+An agent loop can therefore be as small as:
+
+```text
+reset({screenshot: true})
+step_buttons({buttons: {left: true}, frames: 2, screenshot: true})
+observe({screenshot: true})
+step_buttons({buttons: {punch: true}, frames: 1, screenshot: true})
+```
+
+Each step is bounded by a guest-frame count, and every returned screenshot is
+the frame observed after that request. `observe` is useful when a vision agent
+wants another sample without sending another input.
 
 ## Gymnasium mapping
 
@@ -598,6 +618,37 @@ Observation space:
 3. Verify assets with `cargo run -- asset-check <path>` before connecting a real
    backend.
 4. Do not push proprietary dumps, archives, or extracted Windows bundles.
+
+### What the open-source licenses cover
+
+The public source projects license their own code and tooling. They do not
+license the commercial game data:
+
+| Material | Covered by this repository or upstream source license? |
+| --- | --- |
+| `bloodyroar2-gym` Rust source | This repository's Source Available Non-Commercial License |
+| `BloodyRoar2Recomp` source and generated runtime framework | Upstream project licenses; follow each upstream notice |
+| `psxrecomp` and `rea` tooling | Their respective upstream licenses |
+| Bloody Roar 2 arcade ROMs, PS1 disc images, retail BIOS, generated game C, art, FMV, and audio | No. These remain rights-holder material and must be supplied locally by a user with the required rights |
+
+The official [BloodyRoar2Recomp releases](https://github.com/novapowers0/BloodyRoar2Recomp/releases)
+currently publish Windows x64 and Linux x64 runtime archives. They include the
+recompiler runtime and OpenBIOS, but do not include a retail disc image or
+retail BIOS. The current release does not publish a macOS executable; on macOS,
+build the upstream project locally with the caller-owned disc using
+`scripts/recomp-macos.sh`, or use the Rust-native backend with a compatible
+local arcade ROM set.
+
+For the current upstream `v0.7.1` release, the official archives are
+[Windows x64](https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-v0.7.1.zip)
+and [Linux x64](https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-linux-x64-0.7.1.zip).
+Check the release page and its checksums before using an archive.
+
+A Recomp executable is a normal host program, not a MAME ROM. MAME's
+`-rompath` loads a MAME driver ROM set such as `bldyror2` plus its Sony ZN BIOS;
+it does not execute ELF/PE Recomp archives. MAME can be used as a separate
+external compatibility reference, while `recomp-mcp` launches the caller-owned
+Recomp process directly and connects to its localhost debug server.
 
 ## Backend status
 

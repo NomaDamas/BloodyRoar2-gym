@@ -44,6 +44,27 @@ pub fn analysis_manifest() -> Value {
         "schema": "bloodyroar2.analysis/v1",
         "title": "Bloody Roar 2 portable analysis handoff",
         "source_repositories": source_repositories(),
+        "official_recomp_release": {
+            "url": "https://github.com/novapowers0/BloodyRoar2Recomp/releases/latest",
+            "known_version": "v0.7.1",
+            "assets": [
+                {
+                    "platform": "windows-x86_64",
+                    "url": "https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-v0.7.1.zip",
+                    "format": "PE/Windows executable archive"
+                },
+                {
+                    "platform": "linux-x86_64",
+                    "url": "https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-linux-x64-0.7.1.zip",
+                    "format": "ELF/Linux executable archive"
+                }
+            ],
+            "includes": ["compiled recompiler runtime", "OpenBIOS"],
+            "excludes": ["retail disc image", "retail BIOS", "user game assets"],
+            "macos_archive": false,
+            "mame_rom": false,
+            "mame_note": "MAME -rompath accepts driver ROM sets, not host ELF/PE Recomp executables"
+        },
         "regions": [
             {"name": "Europe", "serial": "SLES-01722", "status": "supported"},
             {"name": "USA", "serial": "SCUS-94424", "status": "supported"},
@@ -181,6 +202,11 @@ mod tests {
             false
         );
         assert_eq!(manifest["recomp_runtime"]["default_port"], 4370);
+        assert_eq!(
+            manifest["official_recomp_release"]["assets"][0]["platform"],
+            "windows-x86_64"
+        );
+        assert_eq!(manifest["official_recomp_release"]["mame_rom"], false);
     }
 
     #[test]
