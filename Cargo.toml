@@ -1,11 +1,10 @@
 [package]
 name = "bloodyroar2-gym"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license-file = "LICENSE"
 description = "Rust RL/LLM control harness for legally supplied Bloody Roar 2-compatible emulator backends."
 repository = "https://github.com/NomaDamas/BloodyRoar2-gym"
-homepage = "https://github.com/NomaDamas/BloodyRoar2-gym"
 keywords = ["gymnasium", "reinforcement-learning", "emulator", "mcp", "rust"]
 categories = ["games", "emulators", "command-line-utilities"]
 

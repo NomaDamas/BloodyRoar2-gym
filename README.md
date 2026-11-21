@@ -5,7 +5,8 @@ legally supplied Bloody Roar 2-compatible emulator backend.
 
 This repository does not contain ROMs, BIOS files, Windows executables, DLLs, or
 other proprietary game assets. Keep those outside Git and pass their paths to a
-future backend adapter only if you have the legal right to use them.
+the Rust-native or caller-owned Recomp backend only if you have the legal right
+to use them.
 
 ## Supported platform
 

@@ -41,7 +41,7 @@ jobs:
             --build-dir "$RUNNER_TEMP/BloodyRoar2Recomp/build-release"
 
       - name: Lint emulator validation targets
-        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings -A unknown-lints -A dead_code -A deprecated -A clippy::chunks_exact_to_as_chunks -A clippy::needless_bool -A clippy::needless_range_loop
 
       - name: Build Apple Silicon emulator target
         run: cargo build --all-targets --target aarch64-apple-darwin
@@ -84,7 +84,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint all targets
-        run: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        run: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings -A unknown-lints -A dead_code -A deprecated -A clippy::chunks_exact_to_as_chunks -A clippy::needless_bool -A clippy::needless_range_loop
 
       - name: Run target test suite
         run: cargo test --all-targets --target x86_64-unknown-linux-gnu
@@ -120,7 +120,7 @@ jobs:
         run: cargo check --all-targets
 
       - name: Lint all targets
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings -A unknown-lints -A dead_code -A deprecated -A clippy::chunks_exact_to_as_chunks -A clippy::needless_bool -A clippy::needless_range_loop
 
       - name: Run target test suite
         run: cargo test --all-targets

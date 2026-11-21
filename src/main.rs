@@ -21540,6 +21540,7 @@ fn native_window_button_sample(
         physical_enter_pressed: pressed.enter,
         test_sidecar: ActionButtons::default(),
         merged: minifb,
+        ..NativeWindowButtonSample::default()
     }
 }
 
