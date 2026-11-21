@@ -1,0 +1,100 @@
+name: Publish Rust runtime release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} runtime
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS Apple Silicon
+            runner: macos-14
+            asset_name: bloodyroar2-gym-macos-aarch64.tar.gz
+            binary_name: bloodyroar2-gym
+          - platform: Linux x86_64
+            runner: ubuntu-24.04
+            asset_name: bloodyroar2-gym-linux-x86_64.tar.gz
+            binary_name: bloodyroar2-gym
+          - platform: Windows x86_64
+            runner: windows-latest
+            asset_name: bloodyroar2-gym-windows-x86_64.zip
+            binary_name: bloodyroar2-gym.exe
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Validate source
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Unix runtime
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          stage="$RUNNER_TEMP/bloodyroar2-gym-release"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp "target/release/${{ matrix.binary_name }}" "$stage/"
+          cp README.md LICENSE "$stage/"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/${{ matrix.asset_name }}" "$(basename "$stage")"
+
+      - name: Package Windows runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'bloodyroar2-gym-release'
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/release/${{ matrix.binary_name }}" $stage
+          Copy-Item README.md, LICENSE $stage
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath (Join-Path $env:RUNNER_TEMP '${{ matrix.asset_name }}')
+
+      - name: Upload packaged runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ runner.temp }}/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download packaged runtimes
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "bloodyroar2-gym $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

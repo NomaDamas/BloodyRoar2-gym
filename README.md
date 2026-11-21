@@ -118,33 +118,74 @@ exposes pad1, so P2 requests are reported as unsupported. See
 [the backend adapter contract](docs/BACKEND_ADAPTER.md) for the limits of the
 Recomp observation fields and the caller-owned asset boundary.
 
-### Get the upstream Recomp executable
+### Download the Rust runtime and supply your own asset path
 
-The upstream project publishes ready-to-run releases separately from this
+This repository publishes the **Rust runtime itself**, without bundling any
+game data:
+
+- [Latest `bloodyroar2-gym` release](https://github.com/NomaDamas/BloodyRoar2-gym/releases/latest)
+- [macOS Apple Silicon](https://github.com/NomaDamas/BloodyRoar2-gym/releases/latest/download/bloodyroar2-gym-macos-aarch64.tar.gz)
+- [Linux x86_64](https://github.com/NomaDamas/BloodyRoar2-gym/releases/latest/download/bloodyroar2-gym-linux-x86_64.tar.gz)
+- [Windows x86_64](https://github.com/NomaDamas/BloodyRoar2-gym/releases/latest/download/bloodyroar2-gym-windows-x86_64.zip)
+
+If no release is available for a platform yet, download and build the same
+public Rust source without any game data:
+
+```sh
+cargo install --git https://github.com/NomaDamas/BloodyRoar2-gym --locked
+```
+
+After downloading and unpacking the matching archive, pass the path to an asset
+you are legally allowed to use. The Rust-native backend accepts an arcade ROM
+ZIP or an extracted ROM directory directly; this path is not copied into the
 repository:
 
-- [Latest BloodyRoar2Recomp release](https://github.com/novapowers0/BloodyRoar2Recomp/releases/latest)
-- [Windows x64 ZIP (v0.7.1)](https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-v0.7.1.zip)
-- [Linux x64 ZIP (v0.7.1)](https://github.com/novapowers0/BloodyRoar2Recomp/releases/download/v0.7.1/BloodyRoar2-linux-x64-0.7.1.zip)
+```sh
+./bloodyroar2-gym native-rom-summary \
+  "/Users/me/Games/BloodyRoar2/bldyror2.zip"
 
-Unpack the release, then place your legally owned Bloody Roar II disc image
-(`.cue` with its matching `.bin`, or `.iso`/`.chd`) beside the unpacked runtime
-and select it in the launcher. These release ZIPs include the compiled runtime,
-OpenBIOS, launcher resources, and authored mods; they do **not** include the
-copyrighted game disc data or a retail BIOS dump. The current upstream release
-does not publish a macOS binary, so macOS users should build from source with
-the helper above and use the resulting executable with `recomp-mcp`.
+./bloodyroar2-gym native-mcp \
+  "/Users/me/Games/BloodyRoar2/bldyror2.zip" 500000
+```
 
-The upstream follows a copyright-friendly static-recompilation model: its
-source, build tools, configuration, and authored runtime code are public, while
-the original disc remains a user-supplied input. The build extracts the boot
-executable and generates the region-specific C locally, compiles that code into
-the executable, and keeps the generated C and disc outside the public
-repository. Files such as `baserom.md` and the catalog identity records publish
-sizes, serials, and checksums so a user can verify a personal dump; they are not
-download links for the game. The same boundary applies here: do not place disc
-images, ROMs, retail BIOS files, or generated game C in GitHub issues, releases,
-CI artifacts, or this repository.
+The same path can be placed directly in an MCP client configuration, so the
+agent starts the Rust server with the user's local asset:
+
+```json
+{
+  "mcpServers": {
+    "bloodyroar2-rust": {
+      "command": "/Users/me/.cargo/bin/bloodyroar2-gym",
+      "args": [
+        "native-mcp",
+        "/Users/me/Games/BloodyRoar2/bldyror2.zip",
+        "500000"
+      ]
+    }
+  }
+}
+```
+
+The MCP process stays on stdio. An agent can then call `reset`, `step`,
+`step_buttons`, `perform_action`, `step_sequence`, `screenshot`, and `health`.
+The path is read locally; the runtime never downloads ROMs, BIOS files, or
+disc images.
+
+The Rust-native path uses the arcade `bldyror2` ROM set and Sony ZN BIOS. If you
+instead have a PlayStation disc image, the current Rust binary does not emulate
+the PS1 disc by itself. `recomp-mcp` is an optional adapter for a
+caller-built Recomp executable and a caller-owned `.cue`/`.bin`/`.iso`/`.chd`:
+
+```sh
+./bloodyroar2-gym recomp-mcp \
+  "/path/to/your/recomp-executable" \
+  "/Users/me/Games/BloodyRoar2/BloodyRoar2-EU.cue" 4370
+```
+
+This distinction keeps the downloadable Rust runtime useful without implying
+that a PS1 disc image is an arcade ROM set. Do not put disc images, ROMs,
+retail BIOS files, or generated game C in GitHub releases, issues, CI artifacts,
+or this repository.
 
 For the upstream universal executable, pass all three regional images; this
 generates the EU, USA, and Japan code before enabling the universal CMake
@@ -485,6 +526,30 @@ Example stdio MCP server configuration:
   }
 }
 ```
+
+For a caller-built Recomp process and a caller-owned PlayStation disc, use the
+same Rust binary with both paths as MCP startup arguments:
+
+```json
+{
+  "mcpServers": {
+    "bloodyroar2-psx": {
+      "command": "/Users/me/.cargo/bin/bloodyroar2-gym",
+      "args": [
+        "recomp-mcp",
+        "/Users/me/src/BloodyRoar2Recomp/build-release/BloodyRoar2_Recompiled",
+        "/Users/me/Games/BloodyRoar2/BloodyRoar2-EU.cue",
+        "4370"
+      ]
+    }
+  }
+}
+```
+
+The MCP client passes these paths to the local process; it does not fetch or
+upload the ROM/disc. `native-mcp` is the Rust-only path for the arcade ROM set.
+`recomp-mcp` is the PS1-disc adapter and requires a locally built Recomp
+executable in addition to the disc image.
 
 The MCP server exposes `analysis_manifest`, `analysis_plan`, `asset_manifest`,
 `platform`, `action_space`, `character_action_space`, `observation_space`,
