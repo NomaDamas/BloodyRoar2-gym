@@ -123,6 +123,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings -A unknown-lints -A dead_code -A deprecated -A clippy::chunks_exact_to_as_chunks -A clippy::needless_bool -A clippy::needless_range_loop
 
       - name: Run target test suite
+        env:
+          # The generated emulator lookup tables exercise a deeply nested
+          # startup path on Windows. Give each test thread the same headroom
+          # as the Unix validation runners.
+          RUST_MIN_STACK: 16777216
         run: cargo test --all-targets
 
       - name: Enforce proprietary asset policy
