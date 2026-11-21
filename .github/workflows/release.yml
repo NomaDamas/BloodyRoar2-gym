@@ -20,7 +20,7 @@ jobs:
       matrix:
         include:
           - platform: macOS Apple Silicon
-            runner: macos-14
+            runner: macos-15
             asset_name: bloodyroar2-gym-macos-aarch64.tar.gz
             binary_name: bloodyroar2-gym
           - platform: Linux x86_64
